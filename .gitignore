@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# Next.js build output
+.next/
+.next-build/
+out/
+
+# local env
+.env
+.env*.local
+
+# TypeScript/cache
+*.tsbuildinfo
+
+# local temp/workspace artifacts
+tmp/
+.agents/
+projects/
+.claude/
+.foundry-data/
+.vscode/
+
+# OS/editor
+.DS_Store
+Thumbs.db
