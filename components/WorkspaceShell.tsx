@@ -564,7 +564,10 @@ export function WorkspaceShell() {
       time: now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       body: factoryResultMessage(result),
       tone: result.status === "failed" || result.status === "unsupported" ? "system" : "note",
-      tags: ["Factory result"],
+      // "Project answer" is what answerForProjectRequest scans for to pair a result with its request —
+      // without it, the compact Foundry response bubble under the request never rendered for a
+      // brand-new project's first build (only MissionSummary did, disconnected from the request above it).
+      tags: ["Factory result", "Project answer"],
       attachments: [],
       sources: [],
     };
@@ -1030,7 +1033,13 @@ export function WorkspaceShell() {
       time: now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       body: brief,
       tone: "human",
-      tags: ["Project brief"],
+      // "Project request" is what ProjectWorkConversation actually scans for to find the active
+      // mission's request (BuildDashboard.tsx's requestMessages filter) — every follow-up gets it, but
+      // the very first message of a brand-new project only had the legacy "Project brief" tag, so the
+      // canvas permanently rendered "Ready for the next instruction" (the zero-messages empty state)
+      // instead of the real request/checklist/timeline, for every first build. Keep "Project brief" too
+      // since projectBriefFromMission's artifact lookup is unrelated and other code may still expect it.
+      tags: ["Project brief", "Project request"],
       attachments: [],
       sources: [],
     };
@@ -1113,18 +1122,31 @@ export function WorkspaceShell() {
       updatedAt: iso,
     };
 
+    const localConnector = isExistingProjectPlan ? localConnectorFromMission(projectMission) : undefined;
+    const instructions = brief.match(/^Custom instructions:\s*(.+)$/im)?.[1]?.trim() ?? "";
+    const hasRealInstructions = Boolean(instructions && !/^none|no additional instructions?\.?$/i.test(instructions));
+    const willExecuteNow = isExistingProjectPlan ? Boolean(localConnector?.url && hasRealInstructions) : shouldAutoExecute;
+    // Every follow-up gets a pending ExecutionMission the instant it's submitted (executeProjectMissionNow),
+    // which is what makes activeExecutionMissionId resolve during live streaming so the header pill,
+    // composer busy state, and detail-level timeline all show real progress. The very first build of a
+    // brand-new project skipped that — executionMissions started empty and stayed that way until the
+    // entire run finished — so updateActiveExecutionMission's every live update silently no-op'd
+    // (it bails out when there's no active id), and the whole build ran with the canvas showing "Ready"
+    // and no timeline at all. Mirror the follow-up path here so the first build is live from turn one.
+    const pendingExecutionMission = willExecuteNow ? createPendingExecutionMission(projectMission, "Build the initial project", briefNoteId) : undefined;
+    const missionToStore: MissionState = pendingExecutionMission
+      ? { ...projectMission, executionMissions: [pendingExecutionMission], activeExecutionMissionId: pendingExecutionMission.id }
+      : projectMission;
+
     setSelectedArtifactId(null);
     setStagedAttachments([]);
     setPendingWork((current) => current.filter((item) => item.missionId !== missionId));
     setWorkspace((current) => ({
-      activeMissionId: projectMission.missionId,
-      missions: [projectMission, ...current.missions],
+      activeMissionId: missionToStore.missionId,
+      missions: [missionToStore, ...current.missions],
     }));
 
     if (isExistingProjectPlan) {
-      const localConnector = localConnectorFromMission(projectMission);
-      const instructions = brief.match(/^Custom instructions:\s*(.+)$/im)?.[1]?.trim() ?? "";
-      const hasRealInstructions = Boolean(instructions && !/^none|no additional instructions?\.?$/i.test(instructions));
       if (localConnector?.url && hasRealInstructions) {
         await runExistingProjectExecutionForMission(
           projectMission.missionId,
