@@ -564,7 +564,10 @@ export function WorkspaceShell() {
       time: now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       body: factoryResultMessage(result),
       tone: result.status === "failed" || result.status === "unsupported" ? "system" : "note",
-      tags: ["Factory result"],
+      // "Project answer" is what answerForProjectRequest scans for to pair a result with its request —
+      // without it, the compact Foundry response bubble under the request never rendered for a
+      // brand-new project's first build (only MissionSummary did, disconnected from the request above it).
+      tags: ["Factory result", "Project answer"],
       attachments: [],
       sources: [],
     };
@@ -1030,7 +1033,13 @@ export function WorkspaceShell() {
       time: now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       body: brief,
       tone: "human",
-      tags: ["Project brief"],
+      // "Project request" is what ProjectWorkConversation actually scans for to find the active
+      // mission's request (BuildDashboard.tsx's requestMessages filter) — every follow-up gets it, but
+      // the very first message of a brand-new project only had the legacy "Project brief" tag, so the
+      // canvas permanently rendered "Ready for the next instruction" (the zero-messages empty state)
+      // instead of the real request/checklist/timeline, for every first build. Keep "Project brief" too
+      // since projectBriefFromMission's artifact lookup is unrelated and other code may still expect it.
+      tags: ["Project brief", "Project request"],
       attachments: [],
       sources: [],
     };
