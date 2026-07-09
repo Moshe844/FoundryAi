@@ -754,6 +754,7 @@ async function runExistingProjectMissionWithAccess(params: {
   if (approvalResponse?.decision === "deny") {
     const deniedCommand = approvalResponse.requestedCommand.trim();
     await emitExecution(execution, "blocked", "warning", `Approval denied: ${deniedCommand}`, {
+      tier: "flag",
       command: deniedCommand,
       details: {
         reason: `The user denied this command. You can run it yourself when ready: \`${deniedCommand}\`. Work that depends on it remains blocked; Foundry will continue only with work that can still be verified safely.`,

@@ -1958,6 +1958,48 @@ function MissionSummary({
   const buildDurationMs = buildDurationFromTimeline(visibleTimeline);
   const retries = visibleTimeline.filter((event) => event.title === "Completion claim rejected").length;
 
+  // A fast-lane mission (a single-item checklist — see isLikelySmallSingleFileRequest /
+  // isLikelyTinyOperationalRequest) is "start my server," not "build an inventory system": the
+  // 8-section report below is exactly the "computerized" over-explanation that makes a one-line
+  // outcome feel like paperwork. Report it the way a person would — one or two sentences — and only
+  // add the specific section that's actually load-bearing (files changed, a pending approval, a
+  // clarifying question), never the full checklist/verification/time-metrics scaffold.
+  const isTinyMission = checklist.length <= 1;
+  if (isTinyMission) {
+    const toneClass = passed ? "border-foundry-teal/25 bg-foundry-teal/[0.03]" : stopped ? "border-foundry-amber/25 bg-foundry-amber/[0.03]" : "border-red-300/30 bg-red-400/[0.03]";
+    return (
+      <section className={`mt-4 overflow-hidden rounded-lg border px-4 py-3 text-[13.5px] leading-6 ${toneClass}`}>
+        <p className="text-foundry-ink">{sessionSummary?.outcome || finalSummary || issue}</p>
+        {verificationEmpty ? <p className="mt-2 text-xs leading-5 text-foundry-amber">Not verified against real file or command evidence — treat this as unconfirmed until you check it yourself.</p> : null}
+        {changedFiles.length ? (
+          <div className="mt-2.5 grid gap-1">
+            {changedFiles.map((file) => (
+              <div key={file.path} className="flex items-center justify-between gap-3 rounded bg-black/20 px-2 py-1 text-xs">
+                <span className="min-w-0 truncate font-mono text-foundry-muted">{file.path}</span>
+                <span className="shrink-0 font-bold text-foundry-teal">{file.status}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {needsClarification && execution.clarificationQuestions?.length ? (
+          <div className="mt-3 grid gap-1.5">
+            {execution.clarificationQuestions.map((question, index) => (
+              <p key={`${question}-${index}`} className="rounded border border-foundry-amber/25 bg-foundry-amber/[0.06] px-2.5 py-1.5 text-foundry-ink">
+                {question}
+              </p>
+            ))}
+          </div>
+        ) : null}
+        {awaitingApproval && approvalEvent ? (
+          <div className="mt-3">
+            <BlockedCommandLine event={approvalEvent} onApprove={onApproveCommand} />
+          </div>
+        ) : null}
+        {!passed && !awaitingApproval && !needsClarification && execution.blocker ? <p className="mt-2 text-xs leading-5 text-foundry-subtle">{execution.blocker}</p> : null}
+      </section>
+    );
+  }
+
   return (
     <section
       className={`mt-4 grid gap-4 overflow-hidden rounded-lg border text-sm leading-6 ${passed ? "border-foundry-teal/25 bg-foundry-teal/[0.03]" : stopped ? "border-foundry-amber/25 bg-foundry-amber/[0.03]" : "border-red-300/30 bg-red-400/[0.03]"}`}
@@ -2588,9 +2630,16 @@ function ExecutionTimeline({
 }) {
   const visibleTimeline = timeline.filter((event) => !event.internal);
   const narrativeEvents = visibleTimeline.filter((event) => event.kind !== "blocked" && isNarrativeEvent(event) && eventVisibleAtLevel(event, level));
-  const traceEvents = visibleTimeline.filter((event) => executionTier(event) === "trace" && eventVisibleAtLevel(event, level));
+  const traceEvents = visibleTimeline.filter((event) => event.kind !== "blocked" && executionTier(event) === "trace" && eventVisibleAtLevel(event, level));
   const blockedEvents = visibleTimeline.filter((event) => event.kind === "blocked" && eventVisibleAtLevel(event, level));
   const rawMode = level === "code" || level === "command";
+  // Engineering work first, trace as proof: "inspection" events (file reads, directory listings —
+  // pure investigation, not an outcome) are the highest-volume noise source and add nothing on their
+  // own outside raw mode. Command/build/preview/edit/file events are real outcomes worth a visible
+  // row (✓ Build passed, ✎ Updated server.js) — those stay inline; reads get bundled into one
+  // collapsed "Trace evidence" line instead of one row each.
+  const inlineTraceEvents = rawMode ? traceEvents : traceEvents.filter((event) => event.kind !== "inspection");
+  const collapsedTraceEvents = rawMode ? [] : traceEvents.filter((event) => event.kind === "inspection");
 
   return (
     <div className="grid gap-0.5">
@@ -2604,8 +2653,11 @@ function ExecutionTimeline({
             {narrativeEvents.map((event) => (
               <NarrativeLine key={event.id} event={event} />
             ))}
-            {traceEvents.map((event) => renderTraceEvent(event, { level, onReadFile, onFetchFileContent, onApproveCommand }))}
+            {inlineTraceEvents.map((event) => renderTraceEvent(event, { level, onReadFile, onFetchFileContent, onApproveCommand }))}
             {blockedEvents.map((event) => <BlockedCommandLine key={event.id} event={event} onApprove={onApproveCommand} />)}
+            {collapsedTraceEvents.length ? (
+              <TraceEvidenceSummary events={collapsedTraceEvents} level={level} onReadFile={onReadFile} onFetchFileContent={onFetchFileContent} onApproveCommand={onApproveCommand} />
+            ) : null}
           </>
         ) : visibleTimeline.length === 0 ? (
           fallbackEvents.map((event, index) => (
@@ -2631,6 +2683,39 @@ function ExecutionTimeline({
   );
 }
 
+function TraceEvidenceSummary({
+  events,
+  level,
+  onReadFile,
+  onFetchFileContent,
+  onApproveCommand,
+}: {
+  events: FactoryExecutionEvent[];
+  level: ExecutionLevel;
+  onReadFile?: (path: string) => void;
+  onFetchFileContent?: (path: string) => Promise<string | null>;
+  onApproveCommand?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
+}) {
+  const readCount = events.filter((event) => /^Read\b/i.test(event.title)).length;
+  const otherCount = events.length - readCount;
+  const parts = [
+    readCount ? `${readCount} read${readCount === 1 ? "" : "s"}` : "",
+    otherCount ? `${otherCount} other check${otherCount === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
+
+  return (
+    <details className="group my-0.5 rounded-md">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-1.5 py-1.5 text-[12px] font-bold uppercase tracking-[0.04em] text-foundry-subtle transition hover:text-foundry-muted">
+        <span className="w-4 shrink-0 text-center font-mono normal-case">⋯</span>
+        <span>Trace evidence: {parts.join(", ") || `${events.length} step${events.length === 1 ? "" : "s"}`}</span>
+      </summary>
+      <div className="ml-1 mt-0.5 border-l border-white/10 pl-3">
+        {events.map((event) => renderTraceEvent(event, { level, onReadFile, onFetchFileContent, onApproveCommand }))}
+      </div>
+    </details>
+  );
+}
+
 function renderTraceEvent(
   event: FactoryExecutionEvent,
   options: {
@@ -2653,7 +2738,7 @@ function NarrativeLine({ event }: { event: FactoryExecutionEvent }) {
   const evidence = narrative?.evidence ?? [];
   const source = narrative?.source ? humanizeKey(narrative.source.replace(/-/g, " ")) : "";
   const text = narrative?.rationale || event.rationale || event.title;
-  const icon = tier === "finding" ? "ok" : tier === "decision" ? ">" : "!";
+  const icon = tier === "finding" ? "✓" : tier === "decision" ? "→" : "!";
 
   if (tier !== "flag") {
     return (
@@ -2958,7 +3043,7 @@ function eventLineFor(event: FactoryExecutionEvent) {
   const failed = event.status === "error";
   const running = event.status === "running";
   const warning = event.status === "warning";
-  const symbol = failed ? "!" : warning ? "-" : running ? ">" : event.kind === "edit" || event.kind === "file" ? "+" : "✓";
+  const symbol = failed ? "✕" : warning ? "⚠" : running ? "▶" : event.kind === "edit" || event.kind === "file" ? "✎" : "✓";
   const tone = failed ? "text-red-300" : warning ? "text-foundry-amber" : running ? "text-foundry-blue" : event.kind === "edit" || event.kind === "file" ? "text-foundry-teal" : "text-foundry-muted";
   const verb =
     event.kind === "command" || event.kind === "build"
