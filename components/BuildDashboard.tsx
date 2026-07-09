@@ -1557,7 +1557,7 @@ function ProjectBriefView({
         statusLabel={missionStatus.label}
         locked={missionStatus.isPausedForApproval}
         queuedTask={queuedTask}
-        placeholder={needsUserAction && activeExecutionMission?.pending_mock_review ? "Tell Foundry what to change, or say it looks good…" : undefined}
+        placeholder={needsUserAction && activeExecutionMission?.pending_mock_review ? "Tell Foundry what you'd like to improve…" : undefined}
         canUndo={timeline.some((event) => !event.internal && event.kind === "edit" && event.status === "completed")}
         onTaskChange={setTask}
         onExecute={runTask}
@@ -2573,24 +2573,48 @@ function useMissionRecommendations(execution: FactoryProjectResult | null, dedup
   return { recommendations, loading };
 }
 
-function RecommendationChips({ recommendations, onApply, compact = false }: { recommendations: MissionRecommendation[]; onApply: (recommendation: MissionRecommendation) => void; compact?: boolean }) {
+const businessValueLabel: Record<MissionRecommendation["businessValue"], string> = {
+  "very-high": "Very high",
+  high: "High",
+  medium: "Medium",
+};
+
+const businessValueTone: Record<MissionRecommendation["businessValue"], string> = {
+  "very-high": "border-foundry-teal/40 bg-foundry-teal/[0.12] text-foundry-teal",
+  high: "border-foundry-blue/35 bg-foundry-blue/[0.1] text-foundry-blue",
+  medium: "border-white/15 bg-white/[0.05] text-foundry-subtle",
+};
+
+/**
+ * The only way recommendations are presented: a full reasoned card (what, why, effort, value), not
+ * a bare label — this is the "wow, my engineer actually thought about what's next" moment, not a
+ * row of cryptic chips.
+ */
+function RecommendationCards({ recommendations, onApply }: { recommendations: MissionRecommendation[]; onApply: (recommendation: MissionRecommendation) => void }) {
   if (!recommendations.length) return null;
-  const shown = compact ? recommendations.slice(0, 4) : recommendations;
   return (
-    <div className="flex flex-wrap gap-1.5">
-      {shown.map((recommendation) => (
+    <div className="grid gap-2">
+      {recommendations.map((recommendation) => (
         <button
           key={recommendation.id}
           type="button"
           onClick={() => onApply(recommendation)}
-          className="group max-w-full rounded-md border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-left transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.07]"
-          title={recommendation.why}
+          className="group grid gap-1.5 rounded-lg border border-white/10 bg-white/[0.02] px-3.5 py-3 text-left transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.05]"
         >
-          <span className="flex items-center gap-1.5 text-[12.5px] font-extrabold text-foundry-ink">
-            <Sparkles size={11} className="shrink-0 text-foundry-teal opacity-70 transition group-hover:opacity-100" />
-            {recommendation.label}
-            <span className="font-mono text-[10px] font-normal text-foundry-subtle">~{recommendation.estimatedMinutes}m</span>
-          </span>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 text-[13.5px] font-extrabold text-foundry-ink">
+              <Sparkles size={13} className="shrink-0 text-foundry-teal opacity-70 transition group-hover:opacity-100" />
+              {recommendation.label}
+            </span>
+            <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-[0.06em] ${businessValueTone[recommendation.businessValue]}`}>
+              {businessValueLabel[recommendation.businessValue]}
+            </span>
+          </div>
+          {recommendation.why ? <p className="text-[12.5px] leading-5 text-foundry-muted">{recommendation.why}</p> : null}
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-mono text-[11px] text-foundry-subtle">~{recommendation.estimatedMinutes} min</span>
+            <span className="text-[11px] font-extrabold uppercase tracking-[0.05em] text-foundry-teal opacity-0 transition group-hover:opacity-100">Add →</span>
+          </div>
         </button>
       ))}
     </div>
@@ -2601,13 +2625,14 @@ function PostBuildRecommendations({ recommendations, loading, onExecute }: { rec
   if (!recommendations.length) return null;
 
   return (
-    <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.02] p-3">
+    <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.02] p-3.5">
       <div className="flex items-center gap-1.5">
         <p className="section-kicker">Next best improvements</p>
         {loading ? <Loader2 size={11} className="animate-spin text-foundry-subtle" /> : null}
       </div>
-      <div className="mt-2">
-        <RecommendationChips recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} compact />
+      <p className="mt-1 text-[12.5px] leading-5 text-foundry-muted">Pick one and Foundry starts immediately — no need to type it out.</p>
+      <div className="mt-2.5">
+        <RecommendationCards recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} />
       </div>
     </div>
   );
@@ -2634,7 +2659,7 @@ function MockReviewPanel({
 
   return (
     <div className="mt-4 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.05] p-3.5">
-      <p className="section-kicker">First version ready</p>
+      <p className="text-base font-extrabold text-foundry-ink">The first version is ready.</p>
       <p className="mt-1.5 text-sm leading-6 text-foundry-ink">{pendingMockReview.message}</p>
       {showsOwnPreview && execution ? <PreviewPanel execution={execution} /> : null}
       {pendingMockReview.preview_url ? (
@@ -2649,21 +2674,20 @@ function MockReviewPanel({
       ) : null}
 
       {recommendations.length ? (
-        <div className="mt-3">
+        <div className="mt-3.5">
           <div className="flex items-center gap-1.5">
-            <p className="text-xs font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">While building this, a few things stood out</p>
+            <p className="section-kicker">While building it, I noticed a few things worth adding</p>
             {recommendationsLoading ? <Loader2 size={11} className="animate-spin text-foundry-subtle" /> : null}
           </div>
           <div className="mt-2">
-            <RecommendationChips recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} compact />
+            <RecommendationCards recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} />
           </div>
         </div>
       ) : null}
 
-      <button className="mt-3 text-xs font-extrabold text-foundry-teal transition hover:underline" type="button" onClick={continueBuilding}>
-        Nothing — continue building →
+      <button className="mt-3.5 text-[12px] font-semibold text-foundry-subtle transition hover:text-foundry-ink hover:underline" type="button" onClick={continueBuilding}>
+        Or just continue with the plan as-is →
       </button>
-      <p className="mt-1 text-[11px] leading-4 text-foundry-subtle">Or type what to change in the box below.</p>
     </div>
   );
 }
