@@ -5705,7 +5705,12 @@ function inspectExistingSourceNames(names: string[], mode: ExistingSourceGuardMo
     // node_modules alone can contain hundreds of nested package.json files, so those are
     // excluded here — only markers outside dependency/build noise count toward a "root".
     const markerRootCount = new Set(
-      normalized.filter((name) => PROJECT_MARKER_PATTERN.test(name.toLowerCase()) && !NOISE_PATH_PATTERN.test(name.toLowerCase())).map((name) => name.split("/")[0]),
+      normalized
+        .filter((name) => PROJECT_MARKER_PATTERN.test(name.toLowerCase()) && !NOISE_PATH_PATTERN.test(name.toLowerCase()))
+        .map((name) => {
+          const parts = name.split("/").filter(Boolean);
+          return parts.length > 1 ? parts[0] : ".";
+        }),
     ).size;
     const risky = markerRootCount > 1;
     const signals = [
