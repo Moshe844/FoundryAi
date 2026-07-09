@@ -65,7 +65,7 @@ type TemplateId =
   | "desktop"
   | "custom";
 
-type FlowStep = "kind" | "project" | "understanding" | "stack" | "summary" | "instructions";
+type FlowStep = "kind" | "project" | "understanding" | "stack" | "style" | "summary" | "instructions";
 type ProjectLocation = "connect-existing" | "create-folder" | "inside-foundry";
 type ExistingActionId = "connect-existing" | "debug-existing" | "improve-existing" | "analyze-architecture" | "deploy-existing";
 type ExistingSource = "browser-local" | "upload" | "local" | "connector" | "github-later";
@@ -97,6 +97,8 @@ type ProjectStart = {
   discoveryAnswers: Record<string, string>;
   alternativeStacks: string[];
   deploymentNote: string;
+  styleChoice: string;
+  customStyle: string;
 };
 
 type BuildTemplate = {
@@ -281,6 +283,20 @@ const locationOptions: Array<{ id: ProjectLocation; label: string; description: 
     status: "Fallback",
   },
 ];
+
+const styleDescriptions: Record<string, string> = {
+  "Minimal & Clean": "Quiet and uncluttered, generous whitespace — the interface gets out of the way of the work.",
+  "Enterprise / SaaS": "Professional and dense, optimized for scanning tables and repeated workflows all day.",
+  "Playful & Bold": "High-contrast and energetic, motion-forward — built to feel fun to use.",
+  Editorial: "Content-forward and typographic — reads like a considered publication, not a dashboard.",
+  "Dark & Technical": "Terminal-adjacent, monospace-leaning, built for people comfortable with tools.",
+  "Warm & Approachable": "Soft, rounded, human — designed to feel welcoming to non-technical users.",
+  "Brutalist / Raw": "Unpolished on purpose — sharp edges, visible structure, no decoration.",
+  Retro: "Nostalgic references, period-accurate color and type choices.",
+  "Luxury / Premium": "Restrained and high-contrast with generous negative space — signals quality over quantity.",
+};
+
+const styleOptions = Object.keys(styleDescriptions);
 
 const projectSubtypeOptions: Record<TemplateId, string[]> = {
   inventory: [
@@ -704,6 +720,8 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
       discoveryAnswers: {},
       alternativeStacks: [],
       deploymentNote: "",
+      styleChoice: "",
+      customStyle: "",
     });
   }
 
@@ -2853,20 +2871,15 @@ function CustomBuildStep({ start, onUpdate }: { start: ProjectStart; onUpdate: (
   }
 
   return (
-    <FlowSection title="Intelligent Project Discovery" body="Describe the project in your own words. Foundry will infer the shape, stack, architecture, features, style, and data model before it asks anything else.">
-      <label className="grid gap-1.5 text-xs font-bold text-foundry-muted">
-        What do you want to build?
-        <textarea
-          className="min-h-36 w-full resize-y rounded-md border border-white/10 bg-black/25 p-3 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
-          value={start.projectDescription}
-          onChange={(event) => applyDescription(event.target.value)}
-          placeholder="Example: Build me an inventory system"
-        />
-      </label>
+    <FlowSection eyebrow="Foundry is asking" title="What do you want to build?" body="Describe it in your own words. Foundry will infer the shape, stack, architecture, features, style, and data model before it asks anything else.">
+      <textarea
+        className="min-h-32 w-full resize-y border-0 border-b border-white/10 bg-transparent p-0 pb-2 font-serif text-[17px] italic leading-8 text-foundry-ink outline-none placeholder:not-italic placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+        value={start.projectDescription}
+        onChange={(event) => applyDescription(event.target.value)}
+        placeholder="a small warehouse system tracking pallets across three sites…"
+      />
       {start.discovery ? (
-        <div className="mt-4 rounded-md border border-foundry-teal/20 bg-foundry-teal/[0.06] p-3 text-sm leading-6 text-foundry-muted">
-          Foundry has enough signal to draft a decision memo. Continue to review and edit it before building.
-        </div>
+        <p className="mt-4 text-xs text-foundry-subtle">Foundry has enough signal to draft a decision memo. Continue to review and edit it before building.</p>
       ) : null}
     </FlowSection>
   );
@@ -2945,15 +2958,42 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
     onAdvance();
   }
 
+  const reasoningLines = [
+    `Read the domain — ${start.appKind || "this project"}`,
+    "Weighed likely users and complexity",
+    "Drafting architecture and a first data model…",
+    "Choosing a stack it can honestly commit to",
+  ];
+
   return (
-    <FlowSection title="Understanding the project" body="Foundry is inferring purpose, users, architecture, entities, and features before recommending a stack.">
-      <div className="flex items-center gap-3 rounded-md border border-white/10 bg-black/20 p-4 text-sm text-foundry-muted">
-        <Loader2 size={16} className="animate-spin text-foundry-teal" />
-        <span>Thinking through {start.appKind || "this project"}...</span>
+    <FlowSection eyebrow="Foundry is thinking" title="Working out what this actually needs." body="This takes a few seconds. Foundry is reasoning about purpose, users, architecture, and an honest first stack recommendation — not asking you anything else yet.">
+      <div className="flex items-start gap-7">
+        <span
+          className="mt-1 h-[46px] w-[46px] shrink-0 animate-breathe-slow rounded-full"
+          style={{ background: "radial-gradient(circle at 35% 30%, #7cf0d4, #1f7a5c 70%)", boxShadow: "0 0 0 1px rgba(52,216,166,0.3), 0 0 40px -6px rgba(52,216,166,0.7)" }}
+        />
+        <div className="grid gap-3.5">
+          {reasoningLines.map((line, index) => (
+            <div
+              key={line}
+              className={`flex animate-reveal items-center gap-2.5 font-mono text-[13px] ${index < 2 ? "text-foundry-ink" : index === 2 ? "text-foundry-ink" : "text-foundry-subtle opacity-40"}`}
+              style={{ animationDelay: `${index * 0.2 + 0.05}s` }}
+            >
+              {index < 2 ? (
+                <CheckCircle2 size={13} className="shrink-0 text-foundry-teal" />
+              ) : index === 2 ? (
+                <span className="h-1.5 w-1.5 shrink-0 animate-breathe rounded-full bg-foundry-amber" />
+              ) : (
+                <span className="w-[13px] shrink-0 text-center text-foundry-subtle">·</span>
+              )}
+              {line}
+            </div>
+          ))}
+        </div>
       </div>
       {showEscape ? (
         <button
-          className="mt-3 text-xs font-bold text-foundry-muted underline decoration-dotted underline-offset-4 transition hover:text-foundry-ink"
+          className="mt-8 text-xs font-bold text-foundry-subtle transition hover:text-foundry-muted"
           type="button"
           onClick={skipRefinement}
         >
@@ -2961,6 +3001,53 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
         </button>
       ) : null}
     </FlowSection>
+  );
+}
+
+function DiscoveryRail({ start, stepIndex, steps }: { start: ProjectStart; stepIndex: number; steps: FlowStep[] }) {
+  const idx = (target: FlowStep) => steps.indexOf(target);
+  const starterLabel = start.template.id === "custom" ? "Custom project" : start.template.title.replace(/^Build\s+/i, "");
+  const locationResolved = stepIndex > idx("project");
+  const styleValue = start.customStyle.trim() || start.styleChoice;
+
+  const rows: Array<{ key: string; label: string; value: string; show: boolean; pending?: boolean }> = [
+    { key: "starter", label: "Starter", value: starterLabel, show: true },
+    { key: "domain", label: "Domain", value: start.discovery?.projectType ?? "", show: Boolean(start.discovery) },
+    { key: "stack", label: "Stack", value: selectedStackFor(start), show: stepIndex >= idx("stack") },
+    { key: "style", label: "Style", value: styleValue, show: stepIndex >= idx("style") && Boolean(styleValue) },
+    { key: "location", label: "Where it lives", value: locationResolved ? locationLabel(start.projectLocation) : "Not chosen yet", show: true, pending: !locationResolved },
+  ];
+
+  return (
+    <aside className="hidden border-r border-white/[0.06] bg-gradient-to-b from-white/[0.025] to-transparent px-5 py-6 md:flex md:flex-col">
+      <div className="mb-8 flex items-center gap-2">
+        <span className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[5px] bg-gradient-to-br from-foundry-teal to-[#1f7a5c] font-serif text-[13px] font-bold italic text-[#06110d]">F</span>
+        <span className="font-serif text-[16px] text-foundry-ink">Foundry</span>
+        <span className="font-mono text-[9.5px] uppercase tracking-[0.08em] text-foundry-subtle">discovery</span>
+      </div>
+
+      <div className="mb-3.5 font-mono text-[10px] uppercase tracking-[0.1em] text-foundry-subtle">Established so far</div>
+      <div className="flex flex-1 flex-col gap-0.5">
+        {rows
+          .filter((row) => row.show)
+          .map((row) => (
+            <div key={row.key} className={`flex items-start gap-2.5 rounded-md px-1.5 py-2 transition-opacity ${row.pending ? "opacity-30" : "opacity-100"}`}>
+              <span className={`mt-1.5 h-[5px] w-[5px] shrink-0 rounded-full ${row.pending ? "bg-foundry-subtle" : "bg-foundry-teal shadow-[0_0_0_3px_rgba(79,209,189,0.16)]"}`} />
+              <span className="flex flex-col gap-0.5">
+                <span className="font-mono text-[9.5px] uppercase tracking-[0.06em] text-foundry-subtle">{row.label}</span>
+                <span className="text-[12.5px] leading-tight text-foundry-ink">{row.value}</span>
+              </span>
+            </div>
+          ))}
+      </div>
+
+      <div className="mt-4 border-t border-white/[0.06] pt-4">
+        <span className="inline-flex items-center gap-2 font-mono text-[10px] text-foundry-muted">
+          <span className="h-1.5 w-1.5 animate-breathe rounded-full bg-foundry-teal" />
+          Foundry is here with you
+        </span>
+      </div>
+    </aside>
   );
 }
 
@@ -2990,7 +3077,7 @@ function ProjectStartFlow({
   const selectedRecommendation = recommendationForStart(start);
   const defaults = selectedRecommendation.defaults;
   const canUseFolderPicker = supportsBrowserFolderAccess();
-  const steps: FlowStep[] = ["kind", "project", "understanding", "stack", "summary", "instructions"];
+  const steps: FlowStep[] = ["kind", "project", "understanding", "stack", "style", "summary", "instructions"];
   const stepIndex = steps.indexOf(step);
   const nextStep = steps[Math.min(stepIndex + 1, steps.length - 1)];
   // Going back from "stack" skips the transitional "understanding" screen rather than re-triggering it.
@@ -3117,56 +3204,52 @@ function ProjectStartFlow({
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
-      <section className="grid max-h-[90vh] w-full max-w-3xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-lg border border-white/15 bg-[#111617] shadow-workspace">
-        <header className="flex items-start justify-between gap-4 border-b border-white/10 p-4">
-          <div className="flex min-w-0 gap-3">
-            <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md border border-foundry-teal/25 bg-foundry-teal/[0.08] text-foundry-teal">
-              <Icon size={19} />
+      <section className="grid max-h-[90vh] w-full max-w-4xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-lg border border-white/15 bg-[#111617] shadow-workspace">
+        <header className="flex items-center justify-between gap-4 border-b border-white/[0.08] px-5 py-3.5">
+          <div className="flex items-center gap-2.5">
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-foundry-teal/25 bg-foundry-teal/[0.08] text-foundry-teal">
+              <Icon size={16} />
             </span>
-            <div className="min-w-0">
-              <p className="section-kicker">Intelligent Project Discovery</p>
-              <h2 className="mt-1 truncate text-lg font-extrabold text-foundry-ink">New project</h2>
-            </div>
+            <span className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-foundry-subtle">Intelligent Project Discovery</span>
           </div>
           <button className="rounded-md px-3 py-1.5 text-sm font-bold text-foundry-muted hover:bg-white/10 hover:text-foundry-ink" type="button" onClick={onClose}>
             Close
           </button>
         </header>
 
-        <div className="min-h-0 overflow-auto p-4">
-          <input
-            ref={projectUploadInputRef}
-            className="sr-only"
-            type="file"
-            multiple
-            onChange={(event) => {
-              const files = event.currentTarget.files;
-              void selectedUploadedFiles(files).then((uploadedFiles) =>
-                onUpdate({
-                  uploadNames: selectedUploadNames(files),
-                  uploadedFiles,
-                  browserFolderHandleId: "",
-                  browserFolderName: "",
-                  existingSourceConfirmed: false,
-                  existingSourceChoice: null,
-                }),
-              );
-            }}
-          />
-          <div className="mb-4 grid grid-cols-6 gap-2">
-            {steps.map((item, index) => (
-              <span key={item} className={`h-1.5 rounded-full ${index <= stepIndex ? "bg-foundry-teal" : "bg-white/10"}`} />
-            ))}
-          </div>
+        <div className="grid min-h-0 grid-cols-1 md:grid-cols-[220px_minmax(0,1fr)]">
+          <DiscoveryRail start={start} stepIndex={stepIndex} steps={steps} />
 
-          {step === "kind" ? (
+          <div className="grid min-h-0 grid-rows-[minmax(0,1fr)_auto]">
+            <div className="min-h-0 overflow-auto px-7 py-8 sm:px-9">
+              <input
+                ref={projectUploadInputRef}
+                className="sr-only"
+                type="file"
+                multiple
+                onChange={(event) => {
+                  const files = event.currentTarget.files;
+                  void selectedUploadedFiles(files).then((uploadedFiles) =>
+                    onUpdate({
+                      uploadNames: selectedUploadNames(files),
+                      uploadedFiles,
+                      browserFolderHandleId: "",
+                      browserFolderName: "",
+                      existingSourceConfirmed: false,
+                      existingSourceChoice: null,
+                    }),
+                  );
+                }}
+              />
+
+              {step === "kind" ? (
             start.template.id === "custom" ? (
               <CustomBuildStep start={start} onUpdate={onUpdate} />
             ) : (
-              <FlowSection title={kindStepTitle(start.template, start.appKind)} body="Choose the closest project shape, or describe your own. Foundry will infer the rest before asking anything else.">
-                <div className="grid gap-2 sm:grid-cols-2">
+              <FlowSection eyebrow="Foundry is asking" title={kindStepTitle(start.template, start.appKind)} body="Pick the closest shape — or skip the chips and describe it your own way below.">
+                <div className="flex flex-wrap gap-2.5">
                   {subtypesForEffectiveProject(start).map((subtype) => (
-                    <ChoiceButton
+                    <ChipButton
                       key={subtype}
                       active={!start.customSubtype.trim() && start.subtype === subtype}
                       label={subtype}
@@ -3188,10 +3271,10 @@ function ProjectStartFlow({
                     />
                   ))}
                 </div>
-                <label className="mt-4 grid gap-1.5 text-xs font-bold text-foundry-muted">
-                  Other / Custom
+                <label className="mt-7 flex items-baseline gap-2.5 text-[15px]">
+                  <span className="whitespace-nowrap font-serif italic text-foundry-subtle">or, in your words —</span>
                   <input
-                    className="min-h-11 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                    className="flex-1 border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
                     value={start.customSubtype}
                     onChange={(event) => {
                       const appKind = appKindFor(start.template, start.subtype, event.target.value);
@@ -3207,7 +3290,7 @@ function ProjectStartFlow({
                         discoveryAnswers: {},
                       });
                     }}
-                    placeholder="Describe the exact project type..."
+                    placeholder="describe the exact project type…"
                   />
                 </label>
               </FlowSection>
@@ -3215,10 +3298,9 @@ function ProjectStartFlow({
           ) : null}
 
           {step === "project" ? (
-            <FlowSection title="New Project Location" body="Choose where this new project should live. Debugging, refactoring, analysis, and deployment happen after a project is open.">
+            <FlowSection eyebrow="Foundry is asking" title="Where should this live?" body="Debugging, refactoring, analysis, and deployment all happen after the project is open.">
               <div className="grid gap-3">
                 <div>
-                  <p className="mb-2 text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-muted">Where should the project live?</p>
                   <div className="grid gap-2">
                     {locationOptions.map((option) => (
                       <ChoiceButton
@@ -3381,51 +3463,104 @@ function ProjectStartFlow({
           {step === "understanding" ? <UnderstandingStep start={start} onUpdate={onUpdate} onAdvance={() => onStepChange("stack")} /> : null}
 
           {step === "stack" ? (
-            <FlowSection title="Preferred Stack" body="Foundry recommends sensible stacks from the project type instead of using one generic default.">
-              <div className="grid gap-2 sm:grid-cols-2">
+            <FlowSection eyebrow="Foundry recommends, doesn't force" title="Pick a stack — or trust the recommendation." body="Starred picks fit this project best. Everything else Foundry supports is one click away, with an honest capability level attached.">
+              <div className="grid gap-2.5 sm:grid-cols-2">
                 {starredRecommendations.map((recommendation) => (
-                  <StackChoiceButton key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })} />
+                  <StackCard key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })} />
                 ))}
               </div>
+
               {advancedRecommendations.length ? (
-                <details className="mt-3 rounded-md border border-white/10 bg-black/20 p-3">
-                  <summary className="cursor-pointer text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Advanced ({advancedRecommendations.length})</summary>
-                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                    {advancedRecommendations.map((recommendation) => (
-                      <StackChoiceButton key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })} />
+                <details className="mt-6 border-t border-white/[0.07] pt-4" open>
+                  <summary className="cursor-pointer font-mono text-[10.5px] uppercase tracking-[0.08em] text-foundry-subtle">
+                    Every other language Foundry supports — {advancedRecommendations.length} more
+                  </summary>
+                  <div className="mt-4 grid gap-x-8 gap-y-5 sm:grid-cols-2">
+                    {groupedAdvancedStacks(advancedRecommendations).map((group) => (
+                      <div key={group.label}>
+                        <div className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{group.label}</div>
+                        <div className="grid">
+                          {group.items.map((recommendation) => (
+                            <StackRow key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })} />
+                          ))}
+                        </div>
+                      </div>
                     ))}
                   </div>
                 </details>
               ) : null}
-              <label className="mt-4 grid gap-1.5 text-xs font-bold text-foundry-muted">
-                Custom stack/language
-                <input
-                  className="min-h-11 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
-                  value={start.customStack}
-                  onChange={(event) => onUpdate({ customStack: event.target.value })}
-                  placeholder="Type another stack or language..."
-                />
-              </label>
-              <div className="mt-4 rounded-md border border-foundry-blue/20 bg-foundry-blue/[0.06] p-3">
-                <p className="text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-muted">Why this stack?</p>
-                <p className="mt-2 text-sm leading-6 text-foundry-muted">{selectedRecommendation.why}</p>
-              </div>
-              <div className="mt-4 rounded-md border border-foundry-teal/20 bg-foundry-teal/[0.06] p-3">
-                <p className="text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-muted">Smart Defaults</p>
-                <ul className="mt-2 grid gap-1.5 text-sm text-foundry-muted">
+
+              {defaults.length ? (
+                <ul className="mt-6 grid gap-1 text-[12.5px] text-foundry-muted">
                   {defaults.map((item) => (
                     <li key={item} className="flex gap-2">
-                      <CheckCircle2 size={15} className="mt-0.5 shrink-0 text-foundry-teal" />
-                      <span>{item}</span>
+                      <span className="text-foundry-subtle">—</span>
+                      {item}
                     </li>
                   ))}
                 </ul>
+              ) : null}
+
+              <label className="mt-6 flex items-baseline gap-2.5 text-[15px]">
+                <span className="whitespace-nowrap font-serif italic text-foundry-subtle">or, another stack —</span>
+                <input
+                  className="flex-1 border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+                  value={start.customStack}
+                  onChange={(event) => onUpdate({ customStack: event.target.value })}
+                  placeholder="type any language or framework…"
+                />
+              </label>
+
+              <p className="mt-5 text-[13px] leading-relaxed text-foundry-muted">{selectedRecommendation.why}</p>
+            </FlowSection>
+          ) : null}
+
+          {step === "style" ? (
+            <FlowSection eyebrow="Foundry is asking" title="What should this feel like?" body="Pick a direction, or describe it yourself — adjectives, a reference app, a mood. This shapes density, color, and motion, not just a label.">
+              <div className="flex flex-wrap gap-2.5">
+                {styleOptions.map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    className={`rounded-full border px-4 py-2.5 text-[13.5px] transition ${
+                      !start.customStyle.trim() && start.styleChoice === option
+                        ? "border-foundry-teal bg-foundry-teal font-semibold text-[#06120d]"
+                        : "border-white/10 bg-white/[0.04] text-foundry-muted hover:border-white/25 hover:text-foundry-ink"
+                    }`}
+                    onClick={() =>
+                      onUpdate({
+                        styleChoice: option,
+                        customStyle: "",
+                        discovery: start.discovery ? { ...start.discovery, styleDirection: styleDescriptions[option] } : start.discovery,
+                      })
+                    }
+                  >
+                    {option}
+                  </button>
+                ))}
               </div>
+
+              <label className="mt-7 flex items-baseline gap-2.5 text-[15px]">
+                <span className="whitespace-nowrap font-serif italic text-foundry-subtle">or, in your words —</span>
+                <input
+                  className="flex-1 border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+                  value={start.customStyle}
+                  onChange={(event) =>
+                    onUpdate({
+                      customStyle: event.target.value,
+                      styleChoice: "",
+                      discovery: start.discovery && event.target.value.trim() ? { ...start.discovery, styleDirection: event.target.value } : start.discovery,
+                    })
+                  }
+                  placeholder="like the Linear app, but warmer"
+                />
+              </label>
+              <p className="mt-4 text-xs text-foundry-subtle">Foundry carries this into every screen it generates — not just a color swap.</p>
             </FlowSection>
           ) : null}
 
           {step === "summary" ? (
-            <FlowSection title="Here's what I believe you want." body="These decisions come from the Confidence Map. Edit anything before building.">
+            <FlowSection eyebrow="Here's what I believe you want" title={start.discovery?.projectType || "Your project"} body="These decisions come from the Confidence Map. Edit anything before building.">
               {start.discovery ? (
                 <ProjectDiscoveryMemo
                   start={start}
@@ -3440,56 +3575,58 @@ function ProjectStartFlow({
           ) : null}
 
           {step === "instructions" ? (
-            <FlowSection title="Custom Instructions" body="Optional. Add constraints, features, data fields, brand direction, integrations, or anything Foundry must respect. Leave it empty and Foundry builds from the memo alone.">
+            <FlowSection eyebrow="Optional" title="Anything else Foundry should know?" body="Constraints, features, data fields, brand direction, integrations — leave it empty and Foundry builds from the memo alone.">
               <textarea
-                className="min-h-36 w-full resize-y rounded-md border border-white/10 bg-black/25 p-3 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                className="min-h-32 w-full resize-y border-0 border-b border-white/10 bg-transparent p-0 pb-2 font-serif text-[17px] italic leading-8 text-foundry-ink outline-none placeholder:not-italic placeholder:text-foundry-subtle focus:border-foundry-teal/50"
                 value={start.instructions}
                 onChange={(event) => onUpdate({ instructions: event.target.value })}
-                placeholder="Include roles, pages, workflows, data, integrations, visual style, constraints..."
+                placeholder="roles, pages, workflows, data, integrations, visual style, constraints…"
               />
             </FlowSection>
           ) : null}
         </div>
 
-        <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 p-4">
-          <button
-            className="rounded-md px-3 py-2 text-sm font-bold text-foundry-muted transition hover:bg-white/10 hover:text-foundry-ink disabled:opacity-40"
-            type="button"
-            disabled={stepIndex === 0}
-            onClick={() => onStepChange(previousStep)}
-          >
-            Back
-          </button>
-          <div className="flex gap-2">
-            {step === "understanding" ? null : step !== "instructions" ? (
-              <div className="grid justify-items-end gap-2">
-                {step === "kind" && !start.discovery ? (
-                  <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Select or describe the project first so Foundry can infer a confidence map.</p>
-                ) : null}
-                {step === "project" && blockedByExistingSource ? (
-                  <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Choose what Foundry should do about the existing files before continuing.</p>
-                ) : null}
-                <button
-                  className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.11] px-4 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.16] disabled:cursor-not-allowed disabled:opacity-45"
-                  type="button"
-                  disabled={(step === "kind" && !start.discovery) || (step === "project" && blockedByExistingSource)}
-                  onClick={() => onStepChange(nextStep)}
-                >
-                  Continue
-                </button>
-              </div>
-            ) : (
+            <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.07] px-7 py-5 sm:px-9">
               <button
-                className="rounded-md border border-foundry-amber/35 bg-foundry-amber/[0.12] px-4 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-amber/[0.18] disabled:cursor-not-allowed disabled:opacity-45"
+                className="text-[13px] font-medium text-foundry-subtle transition hover:text-foundry-muted disabled:opacity-30"
                 type="button"
-                disabled={blockedByExistingSource}
-                onClick={onCreate}
+                disabled={stepIndex === 0}
+                onClick={() => onStepChange(previousStep)}
               >
-                Looks good - Build
+                ← back
               </button>
-            )}
+              <div className="flex gap-2">
+                {step === "understanding" ? null : step !== "instructions" ? (
+                  <div className="grid justify-items-end gap-2">
+                    {step === "kind" && !start.discovery ? (
+                      <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Select or describe the project first so Foundry can infer a confidence map.</p>
+                    ) : null}
+                    {step === "project" && blockedByExistingSource ? (
+                      <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Choose what Foundry should do about the existing files before continuing.</p>
+                    ) : null}
+                    <button
+                      className="inline-flex items-center gap-2 rounded-md bg-foundry-teal px-5 py-2.5 text-[13.5px] font-bold text-[#06120d] shadow-[0_6px_20px_-8px_rgba(79,209,189,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
+                      type="button"
+                      disabled={(step === "kind" && !start.discovery) || (step === "project" && blockedByExistingSource)}
+                      onClick={() => onStepChange(nextStep)}
+                    >
+                      Continue <span aria-hidden="true">→</span>
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    className="inline-flex items-center gap-2 rounded-md bg-foundry-amber px-5 py-2.5 text-[13.5px] font-bold text-[#1a1206] shadow-[0_6px_20px_-8px_rgba(232,183,92,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
+                    type="button"
+                    disabled={blockedByExistingSource}
+                    onClick={onCreate}
+                  >
+                    Looks good — build it <span aria-hidden="true">→</span>
+                  </button>
+                )}
+              </div>
+            </footer>
           </div>
-        </footer>
+        </div>
       </section>
     </div>
   );
@@ -3692,7 +3829,7 @@ function ExistingProjectFlow({
               void handleExistingUpload(event.currentTarget.files);
             }}
           />
-          <FlowSection title="Project Source" body="Connect Local Agent is the recommended way to work on a real project with real commands. Import Copy is a fallback that only edits a copy of what you upload.">
+          <FlowSection eyebrow="Bring a project into Foundry" title="Where's the project?" body="Connect Local Agent is the recommended way to work on a real project with real commands. Import Copy is a fallback that only edits a copy of what you upload.">
             <div className="grid gap-2">
               {existingSourceOptions
                 .filter((source) => source.id === "connector" || source.id === "upload")
@@ -4315,12 +4452,16 @@ async function detectLocalAgentForFolder(folderName: string, agentUrl: string) {
   return match ? { url: agentUrl, root: match } : null;
 }
 
-function FlowSection({ title, body, children }: { title: string; body: string; children: ReactNode }) {
+function FlowSection({ eyebrow, title, body, children }: { eyebrow: string; title: string; body: string; children: ReactNode }) {
   return (
     <section>
-      <h3 className="text-lg font-extrabold text-foundry-ink">{title}</h3>
-      <p className="mt-2 text-sm leading-6 text-foundry-muted">{body}</p>
-      <div className="mt-4">{children}</div>
+      <div className="mb-3.5 flex items-center gap-2 font-mono text-[11px] font-bold uppercase tracking-[0.12em] text-foundry-teal">
+        <span className="inline-block h-px w-3.5 bg-foundry-teal" aria-hidden="true" />
+        {eyebrow}
+      </div>
+      <h1 className="max-w-2xl text-balance font-serif text-[32px] font-medium leading-[1.22] tracking-tight text-foundry-ink">{title}</h1>
+      <p className="mt-2.5 max-w-lg text-[14.5px] leading-relaxed text-foundry-muted">{body}</p>
+      <div className="mt-7">{children}</div>
     </section>
   );
 }
@@ -4328,8 +4469,8 @@ function FlowSection({ title, body, children }: { title: string; body: string; c
 function ChoiceButton({ active, label, description, onClick }: { active: boolean; label: string; description?: string; onClick: () => void }) {
   return (
     <button
-      className={`min-h-11 rounded-md border px-3 py-2 text-left text-sm font-bold transition ${
-        active ? "border-foundry-teal/40 bg-foundry-teal/[0.11] text-foundry-ink" : "border-white/10 bg-white/[0.04] text-foundry-muted hover:border-foundry-blue/35 hover:text-foundry-ink"
+      className={`min-h-11 rounded-lg border px-3.5 py-2.5 text-left text-[13.5px] font-semibold transition ${
+        active ? "border-foundry-teal/45 bg-foundry-teal/[0.08] text-foundry-ink" : "border-white/10 bg-white/[0.03] text-foundry-muted hover:border-white/20 hover:text-foundry-ink"
       }`}
       type="button"
       onClick={onClick}
@@ -4340,16 +4481,81 @@ function ChoiceButton({ active, label, description, onClick }: { active: boolean
   );
 }
 
-function StackChoiceButton({ recommendation, active, onClick }: { recommendation: StackRecommendation; active: boolean; onClick: () => void }) {
+function ChipButton({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-full border px-4 py-2.5 text-[13.5px] transition ${
+        active ? "border-foundry-teal bg-foundry-teal font-semibold text-[#06120d]" : "border-white/10 bg-white/[0.04] text-foundry-muted hover:border-white/25 hover:text-foundry-ink"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function CapabilityBadge({ level }: { level: number }) {
+  const styles: Record<number, string> = {
+    4: "border-foundry-teal/40 text-foundry-teal",
+    3: "border-foundry-amber/45 text-foundry-amber",
+    2: "border-white/15 text-foundry-muted",
+    1: "border-red-300/40 text-red-300",
+  };
+  return <span className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[9.5px] tracking-wide ${styles[level] ?? styles[2]}`}>{level}/4</span>;
+}
+
+function StackCard({ recommendation, active, onClick }: { recommendation: StackRecommendation; active: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-lg border px-4 py-4 text-left transition ${
+        active ? "border-foundry-teal/50 bg-foundry-teal/[0.07] shadow-[inset_0_0_0_1px_rgba(79,209,189,0.3)]" : "border-white/10 bg-white/[0.03] hover:border-white/20"
+      }`}
+    >
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <span className="font-serif text-[19px] text-foundry-ink">{recommendation.name}</span>
+        {recommendation.recommended ? <span className="font-mono text-[9.5px] uppercase tracking-wider text-foundry-amber">★ recommended</span> : null}
+      </div>
+      <p className="m-0 text-[12.5px] leading-relaxed text-foundry-muted">{recommendation.why}</p>
+    </button>
+  );
+}
+
+function StackRow({ recommendation, active, onClick }: { recommendation: StackRecommendation; active: boolean; onClick: () => void }) {
   const capability = capabilityLevelForStackChoice(recommendation.name);
   return (
-    <ChoiceButton
-      active={active}
-      label={recommendation.recommended ? `${recommendation.name} - Recommended` : recommendation.name}
-      description={capability.level < 4 ? `Level ${capability.level}/4 support in Foundry` : undefined}
+    <button
+      type="button"
       onClick={onClick}
-    />
+      className={`flex items-center justify-between gap-3 border-b border-white/[0.06] py-2 text-left text-[13px] transition ${active ? "text-foundry-ink" : "text-foundry-muted hover:text-foundry-ink"}`}
+    >
+      <span>{active ? "✓ " : ""}{recommendation.name}</span>
+      <CapabilityBadge level={capability.level} />
+    </button>
   );
+}
+
+function groupLabelForStack(name: string): string {
+  const value = name.toLowerCase();
+  if (/react native|flutter|android/.test(value)) return "Mobile";
+  if (/wpf|winforms|electron|tauri/.test(value)) return "Desktop";
+  if (/unity|godot|phaser/.test(value)) return "Game";
+  if (/node|express|nestjs|fastapi|django|spring|web api|rust|\bgo\b/.test(value)) return "Backend";
+  if (/next\.?js|react|vue|angular|astro|laravel|php|html/.test(value)) return "Web";
+  return "Other";
+}
+
+function groupedAdvancedStacks(recommendations: StackRecommendation[]) {
+  const order = ["Web", "Backend", "Desktop", "Mobile", "Game", "Other"];
+  const groups = new Map<string, StackRecommendation[]>();
+  for (const recommendation of recommendations) {
+    const label = groupLabelForStack(recommendation.name);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label)?.push(recommendation);
+  }
+  return order.filter((label) => groups.has(label)).map((label) => ({ label, items: groups.get(label) as StackRecommendation[] }));
 }
 
 function UploadSummary({ names }: { names: string[] }) {
@@ -4501,13 +4707,13 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
   }
 
   return (
-    <div className="grid gap-4">
-      <div className="rounded-md border border-foundry-teal/25 bg-foundry-teal/[0.07] p-3 text-sm leading-6 text-foundry-muted">
+    <div className="grid gap-7">
+      <div className="rounded-md border border-foundry-teal/20 bg-foundry-teal/[0.06] p-3.5 text-[13px] leading-relaxed text-foundry-muted">
         <p className="font-bold text-foundry-ink">Decision memo generated from: &quot;{discovery.prompt}&quot;</p>
         <p className="mt-1">High-confidence, low-stakes choices were inferred quietly. High-stakes decisions are shown here, and uncertain high-stakes items become questions.</p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2">
+      <div className="grid gap-5 sm:grid-cols-2">
         <EditableMemoField label="Project type" value={discovery.projectType} onChange={(value) => updateDiscovery({ projectType: value })} />
         <EditableMemoField label="Recommended stack" value={discovery.recommendedStack} onChange={(value) => updateDiscovery({ recommendedStack: value })} />
       </div>
@@ -4518,74 +4724,75 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
       <EditableMemoArea label="Data model / entities" value={discovery.dataModel.join("\n")} onChange={(value) => updateList("dataModel", value)} />
 
       {alternativeStacks.length ? (
-        <section className="rounded-md border border-white/10 bg-white/[0.035] p-3">
-          <p className="section-kicker">Alternative Stacks</p>
-          <ul className="mt-2 grid gap-2">
+        <div>
+          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Alternative Stacks</p>
+          <div className="border-t border-white/[0.07]">
             {alternativeStacks.map((name) => (
-              <li key={name} className="flex items-center justify-between gap-3 rounded-md border border-white/10 bg-black/20 px-3 py-2 text-sm text-foundry-muted">
+              <div key={name} className="flex items-center justify-between gap-3 border-b border-white/[0.07] py-2.5 text-[13.5px] text-foundry-ink">
                 <span>{name}</span>
-                <button
-                  className="rounded-md border border-white/15 px-2.5 py-1 text-xs font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink"
-                  type="button"
-                  onClick={() => applyAlternativeStack(name)}
-                >
-                  Use this instead
+                <button className="font-mono text-[10.5px] text-foundry-subtle transition hover:text-foundry-teal" type="button" onClick={() => applyAlternativeStack(name)}>
+                  use instead →
                 </button>
-              </li>
+              </div>
             ))}
-          </ul>
-        </section>
+          </div>
+        </div>
       ) : null}
 
       <EditableMemoArea label="Deployment" value={deploymentNoteFor(start)} onChange={(value) => onUpdate({ deploymentNote: value })} />
 
       {stackCapabilityNote ? (
-        <section className="rounded-md border border-foundry-blue/20 bg-foundry-blue/[0.06] p-3 text-sm leading-6 text-foundry-muted">
-          <p className="section-kicker">Stack Capability</p>
-          <p className="mt-2 font-bold text-foundry-ink">{stackCapability.label} · Level {stackCapability.level}/4</p>
-          <p className="mt-1">{stackCapabilityNote}</p>
-        </section>
+        <div className={`flex gap-2.5 border-l-2 py-1 pl-3.5 text-[12.5px] leading-relaxed text-foundry-muted ${stackCapability.level >= 4 ? "border-foundry-teal" : stackCapability.level >= 2 ? "border-foundry-amber" : "border-red-300/60"}`}>
+            <div>
+              <p className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Stack capability</p>
+              <p className="mt-1 font-bold text-foundry-ink">{stackCapability.label} · {stackCapability.level}/4</p>
+              <p className="mt-0.5">{stackCapabilityNote}</p>
+            </div>
+          </div>
       ) : null}
 
       {questionDecisions.length ? (
-        <section className="rounded-md border border-foundry-amber/25 bg-foundry-amber/[0.07] p-3">
-          <p className="section-kicker">Questions</p>
-          <div className="mt-3 grid gap-3">
+        <div className="rounded-lg border border-foundry-amber/20 bg-foundry-amber/[0.05] p-4">
+          <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">One thing to confirm</p>
+          <div className="grid gap-4">
             {questionDecisions.map((decision) => (
-              <label key={decision.dimension} className="grid gap-1.5 text-xs font-bold text-foundry-muted">
-                {decision.question}
+              <label key={decision.dimension} className="grid gap-2">
+                <span className="font-serif italic text-[14.5px] text-foundry-ink">{decision.question}</span>
                 <input
-                  className="min-h-10 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-amber/45"
+                  className="border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-[13.5px] text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-amber/50"
                   value={start.discoveryAnswers[decision.dimension] ?? ""}
                   onChange={(event) => onUpdate({ discoveryAnswers: { ...start.discoveryAnswers, [decision.dimension]: event.target.value } })}
-                  placeholder="Answer if this matters for the first build..."
+                  placeholder="Answer if it matters for the first build…"
                 />
               </label>
             ))}
           </div>
-        </section>
+        </div>
       ) : null}
 
-      <section className="rounded-md border border-white/10 bg-white/[0.035] p-3">
-        <p className="section-kicker">Assumptions</p>
-        <ul className="mt-2 grid gap-1.5 text-sm leading-6 text-foundry-muted">
+      <div>
+        <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Assumptions</p>
+        <ul className="grid gap-1">
           {discovery.assumptions.map((assumption) => (
-            <li key={assumption}>{assumption}</li>
+            <li key={assumption} className="flex gap-2 text-[13px] leading-relaxed text-foundry-muted">
+              <span className="text-foundry-subtle">—</span>
+              {assumption}
+            </li>
           ))}
         </ul>
-      </section>
+      </div>
 
-      <details className="rounded-md border border-white/10 bg-black/20 p-3">
-        <summary className="cursor-pointer text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Confidence Map</summary>
-        <div className="mt-3 grid gap-2">
+      <details className="border-t border-white/[0.07] pt-4">
+        <summary className="cursor-pointer font-mono text-[10.5px] uppercase tracking-[0.08em] text-foundry-subtle">Confidence map — {disclosedDecisions.length} disclosed</summary>
+        <div className="mt-3 grid overflow-hidden rounded-md border border-white/[0.07]">
           {disclosedDecisions.map((decision) => (
-            <div key={decision.dimension} className="grid gap-1 rounded-md border border-white/10 bg-white/[0.025] p-2 text-xs leading-5 text-foundry-muted">
+            <div key={decision.dimension} className="grid gap-1 border-b border-white/[0.06] bg-white/[0.015] px-3 py-2.5 font-mono text-[11px] leading-5 text-foundry-muted last:border-b-0">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="font-extrabold text-foundry-ink">{humanizeKey(decision.dimension)}</span>
-                <span className="font-mono text-foundry-subtle">{decision.confidence}% · {decision.stakes} stakes · {decision.source} · {decision.action}</span>
+                <span className="font-bold text-foundry-ink">{humanizeKey(decision.dimension)}</span>
+                <span className="text-foundry-subtle">{decision.confidence}% · {decision.stakes} stakes · {decision.source} · {decision.action}</span>
               </div>
-              <p>{decision.hypothesis}</p>
-              <p className="text-foundry-subtle">{decision.rationale}</p>
+              <p className="font-sans">{decision.hypothesis}</p>
+              <p className="font-sans text-foundry-subtle">{decision.rationale}</p>
             </div>
           ))}
         </div>
@@ -4596,10 +4803,10 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
 
 function EditableMemoField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
   return (
-    <label className="grid gap-1.5 text-xs font-bold text-foundry-muted">
-      {label}
+    <label className="grid gap-1.5">
+      <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{label}</span>
       <input
-        className="min-h-10 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+        className="border-0 border-b border-white/10 bg-transparent p-0 pb-1 text-[14px] text-foundry-ink outline-none focus:border-foundry-teal/50"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />
@@ -4609,10 +4816,10 @@ function EditableMemoField({ label, value, onChange }: { label: string; value: s
 
 function EditableMemoArea({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
   return (
-    <label className="grid gap-1.5 text-xs font-bold text-foundry-muted">
-      {label}
+    <label className="grid gap-1.5">
+      <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{label}</span>
       <textarea
-        className="min-h-24 resize-y rounded-md border border-white/10 bg-black/25 p-3 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+        className="min-h-[3.5rem] resize-y border-0 bg-transparent p-0 text-[14px] leading-[1.55] text-foundry-ink outline-none"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />
