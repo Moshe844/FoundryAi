@@ -16,6 +16,7 @@ import {
   LayoutDashboard,
   Loader2,
   Lock,
+  Pencil,
   Settings,
   ShoppingBag,
   SkipForward,
@@ -3625,7 +3626,7 @@ function ProjectStartFlow({
           ) : null}
 
           {step === "summary" ? (
-            <FlowSection eyebrow="Here's what I believe you want" title={start.discovery?.projectType || "Your project"} body="These decisions come from the Confidence Map. Edit anything before building.">
+            <FlowSection eyebrow="Foundry's Understanding" title={start.discovery?.projectType || "Your project"} body="Read Foundry's reasoning below — hover any decision to edit it before building.">
               {start.discovery ? (
                 <ProjectDiscoveryMemo
                   start={start}
@@ -4775,6 +4776,8 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
       assumptions: update.assumptions ?? currentDiscovery.assumptions,
       questions: update.questions ?? currentDiscovery.questions,
       decisions: update.decisions ?? currentDiscovery.decisions,
+      keyFacts: update.keyFacts ?? currentDiscovery.keyFacts,
+      futureCapabilities: update.futureCapabilities ?? currentDiscovery.futureCapabilities,
     };
     onUpdate({ discovery: nextDiscovery });
   }
@@ -4796,36 +4799,47 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
   }
 
   return (
-    <div className="grid gap-7">
+    <div className="grid gap-9">
       <div>
-        <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">What I believe you&apos;re building</p>
-        <p className="font-serif text-[16px] leading-[1.7] text-foundry-ink">{ledeFor(start)}</p>
+        <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Foundry&apos;s Understanding</p>
+        <p className="font-serif text-[17px] leading-[1.75] text-foundry-ink">{ledeFor(start)}</p>
       </div>
 
-      <div className="grid gap-5 sm:grid-cols-2">
-        <EditableMemoField label="Project type" value={discovery.projectType} onChange={(value) => updateDiscovery({ projectType: value })} />
-        <EditableMemoField label="Recommended stack" value={discovery.recommendedStack} onChange={(value) => updateDiscovery({ recommendedStack: value })} />
-      </div>
+      {discovery.keyFacts.length ? (
+        <div>
+          <p className="mb-2.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">What Foundry Already Knows</p>
+          <ul className="grid gap-2 sm:grid-cols-2">
+            {discovery.keyFacts.map((fact) => (
+              <li key={fact} className="flex items-baseline gap-2 text-[13.5px] leading-relaxed text-foundry-ink">
+                <CheckCircle2 size={13} className="mt-[3px] shrink-0 text-foundry-teal" />
+                {fact}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       {memoSections.map((section) => (
         <div key={section.label}>
-          <p className="mb-2 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{section.label}</p>
-          <ul className="grid gap-1.5">
+          <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{section.label}</p>
+          <ul className="grid gap-3.5">
             {section.items.map((decision) => (
-              <li key={decision.dimension} className="flex items-baseline gap-2.5 text-[13.5px] leading-relaxed">
-                <span className={`shrink-0 font-mono text-[11px] ${decision.action === "ask" ? "text-foundry-amber" : "text-foundry-teal"}`}>{decision.action === "ask" ? "?" : "✓"}</span>
-                <span className="text-foundry-ink">
-                  {decision.action === "ask" ? decision.question : decision.hypothesis}
-                  {decision.action !== "ask" ? <span className="ml-2 font-mono text-[10.5px] text-foundry-subtle">{decision.confidence}%</span> : <span className="ml-2 font-mono text-[10.5px] text-foundry-amber">needs confirmation</span>}
-                </span>
+              <li key={decision.dimension}>
+                <div className="flex items-baseline gap-2.5 text-[13.5px] leading-relaxed">
+                  <CheckCircle2 size={13} className="mt-[3px] shrink-0 text-foundry-teal" />
+                  <span className="font-bold text-foundry-ink">{decision.hypothesis}</span>
+                </div>
+                {decision.rationale ? <p className="mt-0.5 pl-[21px] font-serif text-[12.5px] italic leading-relaxed text-foundry-subtle">{decision.rationale}</p> : null}
               </li>
             ))}
           </ul>
         </div>
       ))}
 
-      <EditableMemoArea label="Main features" value={discovery.mainFeatures.join("\n")} onChange={(value) => updateList("mainFeatures", value)} />
-      <EditableMemoArea label="Data model / entities" value={discovery.dataModel.join("\n")} onChange={(value) => updateList("dataModel", value)} />
+      <div className="grid gap-5 sm:grid-cols-2">
+        <ReadableField label="Project type" value={discovery.projectType} onChange={(value) => updateDiscovery({ projectType: value })} />
+        <ReadableField label="Recommended stack" value={discovery.recommendedStack} onChange={(value) => updateDiscovery({ recommendedStack: value })} />
+      </div>
 
       {alternativeStacks.length ? (
         <div>
@@ -4843,7 +4857,27 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
         </div>
       ) : null}
 
-      <EditableMemoArea label="Deployment" value={deploymentNoteFor(start)} onChange={(value) => onUpdate({ deploymentNote: value })} />
+      <ReadableArea label="Main features" value={discovery.mainFeatures.join("\n")} onChange={(value) => updateList("mainFeatures", value)} />
+      <ReadableArea label="Data model / entities" value={discovery.dataModel.join("\n")} onChange={(value) => updateList("dataModel", value)} />
+
+      {discovery.futureCapabilities.length ? (
+        <div>
+          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Growth Strategy</p>
+          <p className="mb-2.5 font-serif text-[13.5px] italic leading-relaxed text-foundry-subtle">
+            Foundry has seen projects like this before — the architecture already leaves room for these without a rewrite.
+          </p>
+          <ul className="grid gap-1.5">
+            {discovery.futureCapabilities.map((item) => (
+              <li key={item} className="flex gap-2 text-[13.5px] leading-relaxed text-foundry-ink">
+                <span className="text-foundry-subtle">·</span>
+                {item}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      <ReadableArea label="Deployment" value={deploymentNoteFor(start)} onChange={(value) => onUpdate({ deploymentNote: value })} />
 
       {stackCapabilityNote ? (
         <div className={`flex gap-2.5 border-l-2 py-1 pl-3.5 text-[12.5px] leading-relaxed text-foundry-muted ${stackCapability.level >= 4 ? "border-foundry-teal" : stackCapability.level >= 2 ? "border-foundry-amber" : "border-red-300/60"}`}>
@@ -4856,14 +4890,18 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
       ) : null}
 
       {questionDecisions.length ? (
-        <div className="rounded-lg border border-foundry-amber/20 bg-foundry-amber/[0.05] p-4">
-          <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Questions I still have</p>
+        <div>
+          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Remaining Unknowns</p>
+          <p className="mb-3 font-serif text-[13.5px] italic leading-relaxed text-foundry-subtle">Only the few things that would actually change the architecture.</p>
           <div className="grid gap-4">
             {questionDecisions.map((decision) => (
               <label key={decision.dimension} className="grid gap-2">
-                <span className="font-serif italic text-[14.5px] text-foundry-ink">{decision.question}</span>
+                <span className="flex items-baseline gap-2 font-serif text-[14.5px] text-foundry-ink">
+                  <span className="shrink-0 font-mono text-[11px] text-foundry-amber">?</span>
+                  {decision.question}
+                </span>
                 <input
-                  className="border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-[13.5px] text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-amber/50"
+                  className="border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 pl-[19px] text-[13.5px] text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-amber/50"
                   value={start.discoveryAnswers[decision.dimension] ?? ""}
                   onChange={(event) => onUpdate({ discoveryAnswers: { ...start.discoveryAnswers, [decision.dimension]: event.target.value } })}
                   placeholder="Answer if it matters for the first build…"
@@ -4874,20 +4912,8 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
         </div>
       ) : null}
 
-      <div>
-        <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Risks &amp; Assumptions</p>
-        <ul className="grid gap-1">
-          {discovery.assumptions.map((assumption) => (
-            <li key={assumption} className="flex gap-2 text-[13px] leading-relaxed text-foundry-muted">
-              <span className="text-foundry-subtle">—</span>
-              {assumption}
-            </li>
-          ))}
-        </ul>
-      </div>
-
       <details className="border-t border-white/[0.07] pt-4">
-        <summary className="cursor-pointer font-mono text-[10.5px] uppercase tracking-[0.08em] text-foundry-subtle">Confidence map — {disclosedDecisions.length} disclosed</summary>
+        <summary className="cursor-pointer font-mono text-[10.5px] uppercase tracking-[0.08em] text-foundry-subtle">Full reasoning &amp; confidence map — {disclosedDecisions.length} decisions</summary>
         <div className="mt-3 grid overflow-hidden rounded-md border border-white/[0.07]">
           {disclosedDecisions.map((decision) => (
             <div key={decision.dimension} className="grid gap-1 border-b border-white/[0.06] bg-white/[0.015] px-3 py-2.5 font-mono text-[11px] leading-5 text-foundry-muted last:border-b-0">
@@ -4905,29 +4931,72 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
   );
 }
 
-function EditableMemoField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+function ReadableField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  if (editing) {
+    return (
+      <label className="grid gap-1.5">
+        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{label}</span>
+        <input
+          autoFocus
+          className="border-0 border-b border-white/10 bg-transparent p-0 pb-1 text-[14px] text-foundry-ink outline-none focus:border-foundry-teal/50"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          onBlur={() => setEditing(false)}
+          onKeyDown={(event) => { if (event.key === "Enter") setEditing(false); }}
+        />
+      </label>
+    );
+  }
   return (
-    <label className="grid gap-1.5">
+    <div className="group grid gap-1.5">
       <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{label}</span>
-      <input
-        className="border-0 border-b border-white/10 bg-transparent p-0 pb-1 text-[14px] text-foundry-ink outline-none focus:border-foundry-teal/50"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </label>
+      <div className="flex items-start justify-between gap-3">
+        <p className="text-[14px] text-foundry-ink">{value}</p>
+        <button
+          type="button"
+          className="mt-0.5 shrink-0 text-foundry-subtle opacity-0 transition hover:text-foundry-teal group-hover:opacity-100 focus-visible:opacity-100"
+          onClick={() => setEditing(true)}
+          aria-label={`Edit ${label}`}
+        >
+          <Pencil size={12} />
+        </button>
+      </div>
+    </div>
   );
 }
 
-function EditableMemoArea({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+function ReadableArea({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  if (editing) {
+    return (
+      <label className="grid gap-1.5">
+        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{label}</span>
+        <textarea
+          autoFocus
+          className="min-h-[3.5rem] resize-y border-0 bg-transparent p-0 text-[14px] leading-[1.55] text-foundry-ink outline-none"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          onBlur={() => setEditing(false)}
+        />
+      </label>
+    );
+  }
   return (
-    <label className="grid gap-1.5">
+    <div className="group grid gap-1.5">
       <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{label}</span>
-      <textarea
-        className="min-h-[3.5rem] resize-y border-0 bg-transparent p-0 text-[14px] leading-[1.55] text-foundry-ink outline-none"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </label>
+      <div className="flex items-start justify-between gap-3">
+        <p className="whitespace-pre-line text-[14px] leading-[1.55] text-foundry-ink">{value}</p>
+        <button
+          type="button"
+          className="mt-0.5 shrink-0 text-foundry-subtle opacity-0 transition hover:text-foundry-teal group-hover:opacity-100 focus-visible:opacity-100"
+          onClick={() => setEditing(true)}
+          aria-label={`Edit ${label}`}
+        >
+          <Pencil size={12} />
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -5155,25 +5224,29 @@ function ledeFor(start: ProjectStart) {
   return `${discovery.architecture} ${discovery.styleDirection}`.trim();
 }
 
-const sectionForDimension: Record<DiscoveryDimension, string> = {
-  domain: "Architecture Decisions",
-  "likely-users": "Architecture Decisions",
-  complexity: "Architecture Decisions",
-  platform: "Architecture Decisions",
-  architecture: "Architecture Decisions",
-  navigation: "Design Decisions",
-  style: "Design Decisions",
-  features: "Design Decisions",
-  "data-shape": "Data Model",
-  "auth-database-api": "Data, Auth & Security",
+// domain / likely-users / complexity are deliberately excluded here — they're already
+// carried by the narrative lede and "What Foundry Already Knows", so repeating them as
+// their own decision group would just be the same understanding said twice.
+const sectionForDimension: Partial<Record<DiscoveryDimension, string>> = {
+  platform: "Architectural Direction",
+  architecture: "Architectural Direction",
+  "auth-database-api": "Architectural Direction",
+  "data-shape": "Architectural Direction",
+  navigation: "Product Experience",
+  style: "Product Experience",
+  features: "Product Experience",
 };
 
-const sectionOrder = ["Architecture Decisions", "Design Decisions", "Data Model", "Data, Auth & Security"];
+const sectionOrder = ["Architectural Direction", "Product Experience"];
 
 function memoSectionsFor(decisions: DiscoveryDecision[]) {
   const groups = new Map<string, DiscoveryDecision[]>();
   for (const decision of decisions) {
-    const label = sectionForDimension[decision.dimension] ?? "Architecture Decisions";
+    // Decisions Foundry is asking about live only in "Remaining Unknowns" — showing
+    // them here too would repeat the same open question twice on the page.
+    if (decision.action === "ask") continue;
+    const label = sectionForDimension[decision.dimension];
+    if (!label) continue;
     if (!groups.has(label)) groups.set(label, []);
     groups.get(label)?.push(decision);
   }
@@ -5734,6 +5807,8 @@ function projectBriefFor(start: ProjectStart) {
     discovery?.styleDirection ? `Style direction: ${discovery.styleDirection}` : "",
     discovery?.mainFeatures.length ? `Main features: ${discovery.mainFeatures.join("; ")}` : "",
     discovery?.dataModel.length ? `Data model/entities: ${discovery.dataModel.join("; ")}` : "",
+    discovery?.keyFacts.length ? `Key facts: ${discovery.keyFacts.join("; ")}` : "",
+    discovery?.futureCapabilities.length ? `Anticipated future capabilities (not building now, but leave room for): ${discovery.futureCapabilities.join("; ")}` : "",
     `Deployment: ${deploymentNoteFor(start)}`,
     `Stack capability: ${stackCapabilityLine(selectedStack)}`,
     discovery?.assumptions.length ? `Assumptions: ${discovery.assumptions.join("; ")}` : "",
