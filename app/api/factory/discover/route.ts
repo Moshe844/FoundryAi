@@ -21,7 +21,7 @@ export async function POST(request: Request) {
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY is not configured.", discovery: heuristic, alternativeStacks: [], deploymentNote: "" }, { status: 503 });
+      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY is not configured.", discovery: heuristic, alternativeStacks: [], deploymentNote: "", lede: "" }, { status: 503 });
     }
 
     const context = compactContext(body.context);
@@ -43,6 +43,7 @@ export async function POST(request: Request) {
       discovery: refined.discovery,
       alternativeStacks: refined.alternativeStacks,
       deploymentNote: refined.deploymentNote,
+      lede: refined.lede,
       usage: result.usage,
     });
   } catch (error) {

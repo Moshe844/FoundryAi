@@ -66,23 +66,34 @@ const profiles: SignalProfile[] = [
     label: "Game",
     patterns: [/\b(game|kids? math|quiz game|arcade|puzzle|platformer|level|score|sprite|phaser|unity|godot)\b/i],
     stack: "Phaser",
-    architecture: "Browser-playable game loop with scenes, input handling, scoring, and asset-ready state.",
-    style: "Playful, responsive, high-contrast game UI with clear feedback and motion.",
-    features: ["Start/play screen", "Core gameplay loop", "Score/progress feedback", "Levels or rounds", "Win/try-again states"],
-    entities: ["Player", "Level", "Challenge", "Score", "Game session"],
-    users: "Players; if the prompt mentions kids, prioritize child-friendly pacing and feedback.",
-    platform: "Web game",
-    complexity: "Interactive prototype",
+    architecture:
+      "Browser-playable game loop built on Phaser 3 scenes, with a state machine for menu/play/pause states, keyboard and pointer input handling, collision detection, and a scoring system persisted to local storage.",
+    style:
+      "Playful, high-contrast game UI with juicy feedback: screen shake and particle bursts on scoring, animated scene transitions, and chunky, readable HUD text.",
+    features: ["Start/menu screen", "Core gameplay loop with win/lose conditions", "Score and combo tracking", "Level or wave progression", "Pause/resume state", "Win/try-again screen with animated feedback"],
+    entities: ["Player", "Level/wave", "Challenge/obstacle", "Score entry", "Game session", "High score"],
+    users: "Players; if the prompt mentions kids, prioritize forgiving difficulty curves, large tap targets, and encouraging feedback over punishing failure states.",
+    platform: "Web game (Phaser canvas)",
+    complexity: "Interactive prototype with a real scoring loop",
   },
   {
     id: "inventory",
     label: "Inventory management system",
     patterns: [/\b(inventory|stock|sku|warehouse|barcode|products?|purchase orders?|reorder|suppliers?)\b/i],
     stack: "Next.js",
-    architecture: "Full-stack business app with typed UI, local-first data model unless persistence/auth is requested.",
-    style: "Professional SaaS/operations interface optimized for scanning tables and repeated workflows.",
-    features: ["Product catalog", "Stock counts", "Low-stock alerts", "Supplier tracking", "Inventory adjustments", "Import/export-ready tables"],
-    entities: ["Product", "SKU", "Location", "Supplier", "Stock movement", "Purchase order"],
+    architecture:
+      "Next.js App Router with Server Actions for CRUD, a typed data layer, optimistic UI updates for stock adjustments, and a local-first SQLite/JSON store until a real database is requested.",
+    style:
+      "Professional SaaS operations interface: dense sortable/filterable tables, sticky headers, keyboard-friendly row actions, and color-coded stock-level badges (low/critical/healthy).",
+    features: [
+      "Product & SKU catalog with barcode-ready fields",
+      "Real-time stock counts by location",
+      "Low-stock threshold alerts",
+      "Supplier directory with reorder history",
+      "Inventory adjustment log with reason codes",
+      "CSV import/export",
+    ],
+    entities: ["Product", "SKU", "Location/warehouse", "Supplier", "Stock movement", "Purchase order", "Adjustment reason"],
     users: "Business operators, managers, and inventory staff.",
     platform: "Web app",
     complexity: "Multi-screen business tool",
@@ -92,10 +103,12 @@ const profiles: SignalProfile[] = [
     label: "E-commerce store",
     patterns: [/\b(e-?commerce|online store|shop|cart|checkout|product catalog|storefront)\b/i],
     stack: "Next.js",
-    architecture: "Storefront plus admin-ready product/catalog structure.",
-    style: "Polished commercial storefront with product-forward browsing and clear conversion paths.",
-    features: ["Product listing", "Product detail", "Cart", "Checkout-ready flow", "Order summary"],
-    entities: ["Product", "Customer", "Cart item", "Order", "Category"],
+    architecture:
+      "Next.js storefront with server-rendered product pages for SEO, optimistic client-side cart state, checkout scaffolding ready for a payment provider, and an admin-ready product/catalog data layer.",
+    style:
+      "Polished commercial storefront: large product photography, a clear pricing hierarchy, a sticky add-to-cart action, and a frictionless checkout flow with visible trust signals.",
+    features: ["Product listing with filters/sort", "Product detail with variant selection", "Cart with quantity/line-item editing", "Checkout-ready flow (shipping, payment placeholder)", "Order confirmation/summary", "Category/collection browsing"],
+    entities: ["Product", "Variant", "Customer", "Cart item", "Order", "Category", "Discount/coupon"],
     users: "Customers and store administrators.",
     platform: "Web app",
     complexity: "Customer-facing commerce app",
@@ -105,10 +118,11 @@ const profiles: SignalProfile[] = [
     label: "Dashboard",
     patterns: [/\b(dashboard|analytics|metrics|kpi|reporting|charts?|admin panel)\b/i],
     stack: "Next.js",
-    architecture: "Data dashboard with reusable metrics, filters, tables, and drill-down surfaces.",
-    style: "Quiet operational UI with dense, readable data and restrained visual hierarchy.",
-    features: ["Metric overview", "Charts", "Filterable table", "Detail panels", "Export-ready reporting"],
-    entities: ["Metric", "Report", "Filter", "User", "Data source"],
+    architecture:
+      "Next.js data dashboard with a reusable metric-card and chart component library, server-side data fetching with caching, filter state synced to the URL, and drill-down routes per metric.",
+    style: "Quiet operational UI: dense typography, restrained color reserved for status/alerts, sparkline-driven metric cards, and a filter bar that stays in view while scrolling.",
+    features: ["KPI overview with trend sparklines", "Interactive charts with date-range filters", "Filterable, sortable data table", "Detail drill-down panels", "Export-ready reporting (CSV/PDF)", "Saved views/filters"],
+    entities: ["Metric", "Report", "Filter/saved view", "User", "Data source/integration"],
     users: "Operators, managers, and analysts.",
     platform: "Web app",
     complexity: "Data-heavy business interface",
@@ -118,10 +132,11 @@ const profiles: SignalProfile[] = [
     label: "Mobile app",
     patterns: [/\b(mobile app|ios|android|react native|flutter|phone app)\b/i],
     stack: "React Native",
-    architecture: "Cross-platform mobile app with screen navigation, device-sized layouts, and local state first.",
-    style: "Mobile-native interface with thumb-friendly controls and clear screen hierarchy.",
-    features: ["Home screen", "Primary workflow", "Settings/profile", "Empty/loading states", "Navigation shell"],
-    entities: ["User", "Screen state", "Item", "Activity"],
+    architecture:
+      "React Native app with file-based navigation, a shared design-token system for consistent spacing and typography, local-first state before any backend sync, and platform-aware safe-area handling.",
+    style: "Mobile-native interface: thumb-reachable primary actions, gesture-friendly navigation, native-feeling transitions, and platform-specific affordances where iOS and Android diverge.",
+    features: ["Home/dashboard screen", "Primary workflow with offline-first state", "Settings/profile screen", "Empty, loading, and error states for every screen", "Bottom-tab or drawer navigation shell", "Pull-to-refresh"],
+    entities: ["User", "Screen state", "Item/record", "Activity/event", "Sync queue"],
     users: "Mobile users in the target workflow.",
     platform: "Mobile",
     complexity: "Multi-screen mobile product",
@@ -131,10 +146,11 @@ const profiles: SignalProfile[] = [
     label: "Desktop app",
     patterns: [/\b(desktop|windows app|wpf|winforms|electron|tauri|installer)\b/i],
     stack: ".NET WPF",
-    architecture: "Desktop-first application with local data and native-window workflows.",
-    style: "Practical desktop UI with efficient forms, tables, and predictable navigation.",
-    features: ["Main workspace", "Local data workflow", "Settings", "File/import actions"],
-    entities: ["Record", "User setting", "Local file", "Workspace"],
+    architecture:
+      "WPF (.NET) app using MVVM with data-binding, a local SQLite database, dependency injection for services, and a native installer planned after the prototype.",
+    style: "Practical desktop UI: sidebar navigation, dense data grids with inline editing, keyboard shortcuts for power users, and consistent modal dialogs for confirmations.",
+    features: ["Main workspace with a data grid", "Local-first CRUD workflow", "Settings/preferences window", "File import/export actions", "Undo/redo for destructive actions", "Autosave with a recovery file"],
+    entities: ["Record", "User setting", "Local file", "Workspace/project file", "Undo history entry"],
     users: "Desktop users who need a focused local tool.",
     platform: "Windows desktop",
     complexity: "Desktop utility/application",
@@ -144,10 +160,11 @@ const profiles: SignalProfile[] = [
     label: "Content website",
     patterns: [/\b(blog|website|portfolio|landing page|marketing site|docs site|content site)\b/i],
     stack: "Next.js",
-    architecture: "Content-oriented website with reusable sections/pages and static-friendly rendering.",
-    style: "Editorial, brand-forward responsive web design.",
-    features: ["Homepage", "Content listing", "Detail page", "Navigation", "Responsive layout"],
-    entities: ["Page", "Post", "Author", "Category"],
+    architecture:
+      "Next.js content site with static generation for pages and posts, MDX-based content authoring, and a component library of reusable sections (hero, feature grid, testimonials, CTA).",
+    style: "Editorial, brand-forward responsive design: a strong type scale, generous whitespace, scroll-triggered reveals, and consistent section rhythm across pages.",
+    features: ["Homepage with hero + feature sections", "Content listing (blog/portfolio grid)", "Detail page with rich content rendering", "Primary + footer navigation", "Responsive images with lazy loading", "SEO metadata per page"],
+    entities: ["Page", "Post/project", "Author", "Category/tag", "Media asset"],
     users: "Visitors and content readers.",
     platform: "Web",
     complexity: "Multi-page website",
@@ -157,23 +174,35 @@ const profiles: SignalProfile[] = [
     label: "Login/auth page",
     patterns: [/\b(login|sign in|signin|signup|sign up|auth page|authentication page)\b/i],
     stack: "Next.js",
-    architecture: "Focused auth UI surface with validation-ready form state.",
-    style: "Clean trust-building product UI with accessible forms and clear error states.",
-    features: ["Login form", "Validation states", "Forgot password link", "Signup link", "Responsive layout"],
-    entities: ["User", "Credential", "Auth session"],
-    users: "Users accessing a product account.",
+    architecture:
+      "Next.js App Router with Server Actions for form submissions, JWT-based sessions in secure httpOnly cookies, middleware-enforced route protection, password hashing via bcrypt/argon2, and a pluggable auth-provider abstraction ready for OAuth.",
+    style:
+      "Premium SaaS trust-building aesthetic: a glassmorphism card over a subtly animated gradient background, dark-mode-first palette, smooth micro-transitions, accessible forms with inline validation, and clear loading/error states.",
+    features: [
+      "Email/password sign-in",
+      "Google OAuth",
+      "GitHub OAuth",
+      "Magic-link sign-in option",
+      "Remember-me / persistent session",
+      "Forgot-password flow with reset token",
+      "Signup with email verification",
+      "MFA-ready session model",
+    ],
+    entities: ["User", "Credential", "OAuth account", "Auth session", "Password reset token", "MFA device (planned)"],
+    users: "People signing in to a product account; assume they expect modern conveniences like social login and magic-link even if not explicitly requested.",
     platform: "Web",
-    complexity: "Focused UI page",
+    complexity: "Focused UI surface backed by real session/security decisions",
   },
   {
     id: "api",
     label: "Backend/API service",
     patterns: [/\b(api|backend|server|service|rest|graphql|webhook|microservice)\b/i],
     stack: "Node/Express",
-    architecture: "Typed API service with routes, validation, and persistence boundary left explicit.",
-    style: "API-first project with minimal admin/status UI if needed.",
-    features: ["Health endpoint", "Resource routes", "Validation", "Error handling", "Configuration"],
-    entities: ["Resource", "Request", "Response", "User", "Integration"],
+    architecture:
+      "Node/Express (TypeScript) service with a layered structure (routes, controllers, services), schema-based request validation, centralized error-handling middleware, and a persistence boundary left explicit until a database is chosen.",
+    style: "API-first project: consistent JSON error shapes, versioned routes, OpenAPI-ready documentation, and a minimal health/status endpoint for uptime checks.",
+    features: ["Health/status endpoint", "Resource CRUD routes", "Request validation with typed schemas", "Centralized error handling", "Environment-based configuration", "Structured request logging"],
+    entities: ["Resource", "Request/response envelope", "Client/API key", "Integration", "Rate limit bucket"],
     users: "Developers and client applications.",
     platform: "Backend service",
     complexity: "Service/API",
@@ -291,11 +320,12 @@ function authSource(prompt: string): DiscoverySource {
 }
 
 function authDataApiFor(prompt: string, profile: SignalProfile) {
-  if (/\b(login|auth|account)\b/i.test(prompt)) return "Include account/auth-ready UI.";
-  if (/\b(database|db|persist|save data)\b/i.test(prompt)) return "Include persistent data boundary.";
-  if (/\b(api|backend|server)\b/i.test(prompt)) return "Include API/backend structure.";
-  if (profile.id === "inventory" || profile.id === "commerce" || profile.id === "dashboard") return "Start with local/mock data, keep database/auth/API seams explicit.";
-  return "Default to local state/mock data for the first version.";
+  if (profile.id === "auth-page") return "Email/password plus Google and GitHub OAuth, JWT sessions in httpOnly cookies, and a password-reset flow with expiring tokens.";
+  if (/\b(login|auth|account)\b/i.test(prompt)) return "Account/auth-ready UI wired to a real session model, not just a static form.";
+  if (/\b(database|db|persist|save data)\b/i.test(prompt)) return "A persistent data boundary (typed models, migration-ready) rather than local-only state.";
+  if (/\b(api|backend|server)\b/i.test(prompt)) return "An explicit API/backend boundary with validated request/response contracts.";
+  if (profile.id === "inventory" || profile.id === "commerce" || profile.id === "dashboard") return "Start with local/mock data and keep the database/auth/API seams explicit so they're easy to wire in later.";
+  return "Local state/mock data for the first version, with clear seams for a real database or auth once needed.";
 }
 
 function navigationFor(profile: SignalProfile) {

@@ -33,6 +33,7 @@ export const REFINE_PROJECT_DISCOVERY_TOOL = {
     type: "object",
     additionalProperties: false,
     properties: {
+      lede: { type: "string" },
       project_type: { type: "string" },
       recommended_stack: { type: "string" },
       architecture: { type: "string" },
@@ -59,7 +60,7 @@ export const REFINE_PROJECT_DISCOVERY_TOOL = {
         },
       },
     },
-    required: ["project_type", "recommended_stack", "architecture", "style_direction", "main_features", "data_model", "alternative_stacks", "deployment_note", "decisions"],
+    required: ["lede", "project_type", "recommended_stack", "architecture", "style_direction", "main_features", "data_model", "alternative_stacks", "deployment_note", "decisions"],
   },
 } as const;
 
@@ -77,13 +78,16 @@ export function buildDiscoveryRequestBody(context: DiscoveryRefinementContext, h
           {
             type: "input_text",
             text: [
-              "You are a senior software architect refining a first-pass project understanding for Foundry, an AI software factory.",
+              "You are a senior software architect who has just heard a one-line project request and is thinking out loud about exactly what you'd build. You are refining a first-pass heuristic guess for Foundry, an AI software factory.",
               "You are given a heuristic (keyword-matched) guess plus the user's actual starter choice, subtype, and any free-text description.",
-              "Sharpen the guess into something specific to what this particular user is building — do not just restate generic category defaults.",
-              "For decisions: reuse the heuristic's dimensions where they're already correct, but tighten hypotheses, rationale, and confidence based on the real context you were given.",
-              "Only lower confidence (raising the odds of a clarifying question) for a dimension when the context is genuinely ambiguous on that dimension — do not manufacture uncertainty.",
+              "The heuristic guess is deliberately generic — your job is to replace vague labels with the SPECIFIC technical and design decisions a senior engineer would actually reach for. Never restate a generic category label as if it were a decision.",
+              "Concretely: name real technologies, patterns, and providers, not categories. 'Secure authentication' is not a decision — 'JWT sessions in httpOnly cookies, bcrypt password hashing, middleware-enforced route protection, Google + GitHub OAuth, magic-link support' is. 'Responsive layout' is not a decision — 'glassmorphism card over an animated gradient, dark-mode-first palette, inline validation, skeleton loading states' is.",
+              "Apply this same level of specificity across domains: for auth/accounts name providers and session/security mechanisms; for e-commerce/inventory name the data operations and table/workflow patterns; for dashboards name the chart/filter/drill-down mechanics; for games name the scene/input/scoring mechanics; for APIs name the validation/error/versioning approach. A user who typed one short sentence should feel like they're reading a senior engineer's actual plan, not a paraphrase of their own words.",
+              "For decisions: reuse the heuristic's dimensions where they're already directionally correct, but rewrite each hypothesis to be this specific — 8-16 words naming real things, not a 2-3 word label. Tighten rationale and confidence based on the real context you were given.",
+              "Only lower confidence (raising the odds of a clarifying question) for a dimension when the context is genuinely ambiguous on that dimension — do not manufacture uncertainty, and do not manufacture false confidence either.",
               "Set 'question' only when you would want to ask the user something on that dimension; otherwise use null.",
               "Cover all 10 dimensions: domain, likely-users, complexity, platform, data-shape, architecture, features, style, navigation, auth-database-api.",
+              "lede: 2-4 sentences, written in a confident first-person-plural voice ('We'll build...' / 'This will...'), summarizing what you believe they're building and why it matters to the people who'll use it — this is the opening of the memo, not a restatement of the project type.",
               "alternative_stacks should list 1-3 other reasonable stack choices distinct from recommended_stack.",
               "deployment_note should be one or two sentences about how this specific project would ship.",
               "Always call refine_project_discovery. Do not answer in prose.",
@@ -108,6 +112,7 @@ export type DiscoveryRefinementResult = {
   discovery: ProjectDiscoveryResult;
   alternativeStacks: string[];
   deploymentNote: string;
+  lede: string;
 };
 
 /**
@@ -118,7 +123,7 @@ export type DiscoveryRefinementResult = {
  * Falls back field-by-field to the heuristic result on any structural problem.
  */
 export function parseDiscoveryRefinement(rawArguments: string | undefined, heuristic: ProjectDiscoveryResult): DiscoveryRefinementResult {
-  const fallback: DiscoveryRefinementResult = { discovery: heuristic, alternativeStacks: [], deploymentNote: "" };
+  const fallback: DiscoveryRefinementResult = { discovery: heuristic, alternativeStacks: [], deploymentNote: "", lede: "" };
   if (!rawArguments) return fallback;
 
   let raw: unknown;
@@ -149,6 +154,7 @@ export function parseDiscoveryRefinement(rawArguments: string | undefined, heuri
     },
     alternativeStacks: stringArrayOr(value.alternative_stacks, []),
     deploymentNote: stringOr(value.deployment_note, ""),
+    lede: stringOr(value.lede, ""),
   };
 }
 

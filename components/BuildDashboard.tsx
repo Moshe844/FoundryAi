@@ -28,7 +28,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
 import type { ExecutionMission, MissionState } from "@/lib/mission-engine";
 import { discoverProject } from "@/lib/ai/project-discovery";
-import type { ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
+import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
 import { capabilityLevelForStackChoice, unsupportedCreationMessage } from "@/lib/factory/language-adapters";
 import type { StackProfile } from "@/lib/factory/language-adapters";
@@ -97,6 +97,7 @@ type ProjectStart = {
   discoveryAnswers: Record<string, string>;
   alternativeStacks: string[];
   deploymentNote: string;
+  lede: string;
   styleChoice: string;
   customStyle: string;
 };
@@ -720,6 +721,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
       discoveryAnswers: {},
       alternativeStacks: [],
       deploymentNote: "",
+      lede: "",
       styleChoice: "",
       customStyle: "",
     });
@@ -2932,6 +2934,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
             discovery: result.discovery,
             alternativeStacks: Array.isArray(result.alternativeStacks) ? result.alternativeStacks : [],
             deploymentNote: typeof result.deploymentNote === "string" ? result.deploymentNote : "",
+            lede: typeof result.lede === "string" ? result.lede : "",
           });
         }
       } catch {
@@ -4700,6 +4703,7 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
   const alternativeStacks = alternativeStacksFor(start);
   const stackCapability = capabilityLevelForStackChoice(selectedStackFor(start));
   const stackCapabilityNote = stackCapabilityNoteFor(stackCapability);
+  const memoSections = memoSectionsFor(discovery.decisions);
 
   function applyAlternativeStack(name: string) {
     updateDiscovery({ recommendedStack: name });
@@ -4708,9 +4712,9 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
 
   return (
     <div className="grid gap-7">
-      <div className="rounded-md border border-foundry-teal/20 bg-foundry-teal/[0.06] p-3.5 text-[13px] leading-relaxed text-foundry-muted">
-        <p className="font-bold text-foundry-ink">Decision memo generated from: &quot;{discovery.prompt}&quot;</p>
-        <p className="mt-1">High-confidence, low-stakes choices were inferred quietly. High-stakes decisions are shown here, and uncertain high-stakes items become questions.</p>
+      <div>
+        <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">What I believe you&apos;re building</p>
+        <p className="font-serif text-[16px] leading-[1.7] text-foundry-ink">{ledeFor(start)}</p>
       </div>
 
       <div className="grid gap-5 sm:grid-cols-2">
@@ -4718,8 +4722,23 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
         <EditableMemoField label="Recommended stack" value={discovery.recommendedStack} onChange={(value) => updateDiscovery({ recommendedStack: value })} />
       </div>
 
-      <EditableMemoArea label="Architecture" value={discovery.architecture} onChange={(value) => updateDiscovery({ architecture: value })} />
-      <EditableMemoArea label="Style direction" value={discovery.styleDirection} onChange={(value) => updateDiscovery({ styleDirection: value })} />
+      {memoSections.map((section) => (
+        <div key={section.label}>
+          <p className="mb-2 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{section.label}</p>
+          <ul className="grid gap-1.5">
+            {section.items.map((decision) => (
+              <li key={decision.dimension} className="flex items-baseline gap-2.5 text-[13.5px] leading-relaxed">
+                <span className={`shrink-0 font-mono text-[11px] ${decision.action === "ask" ? "text-foundry-amber" : "text-foundry-teal"}`}>{decision.action === "ask" ? "?" : "✓"}</span>
+                <span className="text-foundry-ink">
+                  {decision.action === "ask" ? decision.question : decision.hypothesis}
+                  {decision.action !== "ask" ? <span className="ml-2 font-mono text-[10.5px] text-foundry-subtle">{decision.confidence}%</span> : <span className="ml-2 font-mono text-[10.5px] text-foundry-amber">needs confirmation</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+
       <EditableMemoArea label="Main features" value={discovery.mainFeatures.join("\n")} onChange={(value) => updateList("mainFeatures", value)} />
       <EditableMemoArea label="Data model / entities" value={discovery.dataModel.join("\n")} onChange={(value) => updateList("dataModel", value)} />
 
@@ -4753,7 +4772,7 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
 
       {questionDecisions.length ? (
         <div className="rounded-lg border border-foundry-amber/20 bg-foundry-amber/[0.05] p-4">
-          <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">One thing to confirm</p>
+          <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Questions I still have</p>
           <div className="grid gap-4">
             {questionDecisions.map((decision) => (
               <label key={decision.dimension} className="grid gap-2">
@@ -4771,7 +4790,7 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
       ) : null}
 
       <div>
-        <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Assumptions</p>
+        <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Risks &amp; Assumptions</p>
         <ul className="grid gap-1">
           {discovery.assumptions.map((assumption) => (
             <li key={assumption} className="flex gap-2 text-[13px] leading-relaxed text-foundry-muted">
@@ -5044,6 +5063,38 @@ function deploymentNoteFor(start: ProjectStart) {
   return "Deployment path depends on the final stack; Foundry will confirm before shipping.";
 }
 
+function ledeFor(start: ProjectStart) {
+  if (start.lede.trim()) return start.lede;
+  const discovery = start.discovery;
+  if (!discovery) return "";
+  return `${discovery.architecture} ${discovery.styleDirection}`.trim();
+}
+
+const sectionForDimension: Record<DiscoveryDimension, string> = {
+  domain: "Architecture Decisions",
+  "likely-users": "Architecture Decisions",
+  complexity: "Architecture Decisions",
+  platform: "Architecture Decisions",
+  architecture: "Architecture Decisions",
+  navigation: "Design Decisions",
+  style: "Design Decisions",
+  features: "Design Decisions",
+  "data-shape": "Data Model",
+  "auth-database-api": "Data, Auth & Security",
+};
+
+const sectionOrder = ["Architecture Decisions", "Design Decisions", "Data Model", "Data, Auth & Security"];
+
+function memoSectionsFor(decisions: DiscoveryDecision[]) {
+  const groups = new Map<string, DiscoveryDecision[]>();
+  for (const decision of decisions) {
+    const label = sectionForDimension[decision.dimension] ?? "Architecture Decisions";
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label)?.push(decision);
+  }
+  return sectionOrder.filter((label) => groups.has(label)).map((label) => ({ label, items: groups.get(label) as DiscoveryDecision[] }));
+}
+
 function stackCapabilityNoteFor(stack: StackProfile) {
   if (stack.level >= 4) return null;
   if (stack.level === 3) return "Foundry can edit this stack and run its build/test commands, with narrower automation than the fully-supported stacks.";
@@ -5099,7 +5150,7 @@ function categoryForProject(template: BuildTemplate, appKind: string): ProjectCa
   if (/\b(desktop|windows app|winforms|wpf|\.net desktop|installer)\b/.test(text)) return "desktop-windows";
   if (/\b(mobile|ios|react native|flutter|cross-platform|cross platform)\b/.test(text) || template.id === "mobile") return "mobile-cross-platform";
   if (/\b(game|unity|godot|phaser)\b/.test(text) || template.id === "game") return "game";
-  if (["inventory", "commerce", "dashboard", "website", "pos"].includes(template.id)) return "web";
+  if (/\b(login|sign.?in|sign.?up|auth|account|website|landing page|blog|portfolio)\b/.test(text) || ["inventory", "commerce", "dashboard", "website", "pos"].includes(template.id)) return "web";
 
   return "custom";
 }
