@@ -69,7 +69,9 @@ const profiles: SignalProfile[] = [
   {
     id: "game",
     label: "Game",
-    patterns: [/\b(game|kids? math|quiz game|arcade|puzzle|platformer|level|score|sprite|phaser|unity|godot)\b/i],
+    // "level" and "score" alone are too generic (skill level, credit score) — dropped as
+    // standalone triggers; "high score" is kept since it's unambiguously game language.
+    patterns: [/\b(game|kids? math|quiz game|arcade|puzzle|platformer|sprite|phaser|unity|godot|high score)\b/i],
     stack: "Phaser",
     architecture:
       "Browser-playable game loop built on Phaser 3 scenes, with a state machine for menu/play/pause states, keyboard and pointer input handling, collision detection, and a scoring system persisted to local storage.",
@@ -87,7 +89,9 @@ const profiles: SignalProfile[] = [
   {
     id: "inventory",
     label: "Inventory management system",
-    patterns: [/\b(inventory|stock|sku|warehouse|barcode|products?|purchase orders?|reorder|suppliers?)\b/i],
+    // Bare "products?" is too generic — almost any business prompt mentions a "product" —
+    // so it was dropped; the remaining words are all specifically inventory language.
+    patterns: [/\b(inventory|stock levels?|sku|warehouse|barcode|purchase orders?|reorder|suppliers?)\b/i],
     stack: "Next.js",
     architecture:
       "Next.js App Router with Server Actions for CRUD, a typed data layer, optimistic UI updates for stock adjustments, and a local-first SQLite/JSON store until a real database is requested.",
@@ -112,7 +116,9 @@ const profiles: SignalProfile[] = [
   {
     id: "commerce",
     label: "E-commerce store",
-    patterns: [/\b(e-?commerce|online store|shop|cart|checkout|product catalog|storefront)\b/i],
+    // Bare "shop" is too generic (coffee shop, tattoo shop, workshop) — dropped as a
+    // standalone trigger in favor of unambiguous commerce phrases.
+    patterns: [/\b(e-?commerce|online store|online shop|shopping cart|checkout|product catalog|storefront)\b/i],
     stack: "Next.js",
     architecture:
       "Next.js storefront with server-rendered product pages for SEO, optimistic client-side cart state, checkout scaffolding ready for a payment provider, and an admin-ready product/catalog data layer.",
@@ -130,7 +136,8 @@ const profiles: SignalProfile[] = [
   {
     id: "dashboard",
     label: "Dashboard",
-    patterns: [/\b(dashboard|analytics|metrics|kpi|reporting|charts?|admin panel)\b/i],
+    // Bare "chart(s)" is too generic (flow chart, org chart) — dropped as a standalone trigger.
+    patterns: [/\b(dashboard|analytics|metrics|kpi|reporting|admin panel)\b/i],
     stack: "Next.js",
     architecture:
       "Next.js data dashboard with a reusable metric-card and chart component library, server-side data fetching with caching, filter state synced to the URL, and drill-down routes per metric.",
@@ -225,7 +232,9 @@ const profiles: SignalProfile[] = [
   {
     id: "api",
     label: "Backend/API service",
-    patterns: [/\b(api|backend|server|service|rest|graphql|webhook|microservice)\b/i],
+    // Bare "server" and "service" are too generic (game server, customer service business) —
+    // dropped as standalone triggers in favor of unambiguous backend/API language.
+    patterns: [/\b(api|backend|rest api|graphql|webhook|microservice)\b/i],
     stack: "Node/Express",
     architecture:
       "Node/Express (TypeScript) service with a layered structure (routes, controllers, services), schema-based request validation, centralized error-handling middleware, and a persistence boundary left explicit until a database is chosen.",
