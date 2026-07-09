@@ -3001,6 +3001,7 @@ function ProjectStartFlow({
   const [agentToken] = useState(start.localConnectorToken || "");
   const [folderBrowserOpen, setFolderBrowserOpen] = useState(false);
   const [pickError, setPickError] = useState("");
+  const [connectedFolderEntries, setConnectedFolderEntries] = useState<string[]>([]);
   const everConnectedRef = useRef(false);
 
   const pollAgentStatus = useCallback(async () => {
@@ -3030,10 +3031,36 @@ function ProjectStartFlow({
     };
   }, [start.projectLocation, pollAgentStatus]);
 
+  useEffect(() => {
+    if (start.projectLocation !== "create-folder" || agentStatus !== "connected" || !start.localConnectorRoot) {
+      setConnectedFolderEntries([]);
+      return;
+    }
+    let cancelled = false;
+    void listAgentTree(agentUrl, agentToken, start.localConnectorRoot).then((result) => {
+      if (!cancelled && result.ok) setConnectedFolderEntries(result.entries.map((entry) => entry.path));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [start.projectLocation, agentStatus, start.localConnectorRoot, agentUrl, agentToken]);
+
   function applyConnectedProjectFolder(root: string) {
-    onUpdate({ projectLocation: "create-folder", localConnectorUrl: agentUrl, localConnectorToken: agentToken, localConnectorRoot: root });
+    onUpdate({ projectLocation: "create-folder", localConnectorUrl: agentUrl, localConnectorToken: agentToken, localConnectorRoot: root, existingSourceChoice: null, existingSourceConfirmed: false });
     setAgentStatus("connected");
     setPickError("");
+  }
+
+  async function handleCreateProjectSubfolder() {
+    if (!start.localConnectorRoot) return;
+    const slug = slugifyProjectName(start.projectName || start.appKind || defaultKindFor(start.template.id));
+    const result = await createAgentFolder(agentUrl, agentToken, start.localConnectorRoot, slug);
+    if (result.ok && result.root) {
+      applyConnectedProjectFolder(result.root);
+      onUpdate({ existingSourceChoice: "create-subfolder", existingSourceConfirmed: true });
+    } else {
+      setPickError(result.error || "Could not create a subfolder there.");
+    }
   }
 
   async function handleOpenProjectFolderPicker() {
@@ -3084,6 +3111,10 @@ function ProjectStartFlow({
     });
   }
 
+  const activeSourceNames = start.projectLocation === "create-folder" ? connectedFolderEntries : start.projectLocation === "connect-existing" ? start.uploadNames : [];
+  const existingSourceRisky = activeSourceNames.length > 0 && inspectExistingSourceNames(activeSourceNames).risky;
+  const blockedByExistingSource = existingSourceRisky && !start.existingSourceChoice;
+
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
       <section className="grid max-h-[90vh] w-full max-w-3xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-lg border border-white/15 bg-[#111617] shadow-workspace">
@@ -3109,13 +3140,15 @@ function ProjectStartFlow({
             type="file"
             multiple
             onChange={(event) => {
-              void selectedUploadedFiles(event.currentTarget.files).then((uploadedFiles) =>
+              const files = event.currentTarget.files;
+              void selectedUploadedFiles(files).then((uploadedFiles) =>
                 onUpdate({
-                  uploadNames: selectedUploadNames(event.currentTarget.files),
+                  uploadNames: selectedUploadNames(files),
                   uploadedFiles,
                   browserFolderHandleId: "",
                   browserFolderName: "",
                   existingSourceConfirmed: false,
+                  existingSourceChoice: null,
                 }),
               );
             }}
@@ -3265,7 +3298,17 @@ function ProjectStartFlow({
                           Open Project Folder
                         </button>
                         {agentStatus === "connected" && start.localConnectorRoot ? (
-                          <p className="mt-3 text-sm font-bold text-foundry-teal">Connected: {start.localConnectorRoot}</p>
+                          <>
+                            <p className="mt-3 text-sm font-bold text-foundry-teal">Connected: {start.localConnectorRoot}</p>
+                            <ExistingSourceGuard
+                              names={connectedFolderEntries}
+                              mode="new-project"
+                              choice={start.existingSourceChoice}
+                              onChoose={(choice) => onUpdate({ existingSourceChoice: choice, existingSourceConfirmed: true })}
+                              onCreateSubfolder={() => void handleCreateProjectSubfolder()}
+                              onCancel={() => onUpdate({ localConnectorRoot: "", existingSourceChoice: null, existingSourceConfirmed: false })}
+                            />
+                          </>
                         ) : pickError ? (
                           <p className="mt-3 text-sm font-bold text-red-300">{pickError}</p>
                         ) : null}
@@ -3312,11 +3355,23 @@ function ProjectStartFlow({
                       <p className="mt-3 text-sm font-bold text-foundry-ink">Connected live folder: {start.browserFolderName}</p>
                     ) : null}
                     <UploadSummary names={start.uploadNames} />
-                    {start.browserFolderHandleId ? (
-                      <ExistingProjectSelectionSummary names={start.uploadNames} />
-                    ) : (
-                      <ExistingSourceInspection names={start.uploadNames} confirmed={start.existingSourceConfirmed} onConfirm={(checked) => onUpdate({ existingSourceConfirmed: checked })} />
-                    )}
+                    <ExistingSourceGuard
+                      names={start.uploadNames}
+                      mode="new-project"
+                      choice={start.existingSourceChoice}
+                      onChoose={(choice) => onUpdate({ existingSourceChoice: choice, existingSourceConfirmed: true })}
+                      onCancel={() =>
+                        onUpdate({
+                          projectLocation: "inside-foundry",
+                          uploadNames: [],
+                          uploadedFiles: [],
+                          browserFolderHandleId: "",
+                          browserFolderName: "",
+                          existingSourceChoice: null,
+                          existingSourceConfirmed: false,
+                        })
+                      }
+                    />
                   </div>
                 ) : null}
               </div>
@@ -3411,10 +3466,13 @@ function ProjectStartFlow({
                 {step === "kind" && !start.discovery ? (
                   <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Select or describe the project first so Foundry can infer a confidence map.</p>
                 ) : null}
+                {step === "project" && blockedByExistingSource ? (
+                  <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Choose what Foundry should do about the existing files before continuing.</p>
+                ) : null}
                 <button
                   className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.11] px-4 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.16] disabled:cursor-not-allowed disabled:opacity-45"
                   type="button"
-                  disabled={step === "kind" && !start.discovery}
+                  disabled={(step === "kind" && !start.discovery) || (step === "project" && blockedByExistingSource)}
                   onClick={() => onStepChange(nextStep)}
                 >
                   Continue
@@ -3422,8 +3480,9 @@ function ProjectStartFlow({
               </div>
             ) : (
               <button
-                className="rounded-md border border-foundry-amber/35 bg-foundry-amber/[0.12] px-4 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-amber/[0.18]"
+                className="rounded-md border border-foundry-amber/35 bg-foundry-amber/[0.12] px-4 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-amber/[0.18] disabled:cursor-not-allowed disabled:opacity-45"
                 type="button"
+                disabled={blockedByExistingSource}
                 onClick={onCreate}
               >
                 Looks good - Build
@@ -3456,6 +3515,7 @@ function ExistingProjectFlow({
   const [connectError, setConnectError] = useState("");
   const [connecting, setConnecting] = useState(false);
   const [folderBrowserOpen, setFolderBrowserOpen] = useState(false);
+  const [connectedFolderEntries, setConnectedFolderEntries] = useState<string[]>([]);
   const everConnectedRef = useRef(false);
 
   function selectExistingSource(sourceId: ExistingSource) {
@@ -3470,6 +3530,7 @@ function ExistingProjectFlow({
       localConnectorToken: sourceId === "connector" ? start.localConnectorToken : "",
       localConnectorRoot: sourceId === "browser-local" || sourceId === "connector" ? start.localConnectorRoot : "",
       existingSourceConfirmed: false,
+      existingSourceChoice: null,
     });
   }
   const canOpenProject =
@@ -3483,10 +3544,14 @@ function ExistingProjectFlow({
             ? start.uploadedFiles.length > 0
             : false;
 
+  const activeSourceNames = start.source === "connector" ? connectedFolderEntries : start.source === "browser-local" || start.source === "upload" ? start.uploadNames : [];
+  const existingSourceRisky = activeSourceNames.length > 0 && inspectExistingSourceNames(activeSourceNames).risky;
+  const blockedByExistingSource = existingSourceRisky && !start.existingSourceChoice;
+
   async function handleExistingUpload(files: FileList | null) {
     const uploadNames = selectedUploadNames(files);
     const uploadedFiles = await selectedUploadedFiles(files);
-    onUpdate({ uploadNames, uploadedFiles, source: "upload", existingSourceConfirmed: false });
+    onUpdate({ uploadNames, uploadedFiles, source: "upload", existingSourceConfirmed: false, existingSourceChoice: null });
   }
 
   async function openBrowserLocalFolder() {
@@ -3508,6 +3573,7 @@ function ExistingProjectFlow({
       localConnectorRoot: agent ? agent.root : "",
       localConnectorToken: "",
       existingSourceConfirmed: false,
+      existingSourceChoice: null,
     });
   }
 
@@ -3538,8 +3604,22 @@ function ExistingProjectFlow({
     };
   }, [start.source, pollAgentStatus]);
 
+  useEffect(() => {
+    if (start.source !== "connector" || agentStatus !== "connected" || !start.localConnectorRoot) {
+      setConnectedFolderEntries([]);
+      return;
+    }
+    let cancelled = false;
+    void listAgentTree(agentUrl, agentToken, start.localConnectorRoot).then((result) => {
+      if (!cancelled && result.ok) setConnectedFolderEntries(result.entries.map((entry) => entry.path));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [start.source, agentStatus, start.localConnectorRoot, agentUrl, agentToken]);
+
   function applyConnectedFolder(root: string) {
-    onUpdate({ source: "connector", localConnectorUrl: agentUrl, localConnectorToken: agentToken, localConnectorRoot: root, existingSourceConfirmed: false });
+    onUpdate({ source: "connector", localConnectorUrl: agentUrl, localConnectorToken: agentToken, localConnectorRoot: root, existingSourceConfirmed: false, existingSourceChoice: null });
     setAgentStatus("connected");
     setConnectError("");
   }
@@ -3669,6 +3749,13 @@ function ExistingProjectFlow({
                   <p className="mt-2 text-xs leading-5 text-foundry-teal">Local agent attached for permanent commands.</p>
                 ) : null}
                 <UploadSummary names={start.uploadNames} />
+                <ExistingSourceGuard
+                  names={start.uploadNames}
+                  mode="open-existing"
+                  choice={start.existingSourceChoice}
+                  onChoose={(choice) => onUpdate({ existingSourceChoice: choice, existingSourceConfirmed: true })}
+                  onCancel={() => onUpdate({ browserFolderHandleId: "", browserFolderName: "", uploadNames: [], uploadedFiles: [], existingSourceChoice: null, existingSourceConfirmed: false })}
+                />
               </div>
             ) : null}
 
@@ -3727,7 +3814,16 @@ function ExistingProjectFlow({
                       Open Project Folder
                     </button>
                     {agentStatus === "connected" && start.localConnectorRoot ? (
-                      <p className="mt-3 text-sm font-bold text-foundry-teal">Connected: {start.localConnectorRoot}</p>
+                      <>
+                        <p className="mt-3 text-sm font-bold text-foundry-teal">Connected: {start.localConnectorRoot}</p>
+                        <ExistingSourceGuard
+                          names={connectedFolderEntries}
+                          mode="open-existing"
+                          choice={start.existingSourceChoice}
+                          onChoose={(choice) => onUpdate({ existingSourceChoice: choice, existingSourceConfirmed: true })}
+                          onCancel={() => onUpdate({ localConnectorRoot: "", existingSourceChoice: null, existingSourceConfirmed: false })}
+                        />
+                      </>
                     ) : connectError ? (
                       <p className="mt-3 text-sm font-bold text-red-300">{connectError}</p>
                     ) : null}
@@ -3817,7 +3913,13 @@ function ExistingProjectFlow({
                   </button>
                 </div>
                 <UploadSummary names={start.uploadNames} />
-                <ExistingProjectSelectionSummary names={start.uploadNames} />
+                <ExistingSourceGuard
+                  names={start.uploadNames}
+                  mode="open-existing"
+                  choice={start.existingSourceChoice}
+                  onChoose={(choice) => onUpdate({ existingSourceChoice: choice, existingSourceConfirmed: true })}
+                  onCancel={() => onUpdate({ uploadNames: [], uploadedFiles: [], existingSourceChoice: null, existingSourceConfirmed: false })}
+                />
               </div>
             ) : null}
 
@@ -3855,14 +3957,15 @@ function ExistingProjectFlow({
           </FlowSection>
         </div>
 
-        <footer className="flex justify-end gap-2 border-t border-white/10 p-4">
+        <footer className="flex flex-wrap items-center justify-end gap-2 border-t border-white/10 p-4">
+          {blockedByExistingSource ? <p className="mr-auto max-w-xs text-xs leading-5 text-foundry-amber">Choose what Foundry should do about the existing files before opening this project.</p> : null}
           <button className="rounded-md px-3 py-2 text-sm font-bold text-foundry-muted transition hover:bg-white/10 hover:text-foundry-ink" type="button" onClick={onClose}>
             Cancel
           </button>
           <button
             className="rounded-md border border-foundry-amber/35 bg-foundry-amber/[0.12] px-4 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-amber/[0.18] disabled:cursor-not-allowed disabled:opacity-45"
             type="button"
-            disabled={!canOpenProject}
+            disabled={!canOpenProject || blockedByExistingSource}
             onClick={onCreate}
           >
             {start.source === "upload" ? "Open Foundry Copy" : "Open Project"}
@@ -4270,18 +4373,57 @@ function UploadSummary({ names }: { names: string[] }) {
   );
 }
 
-function ExistingSourceInspection({ names, confirmed, onConfirm }: { names: string[]; confirmed: boolean; onConfirm: (checked: boolean) => void }) {
-  const inspection = inspectExistingSourceNames(names);
+type ExistingSourceGuardMode = "new-project" | "open-existing";
+
+/**
+ * Real gating, not a cosmetic checkbox: when the inspected source looks risky
+ * (existing/unrelated project, multiple roots, repo/build noise), the caller
+ * must disable its action button until `choice` is non-null. See gating call
+ * sites in ProjectStartFlow and ExistingProjectFlow.
+ */
+function ExistingSourceGuard({
+  names,
+  mode,
+  choice,
+  onChoose,
+  onCreateSubfolder,
+  onCancel,
+}: {
+  names: string[];
+  mode: ExistingSourceGuardMode;
+  choice: ExistingFolderChoice | null;
+  onChoose: (choice: ExistingFolderChoice) => void;
+  onCreateSubfolder?: () => void;
+  onCancel: () => void;
+}) {
   if (!names.length) {
     return (
       <div className="mt-3 rounded-md border border-white/10 bg-black/20 p-3 text-xs leading-5 text-foundry-subtle">
-        Select a folder or project files before Foundry uses an existing source as a starting reference for this new project.
+        {mode === "open-existing"
+          ? "Select a folder or project files before Foundry opens this project."
+          : "Select a folder or project files before Foundry uses an existing source as a starting reference for this new project."}
+      </div>
+    );
+  }
+
+  const inspection = inspectExistingSourceNames(names);
+
+  if (!inspection.risky) {
+    return (
+      <div className="mt-3 rounded-md border border-foundry-teal/25 bg-foundry-teal/[0.07] p-3">
+        <p className="section-kicker">{mode === "open-existing" ? "Project Selected" : "Existing Source Inspection"}</p>
+        <p className="mt-2 text-sm leading-6 text-foundry-muted">{inspection.message}</p>
+        <ul className="mt-2 grid gap-1 text-xs leading-5 text-foundry-subtle">
+          {inspection.signals.map((signal) => (
+            <li key={signal}>- {signal}</li>
+          ))}
+        </ul>
       </div>
     );
   }
 
   return (
-    <div className={`mt-3 rounded-md border p-3 ${inspection.risky ? "border-foundry-amber/30 bg-foundry-amber/[0.08]" : "border-foundry-teal/25 bg-foundry-teal/[0.07]"}`}>
+    <div className="mt-3 rounded-md border border-foundry-amber/30 bg-foundry-amber/[0.08] p-3">
       <p className="section-kicker">Existing Source Inspection</p>
       <p className="mt-2 text-sm leading-6 text-foundry-muted">{inspection.message}</p>
       <ul className="mt-2 grid gap-1 text-xs leading-5 text-foundry-subtle">
@@ -4289,40 +4431,26 @@ function ExistingSourceInspection({ names, confirmed, onConfirm }: { names: stri
           <li key={signal}>- {signal}</li>
         ))}
       </ul>
-      {inspection.risky ? (
-        <div className="mt-3 grid gap-2 rounded-md border border-white/10 bg-black/20 p-3 text-xs leading-5 text-foundry-muted">
-          <p className="font-extrabold text-foundry-ink">Recommended options</p>
-          <p>- Create this new project in a new Foundry workspace/subfolder.</p>
-          <p>- Choose another folder if this is the wrong project.</p>
-          <p>- Clean/delete unrelated folders before using this as a starting base.</p>
-          <p>- Use anyway only after confirming that Foundry must not mix generated files into the selected root.</p>
-        </div>
-      ) : null}
-      {inspection.risky ? (
-        <label className="mt-3 flex gap-2 rounded-md border border-white/10 bg-black/20 p-3 text-xs font-bold leading-5 text-foundry-muted">
-          <input className="mt-0.5" type="checkbox" checked={confirmed} onChange={(event) => onConfirm(event.target.checked)} />
-          I understand this appears to contain an existing or unrelated project. Use it as reference only and generate into a separate Foundry workspace.
-        </label>
-      ) : null}
-    </div>
-  );
-}
-
-function ExistingProjectSelectionSummary({ names }: { names: string[] }) {
-  if (!names.length) return null;
-
-  const inspection = inspectExistingSourceNames(names);
-  return (
-    <div className="mt-3 rounded-md border border-foundry-blue/20 bg-foundry-blue/[0.06] p-3">
-      <p className="section-kicker">Project Selected</p>
-      <p className="mt-2 text-sm leading-6 text-foundry-muted">
-        Foundry will treat this as the project you intentionally opened. It should inspect files before suggesting or applying changes.
+      <p className="mt-3 text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-muted">
+        {mode === "open-existing" ? "Foundry found files that don't appear related. What should happen?" : "I found files that don't appear related. What should Foundry do?"}
       </p>
-      <ul className="mt-2 grid gap-1 text-xs leading-5 text-foundry-subtle">
-        {inspection.signals.map((signal) => (
-          <li key={signal}>- {signal}</li>
-        ))}
-      </ul>
+      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+        {mode === "new-project" ? (
+          <>
+            {onCreateSubfolder ? (
+              <ChoiceButton active={choice === "create-subfolder"} label="Create a new subfolder" description="Foundry creates a fresh subfolder here and builds inside it." onClick={onCreateSubfolder} />
+            ) : null}
+            <ChoiceButton active={choice === "archive"} label="Archive existing files first" description="Foundry moves existing content aside before generating (applied when the build starts)." onClick={() => onChoose("archive")} />
+            <ChoiceButton active={choice === "continue-anyway"} label="Continue anyway" description="Generate here without touching or moving anything first." onClick={() => onChoose("continue-anyway")} />
+            <ChoiceButton active={false} label="Cancel / choose another location" onClick={onCancel} />
+          </>
+        ) : (
+          <>
+            <ChoiceButton active={choice === "continue"} label="Continue - this is my project" description="Foundry will inspect before making any changes." onClick={() => onChoose("continue")} />
+            <ChoiceButton active={false} label="Choose a different folder / cancel" onClick={onCancel} />
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -5253,6 +5381,7 @@ function projectBriefFor(start: ProjectStart) {
     start.projectLocation === "connect-existing"
       ? `Existing source guard: ${existingSourceSummary(start.uploadNames, start.existingSourceConfirmed)}`
       : "",
+    start.existingSourceChoice ? `Existing folder guard: ${start.existingSourceChoice}` : "",
     `Project name: ${projectName}`,
     start.projectDescription ? `Project description: ${start.projectDescription}` : "",
     `Project type: ${discovery?.projectType || start.customSubtype.trim() || start.subtype}`,
@@ -5318,6 +5447,7 @@ function existingProjectBriefFor(start: ExistingProjectStart) {
     start.uploadNames.length ? `Selected upload paths: ${start.uploadNames.join("; ")}` : "",
     `Editable uploaded files stored: ${start.uploadedFiles.length}`,
     `Existing project selection: ${openedExistingProjectSummary(start.uploadNames)}`,
+    start.existingSourceChoice ? `Existing folder guard: ${start.existingSourceChoice}` : "",
     start.description ? `Custom instructions: ${start.description.replace(/\s+/g, " ").trim()}` : "Custom instructions: No additional instructions.",
     start.description ? `Initial requested task: ${start.description.replace(/\s+/g, " ").trim()}` : "Initial requested task: Not described yet.",
     "",
