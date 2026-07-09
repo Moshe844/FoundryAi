@@ -2937,6 +2937,10 @@ function CustomBuildStep({ start, onUpdate }: { start: ProjectStart; onUpdate: (
   );
 }
 
+function wait(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
 function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart; onUpdate: (update: Partial<ProjectStart>) => void; onAdvance: () => void }) {
   const [showEscape, setShowEscape] = useState(false);
   const controllerRef = useRef<AbortController | null>(null);
@@ -2950,9 +2954,15 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
     const escapeTimer = window.setTimeout(() => {
       if (!cancelledRef.current) setShowEscape(true);
     }, 2500);
+    // Foundry is genuinely reasoning here even when the API call resolves in a
+    // few hundred ms — without a floor the "thinking" beat can flash by unnoticed.
+    const minVisibleMs = 1800;
+    const startedAt = Date.now();
 
     async function refine() {
       if (!start.discovery) {
+        const remaining = minVisibleMs - (Date.now() - startedAt);
+        if (remaining > 0) await wait(remaining);
         if (!cancelledRef.current) onAdvance();
         return;
       }
@@ -2991,6 +3001,8 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
         // Network error, timeout, or malformed response — keep the heuristic result already in start.discovery.
       } finally {
         window.clearTimeout(escapeTimer);
+        const remaining = minVisibleMs - (Date.now() - startedAt);
+        if (remaining > 0 && !cancelledRef.current) await wait(remaining);
         if (!cancelledRef.current) onAdvance();
       }
     }

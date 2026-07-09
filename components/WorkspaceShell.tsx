@@ -2347,9 +2347,10 @@ function stateForTimeline(timeline: FactoryExecutionEvent[], mission: MissionSta
 }
 
 function shouldAutoExecuteProjectBrief(brief: string) {
-  if (/^Mode:\s*Work on existing project/im.test(brief)) return false;
-  const instructions = brief.match(/^Custom instructions:\s*(.+)$/im)?.[1]?.trim() ?? "";
-  return Boolean(instructions && !/^none|no additional instructions?\.?$/i.test(instructions));
+  // New-project briefs always carry a full discovery memo by the time the wizard
+  // reaches "Looks good — build it", so execution should start regardless of
+  // whether the optional custom-instructions step was filled in.
+  return !/^Mode:\s*Work on existing project/im.test(brief);
 }
 
 function uploadedProjectFilesFromMission(mission: MissionState): FactoryUploadedFile[] {
