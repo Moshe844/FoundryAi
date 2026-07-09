@@ -1196,6 +1196,8 @@ function FactoryHome({
 }) {
   const starterTemplates = buildTemplates.filter((template) => template.id !== "custom");
   const customTemplate = buildTemplates.find((template) => template.id === "custom") ?? buildTemplates[0];
+  const localAgentStatus = useLocalAgentInstallStatus();
+  const localAgentInstalled = localAgentStatus === "installed" || localAgentStatus === "connected";
 
   return (
     <section className="min-h-0 overflow-auto rounded-xl border border-white/10 bg-[#101416]/90 shadow-workspace">
@@ -1208,17 +1210,38 @@ function FactoryHome({
               Create a new software project or open an existing one. Once you are inside a project, Foundry becomes the engineering teammate for build, debug, improve, analyze, deploy, preview, and export work.
             </p>
           </div>
-          <a
-            className="inline-flex min-h-10 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3.5 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
-            href="/api/factory/agent/download?platform=windows"
-            download
-            onClick={(event) => {
-              event.currentTarget.href = `/api/factory/agent/download?platform=windows&v=${encodeURIComponent(String(Date.now()))}`;
-            }}
-          >
-            <Download size={16} />
-            Download Local Agent
-          </a>
+          {localAgentInstalled ? (
+            <button
+              className="inline-flex min-h-10 cursor-default items-center gap-2 rounded-md border border-white/15 bg-white/[0.045] px-3.5 text-sm font-extrabold text-foundry-subtle opacity-70"
+              type="button"
+              disabled
+              title="Foundry Local Agent is responding on this computer."
+            >
+              <CheckCircle2 size={16} />
+              Local Agent Downloaded
+            </button>
+          ) : localAgentStatus === "checking" ? (
+            <button
+              className="inline-flex min-h-10 cursor-default items-center gap-2 rounded-md border border-white/15 bg-white/[0.045] px-3.5 text-sm font-extrabold text-foundry-subtle"
+              type="button"
+              disabled
+            >
+              <Loader2 size={16} className="animate-spin" />
+              Checking Agent
+            </button>
+          ) : (
+            <a
+              className="inline-flex min-h-10 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3.5 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
+              href="/api/factory/agent/download?platform=windows"
+              download
+              onClick={(event) => {
+                event.currentTarget.href = `/api/factory/agent/download?platform=windows&v=${encodeURIComponent(String(Date.now()))}`;
+              }}
+            >
+              <Download size={16} />
+              Download Local Agent
+            </a>
+          )}
         </div>
       </div>
 
@@ -4141,6 +4164,29 @@ function ExistingProjectFlow({
 }
 
 type AgentStatus = "checking" | "not-installed" | "installed" | "connected" | "offline";
+
+function useLocalAgentInstallStatus(): AgentStatus {
+  const [status, setStatus] = useState<AgentStatus>("checking");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      const health = await checkAgentHealth("http://127.0.0.1:3917", "");
+      if (cancelled) return;
+      setStatus(health.ok ? "installed" : "not-installed");
+    }
+
+    void poll();
+    const interval = window.setInterval(poll, 5_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  return status;
+}
 
 function useLiveAgentStatus(connectorUrl: string, connectorToken: string, connectorRoot: string): AgentStatus | null {
   const [status, setStatus] = useState<AgentStatus | null>(null);
