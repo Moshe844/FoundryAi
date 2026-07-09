@@ -3748,7 +3748,7 @@ function ExistingProjectFlow({
             : false;
 
   const activeSourceNames = start.source === "connector" ? connectedFolderEntries : start.source === "browser-local" || start.source === "upload" ? start.uploadNames : [];
-  const existingSourceRisky = activeSourceNames.length > 0 && inspectExistingSourceNames(activeSourceNames).risky;
+  const existingSourceRisky = activeSourceNames.length > 0 && inspectExistingSourceNames(activeSourceNames, "open-existing").risky;
   const blockedByExistingSource = existingSourceRisky && !start.existingSourceChoice;
 
   async function handleExistingUpload(files: FileList | null) {
@@ -4701,7 +4701,7 @@ function ExistingSourceGuard({
     );
   }
 
-  const inspection = inspectExistingSourceNames(names);
+  const inspection = inspectExistingSourceNames(names, mode);
 
   if (!inspection.risky) {
     return (
@@ -4719,7 +4719,7 @@ function ExistingSourceGuard({
 
   return (
     <div className="mt-3 rounded-md border border-foundry-amber/30 bg-foundry-amber/[0.08] p-3">
-      <p className="section-kicker">Existing Source Inspection</p>
+      <p className="section-kicker">{mode === "open-existing" ? "Multiple Projects Detected" : "Existing Source Inspection"}</p>
       <p className="mt-2 text-sm leading-6 text-foundry-muted">{inspection.message}</p>
       <ul className="mt-2 grid gap-1 text-xs leading-5 text-foundry-subtle">
         {inspection.signals.map((signal) => (
@@ -5148,14 +5148,43 @@ function uploadSummaryText(names: string[]) {
   return `${names.slice(0, 3).join(", ")} and ${names.length - 3} more`;
 }
 
-function inspectExistingSourceNames(names: string[]) {
+const PROJECT_MARKER_PATTERN =
+  /(^|\/)(package\.json|pnpm-lock\.yaml|yarn\.lock|package-lock\.json|next\.config\.(js|mjs|ts)|vite\.config\.(js|ts)|angular\.json|pom\.xml|build\.gradle|settings\.gradle|\.csproj|\.sln|pubspec\.yaml|cargo\.toml|go\.mod)$/i;
+const NOISE_PATH_PATTERN = /(^|\/)(node_modules|\.git|\.next|dist|build|coverage|target|bin|obj|out|\.cache|\.vscode|\.idea)(\/|$)/i;
+
+function inspectExistingSourceNames(names: string[], mode: ExistingSourceGuardMode = "new-project") {
   const normalized = names.map((name) => name.replace(/\\/g, "/"));
   const roots = new Set(normalized.map((name) => name.split("/")[0]).filter(Boolean));
   const lower = normalized.map((name) => name.toLowerCase());
-  const hasProjectMarkers = lower.some((name) =>
-    /(^|\/)(package\.json|pnpm-lock\.yaml|yarn\.lock|package-lock\.json|next\.config\.(js|mjs|ts)|vite\.config\.(js|ts)|angular\.json|pom\.xml|build\.gradle|settings\.gradle|\.csproj|\.sln|pubspec\.yaml|cargo\.toml|go\.mod)$/i.test(name),
-  );
-  const hasRepoOrBuildFolders = lower.some((name) => /(^|\/)(\.git|node_modules|\.next|dist|build|target|bin|obj)(\/|$)/i.test(name));
+  const hasProjectMarkers = lower.some((name) => PROJECT_MARKER_PATTERN.test(name));
+  const hasRepoOrBuildFolders = lower.some((name) => NOISE_PATH_PATTERN.test(name));
+
+  if (mode === "open-existing") {
+    // Opening an existing project SHOULD look like a real project — config files, a
+    // node_modules folder, multiple top-level folders are reassuring here, not risky.
+    // The one real danger is selecting a parent directory that bundles several distinct,
+    // separate projects together (each with its own project marker) instead of one.
+    // node_modules alone can contain hundreds of nested package.json files, so those are
+    // excluded here — only markers outside dependency/build noise count toward a "root".
+    const markerRootCount = new Set(
+      normalized.filter((name) => PROJECT_MARKER_PATTERN.test(name.toLowerCase()) && !NOISE_PATH_PATTERN.test(name.toLowerCase())).map((name) => name.split("/")[0]),
+    ).size;
+    const risky = markerRootCount > 1;
+    const signals = [
+      `${normalized.length} selected path${normalized.length === 1 ? "" : "s"}`,
+      `${roots.size} top-level folder${roots.size === 1 ? "" : "s"} detected`,
+      hasProjectMarkers ? "Project configuration file found — this looks like a real project" : "No project configuration file detected yet",
+      hasRepoOrBuildFolders ? "Dependency/build folders found (normal for a real project)" : "No dependency/build folders detected yet",
+    ];
+    return {
+      risky,
+      signals,
+      message: risky
+        ? "This selection appears to bundle more than one separate project together (multiple folders each with their own project configuration). Pick the single project folder you want Foundry to open, or continue if that's intentional."
+        : "This looks like a real project — Foundry detected the usual project structure. Confirm this is the project you want to open.",
+    };
+  }
+
   const hasManyLooseFiles = normalized.length > 12 && roots.size > Math.max(3, normalized.length / 4);
   const risky = roots.size > 1 || hasProjectMarkers || hasRepoOrBuildFolders || hasManyLooseFiles;
   const signals = [
@@ -5185,7 +5214,7 @@ function existingSourceSummary(names: string[], confirmed: boolean) {
 
 function openedExistingProjectSummary(names: string[]) {
   if (!names.length) return "No files selected yet.";
-  const inspection = inspectExistingSourceNames(names);
+  const inspection = inspectExistingSourceNames(names, "open-existing");
   return `Existing project opened intentionally. ${inspection.signals.join("; ")}. Foundry should inspect before editing.`;
 }
 
