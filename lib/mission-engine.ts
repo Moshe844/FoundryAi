@@ -101,6 +101,10 @@ export type ExecutionMission = {
    * mock of a larger build, not because of a generic clarifying question — lets the UI show "Open
    * Preview" + feedback + "Continue building" instead of a text-question prompt. */
   pending_mock_review?: { message: string; preview_url?: string };
+  /** The live preview URL captured at the time this mission finished, if any — so a collapsed
+   * Previous Missions card can still link to what that mission actually built, not just the
+   * project's current preview (which may have moved on since). */
+  preview_url?: string;
   undo_snapshot?: string;
   summary: string;
   parent_mission_id?: string;

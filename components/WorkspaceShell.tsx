@@ -2289,6 +2289,7 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
     verification,
     blocked_reason: blockedReason,
     pending_mock_review: pendingMockReview,
+    preview_url: result.previewState === "ready" ? result.previewUrl : existing?.preview_url,
     undo_snapshot: existing?.undo_snapshot,
     summary: humanSummary,
     parent_mission_id: existing?.parent_mission_id,

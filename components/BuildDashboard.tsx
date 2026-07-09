@@ -1693,7 +1693,17 @@ function ProjectWorkConversation({
 
   return (
     <div className="grid gap-5 pb-6">
-      {previousExecutionMissions.length ? <PreviousMissionsPanel missions={previousExecutionMissions} /> : null}
+      {previousExecutionMissions.length ? (
+        <PreviousMissionsPanel
+          missions={previousExecutionMissions}
+          disableUndo={isExecutionLive}
+          onUndo={(missionToUndo) =>
+            onExecute(
+              `Undo the specific changes from the mission "${missionToUndo.title}" (files: ${missionToUndo.files_touched.map((file) => file.path).join(", ") || "see that mission's history"}) — revert those file edits and confirm exactly what was reverted.`,
+            )
+          }
+        />
+      ) : null}
       <section key={activeRequest.id} ref={activeTaskRef} className="max-w-4xl border-b border-white/10 pb-5">
         <ProjectThreadMessage message={activeRequest} prominent />
         <div className="mt-4 border-l border-white/10 pl-4">
@@ -6295,34 +6305,69 @@ function MissionStatePill({ mission }: { mission: ExecutionMission }) {
 }
 
 
-function PreviousMissionsPanel({ missions }: { missions: ExecutionMission[] }) {
+function PreviousMissionsPanel({
+  missions,
+  onUndo,
+  disableUndo,
+}: {
+  missions: ExecutionMission[];
+  onUndo: (mission: ExecutionMission) => void;
+  disableUndo?: boolean;
+}) {
   return (
     <section className="max-w-4xl rounded-md border border-white/10 bg-black/15">
       <div className="border-b border-white/10 px-3 py-2">
         <p className="text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Previous Missions</p>
       </div>
       <div className="grid gap-1 p-2">
-        {missions.map((mission) => (
-          <details key={mission.id} className="rounded border border-white/5 bg-black/15">
-            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-2.5 py-2 text-sm">
-              <span className="min-w-0 truncate font-bold text-foundry-ink">Previous mission: {mission.title}</span>
-              <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">{missionStateLabel(mission)}</span>
-            </summary>
-            <div className="grid gap-2 border-t border-white/10 px-2.5 py-2 text-xs leading-5 text-foundry-muted">
-              <DetailRow label="Request" value={mission.source_requirements.join("\n") || mission.title} />
-              <DetailRow label="Summary" value={mission.summary || mission.blocked_reason || "No final summary was recorded."} />
-              {mission.files_touched.length ? <DetailRow label="Files" value={mission.files_touched.map((file) => `${file.verified ? "verified" : "unverified"} ${file.path}`).join("\n")} /> : null}
-              {mission.commands_run.length ? (
-                <DetailRow
-                  label="Commands"
-                  value={mission.commands_run.map((command) => `${command.command} (exit ${command.exitCode ?? "-"}) — ${command.approval_scope_label}`).join("\n")}
-                />
-              ) : null}
-              {mission.verification.length ? <DetailRow label="Verification" value={mission.verification.map((item) => `${item.result}: ${item.evidence}`).join("\n")} /> : null}
-              {mission.parent_mission_id ? <DetailRow label="Continues" value={mission.parent_mission_id} /> : null}
-            </div>
-          </details>
-        ))}
+        {missions.map((mission) => {
+          const canUndoThis = !disableUndo && mission.files_touched.length > 0;
+          return (
+            <details key={mission.id} className="rounded border border-white/5 bg-black/15">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-2.5 py-2 text-sm">
+                <span className="min-w-0 truncate font-bold text-foundry-ink">Previous mission: {mission.title}</span>
+                <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">{missionStateLabel(mission)}</span>
+              </summary>
+              <div className="grid gap-2 border-t border-white/10 px-2.5 py-2 text-xs leading-5 text-foundry-muted">
+                <DetailRow label="Request" value={mission.source_requirements.join("\n") || mission.title} />
+                <DetailRow label="Summary" value={mission.summary || mission.blocked_reason || "No final summary was recorded."} />
+                {mission.files_touched.length ? <DetailRow label="Files" value={mission.files_touched.map((file) => `${file.verified ? "verified" : "unverified"} ${file.path}`).join("\n")} /> : null}
+                {mission.commands_run.length ? (
+                  <DetailRow
+                    label="Commands"
+                    value={mission.commands_run.map((command) => `${command.command} (exit ${command.exitCode ?? "-"}) — ${command.approval_scope_label}`).join("\n")}
+                  />
+                ) : null}
+                {mission.verification.length ? <DetailRow label="Verification" value={mission.verification.map((item) => `${item.result}: ${item.evidence}`).join("\n")} /> : null}
+                {mission.parent_mission_id ? <DetailRow label="Continues" value={mission.parent_mission_id} /> : null}
+                {mission.preview_url ? (
+                  <div className="grid gap-1">
+                    <p className="text-[10px] font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Preview</p>
+                    <a
+                      className="inline-flex w-fit items-center gap-1.5 text-foundry-teal underline-offset-2 hover:underline"
+                      href={mission.preview_url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open the preview as it was for this mission
+                    </a>
+                  </div>
+                ) : null}
+                <div className="flex items-center gap-3 border-t border-white/5 pt-2">
+                  <button
+                    type="button"
+                    disabled={!canUndoThis}
+                    title={mission.files_touched.length ? undefined : "This mission didn't change any files, so there's nothing to undo."}
+                    className="text-xs font-extrabold text-foundry-subtle underline-offset-2 transition hover:text-foundry-ink hover:underline disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:no-underline"
+                    onClick={() => onUndo(mission)}
+                  >
+                    Undo this mission&apos;s changes
+                  </button>
+                </div>
+              </div>
+            </details>
+          );
+        })}
       </div>
     </section>
   );
