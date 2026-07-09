@@ -18,7 +18,7 @@ const MUTATION_PATTERN =
 // "start/restart/stop the server" reads like a status question ("is it running?") but is really an action
 // request — without this, it fell through to the LLM classifier with no deterministic safety net and could
 // get answered as read-only inspection instead of actually starting anything.
-const SERVER_ACTION_PATTERN = /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,30}\b(?:server|app|project|service|api|backend|frontend|dev server|application)\b/i;
+const SERVER_ACTION_PATTERN = /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,30}\b(?:server|app|project|service|api|backend|frontend|dev server|application|build|tests?|lint|linter|typecheck)\b/i;
 const READ_ONLY_PATTERN = /\b(?:can you see|what does|what is this|explain|tell me about|do you understand|review|audit|analy[sz]e|architecture assessment|status|what happened|last run|previous run)\b/i;
 
 export function deterministicMutationIntent(message: string): MissionIntent | undefined {

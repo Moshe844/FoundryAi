@@ -186,6 +186,20 @@ export function isLikelySmallSingleFileRequest(task: string): boolean {
   return filePaths.size === 1 || smallTweakPattern.test(text);
 }
 
+// "Start my server", "run the build", "run the tests" name one concrete operational action with an
+// obvious, directly-verifiable outcome — no multi-phase plan is needed for these, same as a small edit.
+const tinyOperationalPattern =
+  /\b(start|restart|stop|run|launch)\b[^.?!\n]{0,30}\b(server|dev server|the app|the application|build|the build|tests?|the tests|lint|linter|typecheck)\b/i;
+
+export function isLikelyTinyOperationalRequest(task: string): boolean {
+  const text = task.trim();
+  if (!text || text.length > 150) return false;
+  if (bigScopePattern.test(text)) return false;
+  if (newDependencyPattern.test(text)) return false;
+  if ((text.toLowerCase().match(/\b(and|then)\b/g) ?? []).length >= 2) return false;
+  return tinyOperationalPattern.test(text);
+}
+
 export function checklistForRequest(task: string, sourceModeLabel: string): FactoryObjectiveChecklistItem[] {
   const text = task.toLowerCase();
   const isStaticAssetGoal = wantsAssetSeparation(text) && (/\b(css|style|styling)\b/.test(text) || /\b(js|javascript|script)\b/.test(text));

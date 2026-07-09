@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { capabilityLevelForStackChoice, checklistForRequest, detectStackProfile, isLikelySmallSingleFileRequest, unsupportedCreationMessage, unsupportedEditingMessage, type StackCapabilityLevel, type StackProfile } from "@/lib/factory/language-adapters";
+import { capabilityLevelForStackChoice, checklistForRequest, detectStackProfile, isLikelySmallSingleFileRequest, isLikelyTinyOperationalRequest, unsupportedCreationMessage, unsupportedEditingMessage, type StackCapabilityLevel, type StackProfile } from "@/lib/factory/language-adapters";
 import { classifyIntent, deterministicMutationIntent } from "@/lib/ai/mission/intent-classifier";
 import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { isHighRiskArchitectureRequest, planMission } from "@/lib/ai/mission/mission-planner";
@@ -704,7 +704,8 @@ async function runExistingProjectMissionWithAccess(params: {
 
   const executorAccess = accessForCapabilityLevel(access, stackProfile.level);
   const fastLane =
-    (classification.intent === "edit" || classification.intent === "debug") && isLikelySmallSingleFileRequest(task);
+    (classification.intent === "edit" || classification.intent === "debug" || classification.intent === "build") &&
+    (isLikelySmallSingleFileRequest(task) || isLikelyTinyOperationalRequest(task));
   const carryForwardPlan = continuity === "carry_forward_plan" && Boolean(parentMission?.plan.length) && stackProfile.level >= 4;
   if (!fastLane && !carryForwardPlan) await emitExecution(execution, "planning", "running", "Planning the approach", { internal: true });
   let checklist: FactoryObjectiveChecklistItem[];

@@ -64,6 +64,13 @@ const SAFE_COMMAND_PATTERNS: RegExp[] = [
   /\b(npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:build|test|lint|typecheck|check|dev|start|preview)\b/i,
   /\b(node|python|python3|py|ruby|php|java|go|cargo|dotnet|mvn|gradle|pytest|vitest|jest|tsc|eslint|next|vite|astro|svelte-kit)\b/i,
   /\bgit\s+(?:status|log|diff|show|rev-parse|blame|shortlog|describe|ls-files|remote(?:\s+-v)?)\b/i,
+  // Checking that a locally-spawned server responds is a read-only verification step, not a risk — scoped to
+  // loopback addresses only (never a blanket curl/wget allow, and the pipe-to-shell destructive pattern above
+  // already takes precedence over this regardless of target).
+  /\b(curl|wget|iwr|invoke-webrequest)\b[^|]*\b(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])\b/i,
+  // Confirming whether a port is already in use/listening is a read-only check, never a mutation.
+  /\b(netstat|lsof|ss)\b/i,
+  /\b(Get-NetTCPConnection|Test-NetConnection)\b/i,
 ];
 
 export function decideCommandPermission(command: string): CommandPermissionDecision {
