@@ -33,6 +33,7 @@ import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
 import type { ExecutionMission, MissionState } from "@/lib/mission-engine";
+import { deriveMissionDisplayStatus, getActiveExecutionMission, missionStateLabel } from "@/lib/mission/status";
 import { discoverProject } from "@/lib/ai/project-discovery";
 import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
@@ -1376,8 +1377,11 @@ function ProjectBriefView({
   const workScrollRef = useRef<HTMLDivElement | null>(null);
   const middleRowRef = useRef<HTMLDivElement | null>(null);
   const timeline = projectTimelineFromMission(mission, execution);
-  const activeExecutionMission = activeExecutionMissionFor(mission);
-  const isExecutionLive = isProjectWorkInProgress(mission);
+  // Single canonical status derivation — every busy/paused/label flag on this screen (header pill,
+  // composer pill, level toggle gating) reads from this one call so they can never contradict each other.
+  const missionStatus = deriveMissionDisplayStatus(mission);
+  const activeExecutionMission = missionStatus.activeExecutionMission;
+  const isExecutionLive = missionStatus.isBusy || missionStatus.isPausedForUser || missionStatus.isPausedForApproval;
   const isExistingProject = /^Mode:\s*Work on existing project/im.test(brief);
   const localPath = brief.match(/^Local project path:\s*(.+)$/im)?.[1]?.trim() ?? "";
   const sourceMode = projectSourceModeForBrief(brief);
@@ -1386,7 +1390,7 @@ function ProjectBriefView({
   const editingTarget = browserFolderName || localPath || (sourceMode === "upload" && execution?.projectPath ? `${execution.projectPath} (Foundry copy)` : connectedPath || execution?.projectPath || "No editing target yet");
   const activeFileEvent = liveFileIndicatorEvent(timeline, isExecutionLive);
   const recentlyChangedPaths = useRecentlyChangedPaths(timeline);
-  const needsUserAction = activeExecutionMission?.state === "waiting_for_approval" || activeExecutionMission?.state === "waiting_for_user";
+  const needsUserAction = missionStatus.isPausedForApproval || missionStatus.isPausedForUser;
   const effectiveLevel: ExecutionLevel = isExecutionLive || needsUserAction ? "details" : executionLevel;
   const connectorUrl = brief.match(/^Local connector URL:\s*(.+)$/im)?.[1]?.trim() ?? "";
   const connectorToken = brief.match(/^Local connector token:\s*(.+)$/im)?.[1]?.trim() ?? "";
@@ -1549,7 +1553,9 @@ function ProjectBriefView({
       <ProjectComposer
         inputRef={composerRef}
         task={task}
-        isBusy={isExecutionLive && !needsUserAction}
+        isBusy={missionStatus.isBusy}
+        statusLabel={missionStatus.label}
+        locked={missionStatus.isPausedForApproval}
         queuedTask={queuedTask}
         placeholder={needsUserAction && activeExecutionMission?.pending_mock_review ? "Tell Foundry what to change, or say it looks good…" : undefined}
         canUndo={timeline.some((event) => !event.internal && event.kind === "edit" && event.status === "completed")}
@@ -1605,8 +1611,10 @@ function ProjectWorkConversation({
   // narrower distinction: is Foundry actively streaming work right now, or paused waiting on input?
   // A mock-review pause is the latter — it should show the review panel, not the live timeline, and
   // the moment a new turn starts actively running again, the panel needs to disappear immediately.
-  const isPausedForUser = activeExecutionMission?.state === "waiting_for_user" || activeExecutionMission?.state === "waiting_for_approval";
+  const missionStatus = deriveMissionDisplayStatus(mission);
+  const isPausedForUser = missionStatus.isPausedForUser || missionStatus.isPausedForApproval;
   const isActivelyWorking = isExecutionLive && !isPausedForUser;
+  const pendingApprovalEvent = missionStatus.isPausedForApproval ? timeline.filter((event) => event.kind === "blocked").at(-1) : undefined;
   // Keyed so a fresh fetch fires for each distinct pause (a new mock-review message, or the final
   // completed build) — and, critically, this hook lives at the conversation level rather than inside
   // the transient panel that displays it, so a fast-moving mock-review loop (pause → user reacts in a
@@ -1635,6 +1643,17 @@ function ProjectWorkConversation({
     });
     return () => window.cancelAnimationFrame(frame);
   }, [activeTaskRef, execution?.status, isExecutionLive, latestRequest?.id, mission.liveWorkEvents.length, scrollContainerRef, timeline.length]);
+
+  // A brand-new turn must bring the user to it, not leave them scrolled wherever the previous mission
+  // left off. Keyed strictly on the new request's id (not on ongoing streaming), so this fires exactly
+  // once per new mission rather than fighting the bottom-follow effect above on every timeline update.
+  useEffect(() => {
+    if (!latestRequest?.id) return;
+    const frame = window.requestAnimationFrame(() => {
+      activeTaskRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeTaskRef, latestRequest?.id]);
 
   if (!requestMessages.length) {
     return (
@@ -1679,6 +1698,7 @@ function ProjectWorkConversation({
         <ProjectThreadMessage message={activeRequest} prominent />
         <div className="mt-4 border-l border-white/10 pl-4">
           {latestAnswer ? <ProjectThreadMessage message={latestAnswer} compact /> : null}
+          {missionStatus.isPausedForApproval ? <ApprovalGate event={pendingApprovalEvent} onApprove={onApproveCommand} /> : null}
           {(activeExecutionMission?.plan.length ? activeExecutionMission.plan : execution?.checklist)?.length ? (
             <MissionChecklistBoard
               checklist={activeExecutionMission?.plan.length ? activeExecutionMission.plan : execution?.checklist ?? []}
@@ -1695,6 +1715,7 @@ function ProjectWorkConversation({
               onReadFile={onReadFile}
               onFetchFileContent={onFetchFileContent}
               onApproveCommand={onApproveCommand}
+              suppressBlocked={missionStatus.isPausedForApproval}
             />
           ) : null}
           {!isActivelyWorking && pendingMockReview ? (
@@ -1710,7 +1731,7 @@ function ProjectWorkConversation({
           {!isExecutionLive && level === "summary" && execution ? (
             <>
               <MissionSummary execution={execution} timeline={timeline} onReadFile={onReadFile} onApproveCommand={onApproveCommand} />
-              <PostBuildRecommendations recommendations={recommendations} loading={recommendationsLoading} onExecute={onExecute} />
+              {missionStatus.state === "complete" ? <PostBuildRecommendations recommendations={recommendations} loading={recommendationsLoading} onExecute={onExecute} /> : null}
             </>
           ) : null}
         </div>
@@ -1770,6 +1791,8 @@ function ProjectComposer({
   inputRef,
   task,
   isBusy,
+  statusLabel,
+  locked,
   queuedTask,
   placeholder,
   canUndo,
@@ -1781,6 +1804,11 @@ function ProjectComposer({
   inputRef: RefObject<HTMLTextAreaElement | null>;
   task: string;
   isBusy: boolean;
+  /** The exact same label the header MissionStatePill shows for this mission — never a separately
+   * computed "Working"/"Ready" binary, so the composer can never contradict the header. */
+  statusLabel: string;
+  /** Hard pause: a command approval is pending. Only Stop is available; free text cannot bypass it. */
+  locked?: boolean;
   queuedTask?: string;
   placeholder?: string;
   canUndo?: boolean;
@@ -1792,16 +1820,16 @@ function ProjectComposer({
   return (
     <div className="border-t border-white/10 bg-[#0b0f10]/95 p-3">
       <div className="mb-2 flex flex-wrap items-center gap-2 text-xs font-extrabold uppercase tracking-[0.06em]">
-        <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${isBusy ? "border-foundry-teal/30 bg-foundry-teal/10 text-foundry-teal" : "border-white/15 bg-white/[0.04] text-foundry-muted"}`}>
-          <span className={`h-1.5 w-1.5 rounded-full ${isBusy ? "bg-foundry-teal" : "bg-foundry-muted"}`} />
-          {isBusy ? "Working" : "Ready"}
+        <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${isBusy ? "border-foundry-teal/30 bg-foundry-teal/10 text-foundry-teal" : locked ? "border-foundry-amber/30 bg-foundry-amber/10 text-foundry-amber" : "border-white/15 bg-white/[0.04] text-foundry-muted"}`}>
+          <span className={`h-1.5 w-1.5 rounded-full ${isBusy ? "bg-foundry-teal" : locked ? "bg-foundry-amber" : "bg-foundry-muted"}`} />
+          {statusLabel}
         </span>
         {queuedTask ? (
           <span className="inline-flex min-w-0 items-center gap-1.5 rounded-full border border-foundry-blue/30 bg-foundry-blue/10 px-2.5 py-1 text-foundry-blue">
             <span className="truncate normal-case tracking-normal">Queued: {queuedTask}</span>
           </span>
         ) : null}
-        {canUndo && !isBusy && onUndo ? (
+        {canUndo && !isBusy && !locked && onUndo ? (
           <button type="button" className="ml-auto normal-case tracking-normal text-foundry-subtle underline-offset-2 hover:text-foundry-ink hover:underline" onClick={onUndo}>
             Undo last change
           </button>
@@ -1810,18 +1838,20 @@ function ProjectComposer({
       <div className="flex items-end gap-2 rounded-md border border-foundry-teal/25 bg-black/30 p-2 focus-within:border-foundry-teal/60">
         <textarea
           ref={inputRef}
-          className="max-h-40 min-h-16 flex-1 resize-y border-0 bg-transparent p-2 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle"
+          className="max-h-40 min-h-16 flex-1 resize-y border-0 bg-transparent p-2 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle disabled:cursor-not-allowed disabled:opacity-60"
           value={task}
+          disabled={locked}
           onChange={(event) => onTaskChange(event.target.value)}
-          placeholder={isBusy ? "Foundry is working — send a follow-up, or type stop to interrupt it..." : placeholder ?? "Give Foundry a mission in this project..."}
+          placeholder={locked ? "Resolve the approval above to continue — or Stop." : isBusy ? "Foundry is working — send a follow-up, or type stop to interrupt it..." : placeholder ?? "Give Foundry a mission in this project..."}
           onKeyDown={(event) => {
+            if (locked) return;
             if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
               event.preventDefault();
               onExecute();
             }
           }}
         />
-        {isBusy ? (
+        {isBusy || locked ? (
           <button
             className="min-h-11 rounded-md border border-red-400/35 bg-red-400/[0.12] px-4 text-sm font-extrabold text-red-200 transition hover:bg-red-400/[0.2]"
             type="button"
@@ -1832,8 +1862,9 @@ function ProjectComposer({
           </button>
         ) : null}
         <button
-          className="min-h-11 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.16] px-5 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22]"
+          className="min-h-11 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.16] px-5 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:cursor-not-allowed disabled:opacity-50"
           type="button"
+          disabled={locked}
           onClick={onExecute}
         >
           Send
@@ -2480,7 +2511,14 @@ function useMissionRecommendations(execution: FactoryProjectResult | null, dedup
   const fetchedForRef = useRef<string>("");
 
   useEffect(() => {
-    if (!execution || !dedupeKey) return;
+    // dedupeKey resets to "" the instant a new turn starts (BuildDashboard.tsx's recommendationsKey).
+    // Clear immediately rather than leaving the previous turn's suggestions on screen until (if ever)
+    // a future dedupeKey refetch happens to overwrite them.
+    if (!execution || !dedupeKey) {
+      fetchedForRef.current = "";
+      setRecommendations([]);
+      return;
+    }
     if (fetchedForRef.current === dedupeKey) return;
     fetchedForRef.current = dedupeKey;
 
@@ -2684,6 +2722,23 @@ function LiveFileIndicator({ event }: { event: FactoryExecutionEvent }) {
   );
 }
 
+/** Hard pause, rendered as a prominent card at the top of the active mission — not buried as one more
+ * timeline row. While this is showing, nothing else in the mission can proceed: the composer disables
+ * free-text send (ProjectComposer's `locked`), and ExecutionTimeline suppresses its own inline copy of
+ * the same blocked event so there is exactly one place to resolve it. */
+function ApprovalGate({ event, onApprove }: { event: FactoryExecutionEvent | undefined; onApprove?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void }) {
+  if (!event) return null;
+  return (
+    <div className="mb-4 overflow-hidden rounded-lg border-2 border-foundry-amber/40 bg-foundry-amber/[0.05] shadow-[0_0_0_1px_rgba(232,183,92,0.08)]">
+      <div className="flex items-center gap-2 border-b border-foundry-amber/25 bg-foundry-amber/[0.08] px-3.5 py-2">
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-foundry-amber" />
+        <p className="text-[11px] font-extrabold uppercase tracking-[0.08em] text-foundry-amber">Execution paused — approval required</p>
+      </div>
+      <BlockedCommandLine event={event} onApprove={onApprove} />
+    </div>
+  );
+}
+
 function BlockedCommandLine({ event, onApprove }: { event: FactoryExecutionEvent; onApprove?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void }) {
   const reason = (event.details?.reason as string | undefined) || event.output || "Foundry needs approval before continuing.";
   const category = event.details?.category as string | undefined;
@@ -2876,6 +2931,7 @@ function ExecutionTimeline({
   onReadFile,
   onFetchFileContent,
   onApproveCommand,
+  suppressBlocked = false,
 }: {
   timeline: FactoryExecutionEvent[];
   level: ExecutionLevel;
@@ -2884,11 +2940,14 @@ function ExecutionTimeline({
   onReadFile?: (path: string) => void;
   onFetchFileContent?: (path: string) => Promise<string | null>;
   onApproveCommand?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
+  /** True while the ApprovalGate is already showing the pending approval as a hard-pause card — the
+   * timeline then omits its own inline copy so there's exactly one place to act on it, not two. */
+  suppressBlocked?: boolean;
 }) {
   const visibleTimeline = timeline.filter((event) => !event.internal);
   const narrativeEvents = visibleTimeline.filter((event) => event.kind !== "blocked" && isNarrativeEvent(event) && eventVisibleAtLevel(event, level));
   const traceEvents = visibleTimeline.filter((event) => event.kind !== "blocked" && executionTier(event) === "trace" && eventVisibleAtLevel(event, level));
-  const blockedEvents = visibleTimeline.filter((event) => event.kind === "blocked" && eventVisibleAtLevel(event, level));
+  const blockedEvents = suppressBlocked ? [] : visibleTimeline.filter((event) => event.kind === "blocked" && eventVisibleAtLevel(event, level));
   const rawMode = level === "code" || level === "command";
   // Engineering work first, trace as proof: "inspection" events (file reads, directory listings —
   // pure investigation, not an outcome) are the highest-volume noise source and add nothing on their
@@ -6205,7 +6264,7 @@ function normalizeProjectPath(filePath: string) {
 }
 
 function projectTimelineFromMission(mission: MissionState, execution: FactoryProjectResult | null) {
-  const activeExecution = activeExecutionMissionFor(mission);
+  const activeExecution = getActiveExecutionMission(mission);
   if (activeExecution?.timeline?.length) return activeExecution.timeline;
   const artifact = mission.createdArtifacts.find((item) => item.title === "Project Execution Timeline");
   if (artifact) {
@@ -6216,18 +6275,6 @@ function projectTimelineFromMission(mission: MissionState, execution: FactoryPro
     }
   }
   return execution?.timeline ?? [];
-}
-
-function activeExecutionMissionFor(mission: MissionState) {
-  return (
-    mission.executionMissions.find((item) => item.id === mission.activeExecutionMissionId) ??
-    mission.executionMissions.at(-1)
-  );
-}
-
-function executionMissionStateLabel(mission: ExecutionMission) {
-  if (mission.state === "complete" && mission.verification_status !== "passed") return "Complete (unverified)";
-  return mission.state.replace(/_/g, " ");
 }
 
 function MissionStatePill({ mission }: { mission: ExecutionMission }) {
@@ -6242,7 +6289,7 @@ function MissionStatePill({ mission }: { mission: ExecutionMission }) {
         : "border-foundry-blue/30 bg-foundry-blue/[0.08] text-foundry-blue";
   return (
     <span className={`mt-1.5 inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-[0.06em] ${tone}`}>
-      {executionMissionStateLabel(mission)}
+      {missionStateLabel(mission)}
     </span>
   );
 }
@@ -6258,8 +6305,8 @@ function PreviousMissionsPanel({ missions }: { missions: ExecutionMission[] }) {
         {missions.map((mission) => (
           <details key={mission.id} className="rounded border border-white/5 bg-black/15">
             <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-2.5 py-2 text-sm">
-              <span className="min-w-0 truncate font-bold text-foundry-ink">{mission.title}</span>
-              <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">{executionMissionStateLabel(mission)}</span>
+              <span className="min-w-0 truncate font-bold text-foundry-ink">Previous mission: {mission.title}</span>
+              <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">{missionStateLabel(mission)}</span>
             </summary>
             <div className="grid gap-2 border-t border-white/10 px-2.5 py-2 text-xs leading-5 text-foundry-muted">
               <DetailRow label="Request" value={mission.source_requirements.join("\n") || mission.title} />
@@ -6279,19 +6326,6 @@ function PreviousMissionsPanel({ missions }: { missions: ExecutionMission[] }) {
       </div>
     </section>
   );
-}
-
-function isProjectWorkInProgress(mission: MissionState) {
-  const activeExecution = activeExecutionMissionFor(mission);
-  if (
-    activeExecution &&
-    ["understanding", "planning", "executing", "verifying", "waiting_for_user", "waiting_for_approval", "undoing"].includes(activeExecution.state)
-  ) {
-    return true;
-  }
-  const result = mission.lastResult.trim();
-  if (/^(Factory execution started|Inspecting project|Reading the project|Reading previous project result|Getting started)\.?$/i.test(result)) return true;
-  return mission.liveWorkEvents.some((event) => /^(Factory execution started|Inspecting project|Reading the project|Reading previous project result|Routing mission|Getting started|Starting execution)/i.test(event));
 }
 
 function compactChangeText(event: FactoryExecutionEvent) {
