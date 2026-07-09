@@ -635,8 +635,12 @@ export function WorkspaceShell() {
     const isBusy = activeControllersRef.current.has(missionId);
     const targetMission = workspace.missions.find((item) => item.missionId === missionId);
     const activeExecution = targetMission ? activeExecutionMissionFor(targetMission) : undefined;
-    const pendingApproval = activeExecution?.state === "waiting_for_approval" || activeExecution?.state === "waiting_for_user";
-    const followUp = classifyProjectFollowUp(task, isBusy, pendingApproval);
+    // Only a blocked-command approval genuinely requires one of the button-generated synthetic
+    // replies — arbitrary text can't resolve "should this shell command run?". A "waiting_for_user"
+    // pause (a clarification question, or mock-review feedback) is the opposite: typed free text is
+    // exactly the expected resolution, so it must flow straight through to "run", not get parked here.
+    const pendingCommandApproval = activeExecution?.state === "waiting_for_approval";
+    const followUp = classifyProjectFollowUp(task, isBusy, pendingCommandApproval);
 
     if (followUp === "hardStop") {
       activeControllersRef.current.get(missionId)?.abort();
@@ -656,11 +660,11 @@ export function WorkspaceShell() {
     }
 
     if (followUp === "resolvePending") {
-      const reason =
-        activeExecution?.state === "waiting_for_approval"
-          ? "There's a pending command approval on this mission — use Allow once, Allow for this project, Always allow, or Deny above before sending a new request."
-          : "There's a question waiting for your answer above — please respond to that first, or say \"cancel\" to drop it.";
-      appendProjectFollowUpNote(missionId, task, reason);
+      appendProjectFollowUpNote(
+        missionId,
+        task,
+        "There's a pending command approval on this mission — use Allow once, Allow for this project, Always allow, or Deny above before sending a new request.",
+      );
       return;
     }
 
@@ -1833,11 +1837,11 @@ function isApprovalReplyMessage(message: string) {
   return /^(approved:\s*run\s|denied approval to run\s)/i.test(message.trim());
 }
 
-function classifyProjectFollowUp(message: string, isBusy: boolean, pendingApproval = false): "hardStop" | "queue" | "run" | "resolvePending" {
+function classifyProjectFollowUp(message: string, isBusy: boolean, pendingCommandApproval = false): "hardStop" | "queue" | "run" | "resolvePending" {
   const text = message.trim().toLowerCase();
   if (isBusy && /^(stop|halt|cancel|wait[, ]+stop)\b/.test(text)) return "hardStop";
   if (isBusy) return "queue";
-  if (pendingApproval && !isApprovalReplyMessage(message) && !/^(stop|halt|cancel)\b/.test(text)) return "resolvePending";
+  if (pendingCommandApproval && !isApprovalReplyMessage(message) && !/^(stop|halt|cancel)\b/.test(text)) return "resolvePending";
   return "run";
 }
 
