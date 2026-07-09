@@ -188,7 +188,9 @@ const profiles: SignalProfile[] = [
   {
     id: "content",
     label: "Content website",
-    patterns: [/\b(blog|website|portfolio|landing page|marketing site|docs site|content site)\b/i],
+    // Bare "portfolio" is ambiguous (personal/creative portfolio vs. investment/financial
+    // portfolio) — requires "site"/"website" or "personal" to disambiguate toward content.
+    patterns: [/\b(blog|website|portfolio (site|website)|personal portfolio|landing page|marketing site|docs site|content site)\b/i],
     stack: "Next.js",
     architecture:
       "Next.js content site with static generation for pages and posts, MDX-based content authoring, and a component library of reusable sections (hero, feature grid, testimonials, CTA).",
