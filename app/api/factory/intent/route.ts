@@ -244,11 +244,19 @@ function executionModeForIntent(intent: ProjectTurnIntent) {
 }
 
 function applyProjectIntentPolicy(intent: ProjectTurnIntent, message: string, context: ProjectIntentContext | undefined): ProjectTurnIntent {
-  if (intent !== "question" && intent !== "inspection" && intent !== "diagnose") return intent;
+  if (intent !== "question" && intent !== "inspection" && intent !== "diagnose" && intent !== "status") return intent;
   if (!isConnectedProjectContext(context)) return intent;
+  // "Is it running? Can you start it?" reads like a status question, but it's a request to actually take
+  // action — without this override it was answered as read-only inspection and nothing ever started.
+  if (looksLikeServerActionRequest(message)) return "edit";
+  if (intent === "status") return intent;
   if (!looksLikeExecutableBugReport(message)) return intent;
   if (explicitlyReadOnlyDiagnostic(message)) return intent === "question" || intent === "inspection" ? "diagnose" : intent;
   return "debug";
+}
+
+function looksLikeServerActionRequest(message: string) {
+  return /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,30}\b(?:server|app|project|service|api|backend|frontend|dev server|application)\b/i.test(message);
 }
 
 function isConnectedProjectContext(context: ProjectIntentContext | undefined) {

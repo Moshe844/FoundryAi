@@ -13,7 +13,7 @@ const approvedRoots = new Set();
 const maxReadBytes = 300_000;
 const maxSearchFileBytes = 300_000;
 const commandTimeoutMs = 120_000;
-const devServerGracePeriodMs = 4_000;
+const devServerGracePeriodMs = 6_000;
 const maxSnapshotBytes = 200_000;
 const longRunningCommandPattern =
   /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
@@ -833,10 +833,14 @@ function shellInvocation(shellId, command) {
 
 let stickyShellId;
 
-function spawnCommand(invocation, cwd, timeoutMs) {
+function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    const spawnOptions = invocation.useShellOption ? { cwd, shell: true, windowsHide: true } : { cwd, windowsHide: true };
+    // A dev/server command (keepAliveOnTimeout) must survive past its own grace-period timeout — detached so
+    // it isn't tied to this request's process group, and never killed when the grace period elapses below.
+    const spawnOptions = invocation.useShellOption
+      ? { cwd, shell: true, windowsHide: true, detached: keepAliveOnTimeout }
+      : { cwd, windowsHide: true, detached: keepAliveOnTimeout };
     const child = spawn(invocation.cmd, invocation.args, spawnOptions);
     let stdout = "";
     let stderr = "";
@@ -858,6 +862,16 @@ function spawnCommand(invocation, cwd, timeoutMs) {
 
     const timeout = setTimeout(() => {
       timedOut = true;
+      if (keepAliveOnTimeout) {
+        // The grace period was only ever meant to capture startup output as evidence — actually killing the
+        // server here (the previous behavior) contradicted the caller's own claim that it's "still running
+        // in the background". Stop listening and let it run for real, independent of this request.
+        if (child.stdout) child.stdout.destroy();
+        if (child.stderr) child.stderr.destroy();
+        child.unref();
+        finish(null);
+        return;
+      }
       if (typeof child.pid === "number") killProcessTree(child.pid);
       else child.kill();
       // On Windows, killing a shell-wrapped child does not always fire 'close' for the
@@ -875,7 +889,7 @@ function spawnCommand(invocation, cwd, timeoutMs) {
   });
 }
 
-async function runCommandWithShellFallback(command, cwd, timeoutMs) {
+async function runCommandWithShellFallback(command, cwd, timeoutMs, keepAliveOnTimeout = false) {
   const order = process.platform === "win32" ? windowsShellOrder(stickyShellId) : posixShellOrder(stickyShellId);
   const firstAttemptedShellId = order.find((id) => shellInvocation(id, command));
   let lastResult = null;
@@ -884,7 +898,7 @@ async function runCommandWithShellFallback(command, cwd, timeoutMs) {
   for (const shellId of order) {
     const invocation = shellInvocation(shellId, command);
     if (!invocation) continue;
-    const result = await spawnCommand(invocation, cwd, timeoutMs);
+    const result = await spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout);
     lastResult = result;
     lastShellId = shellId;
     const mismatch = result.exitCode !== 0 && isShellMismatchFailure(result.stdout, result.stderr);
@@ -919,7 +933,7 @@ function runCommand(root, command, cwd = "", approvedCommands = [], approvedCate
     });
   }
   if (isLongRunningServerCommand(command)) {
-    return runCommandWithShellFallback(command, requestedCwd, devServerGracePeriodMs).then((result) => {
+    return runCommandWithShellFallback(command, requestedCwd, devServerGracePeriodMs, true).then((result) => {
       if (!result.timedOut) return result;
       return {
         ...result,

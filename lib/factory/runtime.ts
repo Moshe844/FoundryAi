@@ -829,9 +829,33 @@ async function rollbackToEntry(access: ProjectAccess, execution: ExecutionContex
   return { status: revertedFiles.length || candidates.length === 0 ? "passed" : "failed", revertedFiles };
 }
 
-async function buildProjectSnapshot(access: ReturnType<typeof createServerProjectAccess>) {
+/** A bare file-name listing forces the planner to guess at things one real read would answer — which
+ * script actually starts the app, what it's called, whether this is a single app or a monorepo. Fold in the
+ * project's own real package.json (when present) so the planner can answer those from real data instead of
+ * asking the user a question their own project already answers (Section 5, "verify before asking"). */
+async function buildProjectSnapshot(access: ProjectAccess) {
   const entries = await access.listDir("");
-  return entries.slice(0, 60).map((entry) => `${entry.kind === "directory" ? "[dir] " : ""}${entry.name}`).join("\n");
+  const listing = entries.slice(0, 60).map((entry) => `${entry.kind === "directory" ? "[dir] " : ""}${entry.name}`).join("\n");
+  const hasPackageJson = entries.some((entry) => entry.kind === "file" && entry.name.toLowerCase() === "package.json");
+  if (!hasPackageJson) return listing;
+  const read = await access.readFile("package.json", { limitBytes: 6000 }).catch(() => undefined);
+  const manifestSummary = read?.exists ? summarizePackageJsonForPlanning(read.content) : undefined;
+  return manifestSummary ? `${listing}\n\n${manifestSummary}` : listing;
+}
+
+function summarizePackageJsonForPlanning(content: string): string | undefined {
+  try {
+    const pkg = JSON.parse(content) as { name?: string; scripts?: Record<string, string> };
+    const scriptLines = pkg.scripts
+      ? Object.entries(pkg.scripts).map(([name, command]) => `  ${name}: ${command}`).join("\n")
+      : "";
+    return [
+      `package.json${pkg.name ? ` (${pkg.name})` : ""} — this is the real, current script list, not a guess:`,
+      scriptLines || "  (no scripts defined)",
+    ].join("\n");
+  } catch {
+    return undefined;
+  }
 }
 
 /** "This is a{n} <label>{ project} — I'm at Level N here." — avoids "a Unknown project project" and "a Android". */
