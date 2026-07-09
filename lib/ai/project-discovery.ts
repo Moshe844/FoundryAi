@@ -205,6 +205,23 @@ const profiles: SignalProfile[] = [
     growth: ["CMS-backed authoring for non-developers", "Newsletter/email capture", "Multi-language content", "Deeper analytics and SEO tooling"],
   },
   {
+    id: "todo",
+    label: "Task/to-do list app",
+    patterns: [/\b(to-?do list|to-?do app|task list|task manager|task tracker|checklist app)\b/i],
+    stack: "Next.js",
+    architecture:
+      "Next.js App Router with Server Actions for create/update/delete, optimistic UI so checking off a task feels instant, and local-first storage (localStorage or SQLite) until multi-device sync is requested.",
+    architectureRationale: "Optimistic updates matter most here — checking off a task has to feel instant, with the real write happening invisibly behind it.",
+    style: "Calm, focused productivity UI: a single fast input for capturing a task, generous whitespace, satisfying check-off micro-interactions, and unobtrusive completed-task styling (strikethrough, faded).",
+    styleRationale: "A to-do list lives or dies on how fast you can capture a thought and how satisfying it feels to clear it — any friction here kills daily use.",
+    features: ["Add/edit/delete tasks", "Mark complete with instant feedback", "Due dates", "Priority levels", "Categories or tags", "Filter by status (active/completed/all)", "Drag-to-reorder"],
+    entities: ["Task", "Category/tag", "Due date", "Priority", "List (optional, for multiple lists)"],
+    users: "Individuals organizing their own day-to-day work or errands; assume they want speed and low friction over configurability.",
+    platform: "Web app",
+    complexity: "Focused single-purpose productivity tool",
+    growth: ["Shared/collaborative lists", "Recurring tasks", "Subtasks within a task", "Reminders and notifications", "Calendar view"],
+  },
+  {
     id: "auth-page",
     label: "Login/auth page",
     patterns: [/\b(login|log ?in|sign ?in|auth page|authentication page|forgot password|password reset)\b/i, /\bsign ?up\b(?=.*\b(account|password|email|username|credentials|authentication)\b)/i],

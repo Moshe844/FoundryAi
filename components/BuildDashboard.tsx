@@ -3315,6 +3315,35 @@ function ProjectStartFlow({
   const [connectedFolderEntries, setConnectedFolderEntries] = useState<string[]>([]);
   const everConnectedRef = useRef(false);
 
+  // Keeps discovery.recommendedStack in sync with the user's actual pick — projectBriefFor() and the
+  // memo's "Recommended stack" field both read discovery.recommendedStack, so without this the build
+  // silently used whatever the heuristic/LLM guessed first regardless of what was clicked here.
+  function selectStack(name: string, customStack = "") {
+    const resolved = (customStack || name).trim();
+    if (!start.discovery || !resolved) {
+      onUpdate({ stack: name, customStack });
+      return;
+    }
+    // Switching away from the originally-recommended stack invalidates any framework-specific
+    // architecture language (e.g. "Next.js App Router with Server Actions") — replace it with a
+    // stack-neutral description instead of leaving a wrong, stack-mismatched claim in the memo.
+    const stackChanged = resolved !== start.discovery.recommendedStack;
+    const nextArchitecture = stackChanged ? genericArchitectureFor(resolved, start.discovery.dataModel) : start.discovery.architecture;
+    onUpdate({
+      stack: name,
+      customStack,
+      discovery: {
+        ...start.discovery,
+        recommendedStack: resolved,
+        architecture: nextArchitecture,
+        decisions: stackChanged
+          ? start.discovery.decisions.map((decision) => (decision.dimension === "architecture" ? { ...decision, hypothesis: nextArchitecture } : decision))
+          : start.discovery.decisions,
+        keyFacts: stackChanged ? refreshArchitectureKeyFact(start.discovery.keyFacts, start.discovery.recommendedStack, resolved) : start.discovery.keyFacts,
+      },
+    });
+  }
+
   const pollAgentStatus = useCallback(async () => {
     const health = await checkAgentHealth(agentUrl, agentToken);
     if (!health.ok) {
@@ -3690,7 +3719,7 @@ function ProjectStartFlow({
             <FlowSection eyebrow="Foundry recommends, doesn't force" title="Pick a stack — or trust the recommendation." body="Starred picks fit this project best. Everything else Foundry supports is one click away, with an honest capability level attached.">
               <div className="grid gap-2.5 sm:grid-cols-2">
                 {starredRecommendations.map((recommendation) => (
-                  <StackCard key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })} />
+                  <StackCard key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => selectStack(recommendation.name)} />
                 ))}
               </div>
 
@@ -3705,7 +3734,7 @@ function ProjectStartFlow({
                         <div className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{group.label}</div>
                         <div className="grid">
                           {group.items.map((recommendation) => (
-                            <StackRow key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })} />
+                            <StackRow key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => selectStack(recommendation.name)} />
                           ))}
                         </div>
                       </div>
@@ -3730,7 +3759,7 @@ function ProjectStartFlow({
                 <input
                   className="flex-1 border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
                   value={start.customStack}
-                  onChange={(event) => onUpdate({ customStack: event.target.value })}
+                  onChange={(event) => selectStack(start.stack, event.target.value)}
                   placeholder="type any language or framework…"
                 />
               </label>
@@ -4952,7 +4981,16 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
   const memoSections = memoSectionsFor(discovery.decisions);
 
   function applyAlternativeStack(name: string) {
-    updateDiscovery({ recommendedStack: name });
+    const stackChanged = name !== currentDiscovery.recommendedStack;
+    const nextArchitecture = stackChanged ? genericArchitectureFor(name, currentDiscovery.dataModel) : currentDiscovery.architecture;
+    updateDiscovery({
+      recommendedStack: name,
+      architecture: nextArchitecture,
+      decisions: stackChanged
+        ? currentDiscovery.decisions.map((decision) => (decision.dimension === "architecture" ? { ...decision, hypothesis: nextArchitecture } : decision))
+        : currentDiscovery.decisions,
+      keyFacts: stackChanged ? refreshArchitectureKeyFact(currentDiscovery.keyFacts, currentDiscovery.recommendedStack, name) : currentDiscovery.keyFacts,
+    });
     onUpdate({ stack: name, customStack: "" });
   }
 
@@ -5382,6 +5420,20 @@ function primaryRecommendationFor(template: BuildTemplate, appKind: string) {
 
 function selectedStackFor(start: ProjectStart) {
   return start.customStack.trim() || start.stack;
+}
+
+function genericArchitectureFor(stack: string, entities: string[]) {
+  const primaryEntities = entities.slice(0, 2).join(" and ") || "the core data";
+  return `${stack} implementation with create/update/delete flows for ${primaryEntities}, optimistic UI feedback, and local-first storage until a real backend or multi-device sync is requested.`;
+}
+
+/** "What Foundry Already Knows" carries a short architecture-derived tag that would otherwise keep
+ * naming the old stack after the user switches — swap any fact that still mentions it. */
+function refreshArchitectureKeyFact(keyFacts: string[], oldStack: string, newStack: string): string[] {
+  const oldStackLower = oldStack.trim().toLowerCase();
+  if (!oldStackLower) return keyFacts;
+  const replacement = `${newStack} architecture`;
+  return keyFacts.map((fact) => (fact.toLowerCase().includes(oldStackLower) ? replacement : fact));
 }
 
 function alternativeStacksFor(start: ProjectStart) {
