@@ -1680,6 +1680,7 @@ function previewPlatformForStack(stack: string): FactoryPreviewPlatform {
   if (/android|gradle/i.test(stack)) return "android";
   if (/flutter|react native|swift|ios/i.test(stack)) return "mobile";
   if (/\.net|c#|wpf|winforms|unity|godot/i.test(stack)) return "desktop";
+  if (/node\/express|express|fastapi|django|flask|\bapi\b|backend|microservice/i.test(stack)) return "api";
   return "web";
 }
 
@@ -1700,6 +1701,15 @@ async function startPreview(projectId: string, projectPath: string, stack: strin
 
   if (isNextStack(stack)) {
     return startNextPreview(projectId, projectPath, events, execution, platform);
+  }
+
+  // Any other Node-based project (an Express API, a Vite app, a hand-rolled server) can still get a
+  // real live preview — read its actual package.json scripts rather than guessing a framework-specific
+  // command, and run whichever real script is there against a PORT env var, the one convention nearly
+  // every Node HTTP server already respects.
+  const nodeScript = await detectNodeStartScript(projectPath);
+  if (nodeScript) {
+    return startGenericNodePreview(projectId, projectPath, nodeScript, events, execution, platform);
   }
 
   if (/\b(html|css|static)\b/i.test(stack)) {
@@ -1737,6 +1747,48 @@ async function startNextPreview(projectId: string, projectPath: string, events: 
   events.push(ready ? `Preview ready: ${previewUrl}` : `Preview still starting: ${previewUrl}`);
   if (execution) {
     await emitExecution(execution, "preview", ready ? "completed" : "warning", ready ? "Preview ready" : "Preview still starting", { details: { previewUrl, port, ready } });
+  }
+  return { previewUrl, previewState: ready ? "ready" : "starting", previewPlatform: platform };
+}
+
+/** Reads the project's actual package.json scripts and returns the first real, existing one worth
+ * running as a preview server, in the order a person would try them — never a guessed/invented name. */
+async function detectNodeStartScript(projectPath: string): Promise<string | undefined> {
+  try {
+    const raw = await readFile(path.join(projectPath, "package.json"), "utf8");
+    const pkg = JSON.parse(raw) as { scripts?: Record<string, string> };
+    const scripts = pkg.scripts ?? {};
+    return ["dev", "start", "serve"].find((name) => typeof scripts[name] === "string");
+  } catch {
+    return undefined;
+  }
+}
+
+async function startGenericNodePreview(
+  projectId: string,
+  projectPath: string,
+  script: string,
+  events: string[],
+  execution: ExecutionContext | undefined,
+  platform: FactoryPreviewPlatform,
+): Promise<PreviewOutcome> {
+  const port = await findPreviewPort();
+  if (execution) await emitExecution(execution, "preview", "running", "Starting development server", { command: `npm.cmd run ${script}`, details: { port, script } });
+  const child = spawn("npm.cmd", ["run", script], {
+    cwd: projectPath,
+    shell: true,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    env: { ...process.env, PORT: String(port) },
+  });
+  child.unref();
+  previewProcesses.set(projectId, { port, processId: child.pid, lastUsedAt: Date.now() });
+  const previewUrl = `http://localhost:${port}`;
+  const ready = await waitForPreviewReady(port);
+  events.push(ready ? `Preview ready: ${previewUrl}` : `Preview still starting: ${previewUrl}`);
+  if (execution) {
+    await emitExecution(execution, "preview", ready ? "completed" : "warning", ready ? "Preview ready" : "Preview still starting", { details: { previewUrl, port, ready, script } });
   }
   return { previewUrl, previewState: ready ? "ready" : "starting", previewPlatform: platform };
 }
