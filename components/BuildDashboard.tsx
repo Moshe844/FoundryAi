@@ -1480,6 +1480,10 @@ function ProjectBriefView({
         </div>
       </div>
 
+      {activeExecutionMission?.pending_mock_review ? (
+        <MockReviewPanel pendingMockReview={activeExecutionMission.pending_mock_review} execution={execution} onExecute={onExecute} />
+      ) : null}
+
       <ProjectComposer
         inputRef={composerRef}
         task={task}
@@ -2161,6 +2165,75 @@ function PreviewPanel({ execution }: { execution: FactoryProjectResult }) {
   }
 
   return <p className="mt-4 rounded-md border border-dashed border-white/15 px-3 py-2 text-xs leading-5 text-foundry-subtle">{execution.previewReason || "Open index.html from the project folder to preview this static project."}</p>;
+}
+
+function MockReviewPanel({
+  pendingMockReview,
+  execution,
+  onExecute,
+}: {
+  pendingMockReview: { message: string; preview_url?: string };
+  execution: FactoryProjectResult | null;
+  onExecute: (task: string) => void;
+}) {
+  const [feedback, setFeedback] = useState("");
+
+  function sendFeedback() {
+    const trimmed = feedback.trim();
+    if (!trimmed) return;
+    setFeedback("");
+    onExecute(trimmed);
+  }
+
+  function continueBuilding() {
+    onExecute("The mock looks good — continue building out the rest of the plan.");
+  }
+
+  return (
+    <div className="mx-3 mb-3 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.05] p-4 sm:mx-4">
+      <p className="section-kicker">First Working Mock — Ready For Review</p>
+      <p className="mt-2 text-sm leading-6 text-foundry-ink">{pendingMockReview.message}</p>
+      {execution ? <PreviewPanel execution={execution} /> : null}
+      {pendingMockReview.preview_url ? (
+        <a
+          className="mt-3 inline-flex items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
+          href={pendingMockReview.preview_url}
+          target="_blank"
+          rel="noreferrer"
+        >
+          Open preview in a new tab
+        </a>
+      ) : null}
+      <div className="mt-4 grid gap-2">
+        <label className="grid gap-1.5">
+          <span className="text-xs font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">Anything to change?</span>
+          <textarea
+            className="min-h-[4rem] resize-y rounded-md border border-white/10 bg-black/20 p-2 text-sm text-foundry-ink outline-none focus:border-foundry-teal/40"
+            value={feedback}
+            onChange={(event) => setFeedback(event.target.value)}
+            placeholder="Move the nav to the left, make the header bigger…"
+          />
+        </label>
+        <div className="flex flex-wrap gap-2">
+          <button
+            className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
+            type="button"
+            onClick={continueBuilding}
+          >
+            Looks good — continue building
+          </button>
+          <button
+            className="rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink disabled:cursor-not-allowed disabled:opacity-40"
+            type="button"
+            disabled={!feedback.trim()}
+            onClick={sendFeedback}
+          >
+            Send feedback
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function finalSummaryFromTimeline(timeline: FactoryExecutionEvent[]) {

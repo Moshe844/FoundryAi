@@ -17,7 +17,7 @@ export function computeMissionState(input: {
   // A pending approval is a hard pause, checked before anything else — nothing about verification
   // evidence should ever be able to override it.
   if (rawStatus === "awaiting-approval") return { state: "waiting_for_approval", verification_status: verificationStatus };
-  if (rawStatus === "needs-clarification") return { state: "waiting_for_user", verification_status: verificationStatus };
+  if (rawStatus === "needs-clarification" || rawStatus === "awaiting-mock-approval") return { state: "waiting_for_user", verification_status: verificationStatus };
   if (rawStatus === "stopped") return { state: "cancelled", verification_status: verificationStatus };
   if (rawStatus === "failed" || rawStatus === "unsupported") {
     return { state: blocker ? "blocked" : "failed", verification_status: verificationStatus };

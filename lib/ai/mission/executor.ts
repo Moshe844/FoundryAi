@@ -28,10 +28,14 @@ export type MissionExecutorInput = {
   fastLane?: boolean;
   /** Set when the task was heuristically detected as a rewrite/migration/architecture-scale change — keeps the old implementation in place until the user approves replacing it, and checkpoints after each phase. */
   highRisk?: boolean;
+  /** Set for larger new-project builds with a live-previewable stack: the first checklist phase should be a
+   * minimal but real, clickable first pass of the primary screens, and the mission pauses there for the user
+   * to open the preview and react before Foundry goes deeper — instead of building the whole thing unseen. */
+  offerMockGate?: boolean;
 };
 
 export type MissionExecutorResult = {
-  status: "passed" | "failed" | "stopped" | "awaiting-approval";
+  status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval";
   blocker?: string;
   checklist: FactoryObjectiveChecklistItem[];
   timeline: FactoryExecutionEvent[];
@@ -290,7 +294,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     });
   }
 
-  function finalize(status: "passed" | "failed" | "stopped" | "awaiting-approval", blocker: string | undefined, turnsUsed: number): MissionExecutorResult {
+  function finalize(status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval", blocker: string | undefined, turnsUsed: number): MissionExecutorResult {
     return {
       status,
       blocker,
@@ -335,6 +339,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               : "",
             input.highRisk
               ? "Work phase by phase in the order given. The moment every item in a phase is marked completed or skipped, record a decision or finding that plainly states what that phase actually changed and what still matches the old behavior — that's the user's checkpoint to see real progress before you start the next phase."
+              : "",
+            input.offerMockGate
+              ? "This is a larger build, so treat the first checklist phase as building a minimal but real, clickable first pass of the primary screens — real navigation, real forms and layout, placeholder/mock data where deeper logic isn't built yet, professionally designed, not a wireframe. Do not build deep business logic, full data persistence, or later phases yet. The moment every item in that first phase is completed or skipped, the mission will pause automatically so the user can open a live preview and react before you continue — this is expected, not a failure or an interruption to work around. Do not call report_complete or try to keep working past the first phase; let it pause."
               : "",
             "For user-facing UI work, inspect the current UI structure and styling before editing. Improve the actual screen the user will see: aligned rows, clear labels, helpful helper text, sane empty states, accessible controls, and professional spacing. Do not ship raw/basic controls when the request is for product behavior.",
             "For requests that move hardcoded backend fields, payload fields, spreadsheet columns, or transaction fields into the frontend or configuration, build the whole product loop unless the existing project makes it impossible: create or update a durable config file, load existing fields from it, add/edit/remove fields in the UI, persist required/optional metadata, generate frontend forms from that config, and make backend upload/API mapping read the saved config dynamically.",
@@ -543,9 +550,15 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           : false;
         applyChecklistUpdate(checklist, args);
         await emitChecklistSnapshot();
-        if (input.highRisk && phaseBefore && phaseWasOpenBefore) {
+        if ((input.highRisk || input.offerMockGate) && phaseBefore && phaseWasOpenBefore) {
           const phaseNowDone = checklist.every((item) => item.phase !== phaseBefore || item.status === "completed" || item.status === "skipped");
           if (phaseNowDone) {
+            const isFirstPhase = checklist[0]?.phase === phaseBefore;
+            if (input.offerMockGate && isFirstPhase) {
+              const message = `The first working mock is ready — "${phaseBefore}" is done. Open the preview and try it out, then tell me what to change or say it looks good to keep building.`;
+              await emit("summary", "completed", "First working mock ready for review", { details: { reason: message } });
+              return finalize("awaiting-mock-approval", message, turn);
+            }
             await emit("summary", "completed", `Checkpoint: ${phaseBefore} complete`, {
               details: { reason: `Every item in "${phaseBefore}" is resolved. Review this checkpoint before the next phase starts.` },
             });

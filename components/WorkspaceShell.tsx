@@ -619,7 +619,9 @@ export function WorkspaceShell() {
                 ? "Preview, view files, rebuild, or export the project."
                 : result.status === "awaiting-approval"
                   ? "Allow once, allow for this project, or deny the pending command before Foundry continues."
-                  : "Review the build output and blocker.",
+                  : result.status === "awaiting-mock-approval"
+                    ? "Open the preview, react to the first working mock, or say it looks good to continue building."
+                    : "Review the build output and blocker.",
             summary: `Factory execution ${result.status} for ${result.projectName}.`,
             updatedAt: now.toISOString(),
           },
@@ -2267,6 +2269,10 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
     });
   const blockedReason = result.blocker || (state === "complete" ? undefined : result.checklist?.find((item) => item.status === "blocked")?.evidence);
   const humanSummary = result.sessionSummary?.outcome || (state === "complete" && verification.length ? factoryResultMessage(result) : "");
+  const pendingMockReview =
+    result.status === "awaiting-mock-approval"
+      ? { message: result.blocker || "The first working mock is ready for review.", preview_url: result.previewUrl }
+      : undefined;
   return {
     id: existing?.id ?? `execution-${Date.now()}`,
     title: taskTitle(task, result),
@@ -2282,6 +2288,7 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
     })),
     verification,
     blocked_reason: blockedReason,
+    pending_mock_review: pendingMockReview,
     undo_snapshot: existing?.undo_snapshot,
     summary: humanSummary,
     parent_mission_id: existing?.parent_mission_id,

@@ -209,6 +209,11 @@ export async function createFactoryProject(brief: string, onEvent?: ExecutionEmi
   execution.checklist.splice(0, execution.checklist.length, ...execution.checklist.filter((item) => item.id !== "read-project"), ...checklist);
   await emitExecution(execution, "planning", "completed", "Checklist ready", { internal: true, details: { checklistJson: JSON.stringify(checklist) } });
 
+  // A larger build with a live-previewable stack gets a "build the mock first" checkpoint after the
+  // first checklist phase, rather than running the whole thing unseen — see offerMockGate in executor.ts.
+  const distinctPhases = new Set(checklist.map((item) => item.phase).filter(Boolean)).size;
+  const offerMockGate = distinctPhases >= 2 && hasLivePreviewFor(stackProfile.label);
+
   const result = await runMissionExecutor({
     objective,
     task,
@@ -217,21 +222,33 @@ export async function createFactoryProject(brief: string, onEvent?: ExecutionEmi
     apiKey,
     onEvent: emitEvent,
     approvedCategories: ["dependencies", "package-runner"],
+    offerMockGate,
   });
 
   execution.checklist.splice(0, execution.checklist.length, ...result.checklist);
   completeChecklistItem(execution, "files-on-disk", result.changedFiles.length ? "completed" : "blocked", result.changedFiles.length ? `Wrote ${result.changedFiles.length} file(s) to ${projectPath}.` : "No files were written.");
 
-  const status: FactoryProjectResult["status"] = result.status === "passed" ? "passed" : result.status === "awaiting-approval" ? "awaiting-approval" : "failed";
+  const status: FactoryProjectResult["status"] =
+    result.status === "passed" ? "passed" : result.status === "awaiting-approval" ? "awaiting-approval" : result.status === "awaiting-mock-approval" ? "awaiting-mock-approval" : "failed";
   const blocker = result.status === "passed" ? undefined : result.blocker;
+  const mockGateReached = status === "awaiting-mock-approval";
 
-  const preview = status === "passed" ? await startPreview(projectId, projectPath, stackProfile.label, events, execution) : undefined;
+  const preview = status === "passed" || mockGateReached ? await startPreview(projectId, projectPath, stackProfile.label, events, execution) : undefined;
   const files = await listProjectFiles(projectPath);
-  completeChecklistItem(execution, "references-checked", status === "passed" ? "completed" : "blocked", status === "passed" ? "Verified via the mission executor." : blocker);
+  completeChecklistItem(
+    execution,
+    "references-checked",
+    status === "passed" || mockGateReached ? "completed" : "blocked",
+    status === "passed" || mockGateReached ? "Verified via the mission executor." : blocker,
+  );
   finishObjectiveChecklist(execution, status, blocker);
-  await emitExecution(execution, "summary", status === "passed" ? "completed" : "error", status === "passed" ? "Behavior verified" : "Execution finished with blocker", {
-    details: { files: files.length, previewUrl: preview?.previewUrl },
-  });
+  await emitExecution(
+    execution,
+    "summary",
+    status === "passed" ? "completed" : mockGateReached ? "completed" : "error",
+    status === "passed" ? "Behavior verified" : mockGateReached ? "First working mock ready for review" : "Execution finished with blocker",
+    { details: { files: files.length, previewUrl: preview?.previewUrl } },
+  );
 
   return {
     projectId,
@@ -1582,6 +1599,12 @@ function isNextStack(stack: string) {
   return /\bnext(?:\.js)?\b/i.test(stack);
 }
 
+/** Mirrors the stacks startPreview() can actually spin up a real, live preview for today —
+ * only offer the mock-first gate when "Open Preview" will genuinely work. */
+function hasLivePreviewFor(stack: string) {
+  return isNextStack(stack) || /\b(html|css|static)\b/i.test(stack);
+}
+
 async function noteMissingDependencies(projectPath: string, packageManager: string, execution: ExecutionContext) {
   if (!packageManager) return;
   if (!existsSync(path.join(projectPath, "package.json"))) return;
@@ -1932,14 +1955,22 @@ async function pauseForPlanConflicts(execution: ExecutionContext, conflicts: str
 }
 
 function finishObjectiveChecklist(execution: ExecutionContext, status: FactoryProjectResult["status"], blocker?: string) {
+  // A mock-review pause is an intentional checkpoint mid-plan, not a stuck/failed mission — later-phase
+  // items stay "pending" so the follow-up that continues the build picks them back up correctly.
+  const isPausedForMockReview = status === "awaiting-mock-approval";
   for (const item of execution.checklist) {
-    if (item.status === "running") item.status = status === "passed" ? "completed" : "blocked";
-    if (item.status === "pending" && status !== "passed") {
+    if (item.status === "running") item.status = status === "passed" ? "completed" : isPausedForMockReview ? "pending" : "blocked";
+    if (item.status === "pending" && status !== "passed" && !isPausedForMockReview) {
       item.status = "blocked";
       item.evidence = blocker || "Stopped because the objective could not be completed with the available project executor.";
     }
   }
-  completeChecklistItem(execution, "final-result", status === "passed" ? "completed" : "blocked", status === "passed" ? "Final summary maps to the requested goal." : blocker);
+  completeChecklistItem(
+    execution,
+    "final-result",
+    status === "passed" ? "completed" : isPausedForMockReview ? "pending" : "blocked",
+    status === "passed" ? "Final summary maps to the requested goal." : isPausedForMockReview ? undefined : blocker,
+  );
 }
 
 async function emitExecution(

@@ -97,6 +97,10 @@ export type ExecutionMission = {
   commands_run: ExecutionMissionCommandRun[];
   verification: ExecutionMissionVerification[];
   blocked_reason?: string;
+  /** Set only while state is "waiting_for_user" because Foundry paused after building a first working
+   * mock of a larger build, not because of a generic clarifying question — lets the UI show "Open
+   * Preview" + feedback + "Continue building" instead of a text-question prompt. */
+  pending_mock_review?: { message: string; preview_url?: string };
   undo_snapshot?: string;
   summary: string;
   parent_mission_id?: string;

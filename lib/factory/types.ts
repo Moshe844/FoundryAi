@@ -1,6 +1,6 @@
 import type { CommandApprovalScope, CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
 
-export type FactoryBuildStatus = "created" | "running" | "passed" | "failed" | "unsupported" | "stopped" | "awaiting-approval" | "needs-clarification";
+export type FactoryBuildStatus = "created" | "running" | "passed" | "failed" | "unsupported" | "stopped" | "awaiting-approval" | "needs-clarification" | "awaiting-mock-approval";
 
 export type FactoryFileEntry = {
   path: string;
