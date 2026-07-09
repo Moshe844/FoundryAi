@@ -9,6 +9,7 @@ import {
   CircleDot,
   Code2,
   Download,
+  ExternalLink,
   FolderGit2,
   Gamepad2,
   Globe2,
@@ -16,23 +17,28 @@ import {
   LayoutDashboard,
   Loader2,
   Lock,
+  PanelRightClose,
+  PanelRightOpen,
   Pencil,
   Settings,
   ShoppingBag,
   SkipForward,
   Smartphone,
+  Sparkles,
   Store,
   Trash2,
   Webhook,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ReactNode, RefObject } from "react";
+import type { PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
 import type { ExecutionMission, MissionState } from "@/lib/mission-engine";
 import { discoverProject } from "@/lib/ai/project-discovery";
 import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
 import { capabilityLevelForStackChoice, unsupportedCreationMessage } from "@/lib/factory/language-adapters";
+import { genericRecommendations } from "@/lib/ai/mission/recommendations";
+import type { MissionRecommendation } from "@/lib/ai/mission/recommendations";
 import type { StackProfile } from "@/lib/factory/language-adapters";
 import type { CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
 import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryFileReadResult, FactoryJournalEntry, FactoryObjectiveChecklistItem, FactoryProjectResult, FactoryUploadedFile } from "@/lib/factory/types";
@@ -1363,9 +1369,12 @@ function ProjectBriefView({
 }) {
   const [task, setTask] = useState("");
   const [executionLevel, setExecutionLevel] = useState<ExecutionLevel>("summary");
+  const [previewCollapsed, setPreviewCollapsed] = useState(false);
+  const [previewWidthPct, setPreviewWidthPct] = useState(40);
   const activeTaskRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const workScrollRef = useRef<HTMLDivElement | null>(null);
+  const middleRowRef = useRef<HTMLDivElement | null>(null);
   const timeline = projectTimelineFromMission(mission, execution);
   const activeExecutionMission = activeExecutionMissionFor(mission);
   const isExecutionLive = isProjectWorkInProgress(mission);
@@ -1394,6 +1403,29 @@ function ProjectBriefView({
     // to the summary card, no matter how long it's been since the mission actually ran.
     if (!isExecutionLive && !needsUserAction) setExecutionLevel("summary");
   }, [isExecutionLive, needsUserAction]);
+
+  // A preview panel only earns its place beside the conversation when there's a real artifact to
+  // show — not just because an execution object exists. "starting" still reserves the space (the
+  // preview is on its way); "unavailable"/absent collapses back to a full-width conversation.
+  const showPreview = execution?.previewState === "ready" || execution?.previewState === "starting" || execution?.previewState === "error";
+
+  function beginPreviewResize(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const row = middleRowRef.current;
+    if (!row) return;
+    const rowRect = row.getBoundingClientRect();
+    function onMove(moveEvent: PointerEvent) {
+      const fromRight = rowRect.right - moveEvent.clientX;
+      const pct = (fromRight / rowRect.width) * 100;
+      setPreviewWidthPct(Math.min(62, Math.max(22, pct)));
+    }
+    function onUp() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
 
   function runTask() {
     const trimmed = task.trim();
@@ -1443,45 +1475,78 @@ function ProjectBriefView({
           </div>
           <ProjectFileTree files={visibleFiles} onReadFile={onReadFile} recentlyChangedPaths={recentlyChangedPaths} />
         </aside>
-        <div ref={workScrollRef} className="min-h-0 overflow-auto p-3 pr-1 sm:p-4">
-          <ProjectWorkConversation
-            mission={mission}
-            execution={execution}
-            timeline={timeline}
-            activeExecutionMission={activeExecutionMission}
-            level={effectiveLevel}
-            isExecutionLive={isExecutionLive}
-            isExistingProject={isExistingProject}
-            activeTaskRef={activeTaskRef}
-            scrollContainerRef={workScrollRef}
-            onReadFile={onReadFile}
-            onFetchFileContent={onFetchFileContent}
-            onSkipItem={(item) => onExecute(`The user asked to skip checklist item "${item.label}" — mark it skipped and continue with everything else.`)}
-            onApproveCommand={(event, action) => {
-              const command = event.command ?? event.title;
-              const category = event.details?.category as CommandPermissionCategory | undefined;
-              if (action === "skip") {
-                onExecute(
-                  `Denied approval to run "${command}" - mark the checklist item that needed it as skipped (not blocked) and continue with every other item that can still be verified safely.`,
-                  { requestedCommand: command, decision: "deny" },
-                );
-                return;
-              }
-              if (action === "approve-category" && category) {
-                onApproveCategory?.(category);
-              }
-              if (action === "approve-command") {
-                onApproveCommand?.(command);
-              }
-              const decision = action === "approve-once" ? "approve-once" : action === "approve-category" ? "approve-category" : "approve-command";
-              onExecute(`Approved: run ${command}`, { requestedCommand: command, decision, category: decision === "approve-category" ? category : undefined });
-            }}
-          />
+        <div ref={middleRowRef} className="flex min-h-0 overflow-hidden">
+          <div
+            ref={workScrollRef}
+            className="min-h-0 flex-1 overflow-auto p-3 pr-1 sm:p-4"
+            style={showPreview && !previewCollapsed ? { flexBasis: `${100 - previewWidthPct}%` } : undefined}
+          >
+            <ProjectWorkConversation
+              mission={mission}
+              execution={execution}
+              timeline={timeline}
+              activeExecutionMission={activeExecutionMission}
+              level={effectiveLevel}
+              isExecutionLive={isExecutionLive}
+              isExistingProject={isExistingProject}
+              activeTaskRef={activeTaskRef}
+              scrollContainerRef={workScrollRef}
+              onReadFile={onReadFile}
+              onFetchFileContent={onFetchFileContent}
+              onExecute={onExecute}
+              onSkipItem={(item) => onExecute(`The user asked to skip checklist item "${item.label}" — mark it skipped and continue with everything else.`)}
+              onApproveCommand={(event, action) => {
+                const command = event.command ?? event.title;
+                const category = event.details?.category as CommandPermissionCategory | undefined;
+                if (action === "skip") {
+                  onExecute(
+                    `Denied approval to run "${command}" - mark the checklist item that needed it as skipped (not blocked) and continue with every other item that can still be verified safely.`,
+                    { requestedCommand: command, decision: "deny" },
+                  );
+                  return;
+                }
+                if (action === "approve-category" && category) {
+                  onApproveCategory?.(category);
+                }
+                if (action === "approve-command") {
+                  onApproveCommand?.(command);
+                }
+                const decision = action === "approve-once" ? "approve-once" : action === "approve-category" ? "approve-category" : "approve-command";
+                onExecute(`Approved: run ${command}`, { requestedCommand: command, decision, category: decision === "approve-category" ? category : undefined });
+              }}
+            />
+          </div>
+
+          {showPreview && !previewCollapsed ? (
+            <>
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                className="w-1.5 shrink-0 cursor-col-resize bg-white/5 transition hover:bg-foundry-teal/40 active:bg-foundry-teal/50"
+                onPointerDown={beginPreviewResize}
+              />
+              <div className="flex min-h-0 min-w-0 flex-col border-l border-white/10 bg-black/10" style={{ flexBasis: `${previewWidthPct}%` }}>
+                <EngineeringWorkspacePanel execution={execution} onCollapse={() => setPreviewCollapsed(true)} />
+              </div>
+            </>
+          ) : null}
+
+          {showPreview && previewCollapsed ? (
+            <button
+              type="button"
+              onClick={() => setPreviewCollapsed(false)}
+              className="flex w-9 shrink-0 flex-col items-center gap-2 border-l border-white/10 bg-black/15 py-4 text-foundry-subtle transition hover:bg-white/[0.04] hover:text-foundry-ink"
+              title="Show preview"
+            >
+              <PanelRightOpen size={15} />
+              <span className="[writing-mode:vertical-rl] text-[10.5px] font-extrabold uppercase tracking-[0.08em]">Preview</span>
+            </button>
+          ) : null}
         </div>
       </div>
 
       {activeExecutionMission?.pending_mock_review ? (
-        <MockReviewPanel pendingMockReview={activeExecutionMission.pending_mock_review} execution={execution} onExecute={onExecute} />
+        <MockReviewPanel pendingMockReview={activeExecutionMission.pending_mock_review} execution={execution} onExecute={onExecute} showsOwnPreview={!showPreview} />
       ) : null}
 
       <ProjectComposer
@@ -1511,6 +1576,7 @@ function ProjectWorkConversation({
   scrollContainerRef,
   onReadFile,
   onFetchFileContent,
+  onExecute,
   onApproveCommand,
   onSkipItem,
 }: {
@@ -1525,6 +1591,7 @@ function ProjectWorkConversation({
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onReadFile: (path: string) => void;
   onFetchFileContent: (path: string) => Promise<string | null>;
+  onExecute: (task: string) => void;
   onApproveCommand?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
   onSkipItem?: (item: FactoryObjectiveChecklistItem) => void;
 }) {
@@ -1612,7 +1679,7 @@ function ProjectWorkConversation({
           {!isExecutionLive && level === "summary" && execution ? (
             <>
               <MissionSummary execution={execution} timeline={timeline} onReadFile={onReadFile} onApproveCommand={onApproveCommand} />
-              <PreviewPanel execution={execution} />
+              <PostBuildRecommendations execution={execution} onExecute={onExecute} />
             </>
           ) : null}
         </div>
@@ -2177,9 +2244,10 @@ function SummarySection({ title, children }: { title: string; children: ReactNod
   );
 }
 
-function PreviewPanel({ execution }: { execution: FactoryProjectResult }) {
+function PreviewPanel({ execution, fill = false }: { execution: FactoryProjectResult; fill?: boolean }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const previousUrlRef = useRef(execution.previewUrl);
+  const wrap = fill ? "" : "mt-4";
 
   useEffect(() => {
     if (execution.previewUrl && execution.previewUrl !== previousUrlRef.current) {
@@ -2188,18 +2256,38 @@ function PreviewPanel({ execution }: { execution: FactoryProjectResult }) {
     }
   }, [execution.previewUrl]);
 
+  if (execution.previewState === "starting") {
+    return (
+      <div className={`${wrap} flex flex-1 flex-col items-center justify-center gap-2 px-4 text-center text-xs leading-5 text-foundry-subtle`}>
+        <Loader2 size={16} className="animate-spin text-foundry-teal" />
+        <p>Starting the preview server…</p>
+      </div>
+    );
+  }
+
+  if (execution.previewState === "error") {
+    return (
+      <div className={`${wrap} flex flex-1 flex-col items-center justify-center gap-1.5 px-4 text-center text-xs leading-5 text-foundry-amber`}>
+        <p className="font-bold">Preview couldn&apos;t start.</p>
+        <p className="text-foundry-subtle">{execution.previewReason || "Check the command timeline for what failed."}</p>
+      </div>
+    );
+  }
+
   if (!execution.previewState || execution.previewState === "unavailable") {
     return execution.previewReason ? (
-      <p className="mt-4 rounded-md border border-dashed border-white/15 px-3 py-2 text-xs leading-5 text-foundry-subtle">Preview: {execution.previewReason}</p>
+      <p className={`${wrap} rounded-md border border-dashed border-white/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>Preview: {execution.previewReason}</p>
     ) : null;
   }
 
   if (execution.previewUrl && execution.previewPlatform === "api") {
-    return <ApiPlayground baseUrl={execution.previewUrl} />;
+    return <ApiPlayground baseUrl={execution.previewUrl} fill={fill} />;
   }
 
   if (execution.previewUrl) {
-    return (
+    return fill ? (
+      <iframe key={refreshKey} src={execution.previewUrl} className="h-full w-full flex-1 border-0 bg-white" title="Live preview" />
+    ) : (
       <div className="mt-4 overflow-hidden rounded-md border border-white/10">
         <div className="flex items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
           <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">Live Preview</span>
@@ -2210,10 +2298,51 @@ function PreviewPanel({ execution }: { execution: FactoryProjectResult }) {
     );
   }
 
-  return <p className="mt-4 rounded-md border border-dashed border-white/15 px-3 py-2 text-xs leading-5 text-foundry-subtle">{execution.previewReason || "Open index.html from the project folder to preview this static project."}</p>;
+  return <p className={`${wrap} rounded-md border border-dashed border-white/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>{execution.previewReason || "Open index.html from the project folder to preview this static project."}</p>;
 }
 
-function ApiPlayground({ baseUrl }: { baseUrl: string }) {
+function EngineeringWorkspacePanel({ execution, onCollapse }: { execution: FactoryProjectResult | null; onCollapse: () => void }) {
+  const previewUrl = execution?.previewUrl;
+  const canPopOut = Boolean(previewUrl) && execution?.previewPlatform !== "api";
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">
+            {execution?.previewPlatform === "api" ? "API Playground" : "Live Preview"}
+          </span>
+          {execution?.previewState === "ready" ? <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-foundry-teal" /> : null}
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {canPopOut && previewUrl ? (
+            <button
+              type="button"
+              onClick={() => window.open(previewUrl, "_blank", "noopener,noreferrer")}
+              className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"
+              title="Open in a new window"
+            >
+              <ExternalLink size={14} />
+            </button>
+          ) : null}
+          <button
+            type="button"
+            onClick={onCollapse}
+            className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"
+            title="Collapse preview"
+          >
+            <PanelRightClose size={14} />
+          </button>
+        </div>
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col overflow-auto">
+        {execution ? <PreviewPanel execution={execution} fill /> : null}
+      </div>
+    </div>
+  );
+}
+
+function ApiPlayground({ baseUrl, fill = false }: { baseUrl: string; fill?: boolean }) {
   const [method, setMethod] = useState("GET");
   const [path, setPath] = useState("/");
   const [body, setBody] = useState("");
@@ -2242,53 +2371,155 @@ function ApiPlayground({ baseUrl }: { baseUrl: string }) {
     }
   }
 
+  const fields = (
+    <div className="grid gap-2 p-3">
+      <div className="flex gap-2">
+        <select
+          className="rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-xs font-bold text-foundry-ink"
+          value={method}
+          onChange={(event) => setMethod(event.target.value)}
+        >
+          {["GET", "POST", "PUT", "PATCH", "DELETE"].map((item) => (
+            <option key={item} value={item}>{item}</option>
+          ))}
+        </select>
+        <input
+          className="flex-1 rounded-md border border-white/10 bg-black/20 px-2 py-1.5 font-mono text-xs text-foundry-ink outline-none focus:border-foundry-teal/40"
+          value={path}
+          onChange={(event) => setPath(event.target.value)}
+          placeholder="/api/resource"
+        />
+        <button
+          className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-1.5 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2] disabled:opacity-50"
+          type="button"
+          disabled={sending}
+          onClick={send}
+        >
+          {sending ? "Sending…" : "Send"}
+        </button>
+      </div>
+      {method !== "GET" && method !== "HEAD" ? (
+        <textarea
+          className="min-h-[3rem] resize-y rounded-md border border-white/10 bg-black/20 p-2 font-mono text-xs text-foundry-ink outline-none focus:border-foundry-teal/40"
+          value={body}
+          onChange={(event) => setBody(event.target.value)}
+          placeholder='{"key": "value"}'
+        />
+      ) : null}
+      {error ? <p className="text-xs leading-5 text-red-300">{error}</p> : null}
+      {response ? (
+        <div className="rounded-md border border-white/10 bg-black/30 p-2">
+          <p className="font-mono text-[11px] font-bold text-foundry-teal">Status: {response.status}</p>
+          <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-foundry-muted">{response.body}</pre>
+        </div>
+      ) : null}
+    </div>
+  );
+
+  if (fill) return fields;
+
   return (
     <div className="mt-4 overflow-hidden rounded-md border border-white/10">
       <div className="flex items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
         <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">API Playground</span>
         <span className="truncate font-mono text-[10.5px] text-foundry-subtle">{baseUrl}</span>
       </div>
-      <div className="grid gap-2 p-3">
-        <div className="flex gap-2">
-          <select
-            className="rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-xs font-bold text-foundry-ink"
-            value={method}
-            onChange={(event) => setMethod(event.target.value)}
-          >
-            {["GET", "POST", "PUT", "PATCH", "DELETE"].map((item) => (
-              <option key={item} value={item}>{item}</option>
-            ))}
-          </select>
-          <input
-            className="flex-1 rounded-md border border-white/10 bg-black/20 px-2 py-1.5 font-mono text-xs text-foundry-ink outline-none focus:border-foundry-teal/40"
-            value={path}
-            onChange={(event) => setPath(event.target.value)}
-            placeholder="/api/resource"
-          />
-          <button
-            className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-1.5 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2] disabled:opacity-50"
-            type="button"
-            disabled={sending}
-            onClick={send}
-          >
-            {sending ? "Sending…" : "Send"}
-          </button>
-        </div>
-        {method !== "GET" && method !== "HEAD" ? (
-          <textarea
-            className="min-h-[3rem] resize-y rounded-md border border-white/10 bg-black/20 p-2 font-mono text-xs text-foundry-ink outline-none focus:border-foundry-teal/40"
-            value={body}
-            onChange={(event) => setBody(event.target.value)}
-            placeholder='{"key": "value"}'
-          />
-        ) : null}
-        {error ? <p className="text-xs leading-5 text-red-300">{error}</p> : null}
-        {response ? (
-          <div className="rounded-md border border-white/10 bg-black/30 p-2">
-            <p className="font-mono text-[11px] font-bold text-foundry-teal">Status: {response.status}</p>
-            <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-foundry-muted">{response.body}</pre>
-          </div>
-        ) : null}
+      {fields}
+    </div>
+  );
+}
+
+/**
+ * Fetches domain-aware next-improvement recommendations after a mission finishes. Always starts
+ * from the generic, stack-only heuristic list (instant, no network) and silently upgrades to the
+ * LLM's domain-specific picks if that call succeeds — never blocks or shows an error state on
+ * failure/missing key, matching the same silent-fallback contract as project discovery.
+ */
+function useMissionRecommendations(execution: FactoryProjectResult | null) {
+  const [recommendations, setRecommendations] = useState<MissionRecommendation[]>([]);
+  const fetchedForRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!execution) return;
+    const changedFiles = execution.files.filter((file) => file.status === "created" || file.status === "edited").map((file) => file.path);
+    const key = `${execution.projectPath}:${changedFiles.length}:${execution.objective ?? ""}`;
+    if (fetchedForRef.current === key) return;
+    fetchedForRef.current = key;
+
+    const heuristic = genericRecommendations(execution.stack);
+    setRecommendations(heuristic);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    fetch("/api/factory/recommendations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        heuristic,
+        context: {
+          brief: execution.objective || "",
+          objective: execution.objective || "",
+          stack: execution.stack,
+          changedFiles,
+          checklistLabels: (execution.checklist ?? []).map((item) => item.label),
+        },
+      }),
+    })
+      .then((response) => response.json())
+      .then((data) => {
+        if (data?.ok && Array.isArray(data.recommendations) && data.recommendations.length) {
+          setRecommendations(data.recommendations);
+        }
+      })
+      .catch(() => {})
+      .finally(() => clearTimeout(timeout));
+
+    return () => {
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [execution]);
+
+  return recommendations;
+}
+
+function RecommendationChips({ recommendations, onApply }: { recommendations: MissionRecommendation[]; onApply: (recommendation: MissionRecommendation) => void }) {
+  if (!recommendations.length) return null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      {recommendations.map((recommendation) => (
+        <button
+          key={recommendation.id}
+          type="button"
+          onClick={() => onApply(recommendation)}
+          className="group max-w-full rounded-lg border border-white/12 bg-white/[0.03] px-3 py-2 text-left transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.07]"
+          title={recommendation.why}
+        >
+          <span className="flex items-center gap-1.5 text-[13px] font-extrabold text-foundry-ink">
+            <Sparkles size={12} className="shrink-0 text-foundry-teal opacity-70 transition group-hover:opacity-100" />
+            {recommendation.label}
+          </span>
+          <span className="mt-0.5 block max-w-[20rem] text-[11px] leading-4 text-foundry-subtle line-clamp-2">
+            {recommendation.why} · ~{recommendation.estimatedMinutes} min
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function PostBuildRecommendations({ execution, onExecute }: { execution: FactoryProjectResult; onExecute: (task: string) => void }) {
+  const recommendations = useMissionRecommendations(execution);
+  if (execution.status !== "passed" || !recommendations.length) return null;
+
+  return (
+    <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.02] p-3.5">
+      <p className="section-kicker">Next best improvements</p>
+      <p className="mt-1 text-xs leading-5 text-foundry-subtle">Foundry looked at what it just built and flagged what&apos;s worth doing next. Click one to start, or just tell it what you want below.</p>
+      <div className="mt-3">
+        <RecommendationChips recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} />
       </div>
     </div>
   );
@@ -2298,12 +2529,15 @@ function MockReviewPanel({
   pendingMockReview,
   execution,
   onExecute,
+  showsOwnPreview,
 }: {
   pendingMockReview: { message: string; preview_url?: string };
   execution: FactoryProjectResult | null;
   onExecute: (task: string) => void;
+  showsOwnPreview: boolean;
 }) {
   const [feedback, setFeedback] = useState("");
+  const recommendations = useMissionRecommendations(execution);
 
   function sendFeedback() {
     const trimmed = feedback.trim();
@@ -2313,14 +2547,14 @@ function MockReviewPanel({
   }
 
   function continueBuilding() {
-    onExecute("The mock looks good — continue building out the rest of the plan.");
+    onExecute("The first version looks good — continue building out the rest of the plan.");
   }
 
   return (
     <div className="mx-3 mb-3 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.05] p-4 sm:mx-4">
-      <p className="section-kicker">First Working Mock — Ready For Review</p>
+      <p className="section-kicker">First version ready</p>
       <p className="mt-2 text-sm leading-6 text-foundry-ink">{pendingMockReview.message}</p>
-      {execution ? <PreviewPanel execution={execution} /> : null}
+      {showsOwnPreview && execution ? <PreviewPanel execution={execution} /> : null}
       {pendingMockReview.preview_url ? (
         <a
           className="mt-3 inline-flex items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
@@ -2331,31 +2565,34 @@ function MockReviewPanel({
           Open preview in a new tab
         </a>
       ) : null}
+
+      {recommendations.length ? (
+        <div className="mt-4">
+          <p className="text-xs font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">While building this, a few things stood out</p>
+          <div className="mt-2">
+            <RecommendationChips recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} />
+          </div>
+        </div>
+      ) : null}
+
       <div className="mt-4 grid gap-2">
-        <label className="grid gap-1.5">
-          <span className="text-xs font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">Anything to change?</span>
-          <textarea
-            className="min-h-[4rem] resize-y rounded-md border border-white/10 bg-black/20 p-2 text-sm text-foundry-ink outline-none focus:border-foundry-teal/40"
-            value={feedback}
-            onChange={(event) => setFeedback(event.target.value)}
-            placeholder="Move the nav to the left, make the header bigger…"
-          />
-        </label>
-        <div className="flex flex-wrap gap-2">
+        <textarea
+          className="min-h-[4rem] resize-y rounded-md border border-white/10 bg-black/20 p-2 text-sm text-foundry-ink outline-none focus:border-foundry-teal/40"
+          value={feedback}
+          onChange={(event) => setFeedback(event.target.value)}
+          placeholder="Tell Foundry what you'd like to improve…"
+        />
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <button
-            className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
-            type="button"
-            onClick={continueBuilding}
-          >
-            Looks good — continue building
-          </button>
-          <button
-            className="rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink disabled:cursor-not-allowed disabled:opacity-40"
+            className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2] disabled:cursor-not-allowed disabled:opacity-40"
             type="button"
             disabled={!feedback.trim()}
             onClick={sendFeedback}
           >
-            Send feedback
+            Send
+          </button>
+          <button className="text-xs font-extrabold text-foundry-teal transition hover:underline" type="button" onClick={continueBuilding}>
+            Nothing — continue building →
           </button>
         </div>
       </div>
