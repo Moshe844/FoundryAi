@@ -1122,18 +1122,31 @@ export function WorkspaceShell() {
       updatedAt: iso,
     };
 
+    const localConnector = isExistingProjectPlan ? localConnectorFromMission(projectMission) : undefined;
+    const instructions = brief.match(/^Custom instructions:\s*(.+)$/im)?.[1]?.trim() ?? "";
+    const hasRealInstructions = Boolean(instructions && !/^none|no additional instructions?\.?$/i.test(instructions));
+    const willExecuteNow = isExistingProjectPlan ? Boolean(localConnector?.url && hasRealInstructions) : shouldAutoExecute;
+    // Every follow-up gets a pending ExecutionMission the instant it's submitted (executeProjectMissionNow),
+    // which is what makes activeExecutionMissionId resolve during live streaming so the header pill,
+    // composer busy state, and detail-level timeline all show real progress. The very first build of a
+    // brand-new project skipped that — executionMissions started empty and stayed that way until the
+    // entire run finished — so updateActiveExecutionMission's every live update silently no-op'd
+    // (it bails out when there's no active id), and the whole build ran with the canvas showing "Ready"
+    // and no timeline at all. Mirror the follow-up path here so the first build is live from turn one.
+    const pendingExecutionMission = willExecuteNow ? createPendingExecutionMission(projectMission, "Build the initial project", briefNoteId) : undefined;
+    const missionToStore: MissionState = pendingExecutionMission
+      ? { ...projectMission, executionMissions: [pendingExecutionMission], activeExecutionMissionId: pendingExecutionMission.id }
+      : projectMission;
+
     setSelectedArtifactId(null);
     setStagedAttachments([]);
     setPendingWork((current) => current.filter((item) => item.missionId !== missionId));
     setWorkspace((current) => ({
-      activeMissionId: projectMission.missionId,
-      missions: [projectMission, ...current.missions],
+      activeMissionId: missionToStore.missionId,
+      missions: [missionToStore, ...current.missions],
     }));
 
     if (isExistingProjectPlan) {
-      const localConnector = localConnectorFromMission(projectMission);
-      const instructions = brief.match(/^Custom instructions:\s*(.+)$/im)?.[1]?.trim() ?? "";
-      const hasRealInstructions = Boolean(instructions && !/^none|no additional instructions?\.?$/i.test(instructions));
       if (localConnector?.url && hasRealInstructions) {
         await runExistingProjectExecutionForMission(
           projectMission.missionId,
