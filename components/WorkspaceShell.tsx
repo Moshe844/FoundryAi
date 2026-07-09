@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { appendAssistantMessage, applyUserMessage, classifyMessage, createInitialMission, decideWorkThread, looksLikeDiagnosticPaste, shouldUseReasoning } from "@/lib/mission-engine";
 import type { CreatedArtifact, ExecutionMission, ExecutionMissionState, MissionState } from "@/lib/mission-engine";
 import { computeMissionState, verificationStatusFrom } from "@/lib/mission/state";
+import { deriveMissionDisplayStatus, getActiveExecutionMission } from "@/lib/mission/status";
 import { BuildDashboard } from "@/components/BuildDashboard";
 import { StatusBar } from "@/components/StatusBar";
 import { TopBar } from "@/components/TopBar";
@@ -362,19 +363,6 @@ function normalizeVisualArtifact(visual: VisualArtifact, missionId: string): Vis
   };
 }
 
-function workspaceStatusTextForMission(mission: MissionState) {
-  const activeExecution =
-    mission.executionMissions.find((item) => item.id === mission.activeExecutionMissionId) ??
-    mission.executionMissions.at(-1);
-
-  if (!activeExecution) return "Ready";
-  if (activeExecution.state === "complete") {
-    return activeExecution.verification_status === "passed" ? "Complete" : "Complete (unverified)";
-  }
-  if (activeExecution.state === "idle") return "Ready";
-  return activeExecution.state.replace(/_/g, " ").replace(/^./, (char) => char.toUpperCase());
-}
-
 export function WorkspaceShell() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(() => createInitialWorkspace());
   const [hasLoadedMission, setHasLoadedMission] = useState(false);
@@ -389,7 +377,14 @@ export function WorkspaceShell() {
   const mission = workspace.missions.find((item) => item.missionId === workspace.activeMissionId) ?? workspace.missions[0];
   const selectedArtifact = mission.createdArtifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
   const activeProgress = pendingWork.filter((item) => item.missionId === mission.missionId);
-  const statusText = activeProgress[0]?.steps[activeProgress[0].stepIndex] ?? workspaceStatusTextForMission(mission);
+  // A mission with any ExecutionMission turns is the project/execution canvas — its footer status must
+  // always be the same canonical derivation as the header pill and composer, never the legacy simulated
+  // "typing" steps below (those exist only for the plain-chat path, which has no ExecutionMission turns).
+  // Letting pendingWork override it here was one of four independently-computed status strings that could
+  // disagree with each other (header said "Working", footer said "Ready", or vice versa).
+  const statusText = mission.executionMissions.length
+    ? deriveMissionDisplayStatus(mission).label
+    : (activeProgress[0]?.steps[activeProgress[0].stepIndex] ?? "Ready");
 
   useEffect(() => {
     let cancelled = false;
@@ -634,7 +629,7 @@ export function WorkspaceShell() {
   async function executeProjectMission(missionId: string, task: string, approvalResponse?: FactoryExistingProjectRequest["approvalResponse"]) {
     const isBusy = activeControllersRef.current.has(missionId);
     const targetMission = workspace.missions.find((item) => item.missionId === missionId);
-    const activeExecution = targetMission ? activeExecutionMissionFor(targetMission) : undefined;
+    const activeExecution = targetMission ? getActiveExecutionMission(targetMission) : undefined;
     // Only a blocked-command approval genuinely requires one of the button-generated synthetic
     // replies — arbitrary text can't resolve "should this shell command run?". A "waiting_for_user"
     // pause (a clarification question, or mock-review feedback) is the opposite: typed free text is
@@ -949,26 +944,31 @@ export function WorkspaceShell() {
 
     setWorkspace((current) => ({
       activeMissionId: missionId,
-      missions: current.missions.map((item) =>
-        item.missionId === missionId
-          ? {
-              ...item,
-              messages: [...item.messages, answerNote],
-              liveWorkEvents: [],
-              lastResult: answer,
-              // Every project request gets a Mission entry — even read-only ones — so "Previous Missions" is
-              // the single unified history (Section 16), not a separate plain-text message count.
-              executionMissions: [...item.executionMissions, executionMissionFromAnswer(task, answer)],
-              workMemory: {
-                ...item.workMemory,
-                latestEvidence: [intent === "status" ? "Read previous project result" : "Inspected project without writing files"],
-                recommendedNextAction: "Ask a follow-up question or describe the change you want Foundry to make.",
-                updatedAt: now.toISOString(),
-              },
-              updatedAt: now.toISOString(),
-            }
-          : item,
-      ),
+      missions: current.missions.map((item) => {
+        if (item.missionId !== missionId) return item;
+        // Every project request gets a Mission entry — even read-only ones — so "Previous Missions" is
+        // the single unified history (Section 16), not a separate plain-text message count. It must also
+        // become the active one immediately: leaving activeExecutionMissionId pointed at whatever was
+        // active before is what made every read-only follow-up (the most common kind) file itself straight
+        // into "Previous Missions" while its text rendered elsewhere — the single root cause behind the new
+        // message appearing in the wrong place, stale status pills, and stale suggestions surviving it.
+        const answerMission = executionMissionFromAnswer(task, answer, item.activeExecutionMissionId, answerNote.id);
+        return {
+          ...item,
+          messages: [...item.messages, answerNote],
+          liveWorkEvents: [],
+          lastResult: answer,
+          executionMissions: [...item.executionMissions, answerMission],
+          activeExecutionMissionId: answerMission.id,
+          workMemory: {
+            ...item.workMemory,
+            latestEvidence: [intent === "status" ? "Read previous project result" : "Inspected project without writing files"],
+            recommendedNextAction: "Ask a follow-up question or describe the change you want Foundry to make.",
+            updatedAt: now.toISOString(),
+          },
+          updatedAt: now.toISOString(),
+        };
+      }),
     }));
   }
 
@@ -1828,10 +1828,6 @@ function attachmentsFromMessages(messages: WorkspaceNote[]) {
   return Array.from(merged.values());
 }
 
-function activeExecutionMissionFor(mission: MissionState) {
-  return mission.executionMissions.find((item) => item.id === mission.activeExecutionMissionId) ?? mission.executionMissions.at(-1);
-}
-
 /** Approval/clarification "Allow once" / "Deny" etc. actions replay as one of these synthetic control strings, generated internally — never typed by the user — so they're safe to recognize literally here without turning this into a general keyword-based intent classifier. */
 function isApprovalReplyMessage(message: string) {
   return /^(approved:\s*run\s|denied approval to run\s)/i.test(message.trim());
@@ -1881,7 +1877,7 @@ function isMutatingProjectIntent(intent: ProjectMessageIntent) {
 
 function projectIntentContextForMission(mission: MissionState) {
   const execution = projectExecutionFromWorkspaceMission(mission);
-  const activeExecution = activeExecutionMissionFor(mission);
+  const activeExecution = getActiveExecutionMission(mission);
   const localConnector = localConnectorFromMission(mission);
   const source = localConnector?.url
     ? `local-agent:${localConnector.rootLabel || localConnector.url}`
@@ -2293,6 +2289,7 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
     verification,
     blocked_reason: blockedReason,
     pending_mock_review: pendingMockReview,
+    preview_url: result.previewState === "ready" ? result.previewUrl : existing?.preview_url,
     undo_snapshot: existing?.undo_snapshot,
     summary: humanSummary,
     parent_mission_id: existing?.parent_mission_id,
@@ -2307,7 +2304,7 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
 /** A read-only Q&A request never runs the mission executor, so it has no checklist/files/commands — but it
  * still gets a real Mission entry so "Previous Missions" is one unified list instead of a separate plain-text
  * message count (Section 16). */
-function executionMissionFromAnswer(task: string, answer: string): ExecutionMission {
+function executionMissionFromAnswer(task: string, answer: string, parentMissionId: string | undefined, resultMessageId: string): ExecutionMission {
   const now = new Date().toISOString();
   return {
     id: `execution-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -2322,9 +2319,9 @@ function executionMissionFromAnswer(task: string, answer: string): ExecutionMiss
     blocked_reason: undefined,
     undo_snapshot: undefined,
     summary: answer,
-    parent_mission_id: undefined,
+    parent_mission_id: parentMissionId,
     request_message_id: undefined,
-    result_message_id: undefined,
+    result_message_id: resultMessageId,
     timeline: [],
     created_at: now,
     updated_at: now,

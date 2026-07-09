@@ -347,6 +347,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               ? "This is a larger build, so treat the first checklist phase as building a minimal but real, clickable first pass of the primary screens — real navigation, real forms and layout, placeholder/mock data where deeper logic isn't built yet, professionally designed, not a wireframe. Do not build deep business logic, full data persistence, or later phases yet. The moment every item in that first phase is completed or skipped, the mission will pause automatically so the user can open a live preview and react before you continue — this is expected, not a failure or an interruption to work around. Do not call report_complete or try to keep working past the first phase; let it pause."
               : "",
             "For user-facing UI work, inspect the current UI structure and styling before editing. Improve the actual screen the user will see: aligned rows, clear labels, helpful helper text, sane empty states, accessible controls, and professional spacing. Do not ship raw/basic controls when the request is for product behavior.",
+            "A styling or layout change is not verified by how it looks in your head — it's verified by the app still working. Before report_complete on any mission that touched .tsx/.jsx/.vue/.svelte/.html files: (1) actually run the app (build, dev server, or existing test suite — whichever this project has) and confirm it starts/builds without new errors, and (2) explicitly check that the interactive elements your change touched or sits near — buttons, forms, nav links, click handlers — still reference real, existing functions/state after your edit (read the handler wiring, don't assume a move/restyle left it intact). Record a finding or decision that states this plainly, e.g. \"Verified nav links still route correctly after moving the nav\" — not just \"updated styles.\" If you find something broken, fix it before completing; never report complete with a known-broken interaction.",
             "For requests that move hardcoded backend fields, payload fields, spreadsheet columns, or transaction fields into the frontend or configuration, build the whole product loop unless the existing project makes it impossible: create or update a durable config file, load existing fields from it, add/edit/remove fields in the UI, persist required/optional metadata, generate frontend forms from that config, and make backend upload/API mapping read the saved config dynamically.",
             "Do not treat 'created config file' as complete if the frontend still cannot edit it or the backend still uses hardcoded fields. Do not treat 'frontend form exists' as complete if Excel/upload/server processing is still hardcoded.",
             "Maintain two execution layers. Raw tool activity is trace. Narrative must come only from structured objects you explicitly record: record_finding for project understanding, record_decision for Confidence Map decisions, and record_flag for uncertainty/conflict/preserved behavior. Do not rely on generic reasoning text as narrative.",
@@ -514,7 +515,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       }
 
       if (call.name === "report_complete") {
-        const verification = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure);
+        const verification = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure, commands);
         if (!verification.ok) {
           completionRejections += 1;
           if (completionRejections > maxCompletionRejections) {
@@ -633,7 +634,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     }
   }
 
-  const ranOutOfTurnsButActuallyDone = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure);
+  const ranOutOfTurnsButActuallyDone = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure, commands);
   if (ranOutOfTurnsButActuallyDone.ok) {
     await emit("summary", "completed", "Behavior verified", {
       details: { summary: "The work was verified complete before the turn budget ran out; skipping the final wrap-up call." },
@@ -755,7 +756,37 @@ function applyChecklistUpdate(checklist: FactoryObjectiveChecklistItem[], args: 
   if (typeof args.evidence === "string") item.evidence = args.evidence;
 }
 
-function verifyCompletion(checklist: FactoryObjectiveChecklistItem[], changedFiles: Set<string>, narrativeObjects: FactoryNarrativeObject[], fastLane = false, hasUnresolvedFailure = false): { ok: true } | { ok: false; reason: string } {
+/** Files whose extension means "this is interactive UI markup, not pure logic" — buttons, forms, nav,
+ * event handlers live here. Used to decide whether report_complete needs real behavioral evidence on
+ * top of the build/lint/typecheck check already required elsewhere, not just a styling read-back. */
+const interactiveUiExtensions = /\.(tsx|jsx|vue|svelte|html)$/i;
+
+function changedInteractiveUiFiles(changedFiles: Set<string>): string[] {
+  return Array.from(changedFiles).filter((path) => interactiveUiExtensions.test(path));
+}
+
+/** Whether the mission ran something that could actually exercise runtime behavior (build/dev server/
+ * test), as opposed to only reading a file back — a read-back proves the edit landed, not that it runs. */
+function hasRuntimeVerificationCommand(commands: MissionExecutorResult["commands"]): boolean {
+  return commands.some((command) => command.exitCode === 0 && /\b(build|dev|start|test|serve)\b/i.test(command.command));
+}
+
+/** Matches narrative text that actually addresses interactive/runtime behavior, not just styling —
+ * e.g. "confirmed the nav links still route correctly" vs. "moved the nav and updated the colors". */
+const interactionVerificationPattern = /\b(buttons?|forms?|submit\w*|clicks?|clicked|navigat\w*|links?|interactions?|renders?|rendering|rendered|runtime errors?|console errors?|no (new )?errors?|still works?|still functions?|behavior (is |was )?(unchanged|preserved|intact))\b/i;
+
+function hasInteractionVerificationNarrative(narrativeObjects: FactoryNarrativeObject[]): boolean {
+  return narrativeObjects.some((item) => interactionVerificationPattern.test(item.rationale ?? ""));
+}
+
+function verifyCompletion(
+  checklist: FactoryObjectiveChecklistItem[],
+  changedFiles: Set<string>,
+  narrativeObjects: FactoryNarrativeObject[],
+  fastLane = false,
+  hasUnresolvedFailure = false,
+  commands: MissionExecutorResult["commands"] = [],
+): { ok: true } | { ok: false; reason: string } {
   // Section 19: never let a mission complete while its most recent command or write failure was never
   // followed by a fix or a successful retry — completion must never silently paper over a real failure.
   if (hasUnresolvedFailure) {
@@ -782,6 +813,25 @@ function verifyCompletion(checklist: FactoryObjectiveChecklistItem[], changedFil
   const hasDecision = narrativeObjects.some((item) => item.tier === "decision");
   if (!hasFinding || !hasDecision) {
     return { ok: false, reason: "The mission cannot complete until it records structured finding and decision objects for the narrative layer." };
+  }
+  // A change to interactive UI markup is not verified by styling alone: require evidence the app was
+  // actually run (build/dev/test), and a narrative object that speaks to interactive behavior — not just
+  // "the file reads back correctly." Skip this for fastLane (already handled above) and for missions that
+  // only skipped items (already flagged honestly by the checks above).
+  const touchedUi = changedInteractiveUiFiles(changedFiles);
+  if (touchedUi.length && !hasSkippedItem) {
+    if (!hasRuntimeVerificationCommand(commands)) {
+      return {
+        ok: false,
+        reason: `Interactive UI file(s) changed (${touchedUi.join(", ")}) but no build/dev/test run verified the app still runs. A styling change is not enough evidence — actually run it.`,
+      };
+    }
+    if (!hasInteractionVerificationNarrative(narrativeObjects)) {
+      return {
+        ok: false,
+        reason: `Interactive UI file(s) changed (${touchedUi.join(", ")}) but no finding/decision confirms the actual interactive behavior (buttons, forms, navigation) still works — only that it runs or looks right. Record a finding or decision that says so, based on real evidence (reading the handler, checking the console/build output), not an assumption.`,
+      };
+    }
   }
   return { ok: true };
 }
