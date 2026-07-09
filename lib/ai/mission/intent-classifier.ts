@@ -15,6 +15,10 @@ const DEBUG_PATTERN = /\b(?:fix|repair|bug|error|crash|broken|exception|stack tr
 const BUILD_PATTERN = /\b(?:create|build|scaffold|generate(?: a new)?|set up|make a new)\b/i;
 const MUTATION_PATTERN =
   /\b(?:add|create|make|build|generate|implement|edit|change|update|modify|fix|repair|separate|split|extract|move|delete|remove|rename|refactor|install|allow|enable|wire|hook up|replace)\b/i;
+// "start/restart/stop the server" reads like a status question ("is it running?") but is really an action
+// request — without this, it fell through to the LLM classifier with no deterministic safety net and could
+// get answered as read-only inspection instead of actually starting anything.
+const SERVER_ACTION_PATTERN = /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,30}\b(?:server|app|project|service|api|backend|frontend|dev server|application)\b/i;
 const READ_ONLY_PATTERN = /\b(?:can you see|what does|what is this|explain|tell me about|do you understand|review|audit|analy[sz]e|architecture assessment|status|what happened|last run|previous run)\b/i;
 
 export function deterministicMutationIntent(message: string): MissionIntent | undefined {
@@ -24,6 +28,7 @@ export function deterministicMutationIntent(message: string): MissionIntent | un
   if (/\b(?:deploy|production|release|ship it|hosting)\b/i.test(text) && /\b(?:deploy|ship|release|publish|prepare)\b/i.test(text)) return "deploy";
   if (BUILD_PATTERN.test(text)) return "build";
   if (DEBUG_PATTERN.test(text)) return "debug";
+  if (SERVER_ACTION_PATTERN.test(text)) return "edit";
   if (MUTATION_PATTERN.test(text)) return "edit";
   return undefined;
 }

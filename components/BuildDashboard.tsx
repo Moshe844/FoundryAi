@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   CircleDot,
   Code2,
+  Download,
   FolderGit2,
   Gamepad2,
   Globe2,
@@ -868,6 +869,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
           onCreate={() => {
             void onCreateProject?.(existingProjectBriefFor(existingStart), existingStart.uploadedFiles);
             setExistingStart(null);
+            setActiveView("workspace");
           }}
         />
       ) : null}
@@ -1196,6 +1198,8 @@ function FactoryHome({
 }) {
   const starterTemplates = buildTemplates.filter((template) => template.id !== "custom");
   const customTemplate = buildTemplates.find((template) => template.id === "custom") ?? buildTemplates[0];
+  const localAgentStatus = useLocalAgentInstallStatus();
+  const localAgentInstalled = localAgentStatus === "installed" || localAgentStatus === "connected";
 
   return (
     <section className="min-h-0 overflow-auto rounded-xl border border-white/10 bg-[#101416]/90 shadow-workspace">
@@ -1208,6 +1212,38 @@ function FactoryHome({
               Create a new software project or open an existing one. Once you are inside a project, Foundry becomes the engineering teammate for build, debug, improve, analyze, deploy, preview, and export work.
             </p>
           </div>
+          {localAgentInstalled ? (
+            <button
+              className="inline-flex min-h-10 cursor-default items-center gap-2 rounded-md border border-white/15 bg-white/[0.045] px-3.5 text-sm font-extrabold text-foundry-subtle opacity-70"
+              type="button"
+              disabled
+              title="Foundry Local Agent is responding on this computer."
+            >
+              <CheckCircle2 size={16} />
+              Local Agent Downloaded
+            </button>
+          ) : localAgentStatus === "checking" ? (
+            <button
+              className="inline-flex min-h-10 cursor-default items-center gap-2 rounded-md border border-white/15 bg-white/[0.045] px-3.5 text-sm font-extrabold text-foundry-subtle"
+              type="button"
+              disabled
+            >
+              <Loader2 size={16} className="animate-spin" />
+              Checking Agent
+            </button>
+          ) : (
+            <a
+              className="inline-flex min-h-10 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3.5 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
+              href="/api/factory/agent/download?platform=windows"
+              download
+              onClick={(event) => {
+                event.currentTarget.href = `/api/factory/agent/download?platform=windows&v=${encodeURIComponent(String(Date.now()))}`;
+              }}
+            >
+              <Download size={16} />
+              Download Local Agent
+            </a>
+          )}
         </div>
       </div>
 
@@ -1545,6 +1581,7 @@ function ProjectWorkConversation({
 
   return (
     <div className="grid gap-5 pb-6">
+      {previousExecutionMissions.length ? <PreviousMissionsPanel missions={previousExecutionMissions} /> : null}
       <section key={activeRequest.id} ref={activeTaskRef} className="max-w-4xl border-b border-white/10 pb-5">
         <ProjectThreadMessage message={activeRequest} prominent />
         <div className="mt-4 border-l border-white/10 pl-4">
@@ -1575,7 +1612,6 @@ function ProjectWorkConversation({
           ) : null}
         </div>
       </section>
-      {previousExecutionMissions.length ? <PreviousMissionsPanel missions={previousExecutionMissions} /> : null}
     </div>
   );
 }
@@ -2412,13 +2448,24 @@ function ExecutionTimeline({
             {traceEvents.map((event) => renderTraceEvent(event, { level, onReadFile, onFetchFileContent, onApproveCommand }))}
             {blockedEvents.map((event) => <BlockedCommandLine key={event.id} event={event} onApprove={onApproveCommand} />)}
           </>
-        ) : (
+        ) : visibleTimeline.length === 0 ? (
           fallbackEvents.map((event, index) => (
             <div key={`${event}-${index}`} className="flex items-center gap-2 py-1 text-sm text-foundry-muted">
               <CircleDot size={15} className="text-foundry-teal" />
               <span>{event}</span>
             </div>
           ))
+        ) : (
+          // The mission actually ran but has nothing in this specific category — say so plainly instead of
+          // silently falling back to the same generic "getting started" text every empty tab would otherwise
+          // share, which made Code and Command look identical for a mission with neither.
+          <p className="py-2 text-sm text-foundry-subtle">
+            {level === "code"
+              ? "No file edits were made in this mission."
+              : level === "command"
+                ? "No commands were run in this mission."
+                : "Nothing to show at this detail level."}
+          </p>
         )}
         <div ref={endRef} />
     </div>
@@ -2481,6 +2528,9 @@ function NarrativeLine({ event }: { event: FactoryExecutionEvent }) {
             <span className="font-mono text-[10px] text-foundry-subtle">{formatClockTime(event.timestamp)}</span>
           </span>
           <span className="text-[13.5px] font-bold leading-5 text-foundry-ink">{text}</span>
+          {narrative?.source === "conflict" ? (
+            <span className="text-[11px] font-semibold normal-case tracking-normal text-foundry-amber/80">Type your answer in the message box below to continue.</span>
+          ) : null}
         </span>
       </summary>
       <div className="grid gap-2 border-t border-foundry-amber/20 px-3 py-2 text-xs leading-5 text-foundry-muted">
@@ -4117,6 +4167,29 @@ function ExistingProjectFlow({
 }
 
 type AgentStatus = "checking" | "not-installed" | "installed" | "connected" | "offline";
+
+function useLocalAgentInstallStatus(): AgentStatus {
+  const [status, setStatus] = useState<AgentStatus>("checking");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      const health = await checkAgentHealth("http://127.0.0.1:3917", "");
+      if (cancelled) return;
+      setStatus(health.ok ? "installed" : "not-installed");
+    }
+
+    void poll();
+    const interval = window.setInterval(poll, 5_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  return status;
+}
 
 function useLiveAgentStatus(connectorUrl: string, connectorToken: string, connectorRoot: string): AgentStatus | null {
   const [status, setStatus] = useState<AgentStatus | null>(null);

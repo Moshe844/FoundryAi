@@ -435,10 +435,18 @@ function childProcessEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function spawnCommand(cmd: string, args: string[], cwd: string, timeoutMs: number): Promise<{ exitCode: number | null; stdout: string; stderr: string; durationMs: number; timedOut: boolean }> {
+function spawnCommand(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+  keepAliveOnTimeout = false,
+): Promise<{ exitCode: number | null; stdout: string; stderr: string; durationMs: number; timedOut: boolean }> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    const child = spawn(cmd, args, { cwd, windowsHide: true, env: childProcessEnv() });
+    // A dev/server command (keepAliveOnTimeout) must survive past its own grace-period timeout — detached so
+    // it isn't tied to this request's process group, and never killed when the grace period elapses below.
+    const child = spawn(cmd, args, { cwd, windowsHide: true, env: childProcessEnv(), detached: keepAliveOnTimeout });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -459,6 +467,16 @@ function spawnCommand(cmd: string, args: string[], cwd: string, timeoutMs: numbe
 
     const timeout = setTimeout(() => {
       timedOut = true;
+      if (keepAliveOnTimeout) {
+        // The grace period was only ever meant to capture startup output as evidence — actually killing the
+        // server here (the previous behavior) contradicted the caller's own claim that it's "still running
+        // in the background". Stop listening and let it run for real, independent of this request.
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.unref();
+        finish(null);
+        return;
+      }
       if (typeof child.pid === "number") killProcessTree(child.pid);
       else child.kill();
       // On Windows, killing a shell-wrapped child does not always fire 'close' for the
@@ -476,7 +494,7 @@ function spawnCommand(cmd: string, args: string[], cwd: string, timeoutMs: numbe
   });
 }
 
-async function runCommandWithShellFallback(command: string, cwd: string, session: { stickyShellId?: WindowsShellId }, timeoutMs: number): Promise<ProjectCommandResult> {
+async function runCommandWithShellFallback(command: string, cwd: string, session: { stickyShellId?: WindowsShellId }, timeoutMs: number, keepAliveOnTimeout = false): Promise<ProjectCommandResult> {
   const order = windowsShellOrder(session.stickyShellId);
   const firstAttemptedShellId = order.find((id) => shellInvocation(id, command));
   let lastResult: Awaited<ReturnType<typeof spawnCommand>> | null = null;
@@ -485,7 +503,7 @@ async function runCommandWithShellFallback(command: string, cwd: string, session
   for (const shellId of order) {
     const invocation = shellInvocation(shellId, command);
     if (!invocation) continue;
-    const result = await spawnCommand(invocation.cmd, invocation.args, cwd, timeoutMs);
+    const result = await spawnCommand(invocation.cmd, invocation.args, cwd, timeoutMs, keepAliveOnTimeout);
     lastResult = result;
     lastShellId = shellId;
     const isMismatch = result.exitCode !== 0 && isShellMismatchFailure(result.stdout, result.stderr);
@@ -558,7 +576,7 @@ const EXCLUDED_DIR_PATTERN = /(^|\/)(node_modules|\.git|\.next|dist|build|covera
 const MAX_READ_BYTES = 20_000;
 const MAX_SEARCH_FILE_BYTES = 300_000;
 const COMMAND_TIMEOUT_MS = 120_000;
-const DEV_SERVER_GRACE_PERIOD_MS = 4_000;
+const DEV_SERVER_GRACE_PERIOD_MS = 6_000;
 const MAX_COMMANDS_PER_ROOT = 15;
 
 function normalizeRelativePathForFilter(relativePath: string) {
@@ -730,7 +748,7 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode)
       const approvalScope = approvalScopeFor(command, permission, options);
 
       if (isLongRunningServerCommand(command)) {
-        const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, DEV_SERVER_GRACE_PERIOD_MS);
+        const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, DEV_SERVER_GRACE_PERIOD_MS, true);
         if (result.timedOut) {
           return { ...result, exitCode: 0, timedOut: false, approvalScope, stderr: `${result.stderr}\n[This looks like a long-running dev/server process — it's still running in the background rather than having failed or exited.]`.trim() };
         }

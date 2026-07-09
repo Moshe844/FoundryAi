@@ -328,7 +328,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               ? "This is a small edit. Keep it tight: inspect only the files needed for the requested change, make the smallest correct edit, verify by re-reading the changed file, and finish. Do not broaden into architecture review, full-project analysis, dev-server startup, or repeated verification unless the request explicitly needs that."
               : "",
             input.highRisk
-              ? "This is a large-scope rewrite/migration/architecture mission. Build the new implementation alongside the existing one wherever the project structure allows it — do not overwrite or delete the old implementation's working files as a byproduct of building the new one. Only remove old files once the new path that replaces them is verified working, and do it via delete_file (which always pauses for approval) rather than silently overwriting them with write_file. The user should be able to see the old implementation still there until they explicitly approve removing it."
+              ? "This is a large-scope rewrite/migration/conversion/architecture mission. Build the new implementation alongside the existing one wherever the project structure allows it — do not overwrite or delete the old implementation's working files as a byproduct of building the new one. Only remove old files once the new path that replaces them is verified working, and do it via delete_file (which always pauses for approval) rather than silently overwriting them with write_file. The user should be able to see the old implementation still there until they explicitly approve removing it."
+              : "",
+            input.highRisk
+              ? "Migrate feature-by-feature, not line-by-line. For each feature, first understand what it actually does for the user in the existing project, then re-implement that behavior the idiomatic way in the target stack — do not transliterate the old code statement-by-statement. Two implementations of the same feature in different stacks should rarely look structurally alike; they should behave alike."
               : "",
             input.highRisk
               ? "Work phase by phase in the order given. The moment every item in a phase is marked completed or skipped, record a decision or finding that plainly states what that phase actually changed and what still matches the old behavior — that's the user's checkpoint to see real progress before you start the next phase."
@@ -501,7 +504,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       }
 
       if (call.name === "report_complete") {
-        const verification = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane));
+        const verification = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure);
         if (!verification.ok) {
           completionRejections += 1;
           if (completionRejections > maxCompletionRejections) {
@@ -614,7 +617,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     }
   }
 
-  const ranOutOfTurnsButActuallyDone = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane));
+  const ranOutOfTurnsButActuallyDone = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure);
   if (ranOutOfTurnsButActuallyDone.ok) {
     await emit("summary", "completed", "Behavior verified", {
       details: { summary: "The work was verified complete before the turn budget ran out; skipping the final wrap-up call." },
@@ -736,7 +739,12 @@ function applyChecklistUpdate(checklist: FactoryObjectiveChecklistItem[], args: 
   if (typeof args.evidence === "string") item.evidence = args.evidence;
 }
 
-function verifyCompletion(checklist: FactoryObjectiveChecklistItem[], changedFiles: Set<string>, narrativeObjects: FactoryNarrativeObject[], fastLane = false): { ok: true } | { ok: false; reason: string } {
+function verifyCompletion(checklist: FactoryObjectiveChecklistItem[], changedFiles: Set<string>, narrativeObjects: FactoryNarrativeObject[], fastLane = false, hasUnresolvedFailure = false): { ok: true } | { ok: false; reason: string } {
+  // Section 19: never let a mission complete while its most recent command or write failure was never
+  // followed by a fix or a successful retry — completion must never silently paper over a real failure.
+  if (hasUnresolvedFailure) {
+    return { ok: false, reason: "A command or file write failed and was never followed by a fix or a successful retry." };
+  }
   if (fastLane && checklist.length === 1 && changedFiles.size > 0) return { ok: true };
   const incomplete = checklist.filter((item) => item.status !== "completed" && item.status !== "skipped");
   if (incomplete.length) {

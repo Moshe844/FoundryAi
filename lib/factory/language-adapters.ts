@@ -158,6 +158,10 @@ export function capabilityLevelForStackChoice(stackName: string): StackProfile {
 }
 
 const bigScopePattern = /\b(refactor|restructure|redesign|migrate|migration|architecture|rewrite|overhaul|multiple files|several files|every page|all pages|throughout|entire (project|app|codebase)|new feature|from scratch)\b/i;
+// Adding a new external dependency always carries unverified-runtime risk (does it actually resolve/install?)
+// disproportionate to how small the edit otherwise looks — never fast-lane past that, regardless of file count.
+const newDependencyPattern =
+  /\b(npm|pip|pypi|nuget|composer|cargo|gem)\s+(?:i|install|add)\b|\b(?:use|add|install|bring in|pull in)\b[^.?!\n]{0,40}\b(?:npm |python |pip )?(?:package|library|module|dependency|gem|crate)\b/i;
 const smallTweakPattern =
   /\b(typo|rename|color|colour|gray|grey|background|button|label|title|padding|margin|font|border|border-radius|shadow|size|width|height|position|align|spacing|one line|tweak|swap|toggle|hover|disabled state)\b/i;
 const recognizedFileExtensions = new Set([
@@ -170,6 +174,7 @@ export function isLikelySmallSingleFileRequest(task: string): boolean {
   const text = task.trim();
   if (!text || text.length > 200) return false;
   if (bigScopePattern.test(text)) return false;
+  if (newDependencyPattern.test(text)) return false;
   const candidates = text.match(/\b[\w./-]+\.[a-zA-Z0-9]{1,12}\b/g) ?? [];
   const filePaths = new Set(
     candidates

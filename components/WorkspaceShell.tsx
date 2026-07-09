@@ -560,7 +560,7 @@ export function WorkspaceShell() {
     }));
   }
 
-  function updateProjectExecution(missionId: string, result: FactoryProjectResult, task = "Build the initial project", treatAsContinuation = true) {
+  function updateProjectExecution(missionId: string, result: FactoryProjectResult, task = "Build the initial project") {
     const now = new Date();
     const resultNote: WorkspaceNote = {
       id: `message-${now.getTime()}-factory-rebuild`,
@@ -589,12 +589,12 @@ export function WorkspaceShell() {
           description: `Factory execution ${result.status}.`,
           createdAt: now.toISOString(),
         };
-        // Only merge into the last mission slot when this result genuinely continues it (carry_forward_plan).
-        // A fresh/unrelated mission must append a new history entry instead of silently overwriting the
-        // previous one — otherwise "Previous Missions" never accumulates real history (Section 16).
-        const existingExecutionMission = treatAsContinuation
-          ? (item.executionMissions.find((entry) => entry.id === item.activeExecutionMissionId) ?? item.executionMissions.at(-1))
-          : undefined;
+        // Merge into whatever activeExecutionMissionId currently points to — the eager placeholder created
+        // for THIS submission (fresh mission) or the earlier still-open mission restored by
+        // retractPendingExecutionMission (a real continuation). Either way, activeExecutionMissionId is
+        // already correct by the time this runs — forcing an append here regardless of that (an earlier,
+        // broken version of this fix) orphaned the placeholder as a duplicate ghost for every fresh mission.
+        const existingExecutionMission = item.executionMissions.find((entry) => entry.id === item.activeExecutionMissionId) ?? item.executionMissions.at(-1);
         const nextExecutionMission = executionMissionFromResult(item, result, task, existingExecutionMission);
         const executionMissions = existingExecutionMission
           ? item.executionMissions.map((entry) => (entry.id === existingExecutionMission.id ? nextExecutionMission : entry))
@@ -704,6 +704,25 @@ export function WorkspaceShell() {
       ...current,
       missions: current.missions.map((item) =>
         item.missionId === missionId ? { ...item, messages: [...item.messages, requestNote, assistantNote], updatedAt: now.toISOString() } : item,
+      ),
+    }));
+  }
+
+  /** Undoes the eager "pending" placeholder mission created at the start of executeProjectMissionNow, restoring
+   * the mission that was actually active before this request — used whenever this request turns out to be a
+   * continuation (or a read-only answer with its own entry) rather than a genuinely new mission, so the
+   * mission it interrupted doesn't get abandoned mid-state as a permanent ghost in Previous Missions. */
+  function retractPendingExecutionMission(missionId: string, pendingExecutionId: string, previousActiveExecutionMissionId: string | undefined) {
+    setWorkspace((current) => ({
+      ...current,
+      missions: current.missions.map((item) =>
+        item.missionId === missionId
+          ? {
+              ...item,
+              executionMissions: item.executionMissions.filter((entry) => entry.id !== pendingExecutionId),
+              activeExecutionMissionId: previousActiveExecutionMissionId,
+            }
+          : item,
       ),
     }));
   }
@@ -830,12 +849,25 @@ export function WorkspaceShell() {
     }));
 
     if (projectIntent === "inspection" || projectIntent === "diagnose" || projectIntent === "question" || projectIntent === "status" || projectIntent === "retrospective") {
+      // A read-only answer gets its own Mission entry (executionMissionFromAnswer, Section 16) — the
+      // placeholder created above must not also stick around as a second, permanently-"pending" ghost entry.
+      retractPendingExecutionMission(missionId, pendingExecutionId, previousActiveExecutionMissionId);
       await answerProjectReadOnlyMessage(missionId, targetMission, task, projectIntent);
       return;
     }
 
     const parentMission = isMutatingProjectIntent(projectIntent) ? parentMissionContextFor(targetMission) : undefined;
-    const missionContinuity: "carry_forward_plan" | undefined = parentMission && continuity === "carry_forward_plan" ? "carry_forward_plan" : undefined;
+    // An "Approved: run X" / "Denied approval to run X" reply is, by construction, always a continuation of
+    // the mission that's currently paused waiting for it — trust that over the classifier's own read, since
+    // forking a new mission entry here is exactly what left "waiting for approval" ghosts stuck in history.
+    const isApprovalReply = isApprovalReplyMessage(task);
+    const missionContinuity: "carry_forward_plan" | undefined =
+      parentMission && (continuity === "carry_forward_plan" || isApprovalReply) ? "carry_forward_plan" : undefined;
+    if (missionContinuity === "carry_forward_plan") {
+      // Continue the SAME mission entry instead of leaving the one just paused ("waiting for approval"/
+      // "waiting for user") stranded forever while a brand-new entry takes over as active (Section 16).
+      retractPendingExecutionMission(missionId, pendingExecutionId, previousActiveExecutionMissionId);
+    }
 
     if (isExistingProjectPlan) {
       const localConnector = localConnectorFromMission(targetMission);
@@ -1112,7 +1144,7 @@ export function WorkspaceShell() {
   async function runExistingProjectExecutionForMission(missionId: string, brief: string, task: string, files: FactoryUploadedFile[], localPath: string, localConnector?: { url: string; token?: string; rootLabel?: string }, parentMission?: MissionParentContext, continuity?: "carry_forward_plan", approvalResponse?: FactoryExistingProjectRequest["approvalResponse"]) {
     const approvedCategories = approvedCommandCategories[missionId] ?? [];
     const approvedProjectCommands = approvedCommands[missionId] ?? [];
-    await runProjectExecutionRequest(missionId, "/api/factory/existing?stream=1", { brief, task, files, localPath, localConnector, approvedCategories, approvedCommands: approvedProjectCommands, parentMission, continuity, approvalResponse }, "Existing project execution failed.", task, continuity === "carry_forward_plan");
+    await runProjectExecutionRequest(missionId, "/api/factory/existing?stream=1", { brief, task, files, localPath, localConnector, approvedCategories, approvedCommands: approvedProjectCommands, parentMission, continuity, approvalResponse }, "Existing project execution failed.", task);
   }
 
   function approveCommandCategory(missionId: string, category: string) {
@@ -1209,7 +1241,7 @@ export function WorkspaceShell() {
     }));
   }
 
-  async function runProjectExecutionRequest(missionId: string, endpoint: string, body: unknown, fallbackMessage: string, task?: string, treatAsContinuation = true) {
+  async function runProjectExecutionRequest(missionId: string, endpoint: string, body: unknown, fallbackMessage: string, task?: string) {
     const controller = new AbortController();
     activeControllersRef.current.set(missionId, controller);
     try {
@@ -1223,8 +1255,8 @@ export function WorkspaceShell() {
 
       const streamedResult = await readFactoryExecutionStream(response, missionId);
       if (!streamedResult) throw new Error("Factory execution ended without a result.");
-      if (task) updateProjectExecution(missionId, streamedResult, task, treatAsContinuation);
-      else updateProjectExecution(missionId, streamedResult, undefined, treatAsContinuation);
+      if (task) updateProjectExecution(missionId, streamedResult, task);
+      else updateProjectExecution(missionId, streamedResult);
     } catch (error) {
       if (controller.signal.aborted) {
         appendProjectExecutionEvent(missionId, {
