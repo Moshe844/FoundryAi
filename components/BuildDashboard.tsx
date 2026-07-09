@@ -1489,6 +1489,7 @@ function ProjectBriefView({
               level={effectiveLevel}
               isExecutionLive={isExecutionLive}
               isExistingProject={isExistingProject}
+              showsOwnPreview={!showPreview}
               activeTaskRef={activeTaskRef}
               scrollContainerRef={workScrollRef}
               onReadFile={onReadFile}
@@ -1545,15 +1546,12 @@ function ProjectBriefView({
         </div>
       </div>
 
-      {activeExecutionMission?.pending_mock_review ? (
-        <MockReviewPanel pendingMockReview={activeExecutionMission.pending_mock_review} execution={execution} onExecute={onExecute} showsOwnPreview={!showPreview} />
-      ) : null}
-
       <ProjectComposer
         inputRef={composerRef}
         task={task}
-        isBusy={isExecutionLive}
+        isBusy={isExecutionLive && !needsUserAction}
         queuedTask={queuedTask}
+        placeholder={needsUserAction && activeExecutionMission?.pending_mock_review ? "Tell Foundry what to change, or say it looks good…" : undefined}
         canUndo={timeline.some((event) => !event.internal && event.kind === "edit" && event.status === "completed")}
         onTaskChange={setTask}
         onExecute={runTask}
@@ -1572,6 +1570,7 @@ function ProjectWorkConversation({
   level,
   isExecutionLive,
   isExistingProject,
+  showsOwnPreview,
   activeTaskRef,
   scrollContainerRef,
   onReadFile,
@@ -1587,6 +1586,7 @@ function ProjectWorkConversation({
   level: ExecutionLevel;
   isExecutionLive: boolean;
   isExistingProject: boolean;
+  showsOwnPreview: boolean;
   activeTaskRef: RefObject<HTMLDivElement | null>;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onReadFile: (path: string) => void;
@@ -1599,6 +1599,27 @@ function ProjectWorkConversation({
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const latestRequest = requestMessages.at(-1);
   const previousExecutionMissions = mission.executionMissions.filter((item) => item.id !== activeExecutionMission?.id).slice().reverse();
+  const pendingMockReview = activeExecutionMission?.pending_mock_review;
+  // isExecutionLive is deliberately coarse elsewhere (it also covers "paused waiting on the user,"
+  // which still counts as an in-progress mission for the composer's busy state). Here we need the
+  // narrower distinction: is Foundry actively streaming work right now, or paused waiting on input?
+  // A mock-review pause is the latter — it should show the review panel, not the live timeline, and
+  // the moment a new turn starts actively running again, the panel needs to disappear immediately.
+  const isPausedForUser = activeExecutionMission?.state === "waiting_for_user" || activeExecutionMission?.state === "waiting_for_approval";
+  const isActivelyWorking = isExecutionLive && !isPausedForUser;
+  // Keyed so a fresh fetch fires for each distinct pause (a new mock-review message, or the final
+  // completed build) — and, critically, this hook lives at the conversation level rather than inside
+  // the transient panel that displays it, so a fast-moving mock-review loop (pause → user reacts in a
+  // couple seconds → next phase starts) doesn't abort the in-flight LLM call before it ever resolves.
+  const recommendationsKey =
+    isActivelyWorking || !execution
+      ? ""
+      : pendingMockReview
+        ? `mock:${activeExecutionMission?.id}:${pendingMockReview.message}`
+        : execution.status === "passed"
+          ? `final:${execution.projectPath}:${execution.objective ?? ""}:${execution.files.length}`
+          : "";
+  const { recommendations, loading: recommendationsLoading } = useMissionRecommendations(execution, recommendationsKey);
 
   useEffect(() => {
     const container = scrollContainerRef.current;
@@ -1676,10 +1697,20 @@ function ProjectWorkConversation({
               onApproveCommand={onApproveCommand}
             />
           ) : null}
+          {!isActivelyWorking && pendingMockReview ? (
+            <MockReviewPanel
+              pendingMockReview={pendingMockReview}
+              execution={execution}
+              onExecute={onExecute}
+              showsOwnPreview={showsOwnPreview}
+              recommendations={recommendations}
+              recommendationsLoading={recommendationsLoading}
+            />
+          ) : null}
           {!isExecutionLive && level === "summary" && execution ? (
             <>
               <MissionSummary execution={execution} timeline={timeline} onReadFile={onReadFile} onApproveCommand={onApproveCommand} />
-              <PostBuildRecommendations execution={execution} onExecute={onExecute} />
+              <PostBuildRecommendations recommendations={recommendations} loading={recommendationsLoading} onExecute={onExecute} />
             </>
           ) : null}
         </div>
@@ -1740,6 +1771,7 @@ function ProjectComposer({
   task,
   isBusy,
   queuedTask,
+  placeholder,
   canUndo,
   onTaskChange,
   onExecute,
@@ -1750,6 +1782,7 @@ function ProjectComposer({
   task: string;
   isBusy: boolean;
   queuedTask?: string;
+  placeholder?: string;
   canUndo?: boolean;
   onTaskChange: (value: string) => void;
   onExecute: () => void;
@@ -1780,7 +1813,7 @@ function ProjectComposer({
           className="max-h-40 min-h-16 flex-1 resize-y border-0 bg-transparent p-2 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle"
           value={task}
           onChange={(event) => onTaskChange(event.target.value)}
-          placeholder={isBusy ? "Foundry is working — send a follow-up, or type stop to interrupt it..." : "Give Foundry a mission in this project..."}
+          placeholder={isBusy ? "Foundry is working — send a follow-up, or type stop to interrupt it..." : placeholder ?? "Give Foundry a mission in this project..."}
           onKeyDown={(event) => {
             if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
               event.preventDefault();
@@ -2434,23 +2467,30 @@ function ApiPlayground({ baseUrl, fill = false }: { baseUrl: string; fill?: bool
  * from the generic, stack-only heuristic list (instant, no network) and silently upgrades to the
  * LLM's domain-specific picks if that call succeeds — never blocks or shows an error state on
  * failure/missing key, matching the same silent-fallback contract as project discovery.
+ *
+ * The caller supplies `dedupeKey` and owns when it changes — this hook deliberately does NOT live
+ * inside the transient panel that displays the result. A mock-review pause can end (user reacts,
+ * next phase starts) well before an LLM round-trip finishes; if the fetch were tied to that panel's
+ * mount lifetime it would get aborted every time, and the UI would never show anything but the
+ * instant heuristic fallback — which is exactly why it looked permanently generic/static.
  */
-function useMissionRecommendations(execution: FactoryProjectResult | null) {
+function useMissionRecommendations(execution: FactoryProjectResult | null, dedupeKey: string): { recommendations: MissionRecommendation[]; loading: boolean } {
   const [recommendations, setRecommendations] = useState<MissionRecommendation[]>([]);
+  const [loading, setLoading] = useState(false);
   const fetchedForRef = useRef<string>("");
 
   useEffect(() => {
-    if (!execution) return;
-    const changedFiles = execution.files.filter((file) => file.status === "created" || file.status === "edited").map((file) => file.path);
-    const key = `${execution.projectPath}:${changedFiles.length}:${execution.objective ?? ""}`;
-    if (fetchedForRef.current === key) return;
-    fetchedForRef.current = key;
+    if (!execution || !dedupeKey) return;
+    if (fetchedForRef.current === dedupeKey) return;
+    fetchedForRef.current = dedupeKey;
 
+    const changedFiles = execution.files.filter((file) => file.status === "created" || file.status === "edited").map((file) => file.path);
     const heuristic = genericRecommendations(execution.stack);
     setRecommendations(heuristic);
+    setLoading(true);
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    const timeout = setTimeout(() => controller.abort(), 25000);
 
     fetch("/api/factory/recommendations", {
       method: "POST",
@@ -2474,35 +2514,34 @@ function useMissionRecommendations(execution: FactoryProjectResult | null) {
         }
       })
       .catch(() => {})
-      .finally(() => clearTimeout(timeout));
+      .finally(() => {
+        clearTimeout(timeout);
+        setLoading(false);
+      });
 
-    return () => {
-      clearTimeout(timeout);
-      controller.abort();
-    };
-  }, [execution]);
+    return () => clearTimeout(timeout);
+  }, [execution, dedupeKey]);
 
-  return recommendations;
+  return { recommendations, loading };
 }
 
-function RecommendationChips({ recommendations, onApply }: { recommendations: MissionRecommendation[]; onApply: (recommendation: MissionRecommendation) => void }) {
+function RecommendationChips({ recommendations, onApply, compact = false }: { recommendations: MissionRecommendation[]; onApply: (recommendation: MissionRecommendation) => void; compact?: boolean }) {
   if (!recommendations.length) return null;
+  const shown = compact ? recommendations.slice(0, 4) : recommendations;
   return (
-    <div className="flex flex-wrap gap-2">
-      {recommendations.map((recommendation) => (
+    <div className="flex flex-wrap gap-1.5">
+      {shown.map((recommendation) => (
         <button
           key={recommendation.id}
           type="button"
           onClick={() => onApply(recommendation)}
-          className="group max-w-full rounded-lg border border-white/12 bg-white/[0.03] px-3 py-2 text-left transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.07]"
+          className="group max-w-full rounded-md border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-left transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.07]"
           title={recommendation.why}
         >
-          <span className="flex items-center gap-1.5 text-[13px] font-extrabold text-foundry-ink">
-            <Sparkles size={12} className="shrink-0 text-foundry-teal opacity-70 transition group-hover:opacity-100" />
+          <span className="flex items-center gap-1.5 text-[12.5px] font-extrabold text-foundry-ink">
+            <Sparkles size={11} className="shrink-0 text-foundry-teal opacity-70 transition group-hover:opacity-100" />
             {recommendation.label}
-          </span>
-          <span className="mt-0.5 block max-w-[20rem] text-[11px] leading-4 text-foundry-subtle line-clamp-2">
-            {recommendation.why} · ~{recommendation.estimatedMinutes} min
+            <span className="font-mono text-[10px] font-normal text-foundry-subtle">~{recommendation.estimatedMinutes}m</span>
           </span>
         </button>
       ))}
@@ -2510,16 +2549,17 @@ function RecommendationChips({ recommendations, onApply }: { recommendations: Mi
   );
 }
 
-function PostBuildRecommendations({ execution, onExecute }: { execution: FactoryProjectResult; onExecute: (task: string) => void }) {
-  const recommendations = useMissionRecommendations(execution);
-  if (execution.status !== "passed" || !recommendations.length) return null;
+function PostBuildRecommendations({ recommendations, loading, onExecute }: { recommendations: MissionRecommendation[]; loading: boolean; onExecute: (task: string) => void }) {
+  if (!recommendations.length) return null;
 
   return (
-    <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.02] p-3.5">
-      <p className="section-kicker">Next best improvements</p>
-      <p className="mt-1 text-xs leading-5 text-foundry-subtle">Foundry looked at what it just built and flagged what&apos;s worth doing next. Click one to start, or just tell it what you want below.</p>
-      <div className="mt-3">
-        <RecommendationChips recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} />
+    <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.02] p-3">
+      <div className="flex items-center gap-1.5">
+        <p className="section-kicker">Next best improvements</p>
+        {loading ? <Loader2 size={11} className="animate-spin text-foundry-subtle" /> : null}
+      </div>
+      <div className="mt-2">
+        <RecommendationChips recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} compact />
       </div>
     </div>
   );
@@ -2530,34 +2570,28 @@ function MockReviewPanel({
   execution,
   onExecute,
   showsOwnPreview,
+  recommendations,
+  recommendationsLoading,
 }: {
   pendingMockReview: { message: string; preview_url?: string };
   execution: FactoryProjectResult | null;
   onExecute: (task: string) => void;
   showsOwnPreview: boolean;
+  recommendations: MissionRecommendation[];
+  recommendationsLoading: boolean;
 }) {
-  const [feedback, setFeedback] = useState("");
-  const recommendations = useMissionRecommendations(execution);
-
-  function sendFeedback() {
-    const trimmed = feedback.trim();
-    if (!trimmed) return;
-    setFeedback("");
-    onExecute(trimmed);
-  }
-
   function continueBuilding() {
     onExecute("The first version looks good — continue building out the rest of the plan.");
   }
 
   return (
-    <div className="mx-3 mb-3 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.05] p-4 sm:mx-4">
+    <div className="mt-4 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.05] p-3.5">
       <p className="section-kicker">First version ready</p>
-      <p className="mt-2 text-sm leading-6 text-foundry-ink">{pendingMockReview.message}</p>
+      <p className="mt-1.5 text-sm leading-6 text-foundry-ink">{pendingMockReview.message}</p>
       {showsOwnPreview && execution ? <PreviewPanel execution={execution} /> : null}
       {pendingMockReview.preview_url ? (
         <a
-          className="mt-3 inline-flex items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
+          className="mt-2 inline-flex items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-1.5 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
           href={pendingMockReview.preview_url}
           target="_blank"
           rel="noreferrer"
@@ -2567,35 +2601,21 @@ function MockReviewPanel({
       ) : null}
 
       {recommendations.length ? (
-        <div className="mt-4">
-          <p className="text-xs font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">While building this, a few things stood out</p>
+        <div className="mt-3">
+          <div className="flex items-center gap-1.5">
+            <p className="text-xs font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">While building this, a few things stood out</p>
+            {recommendationsLoading ? <Loader2 size={11} className="animate-spin text-foundry-subtle" /> : null}
+          </div>
           <div className="mt-2">
-            <RecommendationChips recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} />
+            <RecommendationChips recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} compact />
           </div>
         </div>
       ) : null}
 
-      <div className="mt-4 grid gap-2">
-        <textarea
-          className="min-h-[4rem] resize-y rounded-md border border-white/10 bg-black/20 p-2 text-sm text-foundry-ink outline-none focus:border-foundry-teal/40"
-          value={feedback}
-          onChange={(event) => setFeedback(event.target.value)}
-          placeholder="Tell Foundry what you'd like to improve…"
-        />
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <button
-            className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2] disabled:cursor-not-allowed disabled:opacity-40"
-            type="button"
-            disabled={!feedback.trim()}
-            onClick={sendFeedback}
-          >
-            Send
-          </button>
-          <button className="text-xs font-extrabold text-foundry-teal transition hover:underline" type="button" onClick={continueBuilding}>
-            Nothing — continue building →
-          </button>
-        </div>
-      </div>
+      <button className="mt-3 text-xs font-extrabold text-foundry-teal transition hover:underline" type="button" onClick={continueBuilding}>
+        Nothing — continue building →
+      </button>
+      <p className="mt-1 text-[11px] leading-4 text-foundry-subtle">Or type what to change in the box below.</p>
     </div>
   );
 }
