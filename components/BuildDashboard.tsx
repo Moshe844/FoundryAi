@@ -2,6 +2,8 @@
 
 import {
   AlertTriangle,
+  AppWindow,
+  BrainCircuit,
   Boxes,
   CheckCircle2,
   CircleDot,
@@ -19,6 +21,7 @@ import {
   Smartphone,
   Store,
   Trash2,
+  Webhook,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -55,12 +58,16 @@ type TemplateId =
   | "website"
   | "mobile"
   | "game"
+  | "api"
+  | "ai"
+  | "desktop"
   | "custom";
 
-type FlowStep = "describe" | "project" | "kind" | "stack" | "instructions" | "summary";
+type FlowStep = "kind" | "project" | "understanding" | "stack" | "summary" | "instructions";
 type ProjectLocation = "connect-existing" | "create-folder" | "inside-foundry";
 type ExistingActionId = "connect-existing" | "debug-existing" | "improve-existing" | "analyze-architecture" | "deploy-existing";
 type ExistingSource = "browser-local" | "upload" | "local" | "connector" | "github-later";
+type ExistingFolderChoice = "archive" | "create-subfolder" | "continue-anyway" | "continue" | "choose-different" | "cancel";
 
 type ProjectStart = {
   template: BuildTemplate;
@@ -76,6 +83,7 @@ type ProjectStart = {
   browserFolderHandleId: string;
   browserFolderName: string;
   existingSourceConfirmed: boolean;
+  existingSourceChoice: ExistingFolderChoice | null;
   localConnectorUrl: string;
   localConnectorToken: string;
   localConnectorRoot: string;
@@ -85,6 +93,8 @@ type ProjectStart = {
   instructions: string;
   discovery: ProjectDiscoveryResult | null;
   discoveryAnswers: Record<string, string>;
+  alternativeStacks: string[];
+  deploymentNote: string;
 };
 
 type BuildTemplate = {
@@ -96,7 +106,7 @@ type BuildTemplate = {
   defaults: string[];
 };
 
-type ProjectCategory = "web" | "desktop-windows" | "android" | "mobile-cross-platform" | "game" | "backend-api" | "ai-app" | "custom";
+type ProjectCategory = "web" | "desktop" | "desktop-windows" | "android" | "mobile-cross-platform" | "game" | "backend-api" | "ai-app" | "custom";
 
 type StackRecommendation = {
   name: string;
@@ -117,6 +127,7 @@ type ExistingProjectStart = {
   browserFolderHandleId: string;
   browserFolderName: string;
   existingSourceConfirmed: boolean;
+  existingSourceChoice: ExistingFolderChoice | null;
   description: string;
 };
 
@@ -201,6 +212,30 @@ const buildTemplates: BuildTemplate[] = [
     defaults: ["Playable first screen", "Stateful game loop", "Keyboard and pointer input"],
   },
   {
+    id: "api",
+    title: "Build API",
+    description: "REST/GraphQL endpoints, auth, database-backed services, ready for any frontend to call.",
+    icon: Webhook,
+    accent: "blue",
+    defaults: ["Typed request/response contracts", "Validation and error handling", "Health-check endpoint"],
+  },
+  {
+    id: "ai",
+    title: "Build AI Application",
+    description: "Chat, agents, RAG search, or workflow automation powered by a model provider.",
+    icon: BrainCircuit,
+    accent: "teal",
+    defaults: ["Model provider integration", "Conversation or workflow UI", "Guardrails for cost and latency"],
+  },
+  {
+    id: "desktop",
+    title: "Build Desktop Application",
+    description: "A native or web-shell desktop app for Windows, macOS, or Linux with local data and offline-first workflows.",
+    icon: AppWindow,
+    accent: "amber",
+    defaults: ["Local-first data", "Native window/menu shell", "Installer path planned after prototype"],
+  },
+  {
     id: "custom",
     title: "Custom Build",
     description: "Describe anything Foundry should build from scratch.",
@@ -249,11 +284,13 @@ const projectSubtypeOptions: Record<TemplateId, string[]> = {
   inventory: [
     "Retail inventory",
     "Warehouse inventory",
-    "Shoe/clothing sizes",
-    "Restaurant inventory",
-    "POS inventory",
-    "Medical/pharmacy inventory",
     "Manufacturing inventory",
+    "Medical/pharmacy inventory",
+    "Restaurant inventory",
+    "Clothing/apparel inventory",
+    "Asset tracking",
+    "Small business inventory",
+    "Enterprise inventory",
   ],
   commerce: ["Clothing store", "Grocery", "Digital products", "Wholesale", "Subscription"],
   pos: ["Retail POS", "Restaurant POS", "Service business", "Cardknox/payment SDK"],
@@ -261,6 +298,9 @@ const projectSubtypeOptions: Record<TemplateId, string[]> = {
   website: ["Marketing site", "Portfolio", "Product page", "Docs site", "Business website"],
   mobile: ["Consumer mobile app", "Field operations app", "Internal business app", "Companion app", "Mobile commerce app"],
   game: ["2D arcade game", "Puzzle game", "Platformer", "Card/board game", "Educational game"],
+  api: ["REST API", "GraphQL API", "Internal microservice", "Public developer API", "Webhook/integration service", "Auth/identity service", "Data processing API"],
+  ai: ["Chat assistant", "Document Q&A / RAG", "Agentic workflow", "Content generation tool", "AI-powered internal tool", "Voice/multimodal app"],
+  desktop: ["Internal business tool", "Data entry / forms tool", "Utility / productivity tool", "Creative or media tool", "POS/register terminal", "Monitoring/dashboard tool"],
   custom: ["Web app", "Business app", "Internal tool", "AI app", "Backend/API", "Desktop app"],
 };
 
@@ -276,6 +316,29 @@ const stackRecommendations: Record<ProjectCategory, StackRecommendation[]> = {
       name: "React + Vite",
       defaults: ["TypeScript", "Tailwind CSS", "Client-side routing only when needed", "Static deployment-ready output"],
       why: "Good when the project is mostly a client-side interface and does not need server rendering, API routes, or auth-aware routing yet.",
+    },
+  ],
+  desktop: [
+    {
+      name: "Electron",
+      recommended: true,
+      defaults: ["Desktop app", "TypeScript", "Web UI shell", "Local files or SQLite by default", "Cross-platform: Windows, macOS, Linux"],
+      why: "Best default for a generic desktop app because it ships to Windows, macOS, and Linux from one codebase using familiar web UI technology.",
+    },
+    {
+      name: ".NET WPF",
+      defaults: [".NET", "C#", "WPF", "SQLite or local files by default", "Installer option later"],
+      why: "Good when the app is Windows-only and benefits from richer native layouts, data binding, and a long-lived maintainable UI.",
+    },
+    {
+      name: ".NET WinForms",
+      defaults: [".NET", "C#", "WinForms", "SQLite or local files by default", "Installer option later"],
+      why: "Good for simple internal Windows-only utilities and classic business tools where speed matters more than custom UI.",
+    },
+    {
+      name: "Tauri",
+      defaults: ["Desktop app", "Rust shell", "Web UI", "Local files or SQLite by default", "Smaller cross-platform bundles"],
+      why: "Good when the app needs a smaller, faster cross-platform bundle than Electron and the team is comfortable with a Rust-backed shell.",
     },
   ],
   "desktop-windows": [
@@ -497,7 +560,7 @@ const broadStackOptions: StackRecommendation[] = [
 export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelectMission, onCreateMission, onDeleteMission, onCreateProject, onExecuteProject, onRollbackToEntry, onApproveCategory, onApproveCommand }: BuildDashboardProps) {
   const [activeTemplate, setActiveTemplate] = useState<BuildTemplate | null>(null);
   const [existingStart, setExistingStart] = useState<ExistingProjectStart | null>(null);
-  const [flowStep, setFlowStep] = useState<FlowStep>("project");
+  const [flowStep, setFlowStep] = useState<FlowStep>("kind");
   const [start, setStart] = useState<ProjectStart | null>(null);
   const [filePanelOpen, setFilePanelOpen] = useState(false);
   const [selectedFile, setSelectedFile] = useState<FactoryFileReadResult | null>(null);
@@ -609,9 +672,10 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
     const subtype = firstSubtypeFor(template.id);
     const appKind = appKindFor(template, subtype, "");
     const projectName = template.id === "custom" ? "" : cleanProjectName(appKind);
-    const recommendedStack = primaryRecommendationFor(template, appKind).name;
+    const initialDiscovery = template.id === "custom" ? null : discoverProject(appKind);
+    const recommendedStack = initialDiscovery?.recommendedStack ?? primaryRecommendationFor(template, appKind).name;
     setActiveTemplate(template);
-    setFlowStep("describe");
+    setFlowStep("kind");
     setStart({
       template,
       projectMode: "new",
@@ -626,6 +690,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
       browserFolderHandleId: "",
       browserFolderName: "",
       existingSourceConfirmed: false,
+      existingSourceChoice: null,
       localConnectorUrl: "",
       localConnectorToken: "",
       localConnectorRoot: "",
@@ -633,8 +698,10 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
       stack: recommendedStack,
       customStack: "",
       instructions: "",
-      discovery: null,
+      discovery: initialDiscovery,
       discoveryAnswers: {},
+      alternativeStacks: [],
+      deploymentNote: "",
     });
   }
 
@@ -651,6 +718,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
       browserFolderHandleId: "",
       browserFolderName: "",
       existingSourceConfirmed: false,
+      existingSourceChoice: null,
       description: "",
     });
   }
@@ -662,7 +730,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
   function closeFlow() {
     setActiveTemplate(null);
     setStart(null);
-    setFlowStep("project");
+    setFlowStep("kind");
   }
 
   function createProject() {
@@ -2802,6 +2870,22 @@ function CustomBuildStep({ start, onUpdate }: { start: ProjectStart; onUpdate: (
   );
 }
 
+function UnderstandingStep({ start, onAdvance }: { start: ProjectStart; onUpdate: (update: Partial<ProjectStart>) => void; onAdvance: () => void }) {
+  useEffect(() => {
+    onAdvance();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <FlowSection title="Understanding the project" body="Foundry is inferring purpose, users, architecture, entities, and features before recommending a stack.">
+      <div className="flex items-center gap-3 rounded-md border border-white/10 bg-black/20 p-4 text-sm text-foundry-muted">
+        <Loader2 size={16} className="animate-spin text-foundry-teal" />
+        <span>Thinking through {start.appKind || "this project"}...</span>
+      </div>
+    </FlowSection>
+  );
+}
+
 function ProjectStartFlow({
   start,
   hasConnectedProject,
@@ -2826,10 +2910,11 @@ function ProjectStartFlow({
   const selectedRecommendation = recommendationForStart(start);
   const defaults = selectedRecommendation.defaults;
   const canUseFolderPicker = supportsBrowserFolderAccess();
-  const steps: FlowStep[] = ["describe", "summary"];
+  const steps: FlowStep[] = ["kind", "project", "understanding", "stack", "summary", "instructions"];
   const stepIndex = steps.indexOf(step);
   const nextStep = steps[Math.min(stepIndex + 1, steps.length - 1)];
-  const previousStep = steps[Math.max(stepIndex - 1, 0)];
+  // Going back from "stack" skips the transitional "understanding" screen rather than re-triggering it.
+  const previousStep = step === "stack" ? "project" : steps[Math.max(stepIndex - 1, 0)];
   const Icon = start.template.icon;
   const [agentStatus, setAgentStatus] = useState<AgentStatus>("checking");
   const [agentUrl] = useState(start.localConnectorUrl || "http://127.0.0.1:3917");
@@ -2955,13 +3040,66 @@ function ProjectStartFlow({
               );
             }}
           />
-          <div className="mb-4 grid grid-cols-2 gap-2">
+          <div className="mb-4 grid grid-cols-6 gap-2">
             {steps.map((item, index) => (
               <span key={item} className={`h-1.5 rounded-full ${index <= stepIndex ? "bg-foundry-teal" : "bg-white/10"}`} />
             ))}
           </div>
 
-          {step === "describe" ? <CustomBuildStep start={start} onUpdate={onUpdate} /> : null}
+          {step === "kind" ? (
+            start.template.id === "custom" ? (
+              <CustomBuildStep start={start} onUpdate={onUpdate} />
+            ) : (
+              <FlowSection title={kindStepTitle(start.template, start.appKind)} body="Choose the closest project shape, or describe your own. Foundry will infer the rest before asking anything else.">
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {subtypesForEffectiveProject(start).map((subtype) => (
+                    <ChoiceButton
+                      key={subtype}
+                      active={!start.customSubtype.trim() && start.subtype === subtype}
+                      label={subtype}
+                      onClick={() => {
+                        const appKind = appKindFor(start.template, subtype, "");
+                        const discovery = discoverProject(appKind);
+                        onUpdate({
+                          subtype,
+                          customSubtype: "",
+                          appKind,
+                          projectName: cleanProjectName(appKind),
+                          projectNameTouched: false,
+                          stack: discovery.recommendedStack,
+                          customStack: "",
+                          discovery,
+                          discoveryAnswers: {},
+                        });
+                      }}
+                    />
+                  ))}
+                </div>
+                <label className="mt-4 grid gap-1.5 text-xs font-bold text-foundry-muted">
+                  Other / Custom
+                  <input
+                    className="min-h-11 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                    value={start.customSubtype}
+                    onChange={(event) => {
+                      const appKind = appKindFor(start.template, start.subtype, event.target.value);
+                      const discovery = discoverProject(appKind);
+                      onUpdate({
+                        customSubtype: event.target.value,
+                        appKind,
+                        projectName: cleanProjectName(appKind),
+                        projectNameTouched: false,
+                        stack: discovery.recommendedStack,
+                        customStack: "",
+                        discovery,
+                        discoveryAnswers: {},
+                      });
+                    }}
+                    placeholder="Describe the exact project type..."
+                  />
+                </label>
+              </FlowSection>
+            )
+          ) : null}
 
           {step === "project" ? (
             <FlowSection title="New Project Location" body="Choose where this new project should live. Debugging, refactoring, analysis, and deployment happen after a project is open.">
@@ -3105,35 +3243,7 @@ function ProjectStartFlow({
             </FlowSection>
           ) : null}
 
-          {step === "kind" ? (
-            <FlowSection title={kindStepTitle(start.template, start.appKind)} body="Choose the closest project shape. Use Other / Custom for anything not listed.">
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {subtypesForEffectiveProject(start).map((subtype) => (
-                    <ChoiceButton
-                      key={subtype}
-                      active={!start.customSubtype.trim() && start.subtype === subtype}
-                      label={subtype}
-                      onClick={() => {
-                        const appKind = start.template.id === "custom" ? start.appKind : appKindFor(start.template, subtype, "");
-                        onUpdate({ subtype, customSubtype: "", appKind, projectName: start.template.id === "custom" ? start.projectName : cleanProjectName(appKind), projectNameTouched: start.template.id === "custom" ? start.projectNameTouched : false });
-                      }}
-                    />
-                  ))}
-                </div>
-                <label className="mt-4 grid gap-1.5 text-xs font-bold text-foundry-muted">
-                  Other / Custom
-                  <input
-                    className="min-h-11 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
-                    value={start.customSubtype}
-                    onChange={(event) => {
-                      const appKind = start.template.id === "custom" ? start.appKind : appKindFor(start.template, start.subtype, event.target.value);
-                      onUpdate({ customSubtype: event.target.value, appKind, projectName: start.template.id === "custom" ? start.projectName : cleanProjectName(appKind), projectNameTouched: start.template.id === "custom" ? start.projectNameTouched : false });
-                    }}
-                    placeholder="Describe the exact project type..."
-                  />
-                </label>
-              </FlowSection>
-          ) : null}
+          {step === "understanding" ? <UnderstandingStep start={start} onUpdate={onUpdate} onAdvance={() => onStepChange("stack")} /> : null}
 
           {step === "stack" ? (
             <FlowSection title="Preferred Stack" body="Foundry recommends sensible stacks from the project type instead of using one generic default.">
@@ -3174,17 +3284,6 @@ function ProjectStartFlow({
             </FlowSection>
           ) : null}
 
-          {step === "instructions" ? (
-            <FlowSection title="Custom Instructions" body="Add constraints, features, data fields, brand direction, integrations, or anything Foundry must respect.">
-              <textarea
-                className="min-h-36 w-full resize-y rounded-md border border-white/10 bg-black/25 p-3 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
-                value={start.instructions}
-                onChange={(event) => onUpdate({ instructions: event.target.value })}
-                placeholder="Include roles, pages, workflows, data, integrations, visual style, constraints..."
-              />
-            </FlowSection>
-          ) : null}
-
           {step === "summary" ? (
             <FlowSection title="Here's what I believe you want." body="These decisions come from the Confidence Map. Edit anything before building.">
               {start.discovery ? (
@@ -3194,9 +3293,20 @@ function ProjectStartFlow({
                 />
               ) : (
                 <div className="rounded-md border border-foundry-amber/25 bg-foundry-amber/[0.08] p-3 text-sm leading-6 text-foundry-muted">
-                  Add a short project description first so Foundry can build a confidence map.
+                  Go back and choose or describe a project first so Foundry can build a confidence map.
                 </div>
               )}
+            </FlowSection>
+          ) : null}
+
+          {step === "instructions" ? (
+            <FlowSection title="Custom Instructions" body="Optional. Add constraints, features, data fields, brand direction, integrations, or anything Foundry must respect. Leave it empty and Foundry builds from the memo alone.">
+              <textarea
+                className="min-h-36 w-full resize-y rounded-md border border-white/10 bg-black/25 p-3 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                value={start.instructions}
+                onChange={(event) => onUpdate({ instructions: event.target.value })}
+                placeholder="Include roles, pages, workflows, data, integrations, visual style, constraints..."
+              />
             </FlowSection>
           ) : null}
         </div>
@@ -3211,18 +3321,18 @@ function ProjectStartFlow({
             Back
           </button>
           <div className="flex gap-2">
-            {step !== "summary" ? (
+            {step === "understanding" ? null : step !== "instructions" ? (
               <div className="grid justify-items-end gap-2">
-                {!start.discovery ? (
-                  <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Describe the project first so Foundry can infer a confidence map.</p>
+                {step === "kind" && !start.discovery ? (
+                  <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Select or describe the project first so Foundry can infer a confidence map.</p>
                 ) : null}
                 <button
                   className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.11] px-4 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.16] disabled:cursor-not-allowed disabled:opacity-45"
                   type="button"
-                  disabled={!start.discovery}
+                  disabled={step === "kind" && !start.discovery}
                   onClick={() => onStepChange(nextStep)}
                 >
-                  Review memo
+                  Continue
                 </button>
               </div>
             ) : (
@@ -4256,6 +4366,9 @@ function defaultKindFor(id: TemplateId) {
     website: "Responsive website",
     mobile: "Mobile app",
     game: "Playable game",
+    api: "API service",
+    ai: "AI application",
+    desktop: "Desktop application",
     custom: "Custom software project",
   };
 
@@ -4284,6 +4397,9 @@ function kindStepTitle(template: BuildTemplate, appKind?: string) {
   if (template.id === "dashboard") return "What kind of dashboard?";
   if (template.id === "mobile") return "What kind of mobile app?";
   if (template.id === "game") return "What kind of game?";
+  if (template.id === "api") return "What kind of API?";
+  if (template.id === "ai") return "What kind of AI application?";
+  if (template.id === "desktop") return "What kind of desktop application?";
   return "Project Type";
 }
 
@@ -4466,6 +4582,13 @@ function uniqueRecommendations(recommendations: StackRecommendation[]) {
 }
 
 function categoryForProject(template: BuildTemplate, appKind: string): ProjectCategory {
+  // The dedicated starters carry known intent, so they resolve before any text sniffing —
+  // this keeps "Build Desktop Application" cross-platform by default even though its own
+  // copy contains the word "desktop", which would otherwise match the Windows-specific regex below.
+  if (template.id === "desktop") return "desktop";
+  if (template.id === "api") return "backend-api";
+  if (template.id === "ai") return "ai-app";
+
   const text = `${template.title} ${template.description} ${appKind}`.toLowerCase();
 
   if (/\b(ai|llm|chatbot|agent|rag|model provider|openai|anthropic|vector|embedding)\b/.test(text)) return "ai-app";

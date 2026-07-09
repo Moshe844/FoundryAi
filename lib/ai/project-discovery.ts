@@ -1,17 +1,24 @@
-export type DiscoverySource = "inferred" | "observed" | "defaulted" | "user-confirmed";
-export type DiscoveryStakes = "low" | "high";
+export const discoverySourceValues = ["inferred", "observed", "defaulted", "user-confirmed"] as const;
+export type DiscoverySource = (typeof discoverySourceValues)[number];
+
+export const discoveryStakesValues = ["low", "high"] as const;
+export type DiscoveryStakes = (typeof discoveryStakesValues)[number];
+
 export type DiscoveryAction = "silent-infer" | "disclose" | "ask" | "default-disclose";
-export type DiscoveryDimension =
-  | "domain"
-  | "likely-users"
-  | "complexity"
-  | "platform"
-  | "data-shape"
-  | "architecture"
-  | "features"
-  | "style"
-  | "navigation"
-  | "auth-database-api";
+
+export const discoveryDimensions = [
+  "domain",
+  "likely-users",
+  "complexity",
+  "platform",
+  "data-shape",
+  "architecture",
+  "features",
+  "style",
+  "navigation",
+  "auth-database-api",
+] as const;
+export type DiscoveryDimension = (typeof discoveryDimensions)[number];
 
 export type DiscoveryDecision = {
   dimension: DiscoveryDimension;
@@ -202,8 +209,7 @@ export function discoverProject(prompt: string): ProjectDiscoveryResult {
     decision("auth-database-api", authDataApiFor(normalized, selected), authConfidence(normalized, selected), "high", authSource(normalized), "Auth, database, and API choices can change implementation scope."),
   ];
 
-  const questions = decisions.filter((item) => item.action === "ask").map((item) => item.question ?? questionFor(item));
-  const assumptions = decisions.filter((item) => item.action === "disclose" || item.action === "default-disclose").map((item) => `${item.dimension}: ${item.hypothesis}`);
+  const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
 
   return {
     prompt: normalized,
@@ -214,7 +220,7 @@ export function discoverProject(prompt: string): ProjectDiscoveryResult {
     styleDirection: selected.style,
     dataModel: selected.entities,
     assumptions,
-    questions: questions.slice(0, 3),
+    questions,
     decisions,
   };
 }
@@ -250,7 +256,13 @@ function decision(dimension: DiscoveryDimension, hypothesis: string, confidence:
   return partial.action === "ask" ? { ...partial, question: questionFor(partial) } : partial;
 }
 
-function questionFor(decision: Pick<DiscoveryDecision, "dimension" | "hypothesis">) {
+export function deriveQuestionsAndAssumptions(decisions: DiscoveryDecision[]) {
+  const questions = decisions.filter((item) => item.action === "ask").map((item) => item.question ?? questionFor(item)).slice(0, 3);
+  const assumptions = decisions.filter((item) => item.action === "disclose" || item.action === "default-disclose").map((item) => `${item.dimension}: ${item.hypothesis}`);
+  return { questions, assumptions };
+}
+
+export function questionFor(decision: Pick<DiscoveryDecision, "dimension" | "hypothesis">) {
   if (decision.dimension === "domain") return "What kind of tool or product is this, and who is it for?";
   if (decision.dimension === "platform") return "Should this be web, mobile, desktop, game, or backend/API?";
   if (decision.dimension === "auth-database-api") return "Does this need login, persistent database storage, or an external API in the first version?";
