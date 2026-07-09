@@ -30,6 +30,8 @@ import type { ExecutionMission, MissionState } from "@/lib/mission-engine";
 import { discoverProject } from "@/lib/ai/project-discovery";
 import type { ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
+import { capabilityLevelForStackChoice, unsupportedCreationMessage } from "@/lib/factory/language-adapters";
+import type { StackProfile } from "@/lib/factory/language-adapters";
 import type { CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
 import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryFileReadResult, FactoryJournalEntry, FactoryObjectiveChecklistItem, FactoryProjectResult, FactoryUploadedFile } from "@/lib/factory/types";
 
@@ -2870,11 +2872,78 @@ function CustomBuildStep({ start, onUpdate }: { start: ProjectStart; onUpdate: (
   );
 }
 
-function UnderstandingStep({ start, onAdvance }: { start: ProjectStart; onUpdate: (update: Partial<ProjectStart>) => void; onAdvance: () => void }) {
+function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart; onUpdate: (update: Partial<ProjectStart>) => void; onAdvance: () => void }) {
+  const [showEscape, setShowEscape] = useState(false);
+  const controllerRef = useRef<AbortController | null>(null);
+  const cancelledRef = useRef(false);
+
   useEffect(() => {
-    onAdvance();
+    cancelledRef.current = false;
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 12000);
+    const escapeTimer = window.setTimeout(() => {
+      if (!cancelledRef.current) setShowEscape(true);
+    }, 2500);
+
+    async function refine() {
+      if (!start.discovery) {
+        if (!cancelledRef.current) onAdvance();
+        return;
+      }
+      try {
+        const inspection = start.uploadNames.length ? inspectExistingSourceNames(start.uploadNames) : null;
+        const response = await fetch("/api/factory/discover", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            context: {
+              starter: { id: start.template.id, title: start.template.title },
+              subtype: start.subtype,
+              customSubtype: start.customSubtype,
+              projectDescription: start.projectDescription,
+              location: {
+                choice: start.projectLocation,
+                label: locationLabel(start.projectLocation),
+                existingSourceRisky: inspection?.risky ?? false,
+                existingSourceSignals: inspection?.signals ?? [],
+              },
+            },
+            heuristic: start.discovery,
+          }),
+        });
+        const result = await response.json().catch(() => null);
+        if (!cancelledRef.current && result?.ok && result.discovery) {
+          onUpdate({
+            discovery: result.discovery,
+            alternativeStacks: Array.isArray(result.alternativeStacks) ? result.alternativeStacks : [],
+            deploymentNote: typeof result.deploymentNote === "string" ? result.deploymentNote : "",
+          });
+        }
+      } catch {
+        // Network error, timeout, or malformed response — keep the heuristic result already in start.discovery.
+      } finally {
+        window.clearTimeout(escapeTimer);
+        if (!cancelledRef.current) onAdvance();
+      }
+    }
+
+    void refine();
+    return () => {
+      cancelledRef.current = true;
+      window.clearTimeout(timeout);
+      window.clearTimeout(escapeTimer);
+      controller.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function skipRefinement() {
+    cancelledRef.current = true;
+    controllerRef.current?.abort();
+    onAdvance();
+  }
 
   return (
     <FlowSection title="Understanding the project" body="Foundry is inferring purpose, users, architecture, entities, and features before recommending a stack.">
@@ -2882,6 +2951,15 @@ function UnderstandingStep({ start, onAdvance }: { start: ProjectStart; onUpdate
         <Loader2 size={16} className="animate-spin text-foundry-teal" />
         <span>Thinking through {start.appKind || "this project"}...</span>
       </div>
+      {showEscape ? (
+        <button
+          className="mt-3 text-xs font-bold text-foundry-muted underline decoration-dotted underline-offset-4 transition hover:text-foundry-ink"
+          type="button"
+          onClick={skipRefinement}
+        >
+          Continue without deeper analysis
+        </button>
+      ) : null}
     </FlowSection>
   );
 }
@@ -2907,6 +2985,8 @@ function ProjectStartFlow({
 }) {
   const projectUploadInputRef = useRef<HTMLInputElement | null>(null);
   const recommendations = recommendationsFor(start.template, start.appKind);
+  const starredRecommendations = recommendations.filter((item) => item.recommended);
+  const advancedRecommendations = recommendations.filter((item) => !item.recommended);
   const selectedRecommendation = recommendationForStart(start);
   const defaults = selectedRecommendation.defaults;
   const canUseFolderPicker = supportsBrowserFolderAccess();
@@ -3248,15 +3328,20 @@ function ProjectStartFlow({
           {step === "stack" ? (
             <FlowSection title="Preferred Stack" body="Foundry recommends sensible stacks from the project type instead of using one generic default.">
               <div className="grid gap-2 sm:grid-cols-2">
-                {recommendations.map((recommendation) => (
-                  <ChoiceButton
-                    key={recommendation.name}
-                    active={!start.customStack.trim() && start.stack === recommendation.name}
-                    label={recommendation.recommended ? `${recommendation.name} - Recommended` : recommendation.name}
-                    onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })}
-                  />
+                {starredRecommendations.map((recommendation) => (
+                  <StackChoiceButton key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })} />
                 ))}
               </div>
+              {advancedRecommendations.length ? (
+                <details className="mt-3 rounded-md border border-white/10 bg-black/20 p-3">
+                  <summary className="cursor-pointer text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Advanced ({advancedRecommendations.length})</summary>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    {advancedRecommendations.map((recommendation) => (
+                      <StackChoiceButton key={recommendation.name} recommendation={recommendation} active={!start.customStack.trim() && start.stack === recommendation.name} onClick={() => onUpdate({ stack: recommendation.name, customStack: "" })} />
+                    ))}
+                  </div>
+                </details>
+              ) : null}
               <label className="mt-4 grid gap-1.5 text-xs font-bold text-foundry-muted">
                 Custom stack/language
                 <input
@@ -4152,6 +4237,18 @@ function ChoiceButton({ active, label, description, onClick }: { active: boolean
   );
 }
 
+function StackChoiceButton({ recommendation, active, onClick }: { recommendation: StackRecommendation; active: boolean; onClick: () => void }) {
+  const capability = capabilityLevelForStackChoice(recommendation.name);
+  return (
+    <ChoiceButton
+      active={active}
+      label={recommendation.recommended ? `${recommendation.name} - Recommended` : recommendation.name}
+      description={capability.level < 4 ? `Level ${capability.level}/4 support in Foundry` : undefined}
+      onClick={onClick}
+    />
+  );
+}
+
 function UploadSummary({ names }: { names: string[] }) {
   if (!names.length) {
     return <p className="mt-3 text-xs leading-5 text-foundry-subtle">No files selected yet.</p>;
@@ -4266,6 +4363,14 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
 
   const disclosedDecisions = discovery.decisions.filter((decision) => decision.action !== "silent-infer");
   const questionDecisions = discovery.decisions.filter((decision) => decision.action === "ask").slice(0, 3);
+  const alternativeStacks = alternativeStacksFor(start);
+  const stackCapability = capabilityLevelForStackChoice(selectedStackFor(start));
+  const stackCapabilityNote = stackCapabilityNoteFor(stackCapability);
+
+  function applyAlternativeStack(name: string) {
+    updateDiscovery({ recommendedStack: name });
+    onUpdate({ stack: name, customStack: "" });
+  }
 
   return (
     <div className="grid gap-4">
@@ -4283,6 +4388,36 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
       <EditableMemoArea label="Style direction" value={discovery.styleDirection} onChange={(value) => updateDiscovery({ styleDirection: value })} />
       <EditableMemoArea label="Main features" value={discovery.mainFeatures.join("\n")} onChange={(value) => updateList("mainFeatures", value)} />
       <EditableMemoArea label="Data model / entities" value={discovery.dataModel.join("\n")} onChange={(value) => updateList("dataModel", value)} />
+
+      {alternativeStacks.length ? (
+        <section className="rounded-md border border-white/10 bg-white/[0.035] p-3">
+          <p className="section-kicker">Alternative Stacks</p>
+          <ul className="mt-2 grid gap-2">
+            {alternativeStacks.map((name) => (
+              <li key={name} className="flex items-center justify-between gap-3 rounded-md border border-white/10 bg-black/20 px-3 py-2 text-sm text-foundry-muted">
+                <span>{name}</span>
+                <button
+                  className="rounded-md border border-white/15 px-2.5 py-1 text-xs font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink"
+                  type="button"
+                  onClick={() => applyAlternativeStack(name)}
+                >
+                  Use this instead
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      <EditableMemoArea label="Deployment" value={deploymentNoteFor(start)} onChange={(value) => onUpdate({ deploymentNote: value })} />
+
+      {stackCapabilityNote ? (
+        <section className="rounded-md border border-foundry-blue/20 bg-foundry-blue/[0.06] p-3 text-sm leading-6 text-foundry-muted">
+          <p className="section-kicker">Stack Capability</p>
+          <p className="mt-2 font-bold text-foundry-ink">{stackCapability.label} · Level {stackCapability.level}/4</p>
+          <p className="mt-1">{stackCapabilityNote}</p>
+        </section>
+      ) : null}
 
       {questionDecisions.length ? (
         <section className="rounded-md border border-foundry-amber/25 bg-foundry-amber/[0.07] p-3">
@@ -4552,6 +4687,38 @@ function primaryRecommendationFor(template: BuildTemplate, appKind: string) {
 
 function selectedStackFor(start: ProjectStart) {
   return start.customStack.trim() || start.stack;
+}
+
+function alternativeStacksFor(start: ProjectStart) {
+  if (start.alternativeStacks.length) return start.alternativeStacks;
+  const selected = selectedStackFor(start);
+  return recommendationsFor(start.template, start.appKind)
+    .map((item) => item.name)
+    .filter((name) => name !== selected)
+    .slice(0, 3);
+}
+
+function deploymentNoteFor(start: ProjectStart) {
+  if (start.deploymentNote.trim()) return start.deploymentNote;
+  const stack = selectedStackFor(start).toLowerCase();
+  if (/wpf|winforms|\.net desktop|electron|tauri/.test(stack)) return "Ships as a desktop installer; no web hosting needed.";
+  if (/unity|godot/.test(stack)) return "Exports to a game build target after prototype; not web-deployed.";
+  if (/phaser/.test(stack)) return "Deploys as a browser-playable build to any static host.";
+  if (/android|flutter|react native/.test(stack)) return "Builds to app-store packages (Google Play/App Store) after prototype.";
+  if (/next\.?js|react|vue|angular|astro|node|express|fastapi|django|laravel|php|html/.test(stack)) return "Deploys well to Vercel, Netlify, or any Node/static host.";
+  return "Deployment path depends on the final stack; Foundry will confirm before shipping.";
+}
+
+function stackCapabilityNoteFor(stack: StackProfile) {
+  if (stack.level >= 4) return null;
+  if (stack.level === 3) return "Foundry can edit this stack and run its build/test commands, with narrower automation than the fully-supported stacks.";
+  return unsupportedCreationMessage(stack);
+}
+
+function stackCapabilityLine(stackName: string) {
+  const stack = capabilityLevelForStackChoice(stackName);
+  const note = stackCapabilityNoteFor(stack);
+  return `${stack.label} (level ${stack.level}/4)${note ? ` - ${note}` : ""}`;
 }
 
 function recommendationForStart(start: ProjectStart): StackRecommendation {
@@ -5090,10 +5257,13 @@ function projectBriefFor(start: ProjectStart) {
     start.projectDescription ? `Project description: ${start.projectDescription}` : "",
     `Project type: ${discovery?.projectType || start.customSubtype.trim() || start.subtype}`,
     `Selected stack: ${selectedStack}`,
+    alternativeStacksFor(start).length ? `Alternative stacks: ${alternativeStacksFor(start).join("; ")}` : "",
     `Architecture: ${discovery?.architecture || recommendation.why}`,
     discovery?.styleDirection ? `Style direction: ${discovery.styleDirection}` : "",
     discovery?.mainFeatures.length ? `Main features: ${discovery.mainFeatures.join("; ")}` : "",
     discovery?.dataModel.length ? `Data model/entities: ${discovery.dataModel.join("; ")}` : "",
+    `Deployment: ${deploymentNoteFor(start)}`,
+    `Stack capability: ${stackCapabilityLine(selectedStack)}`,
     discovery?.assumptions.length ? `Assumptions: ${discovery.assumptions.join("; ")}` : "",
     answeredQuestions.length ? `User-confirmed answers: ${answeredQuestions.join("; ")}` : "",
     discovery?.decisions.length ? `Confidence map: ${discovery.decisions.map((decision) => `${decision.dimension}=${decision.hypothesis} (${decision.confidence}%, ${decision.stakes}, ${decision.source}, ${decision.action})`).join("; ")}` : "",
