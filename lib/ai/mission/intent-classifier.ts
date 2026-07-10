@@ -1,5 +1,7 @@
-import { callOpenAIResponsesManaged, type RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
-import { modelForProfile } from "@/lib/ai/model-router";
+import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
+import { callManagedModel } from "@/lib/ai/providers/dispatch";
+import { resolveModelForTier } from "@/lib/ai/model-router";
+import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 
 export type MissionIntent = "question" | "edit" | "debug" | "build" | "analyze" | "status" | "undo" | "deploy";
 
@@ -33,10 +35,8 @@ export function deterministicMutationIntent(message: string): MissionIntent | un
   return undefined;
 }
 
-const CLASSIFY_TOOL = {
-  type: "function",
+const CLASSIFY_TOOL: NeutralTool = {
   name: "classify_intent",
-  strict: true,
   description: "Classify what the user actually wants Foundry to do with the connected project.",
   parameters: {
     type: "object",
@@ -51,13 +51,22 @@ const CLASSIFY_TOOL = {
     },
     required: ["intent", "needs_project_inspection", "rationale"],
   },
-} as const;
-
-type ClassifyOutputItem = {
-  type?: string;
-  name?: string;
-  arguments?: string;
 };
+
+const CLASSIFY_SYSTEM_PROMPT = [
+  "You classify a single user message sent inside a connected software project.",
+  "question: the user wants information/explanation and expects no files to change.",
+  "edit: the user wants Foundry to change/add/remove real files.",
+  "debug: the user wants a specific error or bug investigated and fixed.",
+  "build: the user wants something scaffolded/created that does not exist yet.",
+  "analyze: the user wants a review/audit/architecture assessment, read-only.",
+  "status: the user is asking what happened in a previous run.",
+  "undo: the user wants a previous change reverted.",
+  "deploy: the user wants to ship/release/production-prep the project.",
+  "Only 'edit', 'debug', 'build', and 'deploy' should ever result in file writes. Everything else must be read-only.",
+  "Hard rule: if the user asks to add, make, change, update, move, create, fix, implement, allow, enable, replace, or wire project behavior, classify it as edit/build/debug/deploy unless they explicitly ask only for advice or explanation.",
+  "Do not classify a change request as question/analyze just because it mentions inspection, summary, verification, events, or status as part of the requested fix.",
+].join("\n");
 
 export async function classifyIntent(input: {
   message: string;
@@ -65,58 +74,32 @@ export async function classifyIntent(input: {
   apiKey: string;
   workspaceId?: string;
   userId?: string;
+  provider?: ProviderId;
 }): Promise<IntentClassification> {
-  const body = JSON.stringify({
-    model: modelForProfile("fast").model,
-    reasoning: { effort: "low" },
-    tools: [CLASSIFY_TOOL],
-    tool_choice: "auto",
-    max_output_tokens: 800,
-    input: [
-      {
-        role: "system",
-        content: [
-          {
-            type: "input_text",
-            text: [
-              "You classify a single user message sent inside a connected software project.",
-              "question: the user wants information/explanation and expects no files to change.",
-              "edit: the user wants Foundry to change/add/remove real files.",
-              "debug: the user wants a specific error or bug investigated and fixed.",
-              "build: the user wants something scaffolded/created that does not exist yet.",
-              "analyze: the user wants a review/audit/architecture assessment, read-only.",
-              "status: the user is asking what happened in a previous run.",
-              "undo: the user wants a previous change reverted.",
-              "deploy: the user wants to ship/release/production-prep the project.",
-              "Only 'edit', 'debug', 'build', and 'deploy' should ever result in file writes. Everything else must be read-only.",
-              "Hard rule: if the user asks to add, make, change, update, move, create, fix, implement, allow, enable, replace, or wire project behavior, classify it as edit/build/debug/deploy unless they explicitly ask only for advice or explanation.",
-              "Do not classify a change request as question/analyze just because it mentions inspection, summary, verification, events, or status as part of the requested fix.",
-              input.hasProjectContext ? "A project is connected." : "No project is connected yet.",
-              "Always call classify_intent with your answer. Do not respond with plain text.",
-            ].join("\n"),
-          },
-        ],
-      },
-      {
-        role: "user",
-        content: [{ type: "input_text", text: input.message }],
-      },
-    ],
-  });
+  // provider defaults to "openai" — matches this function's behavior before the provider abstraction
+  // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
+  const provider: ProviderId = input.provider ?? "openai";
+  const { model, effort } = resolveModelForTier("fast", { provider });
 
-  const result = await callOpenAIResponsesManaged<{ output?: ClassifyOutputItem[]; error?: { message?: string } }>({
-    apiKey: input.apiKey,
-    body,
-    workspaceId: input.workspaceId,
-    userId: input.userId,
-    maxAttempts: 4,
-  });
+  const result = await callManagedModel(
+    {
+      provider,
+      model,
+      effort: effort ?? "low",
+      system: [CLASSIFY_SYSTEM_PROMPT, input.hasProjectContext ? "A project is connected." : "No project is connected yet.", "Always call classify_intent with your answer. Do not respond with plain text."].join("\n"),
+      messages: [{ role: "user", content: [{ type: "text", text: input.message }] }],
+      tools: [CLASSIFY_TOOL],
+      toolChoice: "auto",
+      maxOutputTokens: 800,
+    },
+    { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 4 },
+  );
 
-  const call = result.data.output?.find((item) => item.type === "function_call" && item.name === "classify_intent");
+  const call = result.toolCalls.find((item) => item.name === "classify_intent");
   const parsed = call?.arguments ? safeJsonParse(call.arguments) : undefined;
 
   if (!parsed) {
-    const detail = result.data.error?.message;
+    const detail = result.errorMessage;
     return {
       intent: guessIntentHeuristically(input.message),
       needsProjectInspection: true,

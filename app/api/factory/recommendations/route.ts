@@ -1,43 +1,65 @@
 import { NextResponse } from "next/server";
-import { callOpenAIResponsesManaged } from "@/lib/ai/foundry-runtime";
-import { modelForProfile } from "@/lib/ai/model-router";
-import { buildRecommendationsRequestBody, parseRecommendations } from "@/lib/ai/mission/recommendations";
+import { callManagedModel } from "@/lib/ai/providers/dispatch";
+import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
+import { TIER_DISPLAY, resolveModelForTier, tierForRuntimePayload } from "@/lib/ai/model-router";
+import type { ModelMode, ModelTier } from "@/lib/ai/model-router";
+import { RECOMMENDATIONS_SYSTEM_PROMPT, SUGGEST_IMPROVEMENTS_TOOL, parseRecommendations, recommendationsUserText } from "@/lib/ai/mission/recommendations";
 import type { MissionRecommendation, RecommendationContext } from "@/lib/ai/mission/recommendations";
+import type { ProviderId } from "@/lib/ai/providers/types";
 
-type RecommendOutputItem = {
-  type?: string;
-  name?: string;
-  arguments?: string;
-};
+const DEFAULT_MODE: ModelMode = "fast";
 
 export async function POST(request: Request) {
   try {
-    const body = (await request.json()) as { context?: RecommendationContext; heuristic?: MissionRecommendation[] };
+    const body = (await request.json()) as { context?: RecommendationContext; heuristic?: MissionRecommendation[]; provider?: ProviderId; mode?: ModelMode };
     const heuristic = body.heuristic ?? [];
     if (!heuristic.length) {
       return NextResponse.json({ ok: false, error: "A heuristic recommendation list is required." }, { status: 400 });
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    // provider defaults to "openai" — see app/api/factory/intent/route.ts for the same pattern and rationale.
+    const provider: ProviderId = body.provider ?? "openai";
+    const apiKey = apiKeyForProvider(provider);
     if (!apiKey) {
-      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY is not configured.", recommendations: heuristic }, { status: 503 });
+      return NextResponse.json({ ok: false, error: `${envVarNameForProvider(provider)} is not configured.`, recommendations: heuristic }, { status: 503 });
     }
 
     const context = compactContext(body.context);
-    const model = modelForProfile("fast").model;
+    // mode defaults to "fast" — the fixed tier this route always used before the mode selector existed.
+    const mode: ModelMode = body.mode ?? DEFAULT_MODE;
+    const autoSelected = mode === "auto";
+    const tier: ModelTier = autoSelected ? tierForRuntimePayload(context) : mode;
+    const { model, effort } = resolveModelForTier(tier, { provider });
 
-    const result = await callOpenAIResponsesManaged<{ output?: RecommendOutputItem[]; error?: { message?: string } }>({
-      apiKey,
-      body: JSON.stringify(buildRecommendationsRequestBody(context, model)),
-      workspaceId: "factory-recommendations",
-      userId: "local-user",
-      maxAttempts: 2,
-    });
+    const result = await callManagedModel(
+      {
+        provider,
+        model,
+        effort: effort ?? "low",
+        system: RECOMMENDATIONS_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: [{ type: "text", text: recommendationsUserText(context) }] }],
+        tools: [SUGGEST_IMPROVEMENTS_TOOL],
+        toolChoice: { name: "suggest_improvements" },
+        maxOutputTokens: 1500,
+      },
+      { apiKey, workspaceId: "factory-recommendations", userId: "local-user", maxAttempts: 2 },
+    );
 
-    const call = result.data.output?.find((item) => item.type === "function_call" && item.name === "suggest_improvements");
+    const call = result.toolCalls.find((item) => item.name === "suggest_improvements");
     const recommendations = parseRecommendations(call?.arguments, heuristic);
 
-    return NextResponse.json({ ok: true, recommendations, usage: result.usage });
+    return NextResponse.json({
+      ok: true,
+      recommendations,
+      usage: result.usage,
+      modelSelection: {
+        tier,
+        provider,
+        model,
+        autoSelected,
+        reason: autoSelected ? `Auto-classified as ${TIER_DISPLAY[tier].label} from the project context.` : undefined,
+      },
+    });
   } catch (error) {
     return NextResponse.json(
       { ok: false, error: error instanceof Error ? error.message : "Recommendation generation failed." },

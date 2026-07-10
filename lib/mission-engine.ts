@@ -1,14 +1,35 @@
 import type { WorkspaceNote } from "@/components/WorkspaceShell";
 import { artifactKindForOutcome, titleFromContent } from "@/lib/artifacts";
-import type { CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 
 export type { CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 import { classifyEvidenceKind, type WorkspaceAttachment } from "@/lib/files";
-import type { ExecutionMissionVerification, FactoryCommandEvent, FactoryExecutionEvent, FactoryObjectiveChecklistItem } from "@/lib/factory/types";
 import type { SourceReference } from "@/lib/sources/types";
 import type { VisualArtifact } from "@/lib/visual-artifacts";
 
 export type { ExecutionMissionVerification } from "@/lib/factory/types";
+
+// Canonical mission state/type definitions now live in lib/mission/reducer.ts, the single source of
+// truth for how an ExecutionMission's fields change. Imported (and re-exported below) so the ~15
+// existing call sites importing these from lib/mission-engine keep working unchanged during the
+// execution-canvas rebuild.
+import type {
+  ExecutionMission,
+  ExecutionMissionApproval,
+  ExecutionMissionCommandRun,
+  ExecutionMissionFileTouch,
+  ExecutionMissionState,
+  ExecutionMissionVerificationStatus,
+  MissionSize,
+} from "@/lib/mission/reducer";
+export type {
+  ExecutionMission,
+  ExecutionMissionApproval,
+  ExecutionMissionCommandRun,
+  ExecutionMissionFileTouch,
+  ExecutionMissionState,
+  ExecutionMissionVerificationStatus,
+  MissionSize,
+};
 
 export type MissionStatus = "idle" | "active" | "waitingForInput" | "complete" | "cancelled";
 export type MissionStage =
@@ -53,66 +74,6 @@ export type CreatedArtifact = {
   description: string;
   visualArtifact?: VisualArtifact;
   createdAt: string;
-};
-
-export type ExecutionMissionState =
-  | "idle"
-  | "understanding"
-  | "planning"
-  | "waiting_for_user"
-  | "waiting_for_approval"
-  | "executing"
-  | "verifying"
-  | "blocked"
-  | "failed"
-  | "complete"
-  | "cancelled"
-  | "undoing";
-
-export type ExecutionMissionVerificationStatus = "none" | "passed" | "failed" | "unverified";
-
-export type ExecutionMissionFileTouch = {
-  path: string;
-  diff?: string;
-  verified: boolean;
-  status?: "created" | "edited" | "uploaded";
-  evidence?: string;
-};
-
-export type ExecutionMissionCommandRun = FactoryCommandEvent & {
-  approved_by?: "user" | "system" | "project-scope" | "exact-command" | "auto-safe";
-  approval_scope?: CommandApprovalScope;
-  /** Always populated, plain language: what was actually granted, e.g. "Always allowed: exact command `npm install xlsx`, this project only." Shown identically in the live timeline and history panel. */
-  approval_scope_label: string;
-};
-
-export type ExecutionMission = {
-  id: string;
-  title: string;
-  source_requirements: string[];
-  state: ExecutionMissionState;
-  verification_status: ExecutionMissionVerificationStatus;
-  plan: FactoryObjectiveChecklistItem[];
-  files_touched: ExecutionMissionFileTouch[];
-  commands_run: ExecutionMissionCommandRun[];
-  verification: ExecutionMissionVerification[];
-  blocked_reason?: string;
-  /** Set only while state is "waiting_for_user" because Foundry paused after building a first working
-   * mock of a larger build, not because of a generic clarifying question — lets the UI show "Open
-   * Preview" + feedback + "Continue building" instead of a text-question prompt. */
-  pending_mock_review?: { message: string; preview_url?: string };
-  /** The live preview URL captured at the time this mission finished, if any — so a collapsed
-   * Previous Missions card can still link to what that mission actually built, not just the
-   * project's current preview (which may have moved on since). */
-  preview_url?: string;
-  undo_snapshot?: string;
-  summary: string;
-  parent_mission_id?: string;
-  request_message_id?: string;
-  result_message_id?: string;
-  timeline: FactoryExecutionEvent[];
-  created_at: string;
-  updated_at: string;
 };
 
 export type MissionState = {

@@ -1,3 +1,5 @@
+import type { NeutralTool } from "@/lib/ai/providers/types";
+
 export type BusinessValue = "medium" | "high" | "very-high";
 
 export type MissionRecommendation = {
@@ -63,10 +65,8 @@ function rec(id: string, label: string, why: string, estimatedMinutes: number, b
 const TOOL_NAME = "suggest_improvements";
 const MIN_VALID_RECOMMENDATIONS = 3;
 
-export const SUGGEST_IMPROVEMENTS_TOOL = {
-  type: "function",
+export const SUGGEST_IMPROVEMENTS_TOOL: NeutralTool = {
   name: TOOL_NAME,
-  strict: true,
   description: "Suggest the highest-value next improvements for the project that was just built or modified.",
   parameters: {
     type: "object",
@@ -90,42 +90,23 @@ export const SUGGEST_IMPROVEMENTS_TOOL = {
     },
     required: ["recommendations"],
   },
-} as const;
+};
 
-export function buildRecommendationsRequestBody(context: RecommendationContext, model: string) {
-  return {
-    model,
-    reasoning: { effort: "low" },
-    tools: [SUGGEST_IMPROVEMENTS_TOOL],
-    tool_choice: { type: "function", name: TOOL_NAME },
-    max_output_tokens: 1500,
-    input: [
-      {
-        role: "system",
-        content: [
-          {
-            type: "input_text",
-            text: [
-              "You are a senior engineer who just finished a piece of work on a real project. You now proactively suggest the highest-value next improvements, the way a good engineer flags follow-up work without being asked.",
-              "You are given the project brief, the objective just completed, the stack, and the files that were changed.",
-              "Ground every recommendation in the ACTUAL project domain from the brief — never generic placeholders. If this is an inventory system, suggest inventory-specific things (barcode scanning, supplier management, stock alerts). If it's a game, suggest game-specific things (scoring, levels, sound). Reason from the real domain every time, never fall back to a generic label.",
-              "Return 5-8 recommendations, ordered by business value (highest first).",
-              "label: 2-4 words, title case, like a button (e.g. 'Add KPI Cards').",
-              "why: one short sentence explaining why this specific project benefits from it. No filler.",
-              "estimated_minutes: a realistic engineering estimate for a focused single task (1-60).",
-              "business_value: 'very-high' for something the product is meaningfully incomplete without, 'high' for a clear near-term win, 'medium' for genuine but lower-urgency polish. Don't inflate — most lists should have at most 1-2 'very-high' entries.",
-              "task: the exact instruction Foundry's execution engine should run if the user clicks this recommendation — specific enough to act on directly, written as an imperative sentence.",
-              "Always call suggest_improvements. Do not answer in prose.",
-            ].join("\n"),
-          },
-        ],
-      },
-      {
-        role: "user",
-        content: [{ type: "input_text", text: JSON.stringify(context, null, 2) }],
-      },
-    ],
-  };
+export const RECOMMENDATIONS_SYSTEM_PROMPT = [
+  "You are a senior engineer who just finished a piece of work on a real project. You now proactively suggest the highest-value next improvements, the way a good engineer flags follow-up work without being asked.",
+  "You are given the project brief, the objective just completed, the stack, and the files that were changed.",
+  "Ground every recommendation in the ACTUAL project domain from the brief — never generic placeholders. If this is an inventory system, suggest inventory-specific things (barcode scanning, supplier management, stock alerts). If it's a game, suggest game-specific things (scoring, levels, sound). Reason from the real domain every time, never fall back to a generic label.",
+  "Return 5-8 recommendations, ordered by business value (highest first).",
+  "label: 2-4 words, title case, like a button (e.g. 'Add KPI Cards').",
+  "why: one short sentence explaining why this specific project benefits from it. No filler.",
+  "estimated_minutes: a realistic engineering estimate for a focused single task (1-60).",
+  "business_value: 'very-high' for something the product is meaningfully incomplete without, 'high' for a clear near-term win, 'medium' for genuine but lower-urgency polish. Don't inflate — most lists should have at most 1-2 'very-high' entries.",
+  "task: the exact instruction Foundry's execution engine should run if the user clicks this recommendation — specific enough to act on directly, written as an imperative sentence.",
+  "Always call suggest_improvements. Do not answer in prose.",
+].join("\n");
+
+export function recommendationsUserText(context: RecommendationContext): string {
+  return JSON.stringify(context, null, 2);
 }
 
 export function parseRecommendations(rawArguments: string | undefined, fallback: MissionRecommendation[]): MissionRecommendation[] {

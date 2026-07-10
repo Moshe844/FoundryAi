@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
-import { callOpenAIResponsesManaged } from "@/lib/ai/foundry-runtime";
-import { modelForProfile } from "@/lib/ai/model-router";
+import { callManagedModel } from "@/lib/ai/providers/dispatch";
+import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
+import { resolveModelForTier } from "@/lib/ai/model-router";
+import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 
 const projectIntentValues = ["question", "inspection", "diagnose", "status", "debug", "edit", "undo", "continue", "retrospective", "clarify"] as const;
 
@@ -27,10 +29,8 @@ type ProjectIntentContext = {
   }>;
 };
 
-const RESOLVE_PROJECT_TURN_INTENT_TOOL = {
-  type: "function",
+const RESOLVE_PROJECT_TURN_INTENT_TOOL: NeutralTool = {
   name: "resolve_project_turn_intent",
-  strict: true,
   description: "Resolve what the user wants Foundry to do in this connected project turn.",
   parameters: {
     type: "object",
@@ -64,12 +64,6 @@ const RESOLVE_PROJECT_TURN_INTENT_TOOL = {
     },
     required: ["intent", "execution_mode", "confidence", "rationale", "continuity", "clarifying_question"],
   },
-} as const;
-
-type ResolveOutputItem = {
-  type?: string;
-  name?: string;
-  arguments?: string;
 };
 
 type ResolveToolResult = {
@@ -81,91 +75,85 @@ type ResolveToolResult = {
   clarifying_question?: string;
 };
 
+const SYSTEM_PROMPT = [
+  "You resolve user intent for Foundry, an AI software agent working inside a connected project.",
+  "Use the whole message and the current mission state. Do not rely on keyword triggers or fixed phrases.",
+  "Return exactly one intent:",
+  "- question: answer a general question; no project inspection or file writes are needed.",
+  "- inspection: read or summarize the project; no file writes.",
+  "- diagnose: investigate/explain root cause or tell the user how to fix something; no file writes.",
+  "- status: report prior execution state, result, blocker, or changed files.",
+  "- retrospective: explain why Foundry previously did something or how a previous fix worked.",
+  "- debug: investigate a bug/error and apply the repair to project files.",
+  "- edit: modify existing project behavior, UI, code, config, docs, or files.",
+  "- undo: revert a previous Foundry change.",
+  "- continue: continue or retry an unfinished mutating project run.",
+  "- clarify: the message could mean two structurally different actions with materially different consequences given the current mission state/blocker, and you cannot tell which without asking. Only use this when genuinely ambiguous — never as a default when you're merely not fully confident.",
+  "If the user asks Foundry to perform the change, choose debug/edit/undo/continue.",
+  "A bare bug report in a connected project is a request to investigate and fix. If the user gives an error/failure/screenshot/log and says it happens during a workflow, choose debug unless they explicitly ask only for explanation, root cause, review, or instructions they will apply themselves.",
+  "If the user asks why, how, what happened, what should I change, or asks for an explanation without asking Foundry to apply the repair, choose a read-only intent.",
+  "If the message is ambiguous between explanation and file mutation, choose the read-only interpretation and say why in rationale — this is a normal, common resolution and does not need clarify.",
+  "Reserve clarify for real forks in the road: e.g. the mission is blocked needing approval for one specific command and the user's message could equally mean 'retry that same command' or 'abandon it and use something else instead', and the wording doesn't say which.",
+  "Resolve short replies such as yes, do it, continue, stop, or no using the mission state and previous execution.",
+  "For edit/debug/continue intents, set continuity: carry_forward_plan when this message revises, corrects, or continues the work described in mission_state.execution (e.g. 'actually don't use that package', 'now add validation', 'switch it to .NET' while a mission is still open) — it should not restart from a blank plan. Set fresh_plan when it's an unrelated new request. Set not_applicable for every other intent.",
+  "Always call resolve_project_turn_intent. Do not answer in prose.",
+].join("\n");
+
 export async function POST(request: Request) {
   try {
-    const body = (await request.json()) as { message?: string; context?: ProjectIntentContext };
+    const body = (await request.json()) as { message?: string; context?: ProjectIntentContext; provider?: ProviderId };
     const message = String(body.message ?? "").trim();
     if (!message) {
       return NextResponse.json({ error: "Message is required." }, { status: 400 });
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    // provider defaults to "openai" — matches today's behavior exactly. The optional body.provider
+    // override exists only for Phase A verification (forcing a real Anthropic/Google request against
+    // this route); it is not yet exposed anywhere in the UI (that lands with the mode selector).
+    const provider: ProviderId = body.provider ?? "openai";
+    const apiKey = apiKeyForProvider(provider);
     if (!apiKey) {
-      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY is not configured." }, { status: 503 });
+      return NextResponse.json({ ok: false, error: `${envVarNameForProvider(provider)} is not configured.` }, { status: 503 });
     }
 
-    const result = await callOpenAIResponsesManaged<{ output?: ResolveOutputItem[]; error?: { message?: string } }>({
-      apiKey,
-      body: JSON.stringify({
-        model: modelForProfile("fast").model,
-        reasoning: { effort: "low" },
-        tools: [RESOLVE_PROJECT_TURN_INTENT_TOOL],
-        tool_choice: { type: "function", name: "resolve_project_turn_intent" },
-        max_output_tokens: 900,
-        input: [
-          {
-            role: "system",
-            content: [
-              {
-                type: "input_text",
-                text: [
-                  "You resolve user intent for Foundry, an AI software agent working inside a connected project.",
-                  "Use the whole message and the current mission state. Do not rely on keyword triggers or fixed phrases.",
-                  "Return exactly one intent:",
-                  "- question: answer a general question; no project inspection or file writes are needed.",
-                  "- inspection: read or summarize the project; no file writes.",
-                  "- diagnose: investigate/explain root cause or tell the user how to fix something; no file writes.",
-                  "- status: report prior execution state, result, blocker, or changed files.",
-                  "- retrospective: explain why Foundry previously did something or how a previous fix worked.",
-                  "- debug: investigate a bug/error and apply the repair to project files.",
-                  "- edit: modify existing project behavior, UI, code, config, docs, or files.",
-                  "- undo: revert a previous Foundry change.",
-                  "- continue: continue or retry an unfinished mutating project run.",
-                  "- clarify: the message could mean two structurally different actions with materially different consequences given the current mission state/blocker, and you cannot tell which without asking. Only use this when genuinely ambiguous — never as a default when you're merely not fully confident.",
-                  "If the user asks Foundry to perform the change, choose debug/edit/undo/continue.",
-                  "A bare bug report in a connected project is a request to investigate and fix. If the user gives an error/failure/screenshot/log and says it happens during a workflow, choose debug unless they explicitly ask only for explanation, root cause, review, or instructions they will apply themselves.",
-                  "If the user asks why, how, what happened, what should I change, or asks for an explanation without asking Foundry to apply the repair, choose a read-only intent.",
-                  "If the message is ambiguous between explanation and file mutation, choose the read-only interpretation and say why in rationale — this is a normal, common resolution and does not need clarify.",
-                  "Reserve clarify for real forks in the road: e.g. the mission is blocked needing approval for one specific command and the user's message could equally mean 'retry that same command' or 'abandon it and use something else instead', and the wording doesn't say which.",
-                  "Resolve short replies such as yes, do it, continue, stop, or no using the mission state and previous execution.",
-                  "For edit/debug/continue intents, set continuity: carry_forward_plan when this message revises, corrects, or continues the work described in mission_state.execution (e.g. 'actually don't use that package', 'now add validation', 'switch it to .NET' while a mission is still open) — it should not restart from a blank plan. Set fresh_plan when it's an unrelated new request. Set not_applicable for every other intent.",
-                  "Always call resolve_project_turn_intent. Do not answer in prose.",
-                ].join("\n"),
-              },
-            ],
-          },
+    const { model, effort } = resolveModelForTier("fast", { provider });
+
+    const result = await callManagedModel(
+      {
+        provider,
+        model,
+        effort: effort ?? "low",
+        system: SYSTEM_PROMPT,
+        messages: [
           {
             role: "user",
             content: [
               {
-                type: "input_text",
-                text: JSON.stringify(
-                  {
-                    message,
-                    mission_state: compactProjectIntentContext(body.context),
-                  },
-                  null,
-                  2,
-                ),
+                type: "text",
+                text: JSON.stringify({ message, mission_state: compactProjectIntentContext(body.context) }, null, 2),
               },
             ],
           },
         ],
-      }),
-      workspaceId: "factory-intent",
-      userId: "local-user",
-      maxAttempts: 3,
-    });
+        tools: [RESOLVE_PROJECT_TURN_INTENT_TOOL],
+        toolChoice: { name: "resolve_project_turn_intent" },
+        maxOutputTokens: 900,
+      },
+      { apiKey, workspaceId: "factory-intent", userId: "local-user", maxAttempts: 3 },
+    );
 
-    const call = result.data.output?.find((item) => item.type === "function_call" && item.name === "resolve_project_turn_intent");
+    const call = result.toolCalls.find((item) => item.name === "resolve_project_turn_intent");
     const parsed = call?.arguments ? safeJsonParse(call.arguments) : undefined;
     const intent = normalizeProjectIntent(parsed?.intent);
+
+    const modelSelection = { tier: "fast" as const, provider, model, autoSelected: false as const };
 
     if (!intent) {
       return NextResponse.json({
         ok: false,
-        error: result.data.error?.message || "Intent classifier did not return a valid intent.",
+        error: result.errorMessage || "Intent classifier did not return a valid intent.",
         usage: result.usage,
+        modelSelection,
       });
     }
 
@@ -184,6 +172,7 @@ export async function POST(request: Request) {
       continuity: finalIntent === intent ? parsed?.continuity ?? "not_applicable" : "not_applicable",
       clarifyingQuestion: finalIntent === "clarify" ? String(parsed?.clarifying_question ?? "").trim() : "",
       usage: result.usage,
+      modelSelection,
     });
   } catch (error) {
     return NextResponse.json(

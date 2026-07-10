@@ -64,3 +64,27 @@ export function missionStateLabel(mission: ExecutionMission): string {
   if (mission.state === "complete") return mission.verification_status === "passed" ? "Complete" : "Complete (unverified)";
   return mission.state.replace(/_/g, " ").replace(/^./, (char) => char.toUpperCase());
 }
+
+/**
+ * Relocated from components/BuildDashboard.tsx (Discovery Engine rebuild) so lib/discovery/* can
+ * classify/rank mission history without importing a 6,500-line component file. Pure move, no
+ * behavior change — every existing call site now imports from here instead of a local definition.
+ */
+export function isSoftwareProjectMission(mission: MissionState) {
+  const title = `${mission.title} ${mission.conversationTitle} ${mission.objective} ${mission.lastResult}`.toLowerCase();
+  return (
+    mission.desiredOutcome === "project" ||
+    mission.desiredOutcome === "patch" ||
+    mission.createdArtifacts.some((artifact) => artifact.type === "project" || artifact.type === "patch" || artifact.kind === "code") ||
+    /\b(create project|build inventory|build e-commerce|build ecommerce|build pos|build dashboard|build website|build mobile|build game|ai software factory|preferred stack|smart defaults)\b/.test(title)
+  );
+}
+
+export function projectTitleFor(mission: MissionState) {
+  const source = mission.title || mission.conversationTitle || mission.objective || "Untitled project";
+  return source.replace(/^Create Project:\s*/i, "").trim() || "Untitled project";
+}
+
+export function projectBriefFromMission(mission: MissionState) {
+  return mission.createdArtifacts.find((artifact) => artifact.type === "project" && artifact.title === "Project Brief")?.body ?? mission.objective;
+}

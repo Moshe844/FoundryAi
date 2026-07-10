@@ -25,6 +25,8 @@ export type ManagedRuntimeResult<T extends RuntimeOpenAIResponse = RuntimeOpenAI
 };
 
 export type RuntimeUsageRecord = {
+  /** Defaults to "openai" for every record this file builds — the other providers (lib/ai/providers/*) set their own. */
+  provider: "openai" | "anthropic" | "google";
   workspaceId: string;
   userId: string;
   model: string;
@@ -485,6 +487,7 @@ function createUsageRecord(input: {
   const estimatedCostUsd = ((inputTokens * pricing.input) + (outputTokens * pricing.output)) / 1_000_000;
 
   return {
+    provider: "openai",
     workspaceId: input.workspaceId,
     userId: input.userId,
     requestedModel: input.requestedModel,

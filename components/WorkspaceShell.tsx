@@ -14,7 +14,7 @@ import { hasFollowUpIntentShape, hasRecommendationFollowUpShape } from "@/lib/ai
 import { artifactKindForOutcome } from "@/lib/artifacts";
 import { classifyEvidenceKind, ingestFile } from "@/lib/files";
 import { executeBrowserFolderTask, getBrowserFolderHandle, readBrowserFolderFiles } from "@/lib/factory/browser-folder";
-import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryProjectResult, FactoryUploadedFile, MissionParentContext } from "@/lib/factory/types";
+import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryProjectResult, FactoryUploadedFile, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
 import type { WorkspaceAttachment } from "@/lib/files";
 import type { SourceReference } from "@/lib/sources/types";
 import { createVisualArtifact, isExplicitVisualArtifactRequest, isTextVisualFormatRequest, isVisualOutcome, shouldReviseExistingVisual } from "@/lib/visual-artifacts";
@@ -1020,7 +1020,7 @@ export function WorkspaceShell() {
     return "I do not have readable project files for this workspace yet. Open a local folder or upload the project files, then ask me to inspect it again.";
   }
 
-  async function createProjectBriefMission(brief: string, uploadedFiles: FactoryUploadedFile[] = []) {
+  async function createProjectBriefMission(brief: string, uploadedFiles: FactoryUploadedFile[] = [], discovery?: StructuredDiscovery) {
     const now = new Date();
     const iso = now.toISOString();
     const projectTitle = titleFromProjectBrief(brief);
@@ -1162,11 +1162,11 @@ export function WorkspaceShell() {
 
     if (!shouldAutoExecute) return;
 
-    await runFactoryExecutionForMission(projectMission.missionId, brief);
+    await runFactoryExecutionForMission(projectMission.missionId, brief, discovery);
   }
 
-  async function runFactoryExecutionForMission(missionId: string, brief: string) {
-    await runProjectExecutionRequest(missionId, "/api/factory/create?stream=1", { brief }, "Factory execution failed.", "Build the initial project");
+  async function runFactoryExecutionForMission(missionId: string, brief: string, discovery?: StructuredDiscovery) {
+    await runProjectExecutionRequest(missionId, "/api/factory/create?stream=1", { brief, discovery }, "Factory execution failed.", "Build the initial project");
   }
 
   async function runExistingProjectExecutionForMission(missionId: string, brief: string, task: string, files: FactoryUploadedFile[], localPath: string, localConnector?: { url: string; token?: string; rootLabel?: string }, parentMission?: MissionParentContext, continuity?: "carry_forward_plan", approvalResponse?: FactoryExistingProjectRequest["approvalResponse"]) {

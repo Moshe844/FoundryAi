@@ -1,7 +1,9 @@
-import { callOpenAIResponsesManaged, type RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
-import { modelForProfile } from "@/lib/ai/model-router";
+import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
+import { callManagedModel } from "@/lib/ai/providers/dispatch";
+import { modelForProfile, resolveModelForTier } from "@/lib/ai/model-router";
 import { isSensitiveFilePath, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
 import { approvalScopeLabel, type CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
+import type { ManagedToolCall, NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { ExecutionMissionVerification, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactorySessionSummary, MissionParentContext } from "@/lib/factory/types";
 
 export type MissionExecutorInput = {
@@ -32,11 +34,15 @@ export type MissionExecutorInput = {
    * minimal but real, clickable first pass of the primary screens, and the mission pauses there for the user
    * to open the preview and react before Foundry goes deeper — instead of building the whole thing unseen. */
   offerMockGate?: boolean;
+  /** Defaults to "openai" — the only provider missions ran on before this field existed. Passing "anthropic"/"google" routes this mission's autonomous loop through that provider's models instead. */
+  provider?: ProviderId;
 };
 
 export type MissionExecutorResult = {
   status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval";
   blocker?: string;
+  /** Only set when status is "awaiting-approval" — the exact action blocked, for a precise approval prompt instead of parsing `blocker`'s free text. */
+  blockedStep?: { kind: "write" | "delete" | "command"; target: string; category: string };
   checklist: FactoryObjectiveChecklistItem[];
   timeline: FactoryExecutionEvent[];
   changedFiles: string[];
@@ -47,46 +53,13 @@ export type MissionExecutorResult = {
   usage: RuntimeUsageRecord[];
 };
 
-type MissionOutputItem = {
-  type?: string;
-  text?: string;
-  content?: Array<{ type?: string; text?: string; refusal?: string }>;
-  call_id?: string;
-  name?: string;
-  arguments?: string;
-};
-
-type MissionOpenAIResponse = {
-  output_text?: string;
-  output?: MissionOutputItem[];
-  error?: { message?: string; type?: string; code?: string };
-  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number };
-};
-
-type ConversationItem = Record<string, unknown>;
-
-type ToolSchema = {
-  type: "function";
-  name: string;
-  strict: boolean;
-  description: string;
-  parameters: {
-    type: "object";
-    additionalProperties: false;
-    properties: Record<string, unknown>;
-    required: string[];
-  };
-};
-
 const DEFAULT_MAX_TURNS = 40;
 const DEFAULT_MAX_NUDGES = 6;
 
-function toolSchemas(canRunCommands: boolean): ToolSchema[] {
-  const tools: ToolSchema[] = [
+function toolSchemas(canRunCommands: boolean): NeutralTool[] {
+  const tools: NeutralTool[] = [
     {
-      type: "function",
       name: "list_dir",
-      strict: true,
       description: "List immediate files and subdirectories under a path relative to the project root. Use \"\" for the root. Does not recurse.",
       parameters: {
         type: "object",
@@ -96,9 +69,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "read_file",
-      strict: true,
       description: "Read a text file's contents relative to the project root. Large files are truncated; pass offset_bytes/limit_bytes to page through them. Use offset_bytes 0 and limit_bytes 20000 for a normal first read.",
       parameters: {
         type: "object",
@@ -112,9 +83,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "write_file",
-      strict: true,
       description: "Create or overwrite a text file relative to the project root with the complete new file contents (never a diff/patch). path must be a real relative file path such as \"server.js\" or \"src/index.js\" — never empty, \".\", or \"/\". The write is read back from disk and verified before being reported successful.",
       parameters: {
         type: "object",
@@ -124,9 +93,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "delete_file",
-      strict: true,
       description: "Delete a file relative to the project root. Always requires the user's approval before it actually happens — call it when deletion is the right fix, don't avoid it just because it needs approval.",
       parameters: {
         type: "object",
@@ -136,9 +103,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "search_files",
-      strict: true,
       description: "Search file names and contents under the project root for a query string.",
       parameters: {
         type: "object",
@@ -148,9 +113,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "mark_checklist_item",
-      strict: true,
       description: "Update the status of one objective checklist item as you make verifiable progress. Use 'skipped' only when the user explicitly told you to skip it — never to avoid difficult work.",
       parameters: {
         type: "object",
@@ -164,9 +127,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "record_finding",
-      strict: true,
       description: "Record a project-understanding finding. This creates a narrative-layer event from a structured finding object, not a rewritten trace log.",
       parameters: {
         type: "object",
@@ -181,9 +142,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "record_decision",
-      strict: true,
       description: "Record a chosen engineering action from the Confidence Map decision object. The rationale must be the decision rationale.",
       parameters: {
         type: "object",
@@ -199,9 +158,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "record_flag",
-      strict: true,
       description: "Record uncertainty, conflict, or a preserved behavior worth user attention. This creates a flag-layer event from a structured flag object.",
       parameters: {
         type: "object",
@@ -216,9 +173,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "report_complete",
-      strict: true,
       description: "Call this only once every checklist item is completed with real evidence from files you actually read or commands you actually ran. The summary must explain the user's request, user-facing behavior now, files changed and why, verification evidence, and limitations. Ends the mission.",
       parameters: {
         type: "object",
@@ -228,9 +183,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
       },
     },
     {
-      type: "function",
       name: "report_blocked",
-      strict: true,
       description: "Call this if you cannot complete the objective (missing info, ambiguous request, tool failure). Ends the mission.",
       parameters: {
         type: "object",
@@ -246,9 +199,7 @@ function toolSchemas(canRunCommands: boolean): ToolSchema[] {
 
   if (canRunCommands) {
     tools.push({
-      type: "function",
       name: "run_command",
-      strict: true,
       description: "Run a shell command inside the project (or a subdirectory of it). No interactive stdin is provided, so avoid commands that prompt for input.",
       parameters: {
         type: "object",
@@ -272,6 +223,17 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const commands: MissionExecutorResult["commands"] = [];
   const narrativeObjects: FactoryNarrativeObject[] = [];
   const tools = toolSchemas(input.access.capabilities.canRunCommands);
+  const provider: ProviderId = input.provider ?? "openai";
+  // For the default "openai" path, model/effort stay exactly what this call site used before the
+  // provider abstraction existed (modelForProfile, no reasoning-effort override) — that's what Phase
+  // C1/C2 verified as a zero-behavior-change migration. Anthropic/Google have no row in modelForProfile
+  // (an OpenAI-only legacy table), so they resolve through the real tier table instead, mapping this
+  // mission's existing fastLane/non-fastLane distinction onto Fast/Architect the same way the legacy
+  // profile mapping already does elsewhere (autonomous -> architect).
+  const { model, effort } =
+    provider === "openai"
+      ? { model: modelForProfile(input.fastLane ? "fast" : "autonomous").model, effort: undefined as "low" | "medium" | "high" | undefined }
+      : resolveModelForTier(input.fastLane ? "fast" : "architect", { provider });
 
   async function emit(kind: FactoryExecutionEventKind, status: FactoryExecutionEventStatus, title: string, extra: Partial<FactoryExecutionEvent> = {}) {
     const event: FactoryExecutionEvent = {
@@ -294,10 +256,16 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     });
   }
 
-  function finalize(status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval", blocker: string | undefined, turnsUsed: number): MissionExecutorResult {
+  function finalize(
+    status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval",
+    blocker: string | undefined,
+    turnsUsed: number,
+    blockedStep?: MissionExecutorResult["blockedStep"]
+  ): MissionExecutorResult {
     return {
       status,
       blocker,
+      blockedStep,
       checklist,
       timeline,
       changedFiles: Array.from(changedFiles),
@@ -314,14 +282,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     return finalize("stopped", "Stopped by user before completion.", turn);
   }
 
-  const conversation: ConversationItem[] = [
-    {
-      role: "system",
-      content: [
-        {
-          type: "input_text",
-          text: [
-            "You are a senior engineer working inside a real, already-connected project. You investigate and fix real problems by calling tools — you are not running a scripted plan.",
+  const system: string = [
+    "You are a senior engineer working inside a real, already-connected project. You investigate and fix real problems by calling tools — you are not running a scripted plan.",
             input.priorContext
               ? "You already have verified context from earlier in this same mission, given below — trust it and don't re-read files it already covers unless something looks inconsistent with the current request."
               : "You have no built-in knowledge of this project's current contents — read files before assuming anything about them.",
@@ -377,15 +339,17 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               ? ["By default, run the app for the user, not just edit its files. Once you're reasonably confident in a fix and the project is a runnable app or server, start (or restart) it as your verification step and leave it running so the user can see the real result — don't stop at 'the file is correct.' Only skip this if the user explicitly said not to run it, or the checklist item genuinely doesn't need a running process to verify (e.g. a pure text/config change)."]
               : []),
             "Never create or write a file just to prove work happened. Every file you create or change must exist because it improves the actual project — evidence of your work belongs in what you say, not in the user's codebase.",
-          ].join("\n"),
-        },
-      ],
-    },
+          ].join("\n");
+
+  // Provider-agnostic turn history — each provider's request-builder renders this into its own wire
+  // format at call time (see lib/ai/providers/*-runtime.ts), same pattern already proven in
+  // lib/ai/mission/inspector.ts's smaller read-only loop.
+  const conversation: NeutralMessage[] = [
     {
       role: "user",
       content: [
         {
-          type: "input_text",
+          type: "text",
           text: [
             `Objective: ${input.objective}`,
             `Task: ${input.task}`,
@@ -399,6 +363,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       ],
     },
   ];
+  let toolCallSeq = 0;
 
   let consecutiveProviderFailures = 0;
   let nudgesUsed = 0;
@@ -425,27 +390,25 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   for (let turn = 1; turn <= maxTurns; turn += 1) {
     if (input.signal?.aborted) return stoppedByUser(turn);
 
-    const body = JSON.stringify({
-      model: modelForProfile(input.fastLane ? "fast" : "autonomous").model,
-      input: conversation,
-      tools,
-      tool_choice: "auto",
-      max_output_tokens: input.fastLane ? 2500 : 8000,
-    });
-
-    const result = await callOpenAIResponsesManaged<MissionOpenAIResponse>({
-      apiKey: input.apiKey,
-      body,
-      workspaceId: input.workspaceId,
-      userId: input.userId,
-      maxAttempts: input.fastLane ? 2 : 6,
-    });
+    const result = await callManagedModel(
+      {
+        provider,
+        model,
+        effort,
+        system,
+        messages: conversation,
+        tools,
+        toolChoice: "auto",
+        maxOutputTokens: input.fastLane ? 2500 : 8000,
+      },
+      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: input.fastLane ? 2 : 6 },
+    );
     usage.push(result.usage);
 
-    if (result.status !== "ok") {
+    if (result.stopReason === "error") {
       consecutiveProviderFailures += 1;
       if (consecutiveProviderFailures >= 2) {
-        const detail = result.data.error?.message;
+        const detail = result.errorMessage;
         const reason = detail ? `Model provider unavailable after retries: ${detail}` : "Model provider unavailable after retries.";
         await emit("summary", "error", "Mission blocked", { details: { reason } });
         return finalize("failed", reason, turn);
@@ -454,10 +417,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     }
     consecutiveProviderFailures = 0;
 
-    const outputItems = result.data.output ?? [];
-    const functionCalls = outputItems.filter((item): item is Required<Pick<MissionOutputItem, "name" | "call_id">> & MissionOutputItem =>
-      item.type === "function_call" && Boolean(item.name) && Boolean(item.call_id));
-    const messageText = extractMessageText(outputItems, result.data.output_text);
+    const functionCalls: ManagedToolCall[] = result.toolCalls;
+    const messageText = result.text;
 
     // Surface the model's own reasoning at moments a person would actually want to hear it: its
     // opening hypothesis, right before a consequential action, when it has nothing to call at all,
@@ -481,11 +442,11 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         return finalize("failed", stuckReason, turn);
       }
       const outstanding = checklist.filter((item) => item.status !== "completed" && item.status !== "skipped");
-      conversation.push({ role: "assistant", content: [{ type: "output_text", text: messageText || "(no text)" }] });
+      conversation.push({ role: "assistant", content: [{ type: "text", text: messageText || "(no text)" }] });
       conversation.push({
         role: "user",
         content: [{
-          type: "input_text",
+          type: "text",
           text: outstanding.length
             ? `Continue working. These checklist items are not yet completed with evidence: ${outstanding.map((item) => `[${item.id}] ${item.label}`).join("; ")}. Verify each by reading the actual file (or re-running a command), then call mark_checklist_item for it. Call a tool now.`
             : "Continue: call a tool, or report_complete / report_blocked.",
@@ -500,16 +461,17 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       const rawArgs = call.arguments ?? "{}";
       const parsedArgs = safeJsonParse(rawArgs);
       const args = parsedArgs ?? {};
-      conversation.push({ type: "function_call", call_id: call.call_id, name: call.name, arguments: rawArgs });
+      toolCallSeq += 1;
+      const callId = call.id ?? `call-${turn}-${toolCallSeq}`;
+      conversation.push({ role: "assistant", content: [{ type: "tool_use", id: callId, name: call.name, arguments: rawArgs, thoughtSignature: call.thoughtSignature }] });
 
       if (!parsedArgs && rawArgs.length > 2) {
         const reason = "The tool call arguments could not be parsed, most likely because the file content was too large and got cut off mid-write. Split this into a smaller change and try again.";
         hadUnresolvedToolFailure = true;
         await emit("edit", "warning", "Large edit failed, switching to a smaller patch", { details: { reason } });
         conversation.push({
-          type: "function_call_output",
-          call_id: call.call_id,
-          output: JSON.stringify({ verified: false, accepted: false, reason }),
+          role: "user",
+          content: [{ type: "tool_result", toolUseId: callId, content: JSON.stringify({ verified: false, accepted: false, reason }) }],
         });
         continue;
       }
@@ -524,13 +486,16 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           }
           await emit("planning", "warning", "Completion claim rejected", { internal: true, details: { reason: verification.reason } });
           conversation.push({
-            type: "function_call_output",
-            call_id: call.call_id,
-            output: JSON.stringify({
-              accepted: false,
-              reason: verification.reason,
-              instruction: "Do not call report_complete again until every checklist item below is verified with real evidence via mark_checklist_item (re-read files or re-run commands as needed).",
-            }),
+            role: "user",
+            content: [{
+              type: "tool_result",
+              toolUseId: callId,
+              content: JSON.stringify({
+                accepted: false,
+                reason: verification.reason,
+                instruction: "Do not call report_complete again until every checklist item below is verified with real evidence via mark_checklist_item (re-read files or re-run commands as needed).",
+              }),
+            }],
           });
           continue;
         }
@@ -570,12 +535,16 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         }
       }
       if (call.name === "write_file") {
-        const writeResult = toolResult as { skipped?: string; reason?: string };
+        const writeResult = toolResult as { skipped?: string; reason?: string; category?: string };
         if (writeResult.skipped === "permission-required") {
           const writePath = typeof args.path === "string" ? args.path : "";
           const reason = writeResult.reason ?? "This write needs your approval before Foundry can continue.";
           await emit("summary", "warning", "Waiting for your approval", { details: { reason, command: `write ${writePath}` } });
-          return finalize("awaiting-approval", `Waiting for your approval to write: ${writePath}`, turn);
+          return finalize("awaiting-approval", `Waiting for your approval to write: ${writePath}`, turn, {
+            kind: "write",
+            target: writePath,
+            category: writeResult.category ?? "unrecognized",
+          });
         }
         if (isFailedWriteResult(toolResult)) {
           hadUnresolvedToolFailure = true;
@@ -605,21 +574,29 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         }
       }
       if (call.name === "delete_file") {
-        const deleteResult = toolResult as { skipped?: string; reason?: string };
+        const deleteResult = toolResult as { skipped?: string; reason?: string; category?: string };
         if (deleteResult.skipped === "permission-required") {
           const deletePath = typeof args.path === "string" ? args.path : "";
           const reason = deleteResult.reason ?? "This delete needs your approval before Foundry can continue.";
           await emit("summary", "warning", "Waiting for your approval", { details: { reason, command: `delete ${deletePath}` } });
-          return finalize("awaiting-approval", `Waiting for your approval to delete: ${deletePath}`, turn);
+          return finalize("awaiting-approval", `Waiting for your approval to delete: ${deletePath}`, turn, {
+            kind: "delete",
+            target: deletePath,
+            category: deleteResult.category ?? "unrecognized",
+          });
         }
       }
       if (call.name === "run_command") {
-        const commandResult = toolResult as { exitCode?: number | null; skipped?: string; reason?: string };
+        const commandResult = toolResult as { exitCode?: number | null; skipped?: string; reason?: string; category?: string };
         if (commandResult.skipped === "permission-required") {
           const command = typeof args.command === "string" ? args.command : "";
           const reason = commandResult.reason ?? "This command needs your approval before Foundry can continue.";
           await emit("summary", "warning", "Waiting for your approval", { details: { reason, command } });
-          return finalize("awaiting-approval", `Waiting for your approval to run: ${command}`, turn);
+          return finalize("awaiting-approval", `Waiting for your approval to run: ${command}`, turn, {
+            kind: "command",
+            target: command,
+            category: commandResult.category ?? "unrecognized",
+          });
         }
         if (!commandResult.skipped && typeof commandResult.exitCode === "number") {
           if (commandResult.exitCode !== 0) {
@@ -630,7 +607,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           }
         }
       }
-      conversation.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(toolResult) });
+      conversation.push({ role: "user", content: [{ type: "tool_result", toolUseId: callId, content: JSON.stringify(toolResult) }] });
     }
   }
 
@@ -652,27 +629,26 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       role: "user",
       content: [
         {
-          type: "input_text",
+          type: "text",
           text: "You're out of turns for this run. Call report_blocked now with your best real understanding: what you found, what's most likely wrong or still needed, and what should happen next. Never say you ran out of turns or time — give a genuinely useful engineering update instead.",
         },
       ],
     });
-    const body = JSON.stringify({
-      model: modelForProfile(input.fastLane ? "fast" : "autonomous").model,
-      input: conversation,
-      tools,
-      tool_choice: { type: "function", name: "report_blocked" },
-      max_output_tokens: input.fastLane ? 1500 : 2500,
-    });
-    const result = await callOpenAIResponsesManaged<MissionOpenAIResponse>({
-      apiKey: input.apiKey,
-      body,
-      workspaceId: input.workspaceId,
-      userId: input.userId,
-      maxAttempts: 4,
-    });
-    if (result.status !== "ok") return "";
-    const call = (result.data.output ?? []).find((item) => item.type === "function_call" && item.name === "report_blocked" && item.call_id);
+    const result = await callManagedModel(
+      {
+        provider,
+        model,
+        effort,
+        system,
+        messages: conversation,
+        tools,
+        toolChoice: { name: "report_blocked" },
+        maxOutputTokens: input.fastLane ? 1500 : 2500,
+      },
+      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 4 },
+    );
+    if (result.stopReason === "error") return "";
+    const call = result.toolCalls.find((item) => item.name === "report_blocked");
     if (!call) return "";
     const args = safeJsonParse(call.arguments ?? "{}") ?? {};
     return typeof args.reason === "string" ? args.reason : "";
@@ -699,7 +675,7 @@ function formatParentContext(context: MissionParentContext): string {
   return lines.join("\n");
 }
 
-function specificCheckInForCalls(functionCalls: MissionOutputItem[]) {
+function specificCheckInForCalls(functionCalls: ManagedToolCall[]) {
   const runCommand = functionCalls.find((call) => call.name === "run_command");
   if (runCommand) {
     const args = safeJsonParse(runCommand.arguments ?? "{}") ?? {};
@@ -1231,15 +1207,6 @@ function textSimilarity(a: string, b: string) {
   let overlap = 0;
   for (const token of aTokens) if (bTokens.has(token)) overlap += 1;
   return overlap / Math.max(aTokens.size, bTokens.size);
-}
-
-function extractMessageText(items: MissionOutputItem[], outputText?: string) {
-  if (outputText) return outputText;
-  return items
-    .filter((item) => item.type === "message")
-    .flatMap((item) => [item.text, ...(item.content ?? []).map((content) => content.text)])
-    .filter(Boolean)
-    .join("\n");
 }
 
 function safeJsonParse(value: string): Record<string, unknown> | undefined {

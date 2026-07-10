@@ -441,29 +441,49 @@ function spawnCommand(
   cwd: string,
   timeoutMs: number,
   keepAliveOnTimeout = false,
-): Promise<{ exitCode: number | null; stdout: string; stderr: string; durationMs: number; timedOut: boolean }> {
+  signal?: AbortSignal,
+): Promise<{ exitCode: number | null; stdout: string; stderr: string; durationMs: number; timedOut: boolean; aborted: boolean }> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
+    if (signal?.aborted) {
+      resolve({ exitCode: null, stdout: "", stderr: "Stopped by user before this command started.", durationMs: 0, timedOut: false, aborted: true });
+      return;
+    }
     // A dev/server command (keepAliveOnTimeout) must survive past its own grace-period timeout — detached so
     // it isn't tied to this request's process group, and never killed when the grace period elapses below.
     const child = spawn(cmd, args, { cwd, windowsHide: true, env: childProcessEnv(), detached: keepAliveOnTimeout });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
     let settled = false;
 
     const finish = (exitCode: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
       resolve({
         exitCode,
         stdout: stdout.length > 20_000 ? `${stdout.slice(0, 20_000)}\n[output truncated]` : stdout,
         stderr: stderr.length > 20_000 ? `${stderr.slice(0, 20_000)}\n[output truncated]` : stderr,
         durationMs: Date.now() - startedAt,
         timedOut,
+        aborted,
       });
     };
+
+    // Killing a shell-wrapped process on Windows doesn't reliably fire 'close' promptly (or at all) for
+    // the original process — resolve immediately on abort instead of waiting for it, so Stop unblocks the
+    // mission's turn loop right away rather than hanging until the OS eventually reaps the child.
+    const onAbort = () => {
+      if (settled) return;
+      aborted = true;
+      if (typeof child.pid === "number") killProcessTree(child.pid);
+      else child.kill();
+      finish(null);
+    };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -494,7 +514,14 @@ function spawnCommand(
   });
 }
 
-async function runCommandWithShellFallback(command: string, cwd: string, session: { stickyShellId?: WindowsShellId }, timeoutMs: number, keepAliveOnTimeout = false): Promise<ProjectCommandResult> {
+async function runCommandWithShellFallback(
+  command: string,
+  cwd: string,
+  session: { stickyShellId?: WindowsShellId },
+  timeoutMs: number,
+  keepAliveOnTimeout = false,
+  signal?: AbortSignal,
+): Promise<ProjectCommandResult> {
   const order = windowsShellOrder(session.stickyShellId);
   const firstAttemptedShellId = order.find((id) => shellInvocation(id, command));
   let lastResult: Awaited<ReturnType<typeof spawnCommand>> | null = null;
@@ -503,8 +530,11 @@ async function runCommandWithShellFallback(command: string, cwd: string, session
   for (const shellId of order) {
     const invocation = shellInvocation(shellId, command);
     if (!invocation) continue;
-    const result = await spawnCommand(invocation.cmd, invocation.args, cwd, timeoutMs, keepAliveOnTimeout);
+    const result = await spawnCommand(invocation.cmd, invocation.args, cwd, timeoutMs, keepAliveOnTimeout, signal);
     lastResult = result;
+    if (result.aborted) {
+      return { ...result, shellUsed: shellId, skipped: "aborted", stderr: result.stderr || "Stopped by user." };
+    }
     lastShellId = shellId;
     const isMismatch = result.exitCode !== 0 && isShellMismatchFailure(result.stdout, result.stderr);
     if (!isMismatch) {
@@ -623,7 +653,7 @@ export function simpleDiff(before: string, after: string) {
   return { added, removed, text: rows.join("\n"), firstChangedLine, lastChangedLine };
 }
 
-export function createServerProjectAccess(root: string, mode: ProjectAccessMode): ProjectAccess {
+export function createServerProjectAccess(root: string, mode: ProjectAccessMode, signal?: AbortSignal): ProjectAccess {
   const resolvedRoot = path.resolve(root);
   let commandsRun = 0;
   const shellSession: { stickyShellId?: WindowsShellId } = {};
@@ -755,7 +785,7 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode)
         return { ...result, approvalScope };
       }
 
-      return { ...(await runCommandWithShellFallback(command, requestedCwd, shellSession, COMMAND_TIMEOUT_MS)), approvalScope };
+      return { ...(await runCommandWithShellFallback(command, requestedCwd, shellSession, COMMAND_TIMEOUT_MS, false, signal)), approvalScope };
     },
 
     async searchFiles(query, opts = {}) {
@@ -814,7 +844,7 @@ export async function connectLocalConnectorRoot(config: LocalConnectorConfig, fo
   return payload as { ok: boolean; root?: string; error?: string };
 }
 
-export function createLocalConnectorProjectAccess(config: LocalConnectorConfig): ProjectAccess {
+export function createLocalConnectorProjectAccess(config: LocalConnectorConfig, signal?: AbortSignal): ProjectAccess {
   const baseUrl = config.url.replace(/\/+$/, "");
   const root = config.rootLabel || baseUrl;
   const headers = {
@@ -822,11 +852,12 @@ export function createLocalConnectorProjectAccess(config: LocalConnectorConfig):
     ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),
   };
 
-  async function post<T>(endpoint: string, body: Record<string, unknown>): Promise<T> {
+  async function post<T>(endpoint: string, body: Record<string, unknown>, requestSignal?: AbortSignal): Promise<T> {
     const response = await fetch(`${baseUrl}${endpoint}`, {
       method: "POST",
       headers,
       body: JSON.stringify({ root, ...body }),
+      signal: requestSignal,
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(typeof payload.error === "string" ? payload.error : `Connector ${endpoint} failed with HTTP ${response.status}.`);
@@ -848,13 +879,17 @@ export function createLocalConnectorProjectAccess(config: LocalConnectorConfig):
       return post<ProjectWriteResult>("/write", { path: relativePath, content });
     },
     async runCommand(command, cwd = "", options) {
-      return post<ProjectCommandResult>("/run", {
-        command,
-        cwd,
-        approvedCommands: options?.approvedCommands ?? [],
-        approvedCategories: options?.approvedCategories ?? [],
-        standingApprovedCommands: options?.standingApprovedCommands ?? [],
-      });
+      return post<ProjectCommandResult>(
+        "/run",
+        {
+          command,
+          cwd,
+          approvedCommands: options?.approvedCommands ?? [],
+          approvedCategories: options?.approvedCategories ?? [],
+          standingApprovedCommands: options?.standingApprovedCommands ?? [],
+        },
+        signal,
+      );
     },
     async searchFiles(query, opts = {}) {
       const result = await post<{ hits?: ProjectSearchHit[] }>("/search", { query, maxResults: opts.maxResults ?? 20 });

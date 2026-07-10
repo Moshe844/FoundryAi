@@ -1,41 +1,62 @@
 import { NextResponse } from "next/server";
-import { callOpenAIResponsesManaged } from "@/lib/ai/foundry-runtime";
-import { modelForProfile } from "@/lib/ai/model-router";
-import { buildDiscoveryRequestBody, parseDiscoveryRefinement } from "@/lib/ai/project-discovery-llm";
+import { callManagedModel } from "@/lib/ai/providers/dispatch";
+import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
+import { TIER_DISPLAY, resolveModelForTier, tierForRuntimePayload } from "@/lib/ai/model-router";
+import type { ModelMode, ModelTier } from "@/lib/ai/model-router";
+import { DISCOVERY_REFINEMENT_SYSTEM_PROMPT, REFINE_PROJECT_DISCOVERY_TOOL, discoveryRefinementUserText, parseDiscoveryRefinement } from "@/lib/ai/project-discovery-llm";
 import type { DiscoveryRefinementContext } from "@/lib/ai/project-discovery-llm";
 import type { ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
+import type { ProviderId } from "@/lib/ai/providers/types";
 
-type DiscoverOutputItem = {
-  type?: string;
-  name?: string;
-  arguments?: string;
-};
+const DEFAULT_MODE: ModelMode = "builder";
 
 export async function POST(request: Request) {
   try {
-    const body = (await request.json()) as { context?: DiscoveryRefinementContext; heuristic?: ProjectDiscoveryResult };
+    const body = (await request.json()) as { context?: DiscoveryRefinementContext; heuristic?: ProjectDiscoveryResult; provider?: ProviderId; mode?: ModelMode };
     const heuristic = body.heuristic;
     if (!heuristic) {
       return NextResponse.json({ ok: false, error: "A heuristic discovery result is required." }, { status: 400 });
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    // provider defaults to "openai" — see app/api/factory/intent/route.ts for the same pattern and rationale.
+    const provider: ProviderId = body.provider ?? "openai";
+    const apiKey = apiKeyForProvider(provider);
     if (!apiKey) {
-      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY is not configured.", discovery: heuristic, alternativeStacks: [], deploymentNote: "", lede: "" }, { status: 503 });
+      return NextResponse.json({ ok: false, error: `${envVarNameForProvider(provider)} is not configured.`, discovery: heuristic, alternativeStacks: [], deploymentNote: "", lede: "" }, { status: 503 });
     }
 
     const context = compactContext(body.context);
-    const model = modelForProfile("standard").model;
+    // mode defaults to "builder" — the fixed tier this route always used before the mode selector
+    // existed, so a client that doesn't send mode gets byte-identical behavior. "auto" classifies from
+    // the actual project context/description rather than re-deriving anything client-side.
+    const mode: ModelMode = body.mode ?? DEFAULT_MODE;
+    const autoSelected = mode === "auto";
+    const tier: ModelTier = autoSelected ? tierForRuntimePayload({ context, heuristic }) : mode;
+    const { model, effort } = resolveModelForTier(tier, { provider });
 
-    const result = await callOpenAIResponsesManaged<{ output?: DiscoverOutputItem[]; error?: { message?: string } }>({
-      apiKey,
-      body: JSON.stringify(buildDiscoveryRequestBody(context, heuristic, model)),
-      workspaceId: "factory-discover",
-      userId: "local-user",
-      maxAttempts: 2,
-    });
+    const result = await callManagedModel(
+      {
+        provider,
+        model,
+        effort: effort ?? "medium",
+        system: DISCOVERY_REFINEMENT_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: discoveryRefinementUserText(context, heuristic) }],
+          },
+        ],
+        tools: [REFINE_PROJECT_DISCOVERY_TOOL],
+        toolChoice: { name: "refine_project_discovery" },
+        // Was 3000 — with stack_options added, that budget was too tight and the model's tool-call JSON
+        // was getting truncated before parsing could succeed, silently falling back to defaults on every
+        // call. Reasoning tokens count against this same budget, so headroom matters here.
+        maxOutputTokens: 6000,
+      },
+      { apiKey, workspaceId: "factory-discover", userId: "local-user", maxAttempts: 2 },
+    );
 
-    const call = result.data.output?.find((item) => item.type === "function_call" && item.name === "refine_project_discovery");
+    const call = result.toolCalls.find((item) => item.name === "refine_project_discovery");
     const refined = parseDiscoveryRefinement(call?.arguments, heuristic);
 
     return NextResponse.json({
@@ -44,7 +65,15 @@ export async function POST(request: Request) {
       alternativeStacks: refined.alternativeStacks,
       deploymentNote: refined.deploymentNote,
       lede: refined.lede,
+      stackOptions: refined.stackOptions,
       usage: result.usage,
+      modelSelection: {
+        tier,
+        provider,
+        model,
+        autoSelected,
+        reason: autoSelected ? `Auto-classified as ${TIER_DISPLAY[tier].label} from the project description.` : undefined,
+      },
     });
   } catch (error) {
     return NextResponse.json(

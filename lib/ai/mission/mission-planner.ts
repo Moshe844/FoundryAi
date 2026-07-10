@@ -1,5 +1,7 @@
-import { callOpenAIResponsesManaged, type RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
-import { modelForProfile } from "@/lib/ai/model-router";
+import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
+import { callManagedModel } from "@/lib/ai/providers/dispatch";
+import { resolveModelForTier } from "@/lib/ai/model-router";
+import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { FactoryObjectiveChecklistItem } from "@/lib/factory/types";
 
 export type MissionPlan = {
@@ -9,10 +11,8 @@ export type MissionPlan = {
   usage?: RuntimeUsageRecord;
 };
 
-const PLAN_TOOL = {
-  type: "function",
+const PLAN_TOOL: NeutralTool = {
   name: "set_checklist",
-  strict: true,
   description: "Decompose the user's request into a concrete, independently verifiable checklist grouped into phases, and flag any contradictions that need the user's input before work can safely start.",
   parameters: {
     type: "object",
@@ -39,12 +39,6 @@ const PLAN_TOOL = {
     },
     required: ["items", "conflicts"],
   },
-} as const;
-
-type PlanOutputItem = {
-  type?: string;
-  name?: string;
-  arguments?: string;
 };
 
 /** A request is "multi-part" when it reads like a requirements list rather than one or two asks — numbered/bulleted lines, or just a lot of distinct clauses. Full extraction (not milestone compression) applies here. */
@@ -78,6 +72,7 @@ export async function planMission(input: {
   workspaceId?: string;
   userId?: string;
   canRunCommands?: boolean;
+  provider?: ProviderId;
 }): Promise<MissionPlan> {
   const canRunCommands = input.canRunCommands ?? true;
   if (isConcreteDebugRequest(input.task)) {
@@ -85,67 +80,48 @@ export async function planMission(input: {
   }
   const multiPart = isMultiPartRequest(input.task);
   const highRisk = isHighRiskArchitectureRequest(input.task);
-  const body = JSON.stringify({
-    model: modelForProfile("standard").model,
-    reasoning: { effort: "low" },
-    tools: [PLAN_TOOL],
-    tool_choice: "auto",
-    max_output_tokens: multiPart ? 4000 : 1800,
-    input: [
-      {
-        role: "system",
-        content: [
-          {
-            type: "input_text",
-            text: [
-              multiPart
-                ? "This request reads like a requirements list, not one or two asks. Extract EVERY distinct requirement it contains — do not compress, merge, or drop any of them to keep the list short. Only combine two clauses into one item when they describe the exact same piece of work (e.g. 'add a name field, required' is one item, not two)."
-                : "Break the user's request into the small number of milestone-level phases a senior engineer would naturally check off — not a line-by-line decomposition of every clause. Group closely related requirements into a single milestone. Produce roughly 3 to 6 items regardless of how many individual details the request mentions. Only exceed that if the request genuinely contains that many unrelated, independently-shippable pieces of work.",
-              "Assign every item a `phase`: a short label for the natural engineering stage it belongs to (e.g. \"Foundation\", \"Feature: checkout\", \"Feature: admin editor\", \"Polish & verification\"). Items in the same phase should be worked together; order phases the way an engineer would sequence the work (setup/foundation first, polish/verification last). Use the same phase label verbatim for every item in that phase.",
-              highRisk
-                ? "This request is a large-scope rewrite, migration, conversion, or architecture change. Break it into real milestone phases: first inventory the existing project's actual features and behavior (not its file layout), then build the target implementation feature-by-feature, then a final phase. This is feature parity, not a line-by-line translation — a feature should be re-expressed the way it's idiomatically done in the target stack, not transliterated statement-by-statement from the old one. That final phase must contain items that each verify one specific piece of the existing project's real behavior still works after the change — derive those items from what this specific project actually does (its real screens, routes, or features), never a generic 'test everything' item."
-                : "",
-              "Each item must still be independently verifiable — something that can be confirmed true or false by reading real files or command output later — avoid vague items like 'improve the code'.",
-              canRunCommands
-                ? "The executor can only read/write files and run shell commands — it cannot open a browser, click through a UI, or inspect DevTools. Never write an item that can only be confirmed by doing those things (e.g. 'check the Console/Network tab', 'visually confirm in the browser'). If a requirement can only be verified that way, verify what the file contents and command output actually support instead, and phrase the item around that."
-                : "The executor can only read and write files in this environment — it cannot run any shell commands (no build, no test, no runtime check, no git). Never write an item that can only be verified by running something (e.g. 'run the tests', 'confirm it builds', 'commit the change', 'check the console'). Every item must be verifiable purely by reading file contents.",
-              "Do not invent requirements the user did not ask for. Do not add generic housekeeping items.",
-              "For concrete bug reports, errors, stack traces, failed uploads, parse errors, failed builds, or broken behavior, do not add product-design questions, README updates, logging tasks, reproduction scripts, or tests unless the user explicitly asked. Start with inspecting the existing code path, then the smallest repair, then direct verification.",
-              "Give each item a short kebab-case id and a concise label written the way an engineer would describe the work, not a sub-task.",
-              "If two requirements contradict each other (e.g. asking for two different databases, two different auth schemes for the same flow), or a requirement contradicts what the project snapshot shows already exists, do not silently pick one. Add a plain-language question describing the contradiction to `conflicts` instead, and still include a best-guess checklist so work isn't blocked entirely — the caller decides whether to pause on conflicts.",
-              "The project snapshot below is real, current data already gathered from this exact project — a file listing and, when this is a Node project, its actual package.json scripts. Before adding anything to `conflicts`, check whether the snapshot already answers it: a single package.json with one relevant script means there is exactly one app and one way to run it — don't ask which one, or invent a generic multi-service question ('frontend, backend, or all?') that doesn't match what's actually there. Only ask about something the snapshot and task genuinely leave undetermined.",
-              "Always call set_checklist with your answer. Do not respond with plain text.",
-            ].join("\n"),
-          },
-        ],
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: [
-              `Objective: ${input.objective}`,
-              `Task: ${input.task}`,
-              "",
-              "Current project snapshot:",
-              input.projectSnapshot || "(empty or unknown project structure)",
-            ].join("\n"),
-          },
-        ],
-      },
-    ],
-  });
+  // provider defaults to "openai" — matches this function's behavior before the provider abstraction
+  // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
+  const provider: ProviderId = input.provider ?? "openai";
+  const { model, effort } = resolveModelForTier("builder", { provider });
 
-  const result = await callOpenAIResponsesManaged<{ output?: PlanOutputItem[] }>({
-    apiKey: input.apiKey,
-    body,
-    workspaceId: input.workspaceId,
-    userId: input.userId,
-    maxAttempts: 4,
-  });
+  const system = [
+    multiPart
+      ? "This request reads like a requirements list, not one or two asks. Extract EVERY distinct requirement it contains — do not compress, merge, or drop any of them to keep the list short. Only combine two clauses into one item when they describe the exact same piece of work (e.g. 'add a name field, required' is one item, not two)."
+      : "Break the user's request into the small number of milestone-level phases a senior engineer would naturally check off — not a line-by-line decomposition of every clause. Group closely related requirements into a single milestone. Produce roughly 3 to 6 items regardless of how many individual details the request mentions. Only exceed that if the request genuinely contains that many unrelated, independently-shippable pieces of work.",
+    "Assign every item a `phase`: a short label for the natural engineering stage it belongs to (e.g. \"Foundation\", \"Feature: checkout\", \"Feature: admin editor\", \"Polish & verification\"). Items in the same phase should be worked together; order phases the way an engineer would sequence the work (setup/foundation first, polish/verification last). Use the same phase label verbatim for every item in that phase.",
+    highRisk
+      ? "This request is a large-scope rewrite, migration, conversion, or architecture change. Break it into real milestone phases: first inventory the existing project's actual features and behavior (not its file layout), then build the target implementation feature-by-feature, then a final phase. This is feature parity, not a line-by-line translation — a feature should be re-expressed the way it's idiomatically done in the target stack, not transliterated statement-by-statement from the old one. That final phase must contain items that each verify one specific piece of the existing project's real behavior still works after the change — derive those items from what this specific project actually does (its real screens, routes, or features), never a generic 'test everything' item."
+      : "",
+    "Each item must still be independently verifiable — something that can be confirmed true or false by reading real files or command output later — avoid vague items like 'improve the code'.",
+    canRunCommands
+      ? "The executor can only read/write files and run shell commands — it cannot open a browser, click through a UI, or inspect DevTools. Never write an item that can only be confirmed by doing those things (e.g. 'check the Console/Network tab', 'visually confirm in the browser'). If a requirement can only be verified that way, verify what the file contents and command output actually support instead, and phrase the item around that."
+      : "The executor can only read and write files in this environment — it cannot run any shell commands (no build, no test, no runtime check, no git). Never write an item that can only be verified by running something (e.g. 'run the tests', 'confirm it builds', 'commit the change', 'check the console'). Every item must be verifiable purely by reading file contents.",
+    "Do not invent requirements the user did not ask for. Do not add generic housekeeping items.",
+    "For concrete bug reports, errors, stack traces, failed uploads, parse errors, failed builds, or broken behavior, do not add product-design questions, README updates, logging tasks, reproduction scripts, or tests unless the user explicitly asked. Start with inspecting the existing code path, then the smallest repair, then direct verification.",
+    "Give each item a short kebab-case id and a concise label written the way an engineer would describe the work, not a sub-task.",
+    "If two requirements contradict each other (e.g. asking for two different databases, two different auth schemes for the same flow), or a requirement contradicts what the project snapshot shows already exists, do not silently pick one. Add a plain-language question describing the contradiction to `conflicts` instead, and still include a best-guess checklist so work isn't blocked entirely — the caller decides whether to pause on conflicts.",
+    "The project snapshot below is real, current data already gathered from this exact project — a file listing and, when this is a Node project, its actual package.json scripts. Before adding anything to `conflicts`, check whether the snapshot already answers it: a single package.json with one relevant script means there is exactly one app and one way to run it — don't ask which one, or invent a generic multi-service question ('frontend, backend, or all?') that doesn't match what's actually there. Only ask about something the snapshot and task genuinely leave undetermined.",
+    "Always call set_checklist with your answer. Do not respond with plain text.",
+  ].join("\n");
 
-  const call = result.data.output?.find((item) => item.type === "function_call" && item.name === "set_checklist");
+  const userText = [`Objective: ${input.objective}`, `Task: ${input.task}`, "", "Current project snapshot:", input.projectSnapshot || "(empty or unknown project structure)"].join("\n");
+
+  const result = await callManagedModel(
+    {
+      provider,
+      model,
+      effort: effort ?? "low",
+      system,
+      messages: [{ role: "user", content: [{ type: "text", text: userText }] }],
+      tools: [PLAN_TOOL],
+      toolChoice: "auto",
+      maxOutputTokens: multiPart ? 4000 : 1800,
+    },
+    { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 4 },
+  );
+
+  const call = result.toolCalls.find((item) => item.name === "set_checklist");
   const parsed = call?.arguments ? safeJsonParse(call.arguments) : undefined;
   const rawItems = parsed?.items ?? [];
   const conflicts = Array.isArray(parsed?.conflicts) ? parsed.conflicts.map((item) => String(item).trim()).filter(Boolean) : [];

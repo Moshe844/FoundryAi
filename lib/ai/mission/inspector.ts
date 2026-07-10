@@ -1,5 +1,7 @@
-import { callOpenAIResponsesManaged, type RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
-import { modelForProfile } from "@/lib/ai/model-router";
+import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
+import { callManagedModel } from "@/lib/ai/providers/dispatch";
+import { resolveModelForTier } from "@/lib/ai/model-router";
+import type { NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { ProjectAccess } from "@/lib/ai/mission/project-access";
 import type { FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus } from "@/lib/factory/types";
 
@@ -8,27 +10,14 @@ export type InspectionResult = {
   usage: RuntimeUsageRecord[];
 };
 
-type InspectorOutputItem = {
-  type?: string;
-  text?: string;
-  content?: Array<{ type?: string; text?: string }>;
-  call_id?: string;
-  name?: string;
-  arguments?: string;
-};
-
-const INSPECTOR_TOOLS = [
+const INSPECTOR_TOOLS: NeutralTool[] = [
   {
-    type: "function",
     name: "list_dir",
-    strict: true,
     description: "List immediate files and subdirectories under a path relative to the project root. Use \"\" for the root.",
     parameters: { type: "object", additionalProperties: false, properties: { path: { type: "string" } }, required: ["path"] },
   },
   {
-    type: "function",
     name: "read_file",
-    strict: true,
     description: "Read a text file's contents relative to the project root.",
     parameters: {
       type: "object",
@@ -38,20 +27,16 @@ const INSPECTOR_TOOLS = [
     },
   },
   {
-    type: "function",
     name: "search_files",
-    strict: true,
     description: "Search file names and contents under the project root for a query string.",
     parameters: { type: "object", additionalProperties: false, properties: { query: { type: "string" } }, required: ["query"] },
   },
   {
-    type: "function",
     name: "answer",
-    strict: true,
     description: "Give the final answer to the user's question. Call this once you have read enough real files to answer accurately, never before.",
     parameters: { type: "object", additionalProperties: false, properties: { text: { type: "string" } }, required: ["text"] },
   },
-] as const;
+];
 
 const DEFAULT_MAX_TURNS = 8;
 const DEFAULT_SOFT_BUDGET_MS = 20_000;
@@ -65,7 +50,12 @@ export async function runReadOnlyInspection(input: {
   userId?: string;
   maxTurns?: number;
   softBudgetMs?: number;
+  provider?: ProviderId;
 }): Promise<InspectionResult> {
+  // provider defaults to "openai" — matches this function's behavior before the provider abstraction
+  // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
+  const provider: ProviderId = input.provider ?? "openai";
+  const { model, effort } = resolveModelForTier("builder", { provider });
   const maxTurns = input.maxTurns ?? DEFAULT_MAX_TURNS;
   const softBudgetMs = input.softBudgetMs ?? DEFAULT_SOFT_BUDGET_MS;
   const startedAt = Date.now();
@@ -101,26 +91,22 @@ export async function runReadOnlyInspection(input: {
     await emit("reasoning", "completed", trimmed);
   }
 
-  const conversation: Record<string, unknown>[] = [
-    {
-      role: "system",
-      content: [
-        {
-          type: "input_text",
-          text: [
-            "You answer a question about a real, already-connected software project by reading its actual files — you investigate like an engineer skimming a codebase, not a script that reads everything indiscriminately.",
-            "Before you call a tool, if the reason isn't already obvious from what you just said, say one short plain sentence connecting it to the user's actual question — e.g. \"Checking server.js because the question mentions an upload token.\" Don't restate the same reasoning again in different words turn after turn; speak again only when your understanding changes.",
-            "Most questions can be answered from a small number of well-chosen files — an entry point, a config/README, and whatever plausibly matches the question's own keywords. Do not read the whole project and do not open a file you have no real reason to open.",
-            "Answer as soon as you have a real, useful answer — never keep reading just to be thorough. A grounded partial answer beats an exhaustive one that never arrives.",
-            "Never invent file names or behavior. Only describe what you actually read.",
-            "Do not write or modify any files — you have no ability to do so in this mode.",
-            "When ready, call answer with a concise, specific response, and end by asking what the user wants next.",
-          ].join("\n"),
-        },
-      ],
-    },
-    { role: "user", content: [{ type: "input_text", text: input.message }] },
-  ];
+  const system = [
+    "You answer a question about a real, already-connected software project by reading its actual files — you investigate like an engineer skimming a codebase, not a script that reads everything indiscriminately.",
+    "Before you call a tool, if the reason isn't already obvious from what you just said, say one short plain sentence connecting it to the user's actual question — e.g. \"Checking server.js because the question mentions an upload token.\" Don't restate the same reasoning again in different words turn after turn; speak again only when your understanding changes.",
+    "Most questions can be answered from a small number of well-chosen files — an entry point, a config/README, and whatever plausibly matches the question's own keywords. Do not read the whole project and do not open a file you have no real reason to open.",
+    "Answer as soon as you have a real, useful answer — never keep reading just to be thorough. A grounded partial answer beats an exhaustive one that never arrives.",
+    "Never invent file names or behavior. Only describe what you actually read.",
+    "Do not write or modify any files — you have no ability to do so in this mode.",
+    "When ready, call answer with a concise, specific response, and end by asking what the user wants next.",
+  ].join("\n");
+
+  // Provider-agnostic turn history — each provider's request-builder renders this into its own wire
+  // format at call time (see lib/ai/providers/*-runtime.ts). This is the same representation
+  // executor.ts's multi-turn loop migrates to in Phase C; this smaller read-only loop validates the
+  // pattern first.
+  const conversation: NeutralMessage[] = [{ role: "user", content: [{ type: "text", text: input.message }] }];
+  let toolCallSeq = 0;
 
   for (let turn = 1; turn <= maxTurns; turn += 1) {
     const elapsedMs = Date.now() - startedAt;
@@ -131,46 +117,45 @@ export async function runReadOnlyInspection(input: {
         role: "user",
         content: [
           {
-            type: "input_text",
+            type: "text",
             text: "Answer now with your best understanding based on everything you've read so far. Do not ask to continue and never say you ran out of time or turns — give a real, useful answer: what you found, what's most likely relevant (or wrong), and what you'd check or change next.",
           },
         ],
       });
     }
 
-    const body = JSON.stringify({
-      model: modelForProfile("standard").model,
-      input: conversation,
-      tools: INSPECTOR_TOOLS,
-      tool_choice: mustAnswerNow ? { type: "function", name: "answer" } : "auto",
-      max_output_tokens: 1200,
-    });
-
-    const result = await callOpenAIResponsesManaged<{ output?: InspectorOutputItem[]; output_text?: string }>({
-      apiKey: input.apiKey,
-      body,
-      workspaceId: input.workspaceId,
-      userId: input.userId,
-      maxAttempts: 6,
-    });
+    const result = await callManagedModel(
+      {
+        provider,
+        model,
+        effort: effort ?? "low",
+        system,
+        messages: conversation,
+        tools: INSPECTOR_TOOLS,
+        toolChoice: mustAnswerNow ? { name: "answer" } : "auto",
+        maxOutputTokens: 1200,
+      },
+      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 6 },
+    );
     usage.push(result.usage);
 
-    if (result.status !== "ok") continue;
+    if (result.stopReason === "error") continue;
 
-    const outputItems = result.data.output ?? [];
-    const call = outputItems.find((item) => item.type === "function_call" && item.name && item.call_id);
-    const messageText = result.data.output_text || extractMessageText(outputItems);
+    const call = result.toolCalls[0];
+    const messageText = result.text;
 
     if (!call) {
       if (messageText) return { answer: messageText, usage };
-      conversation.push({ role: "user", content: [{ type: "input_text", text: "Continue, or call answer with what you found." }] });
+      conversation.push({ role: "user", content: [{ type: "text", text: "Continue, or call answer with what you found." }] });
       continue;
     }
 
     if (messageText) await emitReasoning(messageText);
 
     const args = safeJsonParse(call.arguments ?? "{}") ?? {};
-    conversation.push({ type: "function_call", call_id: call.call_id, name: call.name, arguments: call.arguments ?? "{}" });
+    toolCallSeq += 1;
+    const callId = call.id ?? `call-${turn}-${toolCallSeq}`;
+    conversation.push({ role: "assistant", content: [{ type: "tool_use", id: callId, name: call.name, arguments: call.arguments ?? "{}", thoughtSignature: call.thoughtSignature }] });
 
     if (call.name === "answer") {
       const text = typeof args.text === "string" ? args.text : "";
@@ -183,7 +168,7 @@ export async function runReadOnlyInspection(input: {
     const toolResult = await executeReadOnlyTool(call.name ?? "", args, input.access, emit).catch((error) => ({
       error: error instanceof Error ? error.message : "Tool call failed unexpectedly.",
     }));
-    conversation.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(toolResult) });
+    conversation.push({ role: "user", content: [{ type: "tool_result", toolUseId: callId, content: JSON.stringify(toolResult) }] });
   }
 
   const fallbackAnswer = investigatedPaths.length
@@ -228,14 +213,6 @@ async function executeReadOnlyTool(
     default:
       return { error: `Unknown tool: ${name}` };
   }
-}
-
-function extractMessageText(items: InspectorOutputItem[]) {
-  return items
-    .filter((item) => item.type === "message")
-    .flatMap((item) => [item.text, ...(item.content ?? []).map((content) => content.text)])
-    .filter(Boolean)
-    .join("\n");
 }
 
 function safeJsonParse(value: string): Record<string, unknown> | undefined {

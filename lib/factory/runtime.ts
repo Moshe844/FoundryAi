@@ -9,7 +9,7 @@ import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { isHighRiskArchitectureRequest, planMission } from "@/lib/ai/mission/mission-planner";
 import { runMissionExecutor } from "@/lib/ai/mission/executor";
 import { createLocalConnectorProjectAccess, createServerProjectAccess, type LocalConnectorConfig, type ProjectAccess } from "@/lib/ai/mission/project-access";
-import type { ExecutionMissionVerification, FactoryCommandEvent, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryExistingProjectRequest, FactoryFileEntry, FactoryJournalEntry, FactoryObjectiveChecklistItem, FactoryPreviewPlatform, FactoryPreviewState, FactoryProjectResult, FactorySessionSummary, FactorySourceMode, FactoryUploadedFile, MissionParentContext } from "@/lib/factory/types";
+import type { ExecutionMissionVerification, FactoryCommandEvent, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryExistingProjectRequest, FactoryFileEntry, FactoryJournalEntry, FactoryObjectiveChecklistItem, FactoryPreviewPlatform, FactoryPreviewState, FactoryProjectResult, FactorySessionSummary, FactorySourceMode, FactoryUploadedFile, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 
@@ -91,7 +91,7 @@ async function writeJournal(projectId: string, entries: FactoryJournalEntry[]) {
   await writeFile(filePath, entries.length ? `${body}\n` : "", "utf8");
 }
 
-export async function createFactoryProject(brief: string, onEvent?: ExecutionEmitter): Promise<FactoryProjectResult> {
+export async function createFactoryProject(brief: string, onEvent?: ExecutionEmitter, discovery?: StructuredDiscovery): Promise<FactoryProjectResult> {
   const spec = parseBrief(brief);
   const projectPath = await uniqueProjectPath(spec.slug);
   const projectId = path.basename(projectPath);
@@ -182,11 +182,28 @@ export async function createFactoryProject(brief: string, onEvent?: ExecutionEmi
   }
 
   const primaryIdea = spec.projectDescription.trim() || spec.projectType.trim() || spec.template.trim() || "a small web app";
-  const objective = `Create a new ${stackProfile.label} project: ${primaryIdea}`;
-  const task = [
-    `Build: ${primaryIdea}.`,
-    spec.instructions ? `Additional instructions — these override or extend the above if they conflict with it: ${spec.instructions}` : "",
-  ].filter(Boolean).join("\n");
+  const objective = discovery
+    ? `Create a new ${stackProfile.label} project: ${discovery.projectType}`
+    : `Create a new ${stackProfile.label} project: ${primaryIdea}`;
+  // When a Decision Memo exists, build the executor's real working context directly from its typed
+  // fields instead of the single-line primaryIdea fragment above — otherwise everything the user
+  // reviewed (architecture, features, data model, key facts) never reaches the executor at all,
+  // even though it was written to foundry-brief.md. See StructuredDiscovery's doc comment.
+  const task = discovery
+    ? [
+        `Build: ${discovery.projectType}.`,
+        `Architecture: ${discovery.architecture}`,
+        discovery.mainFeatures.length ? `Main features:\n${discovery.mainFeatures.map((item) => `- ${item}`).join("\n")}` : "",
+        discovery.dataModel.length ? `Data model: ${discovery.dataModel.join(", ")}` : "",
+        discovery.styleDirection ? `Style direction: ${discovery.styleDirection}` : "",
+        discovery.keyFacts.length ? `Key facts:\n${discovery.keyFacts.map((item) => `- ${item}`).join("\n")}` : "",
+        discovery.decisions.length ? `Decisions already made — do not re-litigate these:\n${discovery.decisions.map((item) => `- ${item.dimension}: ${item.hypothesis} (${item.rationale})`).join("\n")}` : "",
+        spec.instructions ? `Additional instructions — these override or extend the above if they conflict with it: ${spec.instructions}` : "",
+      ].filter(Boolean).join("\n\n")
+    : [
+        `Build: ${primaryIdea}.`,
+        spec.instructions ? `Additional instructions — these override or extend the above if they conflict with it: ${spec.instructions}` : "",
+      ].filter(Boolean).join("\n");
 
   const rawAccess = createServerProjectAccess(projectPath, "local-folder");
   const access = accessForCapabilityLevel(rawAccess, stackProfile.level);
@@ -407,7 +424,7 @@ async function executeConnectorProjectTask(brief: string, task: string, connecto
     details: { task, mode: "Local connector", editingTarget: rootLabel, writePolicy: "Connector direct edits and commands. Changes happen in the real connected project folder." },
   });
 
-  const access = createLocalConnectorProjectAccess(connector);
+  const access = createLocalConnectorProjectAccess(connector, signal);
   await emitExecution(execution, "inspection", "completed", "Local connector connected", {
     details: { editingTarget: rootLabel, sourceMode: "Local connector - direct disk edits and commands" },
   });
@@ -563,7 +580,7 @@ async function runExistingProjectMission(params: {
   approvalResponse?: ApprovalResponse;
 }): Promise<{ status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: string[]; changedFiles: string[]; commands?: FactoryCommandEvent[]; sessionSummary?: FactorySessionSummary; verification?: ExecutionMissionVerification[]; events: string[] }> {
   const { projectPath, task, sourceMode, execution, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse } = params;
-  const access = createServerProjectAccess(projectPath, sourceMode);
+  const access = createServerProjectAccess(projectPath, sourceMode, signal);
   const snapshot = await buildProjectSnapshot(access);
   return runExistingProjectMissionWithAccess({ access, task, sourceMode, execution, projectSnapshot: snapshot, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse });
 }

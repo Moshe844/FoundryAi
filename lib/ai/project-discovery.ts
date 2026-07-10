@@ -269,6 +269,31 @@ const profiles: SignalProfile[] = [
   },
 ];
 
+export type DiscoverySeed = {
+  /** Domain label, e.g. "Inventory management system" — same vocabulary discoverProject() uses for projectType. */
+  domainGuess: string;
+  /** Stable id for the matched profile ("inventory", "game", "custom", ...) — a coarse category hint, not a final stack/category decision. */
+  categoryGuess: string;
+  confidence: "low" | "medium";
+};
+
+/**
+ * Stage A of the Discovery Engine (lib/discovery/engine.ts's seedDiscovery()) — a fast, synchronous,
+ * zero-authored-prose guess used only to populate the DiscoveryRail instantly on card click/keystroke,
+ * before the mandatory LLM pass (Stage B, /api/factory/discover) produces the real analysis. Reuses
+ * the same profile-matching table discoverProject() still uses today for its fuller (soon-to-shrink)
+ * heuristic result — kept as one function so the domain-matching logic isn't duplicated.
+ */
+export function guessDomainSeed(prompt: string): DiscoverySeed {
+  const normalized = prompt.trim();
+  const profile = chooseProfile(normalized);
+  return {
+    domainGuess: profile?.label ?? deriveTarget(normalized),
+    categoryGuess: profile?.id ?? "custom",
+    confidence: profile ? "medium" : "low",
+  };
+}
+
 export function actionForDecision(confidence: number, stakes: DiscoveryStakes): DiscoveryAction {
   const highConfidence = confidence >= HIGH_CONFIDENCE;
   if (highConfidence && stakes === "low") return "silent-infer";

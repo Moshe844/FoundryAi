@@ -141,8 +141,27 @@ export type FactoryProjectResult = {
   verification?: ExecutionMissionVerification[];
 };
 
+/**
+ * Structured Decision Memo content, sent verbatim instead of relying on a regex-scraped fragment of
+ * the flattened brief string — same problem, same fix as MissionParentContext below, applied to
+ * project creation instead of mission follow-ups. Optional so ad-hoc/legacy callers of
+ * /api/factory/create that only ever sent a brief keep working unchanged.
+ */
+export type StructuredDiscovery = {
+  projectType: string;
+  architecture: string;
+  styleDirection: string;
+  mainFeatures: string[];
+  dataModel: string[];
+  keyFacts: string[];
+  futureCapabilities: string[];
+  recommendedStack: string;
+  decisions: Array<{ dimension: string; hypothesis: string; rationale: string }>;
+};
+
 export type FactoryCreateRequest = {
   brief: string;
+  discovery?: StructuredDiscovery;
 };
 
 export type FactoryUploadedFile = {

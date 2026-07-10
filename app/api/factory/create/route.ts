@@ -18,9 +18,13 @@ export async function POST(request: Request) {
             controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
           };
 
-          void createFactoryProject(body.brief ?? "", (event: FactoryExecutionEvent) => {
-            send({ type: "event", event });
-          })
+          void createFactoryProject(
+            body.brief ?? "",
+            (event: FactoryExecutionEvent) => {
+              send({ type: "event", event });
+            },
+            body.discovery,
+          )
             .then((result) => {
               send({ type: "result", result });
               controller.close();
@@ -40,7 +44,7 @@ export async function POST(request: Request) {
       });
     }
 
-    const result = await createFactoryProject(body.brief);
+    const result = await createFactoryProject(body.brief, undefined, body.discovery);
     return NextResponse.json(result);
   } catch (error) {
     return NextResponse.json(
