@@ -6,10 +6,15 @@ import path from "node:path";
 import { capabilityLevelForStackChoice, checklistForRequest, detectStackProfile, isLikelySmallSingleFileRequest, isLikelyTinyOperationalRequest, unsupportedCreationMessage, unsupportedEditingMessage, type StackCapabilityLevel, type StackProfile } from "@/lib/factory/language-adapters";
 import { classifyIntent, deterministicMutationIntent } from "@/lib/ai/mission/intent-classifier";
 import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
-import { isHighRiskArchitectureRequest, planMission } from "@/lib/ai/mission/mission-planner";
+import { isHighRiskArchitectureRequest, isMultiPartRequest, planMission } from "@/lib/ai/mission/mission-planner";
 import { runMissionExecutor } from "@/lib/ai/mission/executor";
+import { reviewArchitecture } from "@/lib/ai/mission/architecture-review";
+import { verifyMissionResult } from "@/lib/ai/mission/mission-verifier";
+import { assessMissionComplexity, shouldRunArchitectureReview, shouldRunVerify, tierForStage } from "@/lib/ai/mission/orchestration";
+import { DEFAULT_MISSION_QUALITY, type MissionQualityLevel } from "@/lib/ai/mission/quality-level";
+import type { ProviderId } from "@/lib/ai/providers/types";
 import { createLocalConnectorProjectAccess, createServerProjectAccess, type LocalConnectorConfig, type ProjectAccess } from "@/lib/ai/mission/project-access";
-import type { ExecutionMissionVerification, FactoryCommandEvent, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryExistingProjectRequest, FactoryFileEntry, FactoryJournalEntry, FactoryObjectiveChecklistItem, FactoryPreviewPlatform, FactoryPreviewState, FactoryProjectResult, FactorySessionSummary, FactorySourceMode, FactoryUploadedFile, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
+import type { ExecutionMissionVerification, FactoryCommandEvent, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryExistingProjectRequest, FactoryFileEntry, FactoryJournalEntry, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactoryPreviewPlatform, FactoryPreviewState, FactoryProjectResult, FactorySessionSummary, FactorySourceMode, FactoryUploadedFile, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 
@@ -240,6 +245,7 @@ export async function createFactoryProject(brief: string, onEvent?: ExecutionEmi
     onEvent: emitEvent,
     approvedCategories: ["dependencies", "package-runner"],
     offerMockGate,
+    hasBuildTooling: stackHasBuildStep(stackProfile.id),
   });
 
   execution.checklist.splice(0, execution.checklist.length, ...result.checklist);
@@ -307,16 +313,17 @@ export async function executeExistingProjectTask(
   parentMission?: MissionParentContext,
   continuity?: "carry_forward_plan" | "fresh_plan",
   approvalResponse?: ApprovalResponse,
+  quality?: MissionQualityLevel,
 ): Promise<FactoryProjectResult> {
   const localPath = typeof localPathOrEmitter === "string" ? localPathOrEmitter.trim() : "";
   const onEvent = typeof localPathOrEmitter === "function" ? localPathOrEmitter : maybeEmitter;
   const spec = parseBrief(brief);
   const projectName = spec.projectName === "Open Existing Project" ? "Existing Project" : spec.projectName;
   if (localConnector?.url) {
-    return executeConnectorProjectTask(brief, task, localConnector, projectName, onEvent, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse);
+    return executeConnectorProjectTask(brief, task, localConnector, projectName, onEvent, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse, quality);
   }
   if (localPath) {
-    return executeLocalProjectTask(brief, task, localPath, projectName, onEvent, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse);
+    return executeLocalProjectTask(brief, task, localPath, projectName, onEvent, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse, quality);
   }
   const safeFiles = uploadedFiles.filter((file) => isUsefulUploadedFile(file.path)).map((file) => ({ ...file, path: safeRelativePath(file.path) })).filter((file) => file.path);
   const connectedPath = connectedProjectPathFromFiles(uploadedFiles);
@@ -387,7 +394,7 @@ export async function executeExistingProjectTask(
 
   await noteMissingDependencies(projectPath, detected.packageManager, execution);
 
-  const mission = await runExistingProjectMission({ projectPath, task, sourceMode: "uploaded-copy", execution, signal, approvedCategories });
+  const mission = await runExistingProjectMission({ projectPath, task, sourceMode: "uploaded-copy", execution, signal, approvedCategories, quality });
   commands.push(...(mission.commands ?? []));
   const files = await listProjectFilesWithStatuses(projectPath, mission.changedFiles, new Set(safeFiles.map((file) => file.path)));
   events.push(...mission.events);
@@ -412,7 +419,7 @@ export async function executeExistingProjectTask(
   });
 }
 
-async function executeConnectorProjectTask(brief: string, task: string, connector: LocalConnectorConfig, projectName: string, onEvent?: ExecutionEmitter, signal?: AbortSignal, approvedCategories: string[] = [], approvedCommands: string[] = [], parentMission?: MissionParentContext, continuity?: "carry_forward_plan" | "fresh_plan", approvalResponse?: ApprovalResponse): Promise<FactoryProjectResult> {
+async function executeConnectorProjectTask(brief: string, task: string, connector: LocalConnectorConfig, projectName: string, onEvent?: ExecutionEmitter, signal?: AbortSignal, approvedCategories: string[] = [], approvedCommands: string[] = [], parentMission?: MissionParentContext, continuity?: "carry_forward_plan" | "fresh_plan", approvalResponse?: ApprovalResponse, quality?: MissionQualityLevel): Promise<FactoryProjectResult> {
   const rootLabel = connector.rootLabel || connector.url;
   const projectId = `connector-${slugify(rootLabel) || "project"}`;
   const execution = createExecutionContext(onEvent, projectId);
@@ -446,6 +453,7 @@ async function executeConnectorProjectTask(brief: string, task: string, connecto
     parentMission,
     continuity,
     approvalResponse,
+    quality,
   });
 
   commands.push(...(mission.commands ?? []));
@@ -478,7 +486,7 @@ async function executeConnectorProjectTask(brief: string, task: string, connecto
   });
 }
 
-async function executeLocalProjectTask(brief: string, task: string, localPath: string, projectName: string, onEvent?: ExecutionEmitter, signal?: AbortSignal, approvedCategories: string[] = [], approvedCommands: string[] = [], parentMission?: MissionParentContext, continuity?: "carry_forward_plan" | "fresh_plan", approvalResponse?: ApprovalResponse): Promise<FactoryProjectResult> {
+async function executeLocalProjectTask(brief: string, task: string, localPath: string, projectName: string, onEvent?: ExecutionEmitter, signal?: AbortSignal, approvedCategories: string[] = [], approvedCommands: string[] = [], parentMission?: MissionParentContext, continuity?: "carry_forward_plan" | "fresh_plan", approvalResponse?: ApprovalResponse, quality?: MissionQualityLevel): Promise<FactoryProjectResult> {
   const projectPath = path.resolve(localPath);
   const projectId = `local-${slugify(path.basename(projectPath)) || "project"}`;
   const execution = createExecutionContext(onEvent, projectId);
@@ -534,7 +542,7 @@ async function executeLocalProjectTask(brief: string, task: string, localPath: s
 
   await noteMissingDependencies(projectPath, detected.packageManager, execution);
 
-  const mission = await runExistingProjectMission({ projectPath, task, sourceMode: "local-folder", execution, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse });
+  const mission = await runExistingProjectMission({ projectPath, task, sourceMode: "local-folder", execution, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse, quality });
   commands.push(...(mission.commands ?? []));
   const files = await listProjectFilesWithStatuses(projectPath, mission.changedFiles, new Set(localFiles.map((file) => file.path)));
   events.push(...mission.events);
@@ -578,11 +586,12 @@ async function runExistingProjectMission(params: {
   parentMission?: MissionParentContext;
   continuity?: "carry_forward_plan" | "fresh_plan";
   approvalResponse?: ApprovalResponse;
+  quality?: MissionQualityLevel;
 }): Promise<{ status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: string[]; changedFiles: string[]; commands?: FactoryCommandEvent[]; sessionSummary?: FactorySessionSummary; verification?: ExecutionMissionVerification[]; events: string[] }> {
-  const { projectPath, task, sourceMode, execution, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse } = params;
+  const { projectPath, task, sourceMode, execution, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse, quality } = params;
   const access = createServerProjectAccess(projectPath, sourceMode, signal);
   const snapshot = await buildProjectSnapshot(access);
-  return runExistingProjectMissionWithAccess({ access, task, sourceMode, execution, projectSnapshot: snapshot, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse });
+  return runExistingProjectMissionWithAccess({ access, task, sourceMode, execution, projectSnapshot: snapshot, signal, approvedCategories, approvedCommands, parentMission, continuity, approvalResponse, quality });
 }
 
 async function runExistingProjectMissionWithAccess(params: {
@@ -597,8 +606,9 @@ async function runExistingProjectMissionWithAccess(params: {
   parentMission?: MissionParentContext;
   continuity?: "carry_forward_plan" | "fresh_plan";
   approvalResponse?: ApprovalResponse;
+  quality?: MissionQualityLevel;
 }): Promise<{ status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: string[]; changedFiles: string[]; commands?: FactoryCommandEvent[]; sessionSummary?: FactorySessionSummary; verification?: ExecutionMissionVerification[]; events: string[]; stackLabel?: string }> {
-  const { access, task, execution, projectSnapshot, signal, approvedCategories = [], approvedCommands = [], parentMission, continuity, approvalResponse } = params;
+  const { access, task, execution, projectSnapshot, signal, approvedCategories = [], approvedCommands = [], parentMission, continuity, approvalResponse, quality = DEFAULT_MISSION_QUALITY } = params;
   const apiKey = process.env.OPENAI_API_KEY;
   const objective = engineeringObjectiveForTask(task);
 
@@ -749,7 +759,16 @@ async function runExistingProjectMissionWithAccess(params: {
   } else if (fastLane) {
     checklist = [{ id: "small-edit-applied", label: `Complete: ${task.trim()}`, status: "pending" as const }];
   } else {
-    const plan = await planMission({ objective, task, projectSnapshot, apiKey, canRunCommands: executorAccess.capabilities.canRunCommands });
+    // Pre-plan complexity is necessarily an estimate (distinctPhases doesn't exist until the checklist
+    // does) — fine here, since tierForStage's "plan" branch only ever keys off quality, never complexity.
+    const prePlanComplexity = assessMissionComplexity({
+      highRisk: isHighRiskArchitectureRequest(task),
+      multiPart: isMultiPartRequest(task),
+      distinctPhases: 0,
+      stackCapabilityLevel: stackProfile.level,
+      fileCount: rootEntries.length,
+    });
+    const plan = await planMission({ objective, task, projectSnapshot, apiKey, canRunCommands: executorAccess.capabilities.canRunCommands, tier: tierForStage("plan", quality, prePlanComplexity) });
     checklist = plan.checklist;
     if (plan.conflicts.length) {
       execution.checklist.splice(0, execution.checklist.length, ...checklist);
@@ -778,8 +797,50 @@ async function runExistingProjectMissionWithAccess(params: {
       },
     });
   }
-  const highRisk = isHighRiskArchitectureRequest(task) && new Set(checklist.map((item) => item.phase).filter(Boolean)).size >= 2 && stackProfile.level >= 4;
-  const result = await runMissionExecutor({ objective, task, checklist, access: executorAccess, apiKey, onEvent, signal, preApprovedCommands, approvedCategories, standingApprovedCommands: approvedCommands, priorContext: parentMission, fastLane, highRisk });
+  const distinctPhases = new Set(checklist.map((item) => item.phase).filter(Boolean)).size;
+  const highRisk = isHighRiskArchitectureRequest(task) && distinctPhases >= 2 && stackProfile.level >= 4;
+  const complexity = assessMissionComplexity({
+    highRisk,
+    multiPart: isMultiPartRequest(task),
+    distinctPhases,
+    stackCapabilityLevel: stackProfile.level,
+    fileCount: rootEntries.length,
+  });
+
+  let architectureNotes: string | undefined;
+  if (shouldRunArchitectureReview(quality, complexity, highRisk)) {
+    // Not internal — Capability-First Experience: this is one of the visible workflow steps a user
+    // should see ("Reviewing architecture"), not raw model/provider plumbing.
+    await emitExecution(execution, "planning", "running", "Reviewing architecture");
+    const review = await reviewArchitecture({ objective, task, checklist, projectSnapshot, apiKey, tier: tierForStage("review", quality, complexity) });
+    if (review.revisedChecklist?.length) {
+      checklist = review.revisedChecklist;
+      execution.checklist.splice(0, execution.checklist.length, ...checklist);
+    }
+    if (review.concerns.length) architectureNotes = review.concerns.map((concern) => `- ${concern}`).join("\n");
+    await emitExecution(execution, "planning", "completed", review.concerns.length ? "Architecture review flagged concerns" : "Architecture review found no concerns", {
+      details: review.concerns.length ? { concerns: review.concerns } : undefined,
+    });
+  }
+
+  const result = await runMissionExecutor({
+    objective,
+    task,
+    checklist,
+    access: executorAccess,
+    apiKey,
+    onEvent,
+    signal,
+    preApprovedCommands,
+    approvedCategories,
+    standingApprovedCommands: approvedCommands,
+    priorContext: parentMission,
+    fastLane,
+    highRisk,
+    tier: tierForStage("implement", quality, complexity),
+    architectureNotes,
+    hasBuildTooling: stackHasBuildStep(stackProfile.id),
+  });
 
   const hasHonestlySkippedItem = result.checklist.some((item) => item.status === "skipped");
   if (result.status === "passed" && deterministicIntent && deterministicIntent !== "undo" && result.changedFiles.length === 0 && !hasHonestlySkippedItem) {
@@ -791,9 +852,133 @@ async function runExistingProjectMissionWithAccess(params: {
     result.blocker = blocker;
   }
 
+  if (result.status === "passed" && shouldRunVerify(quality)) {
+    await runVerificationAndEscalate({ objective, task, result, executorAccess, apiKey, signal, preApprovedCommands, approvedCategories, approvedCommands, execution, quality, complexity });
+  }
+
   execution.checklist.splice(0, execution.checklist.length, ...result.checklist);
   finishObjectiveChecklist(execution, result.status, result.blocker);
   return { status: result.status, blocker: result.blocker, changedFiles: result.changedFiles, commands: result.commands, sessionSummary: result.sessionSummary, verification: result.verification, events: [], stackLabel: stackProfile.label };
+}
+
+function narrativeObjectsFromTimeline(timeline: FactoryExecutionEvent[]): FactoryNarrativeObject[] {
+  return timeline.map((event) => event.narrative).filter((item): item is FactoryNarrativeObject => Boolean(item));
+}
+
+/**
+ * The Verify stage + confidence escalation: reviews the mission's own real evidence, and if not
+ * confident, runs exactly one continuation pass (via the existing priorContext mechanism) forced to
+ * "architect" tier before accepting the result. Never blocks — a low-confidence outcome, even after a
+ * second opinion, is surfaced as a flag in the final summary rather than pausing the mission (confirmed
+ * product decision). Mutates `result` in place with whatever the follow-up pass found.
+ */
+async function runVerificationAndEscalate(input: {
+  objective: string;
+  task: string;
+  result: Awaited<ReturnType<typeof runMissionExecutor>>;
+  executorAccess: ProjectAccess;
+  apiKey: string;
+  signal?: AbortSignal;
+  preApprovedCommands: string[];
+  approvedCategories: string[];
+  approvedCommands: string[];
+  execution: ExecutionContext;
+  quality: MissionQualityLevel;
+  complexity: ReturnType<typeof assessMissionComplexity>;
+}): Promise<void> {
+  const { objective, task, result, executorAccess, apiKey, signal, preApprovedCommands, approvedCategories, approvedCommands, execution, quality, complexity } = input;
+  const onEvent = (event: FactoryExecutionEvent) => execution.emit(event);
+
+  // Not internal — see the matching note on "Reviewing architecture" above.
+  await emitExecution(execution, "planning", "running", "Verifying build");
+  const verifyTier = tierForStage("verify", quality, complexity);
+  const verification = await verifyMissionResult({
+    objective,
+    task,
+    checklist: result.checklist,
+    changedFiles: result.changedFiles,
+    commands: result.commands,
+    narrativeObjects: narrativeObjectsFromTimeline(result.timeline),
+    apiKey,
+    tier: verifyTier,
+  });
+
+  let notes = verification.notes;
+  let secondOpinionDisagreed = false;
+
+  if (verification.confidence < 60) {
+    const secondApiKey = process.env.ANTHROPIC_API_KEY;
+    if (secondApiKey) {
+      const secondProvider: ProviderId = "anthropic";
+      const secondOpinion = await verifyMissionResult({
+        objective,
+        task,
+        checklist: result.checklist,
+        changedFiles: result.changedFiles,
+        commands: result.commands,
+        narrativeObjects: narrativeObjectsFromTimeline(result.timeline),
+        apiKey: secondApiKey,
+        provider: secondProvider,
+        tier: verifyTier,
+      });
+      secondOpinionDisagreed = Math.abs(secondOpinion.confidence - verification.confidence) >= 25;
+      notes = `${verification.notes} Second opinion (${secondProvider}, ${secondOpinion.confidence}% confident): ${secondOpinion.notes}`.trim();
+    }
+  }
+
+  if (verification.confidence >= 80) {
+    await emitExecution(execution, "planning", "completed", "Verified build and evidence", { details: { confidence: verification.confidence, notes } });
+    return;
+  }
+
+  // 60-95 (and <60 after a second opinion) escalate to exactly one continuation pass at architect tier
+  // — never more than one, and the mission stays "passed" regardless of what it finds (see file-level note).
+  await emitExecution(execution, "planning", "warning", "Verification wasn't fully confident — running one more pass", {
+    details: { confidence: verification.confidence, notes },
+  });
+
+  const priorContext: MissionParentContext = {
+    id: `verify-${Date.now()}`,
+    state: "passed",
+    plan: result.checklist,
+    files_touched: result.changedFiles.map((filePath) => ({ path: filePath, status: "edited", verified: true })),
+    commands_run: result.commands.map((command) => ({ command: command.command, exitCode: command.exitCode })),
+    decisions: result.sessionSummary?.changes ?? [],
+    findings: [],
+    summary: result.sessionSummary?.outcome ?? "",
+  };
+
+  const followUp = await runMissionExecutor({
+    objective,
+    task: `Double check and address any remaining concerns before this mission is truly done: ${notes || "the verification pass was not fully confident this is correct."}`,
+    checklist: [{ id: "verify-followup", label: "Address verification concerns and re-confirm the fix", status: "pending" }],
+    access: executorAccess,
+    apiKey,
+    onEvent,
+    signal,
+    preApprovedCommands,
+    approvedCategories,
+    standingApprovedCommands: approvedCommands,
+    priorContext,
+    tier: "architect",
+    maxTurns: 12,
+  });
+
+  if (followUp.status === "passed") {
+    result.checklist = followUp.checklist;
+    result.changedFiles = [...new Set([...result.changedFiles, ...followUp.changedFiles])];
+    result.commands = [...result.commands, ...followUp.commands];
+    result.sessionSummary = followUp.sessionSummary ?? result.sessionSummary;
+    result.verification = followUp.verification ?? result.verification;
+  }
+
+  if (verification.confidence < 60) {
+    const flagNote = secondOpinionDisagreed
+      ? `Foundry was less confident about this mission (${verification.confidence}% before the follow-up pass) and a second opinion disagreed — worth a second look before relying on it.`
+      : `Foundry was less confident about this mission (${verification.confidence}% before the follow-up pass) — worth a second look before relying on it.`;
+    await emitExecution(execution, "summary", "warning", "Lower confidence — worth a second look", { details: { reason: flagNote } });
+    if (result.sessionSummary) result.sessionSummary = { ...result.sessionSummary, flags: [...result.sessionSummary.flags, flagNote] };
+  }
 }
 
 async function markJournalEntryReverted(projectId: string, entryId: string) {
@@ -1622,6 +1807,17 @@ function isNextStack(stack: string) {
  * only offer the mock-first gate when "Open Preview" will genuinely work. */
 function hasLivePreviewFor(stack: string) {
   return isNextStack(stack) || /\b(html|css|static)\b/i.test(stack);
+}
+
+/**
+ * Whether a stack has a build/test/dev step that can actually exit 0 and serve as runtime verification.
+ * A pure static HTML/CSS/JS site (and an unrecognized/unknown project) has none — a static preview
+ * server never exits 0 — so the executor must NOT hard-require a runtime command to complete such a
+ * mission (see verifyCompletion's hasBuildTooling gate in lib/ai/mission/executor.ts). Everything with a
+ * real toolchain (Next.js, Node, Python, .NET, Java, Go, Rust, etc.) keeps the stricter requirement.
+ */
+function stackHasBuildStep(stackId: string): boolean {
+  return stackId !== "static-html" && stackId !== "unknown";
 }
 
 async function noteMissingDependencies(projectPath: string, packageManager: string, execution: ExecutionContext) {

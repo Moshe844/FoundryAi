@@ -53,6 +53,7 @@ import type { BlockedCommandAction, ExecutionLevel } from "@/components/executio
 import { ModelModeSelector, ModelSelectionChip } from "@/components/ModelModeSelector";
 import { useModelMode } from "@/lib/ai/model-mode";
 import type { ModelMode, TierResolution } from "@/lib/ai/model-router";
+import { MissionQualitySelector } from "@/components/MissionQualitySelector";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 
@@ -1758,11 +1759,14 @@ function ProjectComposer({
             <span className="truncate normal-case tracking-normal">Queued: {queuedTask}</span>
           </span>
         ) : null}
-        {canUndo && !isBusy && !locked && onUndo ? (
-          <button type="button" className="ml-auto normal-case tracking-normal text-foundry-subtle underline-offset-2 hover:text-foundry-ink hover:underline" onClick={onUndo}>
-            Undo last change
-          </button>
-        ) : null}
+        <span className="ml-auto flex items-center gap-2">
+          <MissionQualitySelector />
+          {canUndo && !isBusy && !locked && onUndo ? (
+            <button type="button" className="normal-case tracking-normal text-foundry-subtle underline-offset-2 hover:text-foundry-ink hover:underline" onClick={onUndo}>
+              Undo last change
+            </button>
+          ) : null}
+        </span>
       </div>
       <div className="flex items-end gap-2 rounded-md border border-foundry-teal/25 bg-black/30 p-2 focus-within:border-foundry-teal/60">
         <textarea
@@ -2729,27 +2733,52 @@ function wait(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
 
+type DiscoveryEngineOutcome = Awaited<ReturnType<typeof runDiscoveryEngine>>;
+
+/**
+ * Module-level cache so the single real discovery request survives React's mount→unmount→mount cycle
+ * (Strict Mode in dev, plus any spurious parent remount). Before this, UnderstandingStep's effect
+ * cleanup called controller.abort(), which tore down the in-flight fetch before it ever reached the
+ * server on every mount — so discovery ALWAYS fell back to the local heuristic, producing the generic
+ * "Next.js" memo and the four hardcoded fallback stack cards. Keying by the request signature means a
+ * remount awaits the same in-flight promise instead of firing (and aborting) a fresh one.
+ */
+const discoveryRequestCache = new Map<string, Promise<DiscoveryEngineOutcome>>();
+
+function cachedRunDiscoveryEngine(key: string, run: () => Promise<DiscoveryEngineOutcome>): Promise<DiscoveryEngineOutcome> {
+  const existing = discoveryRequestCache.get(key);
+  if (existing) return existing;
+  const promise = run().catch((error) => {
+    // Drop failures from the cache so a later attempt for the same project can retry cleanly.
+    discoveryRequestCache.delete(key);
+    throw error;
+  });
+  discoveryRequestCache.set(key, promise);
+  return promise;
+}
+
 function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart; onUpdate: (update: Partial<ProjectStart>) => void; onAdvance: () => void }) {
   const [showEscape, setShowEscape] = useState(false);
-  const controllerRef = useRef<AbortController | null>(null);
+  // "cancelled" means only "this mounted instance should stop touching state" — it must NOT abort the
+  // underlying discovery request. React remounts this component (Strict Mode in dev + parent
+  // re-renders); tying the network request's lifetime to the effect is exactly what made the fetch get
+  // aborted before it reached the server every time. The request now lives in discoveryRequestCache,
+  // independent of any single mount.
   const cancelledRef = useRef(false);
   const { mode: modelMode } = useModelMode();
 
   useEffect(() => {
     cancelledRef.current = false;
-    const controller = new AbortController();
-    controllerRef.current = controller;
-    // A real gpt-5 analysis with reasoning effort "medium" and a large structured response has been
-    // observed taking 60-80+ seconds — the previous 12s timeout aborted essentially every real call
-    // and silently fell back to the generic heuristic, which is why every project looked identical.
-    // 110s gives real headroom above observed worst-case latency.
-    const timeout = window.setTimeout(() => controller.abort(), 110000);
     const escapeTimer = window.setTimeout(() => {
       if (!cancelledRef.current) setShowEscape(true);
     }, 8000);
     // Foundry is genuinely reasoning here even when the API call resolves in a
     // few hundred ms — without a floor the "thinking" beat can flash by unnoticed.
     const minVisibleMs = 1800;
+    // A real gpt-5 analysis has been observed taking 60-80+ seconds; 110s is the hard ceiling. This is a
+    // Promise.race that resolves to a heuristic fallback rather than aborting the shared request, so a
+    // remount's own timer can never tear down an in-flight discovery the cache is serving.
+    const hardTimeoutMs = 110000;
     const startedAt = Date.now();
 
     async function refine() {
@@ -2765,24 +2794,31 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
       // as the fallback memo content if the LLM call fails, so the user never lands on a blank summary
       // step just because OPENAI_API_KEY is unset or the network hiccups.
       const heuristic = discoverProject(seedText);
+      const cacheKey = JSON.stringify([seedText, start.template.id, start.subtype, start.customSubtype, start.projectLocation, modelMode, start.uploadNames]);
       try {
         const inspection = start.uploadNames.length ? inspectExistingSourceNames(start.uploadNames) : null;
-        const result = await runDiscoveryEngine(
-          heuristic,
-          {
-            starter: { id: start.template.id, title: start.template.title },
-            subtype: start.subtype,
-            customSubtype: start.customSubtype,
-            projectDescription: start.projectDescription,
-            location: {
-              choice: start.projectLocation,
-              label: locationLabel(start.projectLocation),
-              existingSourceRisky: inspection?.risky ?? false,
-              existingSourceSignals: inspection?.signals ?? [],
-            },
-          },
-          { signal: controller.signal, mode: modelMode }
-        );
+        const result = await Promise.race([
+          cachedRunDiscoveryEngine(cacheKey, () =>
+            runDiscoveryEngine(
+              heuristic,
+              {
+                starter: { id: start.template.id, title: start.template.title },
+                subtype: start.subtype,
+                customSubtype: start.customSubtype,
+                projectDescription: start.projectDescription,
+                location: {
+                  choice: start.projectLocation,
+                  label: locationLabel(start.projectLocation),
+                  existingSourceRisky: inspection?.risky ?? false,
+                  existingSourceSignals: inspection?.signals ?? [],
+                },
+              },
+              // Deliberately no AbortSignal — the request must outlive this effect's cleanup.
+              { mode: modelMode }
+            )
+          ),
+          wait(hardTimeoutMs).then((): DiscoveryEngineOutcome => ({ ok: false, error: "Discovery analysis exceeded the time budget." })),
+        ]);
         if (!cancelledRef.current) {
           onUpdate({
             discovery: result.ok && result.discovery ? result.discovery : heuristic,
@@ -2794,8 +2830,8 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           });
         }
       } catch {
-        // Network error, timeout, or malformed response — fall back to the heuristic-only memo rather
-        // than leaving start.discovery null and the summary step blank.
+        // Network error or malformed response — fall back to the heuristic-only memo rather than
+        // leaving start.discovery null and the summary step blank.
         if (!cancelledRef.current) onUpdate({ discovery: heuristic });
       } finally {
         window.clearTimeout(escapeTimer);
@@ -2808,18 +2844,16 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
     void refine();
     return () => {
       cancelledRef.current = true;
-      window.clearTimeout(timeout);
       window.clearTimeout(escapeTimer);
-      controller.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function skipRefinement() {
     cancelledRef.current = true;
-    controllerRef.current?.abort();
     // Same fallback as a failed LLM call (see refine() above) — skipping must never leave the summary
-    // step with a blank memo just because the user got impatient before Stage B resolved.
+    // step with a blank memo just because the user got impatient before Stage B resolved. The in-flight
+    // request keeps running in the cache; it just no longer has a listener.
     if (!start.discovery) {
       const seedText = start.projectDescription.trim() || start.appKind;
       if (seedText.trim()) onUpdate({ discovery: discoverProject(seedText) });
@@ -4615,8 +4649,8 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
         <div>
           <p className="mb-2.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">What Foundry Already Knows</p>
           <ul className="grid gap-2 sm:grid-cols-2">
-            {discovery.keyFacts.map((fact) => (
-              <li key={fact} className="flex items-baseline gap-2 text-[13.5px] leading-relaxed text-foundry-ink">
+            {discovery.keyFacts.map((fact, index) => (
+              <li key={`${fact}-${index}`} className="flex items-baseline gap-2 text-[13.5px] leading-relaxed text-foundry-ink">
                 <CheckCircle2 size={13} className="mt-[3px] shrink-0 text-foundry-teal" />
                 {fact}
               </li>
@@ -5039,12 +5073,16 @@ function genericArchitectureFor(stack: string, entities: string[]) {
 }
 
 /** "What Foundry Already Knows" carries a short architecture-derived tag that would otherwise keep
- * naming the old stack after the user switches — swap any fact that still mentions it. */
+ * naming the old stack after the user switches — swap any fact that still mentions it. Dedupes the
+ * result: when two facts both mentioned the old stack they'd otherwise collapse into the identical
+ * "${newStack} architecture" string, which both shows the tag twice and (fatally) collides as a React
+ * list key. */
 function refreshArchitectureKeyFact(keyFacts: string[], oldStack: string, newStack: string): string[] {
   const oldStackLower = oldStack.trim().toLowerCase();
   if (!oldStackLower) return keyFacts;
   const replacement = `${newStack} architecture`;
-  return keyFacts.map((fact) => (fact.toLowerCase().includes(oldStackLower) ? replacement : fact));
+  const swapped = keyFacts.map((fact) => (fact.toLowerCase().includes(oldStackLower) ? replacement : fact));
+  return swapped.filter((fact, index) => swapped.indexOf(fact) === index);
 }
 
 function alternativeStacksFor(start: ProjectStart) {

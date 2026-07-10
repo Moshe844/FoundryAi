@@ -1,6 +1,6 @@
 import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
-import { resolveModelForTier } from "@/lib/ai/model-router";
+import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { FactoryObjectiveChecklistItem } from "@/lib/factory/types";
 
@@ -73,6 +73,8 @@ export async function planMission(input: {
   userId?: string;
   canRunCommands?: boolean;
   provider?: ProviderId;
+  /** Defaults to "builder" — this function's fixed tier before quality-aware routing existed. A quality-aware caller passes tierForStage("plan", quality, complexity) (lib/ai/mission/orchestration.ts) instead. */
+  tier?: ModelTier;
 }): Promise<MissionPlan> {
   const canRunCommands = input.canRunCommands ?? true;
   if (isConcreteDebugRequest(input.task)) {
@@ -83,7 +85,7 @@ export async function planMission(input: {
   // provider defaults to "openai" — matches this function's behavior before the provider abstraction
   // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
   const provider: ProviderId = input.provider ?? "openai";
-  const { model, effort } = resolveModelForTier("builder", { provider });
+  const { model, effort } = resolveModelForTier(input.tier ?? "builder", { provider });
 
   const system = [
     multiPart

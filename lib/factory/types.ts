@@ -1,4 +1,5 @@
 import type { CommandApprovalScope, CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
+import type { MissionQualityLevel } from "@/lib/ai/mission/quality-level";
 
 export type FactoryBuildStatus = "created" | "running" | "passed" | "failed" | "unsupported" | "stopped" | "awaiting-approval" | "needs-clarification" | "awaiting-mock-approval";
 
@@ -210,6 +211,8 @@ export type FactoryExistingProjectRequest = {
     decision: "approve-once" | "approve-command" | "approve-category" | "deny";
     category?: CommandPermissionCategory;
   };
+  /** Defaults to "standard" — how much planning/review/verification depth this mission gets. Independent of Model Mode (which model handles a call); see lib/ai/mission/quality-level.ts. */
+  quality?: MissionQualityLevel;
 };
 
 export type FactoryFileReadResult = {

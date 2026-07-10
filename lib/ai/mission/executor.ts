@@ -1,6 +1,6 @@
 import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
-import { modelForProfile, resolveModelForTier } from "@/lib/ai/model-router";
+import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
 import { isSensitiveFilePath, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
 import { approvalScopeLabel, type CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 import type { ManagedToolCall, NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
@@ -36,6 +36,12 @@ export type MissionExecutorInput = {
   offerMockGate?: boolean;
   /** Defaults to "openai" — the only provider missions ran on before this field existed. Passing "anthropic"/"google" routes this mission's autonomous loop through that provider's models instead. */
   provider?: ProviderId;
+  /** Overrides the fastLane/highRisk-derived tier outright — set by a quality-aware caller via tierForStage("implement", quality, complexity) (see lib/ai/mission/orchestration.ts). Omit to get that same 3-way mapping as the default. */
+  tier?: ModelTier;
+  /** Whether this project actually has a build/test/dev step that can exit 0 (Next.js, Node, Python, .NET, etc. -> true; a pure static HTML/CSS/JS site -> false). Defaults to true. When false, completion does NOT require a build/dev/test command to have run — a no-build static site can never produce one (a dev server never exits 0), and demanding it falsely blocks a fully-built site. */
+  hasBuildTooling?: boolean;
+  /** Advisory concerns from the Architecture Review stage (lib/ai/mission/architecture-review.ts), folded into the system prompt as extra context. Never blocks — the executor treats these exactly like any other planning input. */
+  architectureNotes?: string;
 };
 
 export type MissionExecutorResult = {
@@ -224,16 +230,14 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const narrativeObjects: FactoryNarrativeObject[] = [];
   const tools = toolSchemas(input.access.capabilities.canRunCommands);
   const provider: ProviderId = input.provider ?? "openai";
-  // For the default "openai" path, model/effort stay exactly what this call site used before the
-  // provider abstraction existed (modelForProfile, no reasoning-effort override) — that's what Phase
-  // C1/C2 verified as a zero-behavior-change migration. Anthropic/Google have no row in modelForProfile
-  // (an OpenAI-only legacy table), so they resolve through the real tier table instead, mapping this
-  // mission's existing fastLane/non-fastLane distinction onto Fast/Architect the same way the legacy
-  // profile mapping already does elsewhere (autonomous -> architect).
-  const { model, effort } =
-    provider === "openai"
-      ? { model: modelForProfile(input.fastLane ? "fast" : "autonomous").model, effort: undefined as "low" | "medium" | "high" | undefined }
-      : resolveModelForTier(input.fastLane ? "fast" : "architect", { provider });
+  // Cost Optimization mapping (Intelligent Mission Orchestration): fastLane -> fast, highRisk -> architect,
+  // everything else -> builder. input.tier lets a quality-aware caller (lib/factory/runtime.ts, via
+  // tierForStage("implement", quality, complexity)) override this outright; callers that don't pass one
+  // (or don't pass quality) get this same 3-way default, which is what "standard" quality resolves to
+  // anyway. Applied uniformly across all providers, including OpenAI — dropping the old OpenAI-only
+  // modelForProfile bypass, since this is now an intentional routing decision, not just a migration.
+  const effectiveTier: ModelTier = input.tier ?? (input.fastLane ? "fast" : input.highRisk ? "architect" : "builder");
+  const { model, effort } = resolveModelForTier(effectiveTier, { provider });
 
   async function emit(kind: FactoryExecutionEventKind, status: FactoryExecutionEventStatus, title: string, extra: Partial<FactoryExecutionEvent> = {}) {
     const event: FactoryExecutionEvent = {
@@ -339,6 +343,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               ? ["By default, run the app for the user, not just edit its files. Once you're reasonably confident in a fix and the project is a runnable app or server, start (or restart) it as your verification step and leave it running so the user can see the real result — don't stop at 'the file is correct.' Only skip this if the user explicitly said not to run it, or the checklist item genuinely doesn't need a running process to verify (e.g. a pure text/config change)."]
               : []),
             "Never create or write a file just to prove work happened. Every file you create or change must exist because it improves the actual project — evidence of your work belongs in what you say, not in the user's codebase.",
+            input.architectureNotes ? `A pre-implementation architecture review flagged these concerns before you started — address them where relevant, but they are advisory, not a blocking checklist:\n${input.architectureNotes}` : "",
           ].join("\n");
 
   // Provider-agnostic turn history — each provider's request-builder renders this into its own wire
@@ -477,7 +482,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       }
 
       if (call.name === "report_complete") {
-        const verification = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure, commands);
+        const verification = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure, commands, input.hasBuildTooling ?? true);
         if (!verification.ok) {
           completionRejections += 1;
           if (completionRejections > maxCompletionRejections) {
@@ -611,7 +616,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     }
   }
 
-  const ranOutOfTurnsButActuallyDone = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure, commands);
+  const ranOutOfTurnsButActuallyDone = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure, commands, input.hasBuildTooling ?? true);
   if (ranOutOfTurnsButActuallyDone.ok) {
     await emit("summary", "completed", "Behavior verified", {
       details: { summary: "The work was verified complete before the turn budget ran out; skipping the final wrap-up call." },
@@ -762,6 +767,7 @@ function verifyCompletion(
   fastLane = false,
   hasUnresolvedFailure = false,
   commands: MissionExecutorResult["commands"] = [],
+  hasBuildTooling = true,
 ): { ok: true } | { ok: false; reason: string } {
   // Section 19: never let a mission complete while its most recent command or write failure was never
   // followed by a fix or a successful retry — completion must never silently paper over a real failure.
@@ -796,7 +802,12 @@ function verifyCompletion(
   // only skipped items (already flagged honestly by the checks above).
   const touchedUi = changedInteractiveUiFiles(changedFiles);
   if (touchedUi.length && !hasSkippedItem) {
-    if (!hasRuntimeVerificationCommand(commands)) {
+    // The build/dev/test-run requirement only applies to projects that actually HAVE such a step. A
+    // pure static HTML/CSS/JS site has no build/test, and a static preview server never exits 0 — so
+    // demanding a runtime command there is unsatisfiable and falsely blocks a fully-built site. For
+    // those, reading the handler wiring (the interaction-verification narrative below) is the honest
+    // ceiling, and Foundry's own preview server is the real runtime check once the mission passes.
+    if (hasBuildTooling && !hasRuntimeVerificationCommand(commands)) {
       return {
         ok: false,
         reason: `Interactive UI file(s) changed (${touchedUi.join(", ")}) but no build/dev/test run verified the app still runs. A styling change is not enough evidence — actually run it.`,

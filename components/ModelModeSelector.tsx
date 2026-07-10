@@ -58,8 +58,9 @@ export function ModelModeSelector() {
 }
 
 /**
- * Renders the exact modelSelection a route returned — never re-derives tier/model client-side. Pass
- * showModelNames from useModelMode() to reveal the resolved provider/model id inline.
+ * Renders the exact modelSelection a route returned — never re-derives tier/model client-side.
+ * Capability-First Experience: normal users interact with Foundry, not individual AI models — this
+ * renders nothing at all unless Advanced Mode (showModelNames from useModelMode()) is on.
  */
 export function ModelSelectionChip({
   selection,
@@ -68,14 +69,14 @@ export function ModelSelectionChip({
   selection: (TierResolution & { autoSelected: boolean; reason?: string }) | null | undefined;
   showModelNames: boolean;
 }) {
-  if (!selection) return null;
+  if (!selection || !showModelNames) return null;
   const tierDisplay = TIER_DISPLAY[selection.tier as ModelTier] ?? TIER_DISPLAY.builder;
   const label = selection.autoSelected ? `${AUTO_DISPLAY.emoji} Auto (selected: ${tierDisplay.emoji} ${tierDisplay.label})` : `${tierDisplay.emoji} ${tierDisplay.label}`;
 
   return (
     <span className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10px] font-bold text-foundry-subtle" title={selection.reason}>
       {label}
-      {showModelNames ? <span className="text-foundry-muted">· {selection.provider}/{selection.model}</span> : null}
+      <span className="text-foundry-muted">· {selection.provider}/{selection.model}</span>
     </span>
   );
 }
