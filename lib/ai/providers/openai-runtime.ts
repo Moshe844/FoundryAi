@@ -34,6 +34,8 @@ export async function callOpenAIManaged(request: ManagedModelRequest, options: M
     workspaceId: options.workspaceId,
     userId: options.userId,
     maxAttempts: options.maxAttempts,
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
   });
 
   const parsed = parseToolCalls(result.data, "openai");

@@ -51,6 +51,8 @@ type ManagedCallOptions = {
   priority?: "active" | "background";
   maxAttempts?: number;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 };
 
 type RuntimePlan = {
@@ -112,6 +114,8 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
   const fetcher = options.fetchImpl ?? fetch;
   const prepared = prepareRequestBody(options.body, plan);
   const cacheKey = cacheKeyFor(prepared.body);
+  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 90_000);
+  const callSignal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
 
   const cached = responseCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
@@ -146,6 +150,7 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
             "Content-Type": "application/json",
           },
           body: activeBody,
+          signal: callSignal,
         });
         data = (await response.json().catch(() => ({}))) as T;
       } catch (error) {
@@ -154,6 +159,7 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
         const networkMessage = error instanceof Error ? `Network request to the AI provider failed: ${error.message}${cause ? ` (${cause})` : ""}` : "Network request to the AI provider failed.";
         lastResponse = new Response(null, { status: 503 });
         lastData = { error: { message: networkMessage } } as T;
+        if (callSignal.aborted) break;
         if (attempt < maxAttempts) {
           await delay(Math.min(6000, attempt * 800));
           continue;

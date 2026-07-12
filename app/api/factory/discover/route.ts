@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
-import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
+import { apiKeyForProvider, envVarNameForProvider, providerForTier } from "@/lib/ai/providers/dispatch";
 import { TIER_DISPLAY, resolveModelForTier, tierForRuntimePayload } from "@/lib/ai/model-router";
 import type { ModelMode, ModelTier } from "@/lib/ai/model-router";
 import { DISCOVERY_REFINEMENT_SYSTEM_PROMPT, REFINE_PROJECT_DISCOVERY_TOOL, discoveryRefinementUserText, parseDiscoveryRefinement } from "@/lib/ai/project-discovery-llm";
@@ -19,9 +19,9 @@ export async function POST(request: Request) {
     }
 
     // provider defaults to "openai" — see app/api/factory/intent/route.ts for the same pattern and rationale.
-    const provider: ProviderId = body.provider ?? "openai";
-    const apiKey = apiKeyForProvider(provider);
-    if (!apiKey) {
+    let provider: ProviderId = body.provider ?? "openai";
+    let apiKey = apiKeyForProvider(provider);
+    if (body.provider && !apiKey) {
       return NextResponse.json({ ok: false, error: `${envVarNameForProvider(provider)} is not configured.`, discovery: heuristic, alternativeStacks: [], deploymentNote: "", lede: "" }, { status: 503 });
     }
 
@@ -32,6 +32,12 @@ export async function POST(request: Request) {
     const mode: ModelMode = body.mode ?? DEFAULT_MODE;
     const autoSelected = mode === "auto";
     const tier: ModelTier = autoSelected ? tierForRuntimePayload({ context, heuristic }) : mode;
+    if (!body.provider) {
+      const automatic = providerForTier(tier);
+      provider = automatic?.provider ?? provider;
+      apiKey = automatic?.apiKey;
+    }
+    if (!apiKey) return NextResponse.json({ ok: false, error: "No configured AI provider is available.", discovery: heuristic }, { status: 503 });
     const { model, effort } = resolveModelForTier(tier, { provider });
 
     const result = await callManagedModel(

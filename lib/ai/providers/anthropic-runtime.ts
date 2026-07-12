@@ -13,6 +13,8 @@ const ANTHROPIC_VERSION = "2023-06-01";
  * optimizations, not required for correctness here).
  */
 export async function callAnthropicManaged(request: ManagedModelRequest, options: ManagedCallOptions): Promise<ManagedModelResult> {
+  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 90_000);
+  const callSignal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
   const body: Record<string, unknown> = {
     model: request.model,
     max_tokens: request.maxOutputTokens,
@@ -49,11 +51,13 @@ export async function callAnthropicManaged(request: ManagedModelRequest, options
           "content-type": "application/json",
         },
         body: JSON.stringify(activeBody),
+        signal: callSignal,
       });
       data = (await response.json().catch(() => ({}))) as AnthropicResponse;
     } catch (error) {
       failureCount += 1;
       lastErrorMessage = error instanceof Error ? `Network request to Anthropic failed: ${error.message}` : "Network request to Anthropic failed.";
+      if (callSignal.aborted) break;
       if (attempt < maxAttempts) {
         await delay(Math.min(6000, attempt * 800));
         continue;

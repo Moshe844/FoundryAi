@@ -14,6 +14,8 @@ import { pricingForProviderModel } from "@/lib/ai/model-router";
  * real tool_use response, confirming the functionResponse role/shape below is correct.
  */
 export async function callGoogleManaged(request: ManagedModelRequest, options: ManagedCallOptions): Promise<ManagedModelResult> {
+  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 90_000);
+  const callSignal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
   const body: Record<string, unknown> = {
     contents: renderGoogleContents(request.messages),
     generationConfig: { maxOutputTokens: request.maxOutputTokens },
@@ -39,11 +41,13 @@ export async function callGoogleManaged(request: ManagedModelRequest, options: M
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
+        signal: callSignal,
       });
       data = (await response.json().catch(() => ({}))) as GoogleGenerateContentResponse;
     } catch (error) {
       failureCount += 1;
       lastErrorMessage = error instanceof Error ? `Network request to Google failed: ${error.message}` : "Network request to Google failed.";
+      if (callSignal.aborted) break;
       if (attempt < maxAttempts) {
         await delay(Math.min(6000, attempt * 800));
         continue;

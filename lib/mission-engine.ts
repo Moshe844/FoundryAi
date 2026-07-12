@@ -110,8 +110,23 @@ export type MissionState = {
     previousMissionId?: string;
   };
   liveWorkEvents: string[];
+  /**
+   * A single blocking follow-up question Foundry asked instead of guessing when the user's message was
+   * genuinely ambiguous (the "clarify" turn intent). Surfaced as the same inline one-at-a-time
+   * DecisionPrompt the mission planner uses — never a passive chat note. Cleared the moment any new turn
+   * starts (answering it resumes the same mission thread with the original request + the answer).
+   */
+  pendingClarification?: PendingClarification;
   createdAt: string;
   updatedAt: string;
+};
+
+export type PendingClarification = {
+  question: string;
+  /** Concrete clickable choices when derivable; when absent the prompt shows a free-text field only. */
+  options?: string[];
+  /** The original ambiguous request, kept so answering can resume with full context (routes to edit, not clarify). */
+  originalTask: string;
 };
 
 type Classification = {

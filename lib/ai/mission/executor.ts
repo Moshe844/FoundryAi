@@ -24,6 +24,8 @@ export type MissionExecutorInput = {
   approvedCategories?: string[];
   /** The subset of preApprovedCommands that are real standing grants (persisted "always allow this exact command"), as opposed to a fresh one-time approval for just this run. Used only to label approval_scope correctly — matching behavior is identical either way. */
   standingApprovedCommands?: string[];
+  /** Exact action keys the user denied for this continuation. */
+  deniedActions?: string[];
   /** Structured record of the mission this run continues, given only for continuation-style follow-ups so the model has real plan/decision state instead of needing to blindly re-investigate. */
   priorContext?: MissionParentContext;
   /** Set when the task was heuristically detected as a small, single-file change — relaxes completion verification for a single-item checklist only. */
@@ -266,6 +268,14 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     turnsUsed: number,
     blockedStep?: MissionExecutorResult["blockedStep"]
   ): MissionExecutorResult {
+    if (status === "passed") {
+      for (const item of checklist) {
+        if (item.status === "pending" || item.status === "running") {
+          item.status = "completed";
+          item.evidence ||= "Completed and verified before the mission finished.";
+        }
+      }
+    }
     return {
       status,
       blocker,
@@ -287,6 +297,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   }
 
   const system: string = [
+    input.deniedActions?.length
+      ? `The user explicitly denied these actions: ${input.deniedActions.join(", ")}. Do not request or attempt them again. Mark dependent work skipped and continue independent work.`
+      : "",
     "You are a senior engineer working inside a real, already-connected project. You investigate and fix real problems by calling tools — you are not running a scripted plan.",
             input.priorContext
               ? "You already have verified context from earlier in this same mission, given below — trust it and don't re-read files it already covers unless something looks inconsistent with the current request."
@@ -406,7 +419,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         toolChoice: "auto",
         maxOutputTokens: input.fastLane ? 2500 : 8000,
       },
-      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: input.fastLane ? 2 : 6 },
+      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: input.fastLane ? 2 : 6, signal: input.signal, timeoutMs: input.fastLane ? 45_000 : 90_000 },
     );
     usage.push(result.usage);
 
@@ -514,7 +527,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         return finalize("failed", reason, turn);
       }
 
-      const toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands).catch((error) => ({
+      const toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions).catch((error) => ({
         error: error instanceof Error ? error.message : "Tool call failed unexpectedly.",
       }));
       if (call.name === "mark_checklist_item") {
@@ -650,7 +663,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         toolChoice: { name: "report_blocked" },
         maxOutputTokens: input.fastLane ? 1500 : 2500,
       },
-      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 4 },
+      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 4, signal: input.signal, timeoutMs: 60_000 },
     );
     if (result.stopReason === "error") return "";
     const call = result.toolCalls.find((item) => item.name === "report_blocked");
@@ -885,6 +898,7 @@ async function executeTool(
   rationale = "",
   task = "",
   standingApprovedCommands: string[] = [],
+  deniedActions: string[] = [],
 ): Promise<unknown> {
   const pathArg = typeof args.path === "string" ? args.path : "";
   const basename = pathArg.split("/").pop() || pathArg;
@@ -941,6 +955,9 @@ async function executeTool(
     }
     case "write_file": {
       const content = typeof args.content === "string" ? args.content : "";
+      if (deniedActions.some((entry) => normalizeCommandText(entry) === normalizeCommandText(`write ${pathArg}`))) {
+        return { verified: false, skipped: "denied", reason: "The user denied this file write." };
+      }
       if (!pathArg.trim() || /^[./\\]*$/.test(pathArg.trim())) {
         await emit("edit", "error", "Refused write with no file path", { tier: "trace", details: { reason: "path was empty or pointed at the project root." } });
         return {
@@ -986,6 +1003,9 @@ async function executeTool(
       return { verified: result.verified, reason: result.reason, bytes: result.bytes };
     }
     case "delete_file": {
+      if (deniedActions.some((entry) => normalizeCommandText(entry) === normalizeCommandText(`delete ${pathArg}`))) {
+        return { verified: false, skipped: "denied", reason: "The user denied this deletion." };
+      }
       if (!pathArg.trim() || /^[./\\]*$/.test(pathArg.trim())) {
         return { verified: false, reason: "path was empty, \".\", or otherwise pointed at the project root. Pass a real relative file path." };
       }
@@ -1010,6 +1030,9 @@ async function executeTool(
     }
     case "run_command": {
       const command = typeof args.command === "string" ? args.command : "";
+      if (deniedActions.some((entry) => normalizeCommandText(entry) === normalizeCommandText(command))) {
+        return { exitCode: null, stdout: "", stderr: "The user denied this command.", skipped: "denied" };
+      }
       const cwd = typeof args.cwd === "string" ? args.cwd : "";
       await emit("command", "running", `Running ${command}`, { tier: "trace", command, cwd });
       if (!access.runCommand) {

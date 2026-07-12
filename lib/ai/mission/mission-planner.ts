@@ -152,8 +152,28 @@ export async function planMission(input: {
     ]);
   }
 
+  const numberedRequirements = extractNumberedRequirements(input.task);
+  if (numberedRequirements.length > 1 && checklist.length <= 1) {
+    checklist.splice(0, checklist.length, ...numberedRequirements.map((label, index) => ({
+      id: `requirement-${index + 1}`,
+      label,
+      status: "pending" as const,
+      phase: `Phase ${Math.floor(index / 10) + 1}`,
+    })));
+  }
+
   if (!checklist.length) {
     checklist.push({ id: "complete-request", label: `Complete: ${input.task}`, status: "pending" });
+  }
+
+  const explicitDecisions = extractExplicitDecisionQuestions(input.task);
+  if (explicitDecisions.length) {
+    const explicitSubjects = explicitDecisions.map(normalizeDecisionSubject);
+    const unrelatedModelConflicts = conflicts.filter((conflict) => {
+      const subject = normalizeDecisionSubject(conflict);
+      return !explicitSubjects.some((explicit) => explicit.includes(subject) || subject.includes(explicit));
+    });
+    conflicts.splice(0, conflicts.length, ...explicitDecisions, ...unrelatedModelConflicts);
   }
 
   const statedCount = extractStatedRequirementCount(input.task);
@@ -246,4 +266,27 @@ function safeJsonParse(value: string): { items?: Array<{ id?: string; label?: st
   } catch {
     return undefined;
   }
+}
+
+function extractNumberedRequirements(task: string) {
+  return task
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\s*\d+[.)]\s+(.+?)\s*$/)?.[1]?.trim() ?? "")
+    .filter(Boolean);
+}
+
+function extractExplicitDecisionQuestions(task: string) {
+  const questions: string[] = [];
+  // A period inside a filename/domain (legacy-app.js, api.example.com) is not a sentence boundary.
+  // Stop only at punctuation that is followed by the next instruction, a newline, or end-of-input.
+  const pattern = /\bask(?:\s+me)?\s+whether\s+(.+?)(?=[?!](?:\s|$)|[.;](?=\s+(?:after|then|before|next|finally|once|when|do|please|ask)\b)|\n|$)/gi;
+  for (const match of task.matchAll(pattern)) {
+    const subject = match[1].trim().replace(/[?.!]+$/, "").replace(/^the\s+user\s+/i, "");
+    if (subject) questions.push(`${subject.charAt(0).toUpperCase()}${subject.slice(1)}?`);
+  }
+  return questions;
+}
+
+function normalizeDecisionSubject(question: string) {
+  return question.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }

@@ -60,4 +60,7 @@ export type ManagedCallOptions = {
   workspaceId?: string;
   userId?: string;
   maxAttempts?: number;
+  signal?: AbortSignal;
+  /** Hard ceiling for one managed provider call, including retries. */
+  timeoutMs?: number;
 };

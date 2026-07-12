@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
-import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
-import { resolveModelForTier } from "@/lib/ai/model-router";
+import { apiKeyForProvider, envVarNameForProvider, providerForTier } from "@/lib/ai/providers/dispatch";
+import { resolveModelForTier, tierForRuntimePayload } from "@/lib/ai/model-router";
+import type { ModelMode } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 
 const projectIntentValues = ["question", "inspection", "diagnose", "status", "debug", "edit", "undo", "continue", "retrospective", "clarify"] as const;
@@ -61,6 +62,11 @@ const RESOLVE_PROJECT_TURN_INTENT_TOOL: NeutralTool = {
         type: "string",
         description: "Populate only when intent is clarify: the single plain-language question to ask the user. Leave as an empty string for every other intent.",
       },
+      clarify_options: {
+        type: "array",
+        items: { type: "string" },
+        description: "Only when intent is clarify: 2-4 short, concrete, mutually-exclusive choices the user can click to resolve the question (e.g. the specific paths the fork splits into). Omit or leave empty when the answer is genuinely open-ended and only free text makes sense.",
+      },
     },
     required: ["intent", "execution_mode", "confidence", "rationale", "continuity", "clarifying_question"],
   },
@@ -73,6 +79,7 @@ type ResolveToolResult = {
   rationale?: string;
   continuity?: "carry_forward_plan" | "fresh_plan" | "not_applicable";
   clarifying_question?: string;
+  clarify_options?: string[];
 };
 
 const SYSTEM_PROMPT = [
@@ -101,7 +108,7 @@ const SYSTEM_PROMPT = [
 
 export async function POST(request: Request) {
   try {
-    const body = (await request.json()) as { message?: string; context?: ProjectIntentContext; provider?: ProviderId };
+    const body = (await request.json()) as { message?: string; context?: ProjectIntentContext; provider?: ProviderId; mode?: ModelMode };
     const message = String(body.message ?? "").trim();
     if (!message) {
       return NextResponse.json({ error: "Message is required." }, { status: 400 });
@@ -110,13 +117,15 @@ export async function POST(request: Request) {
     // provider defaults to "openai" — matches today's behavior exactly. The optional body.provider
     // override exists only for Phase A verification (forcing a real Anthropic/Google request against
     // this route); it is not yet exposed anywhere in the UI (that lands with the mode selector).
-    const provider: ProviderId = body.provider ?? "openai";
-    const apiKey = apiKeyForProvider(provider);
+    const tier = body.mode && body.mode !== "auto" ? body.mode : tierForRuntimePayload({ message, context: body.context });
+    const automatic = body.provider ? undefined : providerForTier(tier);
+    const provider: ProviderId = body.provider ?? automatic?.provider ?? "openai";
+    const apiKey = body.provider ? apiKeyForProvider(provider) : automatic?.apiKey;
     if (!apiKey) {
       return NextResponse.json({ ok: false, error: `${envVarNameForProvider(provider)} is not configured.` }, { status: 503 });
     }
 
-    const { model, effort } = resolveModelForTier("fast", { provider });
+    const { model, effort } = resolveModelForTier(tier, { provider });
 
     const result = await callManagedModel(
       {
@@ -137,7 +146,9 @@ export async function POST(request: Request) {
         ],
         tools: [RESOLVE_PROJECT_TURN_INTENT_TOOL],
         toolChoice: { name: "resolve_project_turn_intent" },
-        maxOutputTokens: 900,
+        // Reasoning models count hidden reasoning against this budget. Higher manual tiers need
+        // enough room left to emit the required tool call after thinking.
+        maxOutputTokens: 3000,
       },
       { apiKey, workspaceId: "factory-intent", userId: "local-user", maxAttempts: 3 },
     );
@@ -146,7 +157,7 @@ export async function POST(request: Request) {
     const parsed = call?.arguments ? safeJsonParse(call.arguments) : undefined;
     const intent = normalizeProjectIntent(parsed?.intent);
 
-    const modelSelection = { tier: "fast" as const, provider, model, autoSelected: false as const };
+    const modelSelection = { tier, provider, model, autoSelected: body.mode === "auto" };
 
     if (!intent) {
       return NextResponse.json({
@@ -161,7 +172,7 @@ export async function POST(request: Request) {
     const rationale =
       finalIntent === intent
         ? String(parsed?.rationale ?? "")
-        : `Product policy corrected ${intent} to ${finalIntent}: a concrete project error report should start debug execution unless the user explicitly asks for read-only explanation. ${String(parsed?.rationale ?? "")}`.trim();
+        : `Product policy corrected ${intent} to ${finalIntent}: a concrete imperative change request (or a real project error report) starts an edit/debug mission — any conflicting requirements are resolved inside the mission's decision prompt — unless the user explicitly asked for read-only explanation. ${String(parsed?.rationale ?? "")}`.trim();
 
     return NextResponse.json({
       ok: true,
@@ -171,6 +182,10 @@ export async function POST(request: Request) {
       rationale,
       continuity: finalIntent === intent ? parsed?.continuity ?? "not_applicable" : "not_applicable",
       clarifyingQuestion: finalIntent === "clarify" ? String(parsed?.clarifying_question ?? "").trim() : "",
+      clarifyingOptions:
+        finalIntent === "clarify" && Array.isArray(parsed?.clarify_options)
+          ? parsed.clarify_options.map((option) => String(option).trim()).filter(Boolean).slice(0, 4)
+          : [],
       usage: result.usage,
       modelSelection,
     });
@@ -233,6 +248,22 @@ function executionModeForIntent(intent: ProjectTurnIntent) {
 }
 
 function applyProjectIntentPolicy(intent: ProjectTurnIntent, message: string, context: ProjectIntentContext | undefined): ProjectTurnIntent {
+  // Misroute guard: a concrete imperative change request must start an edit mission — even when it bundles
+  // conflicting requirements. Contradictions are a *plan conflict* the mission resolves with its own
+  // one-at-a-time decision prompt (which pauses and resumes the same run), NOT a reason to dead-end the turn
+  // as a read-only "clarify" chat note that never touches the project. Without this,
+  // "Change storage: use ONLY localStorage / ONLY IndexedDB / ONLY cookies — do all three" was classified
+  // clarify and no mission ever started. Scoped to clarify (and bare read-only reads) so genuine forks the
+  // model flags on an already-blocked mission still ask; explicitly read-only diagnostics still explain.
+  if (
+    (intent === "clarify" || intent === "question" || intent === "inspection") &&
+    isConnectedProjectContext(context) &&
+    looksLikeImperativeMutation(message) &&
+    !explicitlyReadOnlyDiagnostic(message)
+  ) {
+    return "edit";
+  }
+
   if (intent !== "question" && intent !== "inspection" && intent !== "diagnose" && intent !== "status") return intent;
   if (!isConnectedProjectContext(context)) return intent;
   // "Is it running? Can you start it?" reads like a status question, but it's a request to actually take
@@ -242,6 +273,15 @@ function applyProjectIntentPolicy(intent: ProjectTurnIntent, message: string, co
   if (!looksLikeExecutableBugReport(message)) return intent;
   if (explicitlyReadOnlyDiagnostic(message)) return intent === "question" || intent === "inspection" ? "diagnose" : intent;
   return "debug";
+}
+
+function looksLikeImperativeMutation(message: string) {
+  // The user is telling Foundry to alter the project. Broad on change verbs, but each must sit in an
+  // imperative position (clause start, after a connector, or behind please/can you/now) so questions like
+  // "why does the store fail" or "what should I use here" don't trip it.
+  return /(?:^|[.!?;:\n]\s*|\b(?:and|then|also|please|now)\s+|,\s*|\bcan you\s+|\bcould you\s+|\bi(?:'d| would) like (?:you )?to\s+|\bi want (?:you )?to\s+)(change|add|remove|delete|drop|update|implement|build|create|make|replace|refactor|rename|move|set|switch|convert|store|save|persist|use|wire|integrate|install|migrate|rewrite|redesign|restyle|style|connect|enable|disable|configure|hook up|fix|support|allow)\b/i.test(
+    message,
+  );
 }
 
 function looksLikeServerActionRequest(message: string) {

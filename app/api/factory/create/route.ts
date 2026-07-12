@@ -24,6 +24,7 @@ export async function POST(request: Request) {
               send({ type: "event", event });
             },
             body.discovery,
+            body.modelMode,
           )
             .then((result) => {
               send({ type: "result", result });
@@ -44,7 +45,7 @@ export async function POST(request: Request) {
       });
     }
 
-    const result = await createFactoryProject(body.brief, undefined, body.discovery);
+    const result = await createFactoryProject(body.brief, undefined, body.discovery, body.modelMode);
     return NextResponse.json(result);
   } catch (error) {
     return NextResponse.json(

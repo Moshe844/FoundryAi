@@ -51,11 +51,12 @@ export async function runReadOnlyInspection(input: {
   maxTurns?: number;
   softBudgetMs?: number;
   provider?: ProviderId;
+  tier?: import("@/lib/ai/model-router").ModelTier;
 }): Promise<InspectionResult> {
   // provider defaults to "openai" — matches this function's behavior before the provider abstraction
   // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
   const provider: ProviderId = input.provider ?? "openai";
-  const { model, effort } = resolveModelForTier("builder", { provider });
+  const { model, effort } = resolveModelForTier(input.tier ?? "builder", { provider });
   const maxTurns = input.maxTurns ?? DEFAULT_MAX_TURNS;
   const softBudgetMs = input.softBudgetMs ?? DEFAULT_SOFT_BUDGET_MS;
   const startedAt = Date.now();

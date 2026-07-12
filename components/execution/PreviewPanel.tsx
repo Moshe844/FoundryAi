@@ -1,6 +1,6 @@
 "use client";
 
-import { ExternalLink, Loader2, PanelRightClose } from "lucide-react";
+import { ExternalLink, Gamepad2, Loader2, Monitor, PanelRightClose, Play, RefreshCw, Smartphone, Tablet } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FactoryProjectResult } from "@/lib/factory/types";
 
@@ -11,6 +11,7 @@ import type { FactoryProjectResult } from "@/lib/factory/types";
  */
 export function PreviewPanel({ execution, fill = false }: { execution: FactoryProjectResult; fill?: boolean }) {
   const [refreshKey, setRefreshKey] = useState(0);
+  const [viewport, setViewport] = useState<"desktop" | "tablet" | "mobile">("desktop");
   const previousUrlRef = useRef(execution.previewUrl);
   const wrap = fill ? "" : "mt-4";
 
@@ -50,20 +51,76 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
   }
 
   if (execution.previewUrl) {
-    return fill ? (
-      <iframe key={refreshKey} src={execution.previewUrl} className="h-full w-full flex-1 border-0 bg-white" title="Live preview" />
-    ) : (
-      <div className="mt-4 overflow-hidden rounded-md border border-white/10">
-        <div className="flex items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
-          <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">Live Preview</span>
-          <span className="truncate font-mono text-[10.5px] text-foundry-subtle">{execution.previewUrl}</span>
+    const frameWidth = viewport === "mobile" ? "390px" : viewport === "tablet" ? "768px" : "100%";
+    return (
+      <div className={`${fill ? "flex min-h-0 flex-1 flex-col" : "mt-4 overflow-hidden rounded-md border border-white/10"}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">{execution.previewPlatform === "game" ? "Playable Preview" : "Live Preview"}</span>
+            <span className="hidden truncate font-mono text-[10.5px] text-foundry-subtle sm:inline">{execution.previewUrl}</span>
+          </div>
+          <div className="flex items-center gap-1">
+            {([['desktop', Monitor], ['tablet', Tablet], ['mobile', Smartphone]] as const).map(([size, Icon]) => (
+              <button key={size} type="button" title={`${size} preview`} onClick={() => setViewport(size)} className={`rounded p-1.5 transition ${viewport === size ? "bg-foundry-teal/[0.16] text-foundry-teal" : "text-foundry-subtle hover:bg-white/[0.06] hover:text-foundry-ink"}`}>
+                <Icon size={13} />
+              </button>
+            ))}
+            <button type="button" title="Reload preview" onClick={() => setRefreshKey((current) => current + 1)} className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"><RefreshCw size={13} /></button>
+            <button type="button" title="Open preview in a new tab" onClick={() => window.open(execution.previewUrl, "_blank", "noopener,noreferrer")} className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"><ExternalLink size={13} /></button>
+          </div>
         </div>
-        <iframe key={refreshKey} src={execution.previewUrl} className="h-72 w-full border-0 bg-white" title="Live preview" />
+        <div className={`${fill ? "min-h-0 flex-1" : "h-72"} overflow-auto bg-[#050707] p-2`}>
+          <iframe key={refreshKey} src={execution.previewUrl} className="mx-auto h-full max-w-full border-0 bg-white transition-[width] duration-200" style={{ width: frameWidth }} title="Interactive live preview" />
+        </div>
       </div>
     );
   }
 
   return <p className={`${wrap} rounded-md border border-dashed border-white/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>{execution.previewReason || "Open index.html from the project folder to preview this static project."}</p>;
+}
+
+export function PreviewCompletionCard({ execution }: { execution: FactoryProjectResult }) {
+  const [launchState, setLaunchState] = useState<"idle" | "launching" | "launched" | "error">("idle");
+  const platform = execution.previewPlatform ?? "web";
+  const ready = execution.previewState === "ready" || execution.previewState === "starting";
+  const label = previewActionLabel(platform);
+  async function launchDesktop() {
+    setLaunchState("launching");
+    try {
+      const response = await fetch("/api/factory/preview", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: execution.projectId, action: "launch-desktop" }) });
+      setLaunchState(response.ok ? "launched" : "error");
+    } catch {
+      setLaunchState("error");
+    }
+  }
+  return (
+    <section className="mt-3 rounded-md border border-foundry-teal/25 bg-foundry-teal/[0.05] p-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="flex items-center gap-2 text-xs font-extrabold text-foundry-ink">{platform === "game" ? <Gamepad2 size={14} className="text-foundry-teal" /> : <Play size={14} className="text-foundry-teal" />}{ready ? previewReadyTitle(platform) : "Preview availability"}</p>
+          <p className="mt-1 break-all text-xs leading-5 text-foundry-subtle">{execution.previewUrl ? `Running at ${execution.previewUrl}` : execution.previewReason || "No interactive preview is available for this build yet."}</p>
+        </div>
+        {execution.previewUrl ? <a href={execution.previewUrl} target="_blank" rel="noreferrer" className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22]"><ExternalLink size={14} />{label}</a> : platform === "desktop" && ready ? <button type="button" onClick={launchDesktop} disabled={launchState === "launching"} className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:opacity-60"><Play size={14} />{launchState === "launching" ? "Launching..." : launchState === "launched" ? "App launched" : "Launch desktop app"}</button> : null}
+      </div>
+      {launchState === "error" ? <p className="mt-2 text-xs text-foundry-amber">The desktop app could not be launched. Rebuild it and try again.</p> : null}
+    </section>
+  );
+}
+
+function previewActionLabel(platform: FactoryProjectResult["previewPlatform"]) {
+  if (platform === "api") return "Open API playground";
+  if (platform === "desktop") return "Open desktop app";
+  if (platform === "mobile" || platform === "android") return "Open mobile preview";
+  if (platform === "game") return "Play game";
+  if (platform === "report") return "Open report";
+  return "Open preview";
+}
+
+function previewReadyTitle(platform: FactoryProjectResult["previewPlatform"]) {
+  if (platform === "api") return "API server is running";
+  if (platform === "game") return "Playable build is ready";
+  if (platform === "desktop") return "Desktop build is ready";
+  return "Interactive preview is ready";
 }
 
 export function EngineeringWorkspacePanel({ execution, onCollapse }: { execution: FactoryProjectResult | null; onCollapse: () => void }) {
@@ -75,7 +132,7 @@ export function EngineeringWorkspacePanel({ execution, onCollapse }: { execution
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">
-            {execution?.previewPlatform === "api" ? "API Playground" : "Live Preview"}
+            {execution?.previewPlatform === "api" ? "API Playground" : execution?.previewPlatform === "game" ? "Playable Preview" : "Interactive Preview"}
           </span>
           {execution?.previewState === "ready" ? <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-foundry-teal" /> : null}
         </div>
@@ -85,7 +142,7 @@ export function EngineeringWorkspacePanel({ execution, onCollapse }: { execution
               type="button"
               onClick={() => window.open(previewUrl, "_blank", "noopener,noreferrer")}
               className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"
-              title="Open in a new window"
+              title="Open preview in a new tab"
             >
               <ExternalLink size={14} />
             </button>

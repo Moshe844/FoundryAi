@@ -10,7 +10,9 @@ import type { ManagedToolCall, NeutralTool, NeutralToolChoice, ProviderId } from
 export function translateTools(tools: NeutralTool[] | undefined, provider: ProviderId): unknown {
   if (!tools || !tools.length) return undefined;
   if (provider === "openai") {
-    return tools.map((tool) => ({ type: "function", strict: true, name: tool.name, description: tool.description, parameters: tool.parameters }));
+    // Neutral schemas intentionally allow optional properties. OpenAI strict mode requires every
+    // property to be required, so enabling it here rejects otherwise valid cross-provider tools.
+    return tools.map((tool) => ({ type: "function", strict: false, name: tool.name, description: tool.description, parameters: tool.parameters }));
   }
   if (provider === "anthropic") {
     return tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }));

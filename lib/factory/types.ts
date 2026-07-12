@@ -1,5 +1,6 @@
 import type { CommandApprovalScope, CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
 import type { MissionQualityLevel } from "@/lib/ai/mission/quality-level";
+import type { ModelMode } from "@/lib/ai/model-router";
 
 export type FactoryBuildStatus = "created" | "running" | "passed" | "failed" | "unsupported" | "stopped" | "awaiting-approval" | "needs-clarification" | "awaiting-mock-approval";
 
@@ -104,13 +105,23 @@ export type FactoryJournalEntry = {
 };
 
 export type FactoryPreviewState = "unavailable" | "starting" | "ready" | "error";
-export type FactoryPreviewPlatform = "web" | "api" | "desktop" | "android" | "mobile";
+export type FactoryPreviewPlatform = "web" | "api" | "desktop" | "android" | "mobile" | "cli" | "database" | "game" | "report";
 
 /** A single piece of real evidence backing (or refuting) mission completion. Built server-side from the same evidence the executor's completion gate inspects — never independently re-derived by the client. */
 export type ExecutionMissionVerification = {
   check_type: "file-read" | "build" | "test" | "lint" | "typecheck" | "preview" | "manual-evidence" | "checklist" | "command";
   result: "pass" | "fail" | "skipped";
   evidence: string;
+};
+
+/**
+ * A single blocking decision the mission needs from the user. `options` are concrete clickable choices
+ * when the producer knows them (e.g. a yes/adjust scope confirmation); when absent the UI shows a free
+ * text field instead. Only one is ever presented at a time.
+ */
+export type MissionClarification = {
+  question: string;
+  options?: string[];
 };
 
 export type FactoryProjectResult = {
@@ -136,8 +147,8 @@ export type FactoryProjectResult = {
   exportUrl?: string;
   timeline?: FactoryExecutionEvent[];
   sessionSummary?: FactorySessionSummary;
-  /** Plain-language questions the planner needs answered before it can safely proceed (contradictory or ambiguous requirements). Present only when status is "needs-clarification". */
-  clarificationQuestions?: string[];
+  /** Questions the planner needs answered before it can safely proceed (contradictory or ambiguous requirements). Present only when status is "needs-clarification". Surfaced one at a time as an inline decision prompt. */
+  clarificationQuestions?: MissionClarification[];
   /** Real verification evidence backing this result, built from the same checks the executor's completion gate used. Empty when nothing could be verified — the client must show "unverified" rather than guessing at pass/fail itself. */
   verification?: ExecutionMissionVerification[];
 };
@@ -163,6 +174,7 @@ export type StructuredDiscovery = {
 export type FactoryCreateRequest = {
   brief: string;
   discovery?: StructuredDiscovery;
+  modelMode?: ModelMode;
 };
 
 export type FactoryUploadedFile = {
@@ -213,6 +225,8 @@ export type FactoryExistingProjectRequest = {
   };
   /** Defaults to "standard" — how much planning/review/verification depth this mission gets. Independent of Model Mode (which model handles a call); see lib/ai/mission/quality-level.ts. */
   quality?: MissionQualityLevel;
+  /** Auto chooses from the real task; an explicit mode pins the intelligence tier. */
+  modelMode?: ModelMode;
 };
 
 export type FactoryFileReadResult = {

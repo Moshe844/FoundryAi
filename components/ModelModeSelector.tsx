@@ -2,6 +2,7 @@
 
 import { AUTO_DISPLAY, TIER_DISPLAY, type ModelMode, type ModelTier, type TierResolution } from "@/lib/ai/model-router";
 import { useModelMode } from "@/lib/ai/model-mode";
+import { BrainCircuit, ChevronDown, Sparkles } from "lucide-react";
 
 const MODES: ModelMode[] = ["auto", "fast", "builder", "architect", "enterprise-architect", "super-reasoning"];
 
@@ -54,6 +55,31 @@ export function ModelModeSelector() {
         })}
       </div>
     </section>
+  );
+}
+
+export function ComposerModelSelector() {
+  const { mode, setMode } = useModelMode();
+  const display = displayFor(mode);
+
+  return (
+    <label className="relative inline-flex min-w-0 items-center gap-2 text-xs text-foundry-muted">
+      {mode === "auto" ? <Sparkles size={14} className="text-foundry-teal" /> : <BrainCircuit size={14} className="text-foundry-blue" />}
+      <span className="sr-only">Model intelligence</span>
+      <select
+        aria-label="Model intelligence"
+        value={mode}
+        onChange={(event) => setMode(event.target.value as ModelMode)}
+        className="min-h-8 appearance-none rounded-md border border-white/15 bg-[#111718] py-1 pl-2.5 pr-8 text-xs font-bold text-foundry-ink outline-none transition hover:border-foundry-teal/35 focus:border-foundry-teal/60"
+      >
+        {MODES.map((candidate) => {
+          const option = displayFor(candidate);
+          return <option key={candidate} value={candidate}>{candidate === "auto" ? "Auto - Foundry chooses" : `${option.label} - ${option.blurb}`}</option>;
+        })}
+      </select>
+      <ChevronDown size={13} aria-hidden="true" className="pointer-events-none absolute right-2.5 text-foundry-subtle" />
+      <span className="hidden sm:inline">{mode === "auto" ? "Adapts to this task" : display.blurb}</span>
+    </label>
   );
 }
 

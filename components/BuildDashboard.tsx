@@ -19,6 +19,7 @@ import {
   PanelRightOpen,
   Pencil,
   Settings,
+  Send as SendIcon,
   ShoppingBag,
   SkipForward,
   Smartphone,
@@ -30,7 +31,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
-import type { ExecutionMission, MissionState } from "@/lib/mission-engine";
+import type { ExecutionMission, MissionState, PendingClarification } from "@/lib/mission-engine";
 import { deriveMissionDisplayStatus, getActiveExecutionMission, isSoftwareProjectMission, missionStateLabel, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
 import { continueOrResumeMission, recentProjects, type PersonalizedCard } from "@/lib/discovery/personalization";
 import { runDiscoveryEngine, seedDiscovery } from "@/lib/discovery/engine";
@@ -44,13 +45,13 @@ import { genericRecommendations } from "@/lib/ai/mission/recommendations";
 import type { MissionRecommendation } from "@/lib/ai/mission/recommendations";
 import type { StackProfile } from "@/lib/factory/language-adapters";
 import type { CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
-import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryFileReadResult, FactoryJournalEntry, FactoryObjectiveChecklistItem, FactoryProjectResult, FactoryUploadedFile, StructuredDiscovery } from "@/lib/factory/types";
-import { EngineeringWorkspacePanel, PreviewPanel } from "@/components/execution/PreviewPanel";
+import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryFileReadResult, FactoryJournalEntry, FactoryObjectiveChecklistItem, FactoryProjectResult, FactoryUploadedFile, MissionClarification, StructuredDiscovery } from "@/lib/factory/types";
+import { EngineeringWorkspacePanel, PreviewCompletionCard, PreviewPanel } from "@/components/execution/PreviewPanel";
 import { ApprovalGate, BlockedCommandLine } from "@/components/execution/ApprovalPrompt";
 import { CodeViewTabs, DetailRow, ExecutionLevelToggle, ExecutionTimeline } from "@/components/execution/ExecutionTimeline";
 import { humanizeKey } from "@/components/execution/timelineUtils";
 import type { BlockedCommandAction, ExecutionLevel } from "@/components/execution/timelineUtils";
-import { ModelModeSelector, ModelSelectionChip } from "@/components/ModelModeSelector";
+import { ComposerModelSelector, ModelModeSelector, ModelSelectionChip } from "@/components/ModelModeSelector";
 import { useModelMode } from "@/lib/ai/model-mode";
 import type { ModelMode, TierResolution } from "@/lib/ai/model-router";
 import { MissionQualitySelector } from "@/components/MissionQualitySelector";
@@ -546,6 +547,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
             onCreateMission();
           }}
           onDeleteMission={onDeleteMission}
+          hideOnMobile={activeView === "workspace" && Boolean(connectedProject)}
         />
 
         {activeView === "templates" ? (
@@ -672,9 +674,11 @@ function FactorySidebar({
   onSelectMission,
   onCreateMission,
   onDeleteMission,
+  hideOnMobile,
 }: Pick<BuildDashboardProps, "missions" | "activeMissionId" | "onSelectMission" | "onCreateMission" | "onDeleteMission"> & {
   activeView: FactoryView;
   onViewChange: (view: FactoryView) => void;
+  hideOnMobile?: boolean;
 }) {
   const projectMissions = missions.filter(isSoftwareProjectMission);
   const activeMission = missions.find((mission) => mission.missionId === activeMissionId);
@@ -692,7 +696,7 @@ function FactorySidebar({
   ];
 
   return (
-    <aside className="glass-panel flex min-h-0 flex-col gap-4 p-3" aria-label="Factory navigation">
+    <aside className={`glass-panel min-h-0 flex-col gap-4 p-3 ${hideOnMobile ? "hidden lg:flex" : "flex"}`} aria-label="Factory navigation">
       <div className="px-1">
         <p className="section-kicker">Projects</p>
         <p className="mt-1 text-xs leading-5 text-foundry-subtle">Switch workspaces or start a new one.</p>
@@ -1354,7 +1358,7 @@ function ProjectBriefView({
   }
 
   return (
-    <section className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden border border-white/10 bg-[#0c1011]/95 shadow-workspace">
+    <section className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden border border-white/10 bg-[#0c1011]/95 shadow-workspace">
       <div className="border-b border-white/10 px-4 py-3 sm:px-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
@@ -1378,7 +1382,7 @@ function ProjectBriefView({
       </div>
 
       <div className="grid min-h-0 overflow-hidden lg:grid-cols-[280px_minmax(0,1fr)]">
-        <aside className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] border-b border-white/10 bg-black/15 p-3 lg:border-b-0 lg:border-r lg:p-4">
+        <aside className="hidden min-h-0 grid-rows-[auto_minmax(0,1fr)] border-b border-white/10 bg-black/15 p-3 lg:grid lg:border-b-0 lg:border-r lg:p-4">
           <div className="flex items-center justify-between gap-3">
             <div>
               <p className="section-kicker">Project</p>
@@ -1388,7 +1392,7 @@ function ProjectBriefView({
           </div>
           <ProjectFileTree files={visibleFiles} onReadFile={onReadFile} recentlyChangedPaths={recentlyChangedPaths} />
         </aside>
-        <div ref={middleRowRef} className="flex min-h-0 overflow-hidden">
+        <div ref={middleRowRef} className="flex min-h-0 min-w-0 overflow-hidden">
           <div
             ref={workScrollRef}
             className="min-h-0 flex-1 overflow-auto p-3 pr-1 sm:p-4"
@@ -1512,6 +1516,8 @@ function ProjectWorkConversation({
 }) {
   const requestMessages = mission.messages.filter((message) => message.tags?.includes("Project request"));
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const [fullPlanOpen, setFullPlanOpen] = useState(false);
+  const activeChecklist = activeExecutionMission?.plan.length ? activeExecutionMission.plan : execution?.checklist ?? [];
   const latestRequest = requestMessages.at(-1);
   const previousExecutionMissions = mission.executionMissions.filter((item) => item.id !== activeExecutionMission?.id).slice().reverse();
   const pendingMockReview = activeExecutionMission?.pending_mock_review;
@@ -1619,12 +1625,16 @@ function ProjectWorkConversation({
         <div className="mt-4 border-l border-white/10 pl-4">
           {latestAnswer ? <ProjectThreadMessage message={latestAnswer} compact /> : null}
           {missionStatus.isPausedForApproval ? <ApprovalGate event={pendingApprovalEvent} onApprove={onApproveCommand} /> : null}
-          {(activeExecutionMission?.plan.length ? activeExecutionMission.plan : execution?.checklist)?.length ? (
-            <MissionChecklistBoard
-              checklist={activeExecutionMission?.plan.length ? activeExecutionMission.plan : execution?.checklist ?? []}
-              isLive={isExecutionLive}
-              onSkipItem={isExecutionLive ? onSkipItem : undefined}
+          {!missionStatus.isPausedForApproval && execution?.status === "needs-clarification" && execution.clarificationQuestions?.length ? (
+            <DecisionPrompt clarifications={execution.clarificationQuestions} onAnswer={onExecute} />
+          ) : !missionStatus.isPausedForApproval && execution?.status !== "needs-clarification" && mission.pendingClarification ? (
+            <DecisionPrompt
+              clarifications={[{ question: mission.pendingClarification.question, options: mission.pendingClarification.options }]}
+              onAnswer={(answer) => onExecute(resolveClarificationTask(mission.pendingClarification!, answer))}
             />
+          ) : null}
+          {activeChecklist.length ? (
+            <MissionPlanSummary checklist={activeChecklist} isLive={isExecutionLive} onOpenFullPlan={() => setFullPlanOpen(true)} />
           ) : null}
           {(isExecutionLive || level !== "summary") && (isExecutionLive || timeline.length || mission.liveWorkEvents.length) ? (
             <ExecutionTimeline
@@ -1666,6 +1676,14 @@ function ProjectWorkConversation({
           ) : null}
         </div>
       </section>
+      {fullPlanOpen ? (
+        <MissionPlanPanel
+          checklist={activeChecklist}
+          isLive={isExecutionLive}
+          onSkipItem={isExecutionLive ? onSkipItem : undefined}
+          onClose={() => setFullPlanOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1686,7 +1704,7 @@ function ProjectThreadMessage({ message, prominent = false, compact = false }: {
   const isUser = message.tags?.includes("Project request") || message.author === "You";
   const body = message.body.trim();
   return (
-    <article className={`${prominent ? "sticky -top-3 z-20 -mx-3 border-b border-white/15 bg-[#0c1011] px-3 pb-3 pt-4 shadow-[0_12px_24px_rgba(0,0,0,0.42)] sm:-top-4 sm:-mx-4 sm:px-4 sm:pt-5" : ""} ${compact ? "mb-4" : "max-w-4xl border-b border-white/10 pb-5"} ${isUser ? "" : "border-l border-white/10 pl-4"}`}>
+    <article className={`${prominent ? "-mx-3 border-b border-white/15 bg-[#0c1011] px-3 pb-3 pt-4 lg:sticky lg:-top-4 lg:z-20 lg:-mx-4 lg:px-4 lg:pt-5 lg:shadow-[0_12px_24px_rgba(0,0,0,0.42)]" : ""} ${compact ? "mb-4" : "max-w-4xl border-b border-white/10 pb-5"} ${isUser ? "" : "border-l border-white/10 pl-4"}`}>
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-foundry-subtle">
         <p className="font-extrabold uppercase tracking-[0.08em]">{isUser ? "You" : "Foundry"}</p>
         <span>{message.time}</span>
@@ -1760,7 +1778,6 @@ function ProjectComposer({
           </span>
         ) : null}
         <span className="ml-auto flex items-center gap-2">
-          <MissionQualitySelector />
           {canUndo && !isBusy && !locked && onUndo ? (
             <button type="button" className="normal-case tracking-normal text-foundry-subtle underline-offset-2 hover:text-foundry-ink hover:underline" onClick={onUndo}>
               Undo last change
@@ -1768,10 +1785,10 @@ function ProjectComposer({
           ) : null}
         </span>
       </div>
-      <div className="flex items-end gap-2 rounded-md border border-foundry-teal/25 bg-black/30 p-2 focus-within:border-foundry-teal/60">
+      <div className="flex min-w-0 items-end gap-2 rounded-md border border-foundry-teal/25 bg-black/30 p-2 focus-within:border-foundry-teal/60">
         <textarea
           ref={inputRef}
-          className="max-h-40 min-h-16 flex-1 resize-y border-0 bg-transparent p-2 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle disabled:cursor-not-allowed disabled:opacity-60"
+          className="max-h-40 min-h-16 min-w-0 flex-1 resize-y border-0 bg-transparent p-2 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle disabled:cursor-not-allowed disabled:opacity-60"
           value={task}
           disabled={locked}
           onChange={(event) => onTaskChange(event.target.value)}
@@ -1795,13 +1812,18 @@ function ProjectComposer({
           </button>
         ) : null}
         <button
-          className="min-h-11 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.16] px-5 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:cursor-not-allowed disabled:opacity-50"
+          className="inline-flex min-h-11 w-11 shrink-0 items-center justify-center rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.16] px-0 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:px-5"
           type="button"
           disabled={locked}
           onClick={onExecute}
         >
-          Send
+          <SendIcon size={16} aria-hidden="true" className="sm:hidden" />
+          <span className="sr-only sm:not-sr-only">Send</span>
         </button>
+      </div>
+      <div className="mt-2 flex min-h-8 flex-wrap items-center justify-between gap-2 px-1">
+        <ComposerModelSelector />
+        <MissionQualitySelector />
       </div>
     </div>
   );
@@ -1835,7 +1857,202 @@ const CHECKLIST_STATUS_META: Record<FactoryObjectiveChecklistItem["status"], { i
   "needs-approval": { icon: Lock, tone: "text-foundry-amber", label: "Needs approval" },
 };
 
-/** Live, always-visible mission checklist: which phase is active, which item is active right now, and the full backlog — so nothing gets lost in a long multi-part request. */
+type MissionPlanProgress = {
+  phases: ChecklistPhaseGroup[];
+  total: number;
+  doneCount: number;
+  activeItemId: string | undefined;
+  activePhaseIndex: number;
+  activePhaseLabel: string;
+  activeItemLabel: string;
+  phaseCount: number;
+  allDone: boolean;
+};
+
+/** Single source of truth for "where is this mission" — shared by the compact MissionPlanSummary bar and the full MissionChecklistBoard so the two can never disagree about the active phase/item. */
+function missionPlanProgress(checklist: FactoryObjectiveChecklistItem[]): MissionPlanProgress {
+  const phases = groupChecklistByPhase(checklist);
+  const activeItemId = checklist.find((item) => item.status === "running")?.id ?? checklist.find((item) => item.status === "pending")?.id;
+  const activePhaseIndex = Math.max(0, phases.findIndex((group) => group.items.some((item) => item.id === activeItemId)));
+  const doneCount = checklist.filter((item) => item.status === "completed" || item.status === "skipped").length;
+  const activeItem = checklist.find((item) => item.id === activeItemId);
+  return {
+    phases,
+    total: checklist.length,
+    doneCount,
+    activeItemId,
+    activePhaseIndex,
+    activePhaseLabel: phases[activePhaseIndex]?.phase ?? "",
+    activeItemLabel: activeItem?.label ?? "",
+    phaseCount: phases.length,
+    allDone: checklist.length > 0 && doneCount === checklist.length,
+  };
+}
+
+/**
+ * The compact, calm replacement for showing the whole checklist above the live timeline. A single slim
+ * bar: progress + the current phase/step, with a button to open the full plan in a side panel. Renders
+ * nothing for small tasks (<= 3 items) so a quick edit shows no plan chrome at all.
+ */
+function MissionPlanSummary({
+  checklist,
+  isLive,
+  onOpenFullPlan,
+}: {
+  checklist: FactoryObjectiveChecklistItem[];
+  isLive: boolean;
+  onOpenFullPlan: () => void;
+}) {
+  if (checklist.length <= 3) return null;
+  const p = missionPlanProgress(checklist);
+
+  return (
+    <section className="mb-3 max-w-4xl rounded-md border border-white/10 bg-black/15 px-3 py-2">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[11px] font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">
+            Mission plan · {p.phaseCount > 1 ? `${Math.min(p.activePhaseIndex + 1, p.phaseCount)} of ${p.phaseCount} phases · ` : ""}{p.doneCount} of {p.total} done
+          </p>
+          <p className="mt-0.5 flex items-center gap-1.5 text-xs text-foundry-muted">
+            {p.allDone ? (
+              <CheckCircle2 size={12} className="shrink-0 text-foundry-teal" />
+            ) : isLive ? (
+              <Loader2 size={12} className="shrink-0 animate-spin text-foundry-teal" />
+            ) : (
+              <CircleDot size={12} className="shrink-0 text-foundry-subtle" />
+            )}
+            <span className="min-w-0 truncate">
+              {p.allDone ? "All phases complete" : <>Current: <span className="text-foundry-ink">{p.activePhaseLabel}{p.activeItemLabel ? ` → ${p.activeItemLabel}` : ""}</span></>}
+            </span>
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onOpenFullPlan}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded border border-white/10 px-2 py-1 text-[10.5px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle transition hover:border-foundry-teal/35 hover:text-foundry-ink"
+        >
+          <PanelRightOpen size={12} /> View full plan
+        </button>
+      </div>
+    </section>
+  );
+}
+
+/** The full phased checklist, moved off the main canvas into a right-side slide-over so it never dominates the live work. Hosts the unchanged MissionChecklistBoard. */
+function MissionPlanPanel({
+  checklist,
+  isLive,
+  onSkipItem,
+  onClose,
+}: {
+  checklist: FactoryObjectiveChecklistItem[];
+  isLive: boolean;
+  onSkipItem?: (item: FactoryObjectiveChecklistItem) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true">
+      <button type="button" aria-label="Close mission plan" className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative z-10 flex h-full w-full max-w-md flex-col border-l border-white/10 bg-[#0c1011] shadow-workspace">
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <p className="text-sm font-extrabold text-foundry-ink">Mission plan</p>
+          <button type="button" onClick={onClose} className="text-xs font-bold text-foundry-subtle transition hover:text-foundry-ink">
+            Close
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto p-4">
+          <MissionChecklistBoard checklist={checklist} isLive={isLive} onSkipItem={onSkipItem} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Turns a follow-up clarify answer back into a self-contained task that resumes the SAME mission thread.
+ * The answer leads (so the "You" turn reads naturally), with the original ambiguous request carried as
+ * trailing context — which also keeps the imperative verb present so the intent router routes it to edit,
+ * not back to clarify.
+ */
+function resolveClarificationTask(pending: PendingClarification, answer: string) {
+  return `${answer}\n\n(This answers your question — "${pending.question}" — about my earlier request: ${pending.originalTask})`;
+}
+
+/**
+ * One blocking decision at a time, pinned inline near the current work. Shows only the first pending
+ * clarification with real clickable options when the producer supplied them, plus an always-present
+ * free-text field. Answering routes through the normal message path (onAnswer -> onExecute), which
+ * resumes the same mission rather than forking a new one. The rest stay hidden until this is answered.
+ */
+function DecisionPrompt({ clarifications, onAnswer }: { clarifications: MissionClarification[]; onAnswer: (answer: string) => void }) {
+  const [custom, setCustom] = useState("");
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [answers, setAnswers] = useState<Array<{ question: string; answer: string }>>([]);
+  const current = clarifications[currentIndex];
+  if (!current) return null;
+  const remaining = clarifications.length - currentIndex - 1;
+
+  function submit(answer: string) {
+    const trimmed = answer.trim();
+    if (!trimmed) return;
+    const resolved = [...answers, { question: current.question, answer: trimmed }];
+    if (remaining > 0) {
+      setAnswers(resolved);
+      setCurrentIndex((index) => index + 1);
+      setCustom("");
+      return;
+    }
+    onAnswer([
+      "Resolved project decisions:",
+      ...resolved.map((item) => `- ${item.question}\n  Answer: ${item.answer}`),
+      "Continue the same mission using these decisions and carry the existing plan through implementation and verification.",
+    ].join("\n"));
+    setCustom("");
+  }
+
+  return (
+    <section className="my-3 max-w-4xl rounded-md border border-foundry-amber/35 bg-foundry-amber/[0.07] p-3.5">
+      <p className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-[0.08em] text-foundry-amber">
+        <AlertTriangle size={12} /> Foundry needs one decision
+      </p>
+      <p className="mt-2 text-sm leading-6 text-foundry-ink">{current.question}</p>
+      {current.options?.length ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {current.options.map((option) => (
+            <button
+              key={option}
+              type="button"
+              onClick={() => submit(option)}
+              className="max-w-full whitespace-normal rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.12] px-3 py-1.5 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      <form className="mt-3 flex items-end gap-2" onSubmit={(event) => { event.preventDefault(); submit(custom); }}>
+        <input
+          value={custom}
+          onChange={(event) => setCustom(event.target.value)}
+          placeholder={current.options?.length ? "Something else…" : "Type your answer…"}
+          className="min-h-9 flex-1 rounded-md border border-white/15 bg-black/30 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+        />
+        <button
+          type="submit"
+          disabled={!custom.trim()}
+          className="min-h-9 shrink-0 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.16] px-4 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Send
+        </button>
+      </form>
+      {remaining > 0 ? (
+        <p className="mt-2 text-[11px] text-foundry-subtle">{remaining} more {remaining === 1 ? "question" : "questions"} after this — I&apos;ll ask once this one is answered.</p>
+      ) : null}
+    </section>
+  );
+}
+
+/** Live, always-visible mission checklist: which phase is active, which item is active right now, and the full backlog — so nothing gets lost in a long multi-part request. Rendered inside MissionPlanPanel, not directly on the canvas. */
 function MissionChecklistBoard({
   checklist,
   isLive,
@@ -1847,10 +2064,7 @@ function MissionChecklistBoard({
 }) {
   if (checklist.length <= 1) return null;
 
-  const phases = groupChecklistByPhase(checklist);
-  const activeItemId = checklist.find((item) => item.status === "running")?.id ?? checklist.find((item) => item.status === "pending")?.id;
-  const activePhaseIndex = Math.max(0, phases.findIndex((group) => group.items.some((item) => item.id === activeItemId)));
-  const doneCount = checklist.filter((item) => item.status === "completed" || item.status === "skipped").length;
+  const { phases, activeItemId, activePhaseIndex, doneCount } = missionPlanProgress(checklist);
 
   return (
     <section className="mb-3 max-w-4xl rounded-md border border-white/10 bg-black/15 p-3">
@@ -2045,15 +2259,9 @@ function MissionSummary({
             ))}
           </div>
         ) : null}
-        {needsClarification && execution.clarificationQuestions?.length ? (
-          <div className="mt-3 grid gap-1.5">
-            {execution.clarificationQuestions.map((question, index) => (
-              <p key={`${question}-${index}`} className="rounded border border-foundry-amber/25 bg-foundry-amber/[0.06] px-2.5 py-1.5 text-foundry-ink">
-                {question}
-              </p>
-            ))}
-          </div>
-        ) : null}
+        {passed && execution.previewState ? <PreviewCompletionCard execution={execution} /> : null}
+        {/* Clarification questions are surfaced as an inline DecisionPrompt in the live conversation
+            area (one at a time), not duplicated here in the settled summary. */}
         {awaitingApproval && approvalEvent ? (
           <div className="mt-3">
             <BlockedCommandLine event={approvalEvent} onApprove={onApproveCommand} />
@@ -2084,18 +2292,10 @@ function MissionSummary({
             <p className="mt-2 text-foundry-amber">Nothing here was verified against real file or command evidence — treat this as unconfirmed until you check it yourself.</p>
           ) : null}
         </SummarySection>
+        {passed && execution.previewState ? <PreviewCompletionCard execution={execution} /> : null}
 
-        {needsClarification && execution.clarificationQuestions?.length ? (
-          <SummarySection title="Needs your input">
-            <ul className="grid gap-1.5">
-              {execution.clarificationQuestions.map((question, index) => (
-                <li key={`${question}-${index}`} className="rounded border border-foundry-amber/25 bg-foundry-amber/[0.06] px-2.5 py-1.5 text-foundry-ink">
-                  {question}
-                </li>
-              ))}
-            </ul>
-          </SummarySection>
-        ) : null}
+        {/* Clarification questions render as an inline DecisionPrompt in the live conversation area
+            (one at a time, clickable), not here in the settled summary. */}
 
         {awaitingApproval && approvalEvent ? (
           <SummarySection title="Approval Required">

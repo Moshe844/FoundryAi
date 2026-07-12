@@ -19,6 +19,8 @@ import type { WorkspaceAttachment } from "@/lib/files";
 import type { SourceReference } from "@/lib/sources/types";
 import { createVisualArtifact, isExplicitVisualArtifactRequest, isTextVisualFormatRequest, isVisualOutcome, shouldReviseExistingVisual } from "@/lib/visual-artifacts";
 import type { VisualArtifact } from "@/lib/visual-artifacts";
+import { readStoredModelMode } from "@/lib/ai/model-mode";
+import { readStoredMissionQuality } from "@/lib/ai/mission/quality-mode";
 
 export type WorkspaceNote = {
   id: string;
@@ -58,6 +60,7 @@ type ProjectMessageIntentResolution = {
   intent: ProjectMessageIntent;
   continuity: "carry_forward_plan" | "fresh_plan" | "not_applicable";
   clarifyingQuestion: string;
+  clarifyingOptions: string[];
 };
 
 type ReasonApiResponse = {
@@ -762,6 +765,9 @@ export function WorkspaceShell() {
                 createPendingExecutionMission(item, task, requestNote.id),
               ],
               activeExecutionMissionId: pendingExecutionId,
+              // Any new turn supersedes a still-open clarify prompt — whether this turn IS the answer
+              // (resolved via DecisionPrompt) or an unrelated new message that makes the question moot.
+              pendingClarification: undefined,
               liveWorkEvents: ["Understanding request"],
               lastResult: "Understanding request.",
               updatedAt: requestedAt.toISOString(),
@@ -770,33 +776,34 @@ export function WorkspaceShell() {
       ),
     }));
 
-    const { intent: projectIntent, continuity, clarifyingQuestion } = await resolveProjectMessageIntent(targetMission, task);
+    const activeBeforeRequest = getActiveExecutionMission(targetMission);
+    const resolvesExecutionDecisions = activeBeforeRequest?.state === "waiting_for_user" && /^Resolved project decisions:/i.test(task.trim());
+    const resolvedIntent = await resolveProjectMessageIntent(targetMission, task);
+    const projectIntent = resolvesExecutionDecisions ? "edit" : resolvedIntent.intent;
+    const continuity = resolvesExecutionDecisions ? "carry_forward_plan" : resolvedIntent.continuity;
+    const { clarifyingQuestion, clarifyingOptions } = resolvedIntent;
 
     if (projectIntent === "clarify") {
-      // Ambiguous follow-up: ask instead of guessing. Retract the pending execution mission created
-      // above so ambiguity never leaves a phantom entry in the mission timeline/history.
-      const clarifyNote: WorkspaceNote = {
-        id: `message-${requestedAt.getTime()}-clarify`,
-        author: "Foundry",
-        initials: "FW",
-        time: requestedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        body: clarifyingQuestion || "Could you clarify what you'd like me to do here?",
-        tone: "note",
-        tags: ["Project answer"],
-        attachments: [],
-        sources: [],
-      };
+      // Ambiguous follow-up: ask instead of guessing. Retract the pending execution mission created above
+      // so ambiguity never leaves a phantom entry in the mission timeline/history, and surface the question
+      // as an inline one-at-a-time DecisionPrompt (pendingClarification) — not a passive chat note. Answering
+      // it resumes THIS mission thread with the original request + the answer (see resolveClarificationTask
+      // in BuildDashboard); any new turn clears the prompt below at the top of executeProjectMissionNow.
       setWorkspace((current) => ({
         ...current,
         missions: current.missions.map((item) =>
           item.missionId === missionId
             ? {
                 ...item,
-                messages: [...item.messages, clarifyNote],
                 executionMissions: item.executionMissions.filter((entry) => entry.id !== pendingExecutionId),
                 activeExecutionMissionId: previousActiveExecutionMissionId,
                 liveWorkEvents: [],
-                lastResult: clarifyNote.body,
+                lastResult: clarifyingQuestion || "Could you clarify what you'd like me to do here?",
+                pendingClarification: {
+                  question: clarifyingQuestion || "Could you clarify what you'd like me to do here?",
+                  options: clarifyingOptions.length ? clarifyingOptions : undefined,
+                  originalTask: task,
+                },
                 updatedAt: requestedAt.toISOString(),
               }
             : item,
@@ -871,6 +878,20 @@ export function WorkspaceShell() {
       // Continue the SAME mission entry instead of leaving the one just paused ("waiting for approval"/
       // "waiting for user") stranded forever while a brand-new entry takes over as active (Section 16).
       retractPendingExecutionMission(missionId, pendingExecutionId, previousActiveExecutionMissionId);
+      setWorkspace((current) => ({
+        ...current,
+        missions: current.missions.map((item) =>
+          item.missionId === missionId
+            ? {
+                ...item,
+                executionMissions: updateActiveExecutionMission(item, { state: "planning", updated_at: new Date().toISOString() }),
+                liveWorkEvents: ["Resuming the existing mission"],
+                lastResult: "Resuming the existing mission.",
+                updatedAt: new Date().toISOString(),
+              }
+            : item,
+        ),
+      }));
     }
 
     if (isExistingProjectPlan) {
@@ -981,7 +1002,7 @@ export function WorkspaceShell() {
       const response = await fetch("/api/factory/inspect", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ localConnector, task }),
+        body: JSON.stringify({ localConnector, task, mode: readStoredModelMode() }),
       });
       if (!response.ok) {
         const error = (await response.json().catch(() => ({}))) as { error?: string };
@@ -1007,7 +1028,7 @@ export function WorkspaceShell() {
       const response = await fetch("/api/factory/inspect", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ localPath, task }),
+        body: JSON.stringify({ localPath, task, mode: readStoredModelMode() }),
       });
       if (!response.ok) {
         const error = (await response.json().catch(() => ({}))) as { error?: string };
@@ -1166,13 +1187,13 @@ export function WorkspaceShell() {
   }
 
   async function runFactoryExecutionForMission(missionId: string, brief: string, discovery?: StructuredDiscovery) {
-    await runProjectExecutionRequest(missionId, "/api/factory/create?stream=1", { brief, discovery }, "Factory execution failed.", "Build the initial project");
+    await runProjectExecutionRequest(missionId, "/api/factory/create?stream=1", { brief, discovery, modelMode: readStoredModelMode() }, "Factory execution failed.", "Build the initial project");
   }
 
   async function runExistingProjectExecutionForMission(missionId: string, brief: string, task: string, files: FactoryUploadedFile[], localPath: string, localConnector?: { url: string; token?: string; rootLabel?: string }, parentMission?: MissionParentContext, continuity?: "carry_forward_plan", approvalResponse?: FactoryExistingProjectRequest["approvalResponse"]) {
     const approvedCategories = approvedCommandCategories[missionId] ?? [];
     const approvedProjectCommands = approvedCommands[missionId] ?? [];
-    await runProjectExecutionRequest(missionId, "/api/factory/existing?stream=1", { brief, task, files, localPath, localConnector, approvedCategories, approvedCommands: approvedProjectCommands, parentMission, continuity, approvalResponse }, "Existing project execution failed.", task);
+    await runProjectExecutionRequest(missionId, "/api/factory/existing?stream=1", { brief, task, files, localPath, localConnector, approvedCategories, approvedCommands: approvedProjectCommands, parentMission, continuity, approvalResponse, quality: readStoredMissionQuality(), modelMode: readStoredModelMode() }, "Existing project execution failed.", task);
   }
 
   function approveCommandCategory(missionId: string, category: string) {
@@ -1307,7 +1328,7 @@ export function WorkspaceShell() {
       }
 
       const message = error instanceof Error ? error.message : fallbackMessage;
-      appendProjectExecutionEvent(missionId, {
+      const failedEvent: FactoryExecutionEvent = {
         id: `execution-error-${Date.now()}`,
         timestamp: new Date().toISOString(),
         kind: "summary",
@@ -1315,21 +1336,29 @@ export function WorkspaceShell() {
         title: "Execution request failed",
         output: message,
         details: { blocker: message },
-      });
-      setWorkspace((current) => ({
-        activeMissionId: missionId,
-        missions: current.missions.map((item) =>
-          item.missionId === missionId
-            ? {
-                ...item,
-                lastResult: message,
-                liveWorkEvents: [...item.liveWorkEvents, `Factory execution failed: ${message}`],
-                workMemory: { ...item.workMemory, currentBlocker: message, updatedAt: new Date().toISOString() },
-                updatedAt: new Date().toISOString(),
-              }
-            : item,
-        ),
-      }));
+      };
+      const targetMission = workspace.missions.find((item) => item.missionId === missionId);
+      const previous = targetMission ? projectExecutionFromWorkspaceMission(targetMission) : null;
+      const failedResult: FactoryProjectResult = {
+        ...(previous ?? {
+          projectId: missionId,
+          projectName: targetMission?.title || "Project mission",
+          projectPath: "",
+          briefPath: "",
+          stack: "",
+          template: "",
+          supported: true,
+          events: [],
+          files: [],
+          commands: [],
+        }),
+        status: "failed",
+        blocker: message,
+        clarificationQuestions: undefined,
+        timeline: [...(previous?.timeline ?? []), failedEvent],
+        events: [...(previous?.events ?? []), `Factory execution failed: ${message}`],
+      };
+      updateProjectExecution(missionId, failedResult, task ?? "Continue project mission");
     } finally {
       if (activeControllersRef.current.get(missionId) === controller) {
         activeControllersRef.current.delete(missionId);
@@ -1364,7 +1393,7 @@ export function WorkspaceShell() {
     }
 
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readExecutionStreamChunk(reader);
       buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
@@ -1376,6 +1405,20 @@ export function WorkspaceShell() {
 
     if (buffer.trim()) await handleLine(buffer);
     return result;
+  }
+
+  async function readExecutionStreamChunk(reader: ReadableStreamDefaultReader<Uint8Array>) {
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("Execution stream became inactive for 150 seconds. The mission was stopped instead of remaining stuck.")), 150_000);
+        }),
+      ]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
   }
 
   function updateMissionTimeline(missionId: string, timeline: FactoryExecutionEvent[]) {
@@ -1870,23 +1913,27 @@ async function resolveProjectMessageIntent(mission: MissionState, message: strin
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message,
+        mode: readStoredModelMode(),
         context: projectIntentContextForMission(mission),
       }),
     });
     const payload = (await response.json().catch(() => null)) as
-      | { ok?: boolean; intent?: unknown; continuity?: unknown; clarifyingQuestion?: unknown }
+      | { ok?: boolean; intent?: unknown; continuity?: unknown; clarifyingQuestion?: unknown; clarifyingOptions?: unknown }
       | null;
     const modelIntent = normalizeProjectMessageIntent(payload?.intent);
     if (response.ok && payload?.ok && modelIntent) {
       const continuity =
         payload.continuity === "carry_forward_plan" || payload.continuity === "fresh_plan" ? payload.continuity : "not_applicable";
-      return { intent: modelIntent, continuity, clarifyingQuestion: String(payload.clarifyingQuestion ?? "").trim() };
+      const clarifyingOptions = Array.isArray(payload.clarifyingOptions)
+        ? payload.clarifyingOptions.map((option) => String(option).trim()).filter(Boolean).slice(0, 4)
+        : [];
+      return { intent: modelIntent, continuity, clarifyingQuestion: String(payload.clarifyingQuestion ?? "").trim(), clarifyingOptions };
     }
   } catch {
     // Fall through to the local fallback when the model-backed router is unavailable.
   }
 
-  return { intent: classifyProjectMessageIntentFallback(message), continuity: "not_applicable", clarifyingQuestion: "" };
+  return { intent: classifyProjectMessageIntentFallback(message), continuity: "not_applicable", clarifyingQuestion: "", clarifyingOptions: [] };
 }
 
 function normalizeProjectMessageIntent(value: unknown): ProjectMessageIntent | null {

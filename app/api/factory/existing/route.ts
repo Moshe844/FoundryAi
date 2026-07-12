@@ -11,7 +11,7 @@ export async function POST(request: Request) {
   const url = new URL(request.url);
   if (url.searchParams.get("stream") !== "1") {
     try {
-      const result = await executeExistingProjectTask(body.brief, body.task, body.files ?? [], body.localPath, undefined, body.localConnector, request.signal, body.approvedCategories ?? [], body.approvedCommands ?? [], body.parentMission, body.continuity, body.approvalResponse, body.quality);
+      const result = await executeExistingProjectTask(body.brief, body.task, body.files ?? [], body.localPath, undefined, body.localConnector, request.signal, body.approvedCategories ?? [], body.approvedCommands ?? [], body.parentMission, body.continuity, body.approvalResponse, body.quality, body.modelMode);
       return NextResponse.json(result);
     } catch (error) {
       return NextResponse.json({ error: error instanceof Error ? error.message : "Existing project execution failed." }, { status: 500 });
@@ -28,7 +28,7 @@ export async function POST(request: Request) {
       try {
         const result = await executeExistingProjectTask(body.brief, body.task, body.files ?? [], body.localPath, (event) => {
           send({ type: "event", event });
-        }, body.localConnector, request.signal, body.approvedCategories ?? [], body.approvedCommands ?? [], body.parentMission, body.continuity, body.approvalResponse, body.quality);
+        }, body.localConnector, request.signal, body.approvedCategories ?? [], body.approvedCommands ?? [], body.parentMission, body.continuity, body.approvalResponse, body.quality, body.modelMode);
         send({ type: "result", result });
       } catch (error) {
         send({ type: "error", error: error instanceof Error ? error.message : "Existing project execution failed." });
