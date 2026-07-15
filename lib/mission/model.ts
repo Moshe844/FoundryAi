@@ -1,0 +1,95 @@
+import type { CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
+import type { FactoryCommandEvent, FactoryExecutionEvent, FactoryObjectiveChecklistItem } from "@/lib/factory/types";
+import type { ExecutionMissionVerification } from "@/lib/factory/types";
+import type { FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
+
+/**
+ * The durable unit shown on the Mission Canvas. WorkspaceShell owns the one persisted store;
+ * this module owns only its data contract and pure presentation selectors.
+ */
+export type ExecutionMissionState =
+  | "idle"
+  | "understanding"
+  | "planning"
+  | "waiting_for_user"
+  | "waiting_for_approval"
+  | "executing"
+  | "verifying"
+  | "blocked"
+  | "failed"
+  | "complete"
+  | "cancelled"
+  | "undoing";
+
+export type ExecutionMissionVerificationStatus = "none" | "passed" | "failed" | "unverified" | "partially-verified";
+export type MissionSize = "tiny" | "small" | "medium" | "large" | "huge";
+export type ApprovalDecision = "allow_once" | "allow_project" | "always_exact" | "deny";
+
+export type ExecutionMissionApproval = {
+  id: string;
+  command: string;
+  category: CommandPermissionCategory | "unrecognized";
+  reason: string;
+  requestedAt: string;
+  decidedAs?: ApprovalDecision;
+  decidedAt?: string;
+};
+
+export type ExecutionMissionFileTouch = {
+  path: string;
+  diff?: string;
+  verified: boolean;
+  status?: "created" | "edited" | "uploaded";
+  evidence?: string;
+};
+
+export type ExecutionMissionCommandRun = FactoryCommandEvent & {
+  approved_by?: "user" | "system" | "project-scope" | "exact-command" | "auto-safe";
+  approval_scope_label: string;
+};
+
+export type ExecutionMission = {
+  id: string;
+  title: string;
+  source_requirements: string[];
+  state: ExecutionMissionState;
+  verification_status: ExecutionMissionVerificationStatus;
+  size?: MissionSize;
+  plan: FactoryObjectiveChecklistItem[];
+  activeStep?: string | null;
+  files_touched: ExecutionMissionFileTouch[];
+  commands_run: ExecutionMissionCommandRun[];
+  verification: ExecutionMissionVerification[];
+  approvals?: ExecutionMissionApproval[];
+  blocked_reason?: string;
+  pending_mock_review?: { message: string; preview_url?: string };
+  preview_url?: string;
+  undo_snapshot?: string;
+  summary: string;
+  parent_mission_id?: string;
+  /** Unique server-side execution snapshot for this exact turn, never the reusable project id. */
+  control_id?: string;
+  /** The exact intent/reference/scope record accepted before this turn executed. */
+  follow_up_resolution?: FollowUpResolutionRecord;
+  request_message_id?: string;
+  result_message_id?: string;
+  timeline: FactoryExecutionEvent[];
+  created_at: string;
+  updated_at: string;
+};
+
+export const busyMissionStates: ExecutionMissionState[] = ["understanding", "planning", "executing", "verifying", "undoing"];
+
+export function missionStateLabel(mission: ExecutionMission): string {
+  if (mission.state === "idle") return "Ready";
+  if (mission.state === "complete") {
+    if (mission.verification_status === "passed") return "Complete";
+    if (mission.verification_status === "partially-verified") return "Complete (partially verified)";
+    return "Complete (unverified)";
+  }
+  return mission.state.replace(/_/g, " ").replace(/^./, (char) => char.toUpperCase());
+}
+
+export function pendingApprovalOf(mission: ExecutionMission): ExecutionMissionApproval | undefined {
+  return (mission.approvals ?? []).find((approval) => !approval.decidedAs);
+}

@@ -18,6 +18,7 @@ export async function callAnthropicManaged(request: ManagedModelRequest, options
   const body: Record<string, unknown> = {
     model: request.model,
     max_tokens: request.maxOutputTokens,
+    cache_control: { type: "ephemeral" },
     messages: request.messages.map(renderAnthropicMessage),
   };
   if (request.system) body.system = request.system;
@@ -83,7 +84,7 @@ export async function callAnthropicManaged(request: ManagedModelRequest, options
         rateLimitCount,
         failureCount,
         contextCompressed: false,
-        cached: false,
+        cached: (data.usage?.cache_read_input_tokens ?? 0) > 0,
         createdAt: new Date().toISOString(),
       };
       return {
@@ -148,7 +149,7 @@ export async function callAnthropicManaged(request: ManagedModelRequest, options
 type AnthropicResponse = {
   content?: Array<{ type?: string; text?: string; id?: string; name?: string; input?: unknown }>;
   stop_reason?: string;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
   error?: { type?: string; message?: string };
 };
 
@@ -158,10 +159,19 @@ function renderAnthropicMessage(message: NeutralMessage) {
     role: message.role,
     content: message.content.map((part) => {
       if (part.type === "text") return { type: "text", text: part.text };
+      if (part.type === "image") {
+        const parsed = parseDataUrl(part.dataUrl);
+        return { type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } };
+      }
       if (part.type === "tool_use") return { type: "tool_use", id: part.id, name: part.name, input: safeJsonParse(part.arguments) };
       return { type: "tool_result", tool_use_id: part.toolUseId, content: part.content, is_error: part.isError || undefined };
     }),
   };
+}
+
+function parseDataUrl(value: string) {
+  const match = value.match(/^data:([^;,]+);base64,([\s\S]+)$/);
+  return { mediaType: match?.[1] ?? "image/png", data: match?.[2] ?? "" };
 }
 
 function safeJsonParse(value: string): unknown {

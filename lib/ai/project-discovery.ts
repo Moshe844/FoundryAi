@@ -134,6 +134,23 @@ const profiles: SignalProfile[] = [
     growth: ["Discount codes and a promotions engine", "Customer accounts with order history", "Reviews and ratings", "Multi-currency / multi-region support"],
   },
   {
+    id: "pos",
+    label: "Point-of-sale app",
+    patterns: [/\b(point[ -]of[ -]sale|pos app|retail pos|restaurant pos|register terminal|checkout register)\b/i],
+    stack: "Next.js",
+    architecture:
+      "Touch-first register application with an explicit transaction state machine, local-first cart and held-sale state, catalog and inventory boundaries, receipt generation, and auditable payment/refund records.",
+    architectureRationale: "A transaction state machine prevents partial tenders, duplicate completion, and refunds from becoming ambiguous UI-only state.",
+    style: "Dense register UI with large touch targets, keyboard and barcode-scanner paths, persistent totals, clear tender status, and restrained color reserved for exceptions.",
+    styleRationale: "Cashiers need speed and error resistance, so the sell flow keeps totals and the next safe action continuously visible.",
+    features: ["SKU/barcode product lookup", "Cart quantity, discounts, and tax", "Cash/card tender and change due", "Held cart restore", "Receipt generation", "Transaction history and refunds", "Low-stock visibility"],
+    entities: ["Product/SKU", "Cart line", "Sale", "Payment/tender", "Receipt", "Register shift", "Refund", "Inventory movement"],
+    users: "Cashiers, store managers, and retail operators.",
+    platform: "Web app optimized for a touch register",
+    complexity: "Transactional business application",
+    growth: ["Hardware barcode and receipt-printer integration", "Multi-register shift reconciliation", "Offline transaction queue", "Role-based approvals", "Payment-provider integration"],
+  },
+  {
     id: "dashboard",
     label: "Dashboard",
     // Bare "chart(s)" is too generic (flow chart, org chart) — dropped as a standalone trigger.

@@ -1252,3 +1252,37 @@ body {
     display: block;
   }
 }
+
+/* Mission Canvas motion system (docs/mission-canvas-ux-spec.md §11).
+   Every animation maps 1:1 to a real event or user action — no loops, no idle motion. */
+@keyframes canvas-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.canvas-enter {
+  animation: canvas-enter 200ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+/* Evidence-link flash: a summary claim scrolling to the events that back it. */
+.canvas-flash {
+  background: rgba(79, 209, 189, 0.12);
+  outline: 1px solid rgba(79, 209, 189, 0.35);
+  transition: background 600ms ease, outline-color 600ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .canvas-enter {
+    animation: none;
+  }
+  .canvas-flash {
+    transition: none;
+    outline-width: 2px;
+  }
+}

@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
+const { validationCapabilities, runBrowserValidation, compareScreenshots, runAndroidValidation, runIosValidation, runDesktopValidation } = require("./local-agent-validation.cjs");
 
 const initialRoot = process.env.FOUNDRY_CONNECTOR_ROOT || process.argv[2] || "";
 const port = Number(process.env.FOUNDRY_CONNECTOR_PORT || process.argv[3] || 3917);
@@ -16,7 +17,7 @@ const commandTimeoutMs = 120_000;
 const devServerGracePeriodMs = 6_000;
 const maxSnapshotBytes = 200_000;
 const longRunningCommandPattern =
-  /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
+  /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\b(?:python|python3|py)(?:\.exe)?\s+-m\s+http\.server\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
 
 function isLongRunningServerCommand(command) {
   return longRunningCommandPattern.test(command);
@@ -291,7 +292,7 @@ function pickFolderNative() {
       return resolve({ ok: false, unsupported: true });
     }
     let stdout = "";
-    child.stdout && child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
     child.on("error", () => {
       resolve(process.platform === "linux" ? { ok: false, unsupported: true } : { ok: false, error: "Could not open the native folder picker." });
     });
@@ -336,8 +337,30 @@ function decideCommandPermission(command) {
   }
   const approvalMatch = permissionRequiredCommandPatterns.find((entry) => entry.pattern.test(trimmed));
   if (approvalMatch) return { allowed: false, status: "permission-required", reason: approvalMatch.reason, category: approvalMatch.category };
-  if (safeCommandPatterns.some((pattern) => pattern.test(trimmed))) return { allowed: true };
+  if (safeCommandPatterns.some((pattern) => pattern.test(trimmed)) || isReadOnlyExistenceProbe(trimmed)) return { allowed: true };
   return { allowed: false, status: "permission-required", reason: "Foundry needs approval before running an unrecognized local command.", category: "unrecognized" };
+}
+
+// Mirror of lib/ai/mission/command-permissions.ts::isReadOnlyExistenceProbe — kept in sync by hand because
+// the connector is a standalone process that cannot import the app's TypeScript. A read-only existence
+// probe (`dir node_modules\pkg 2>nul || echo NOT_FOUND`, `powershell -Command "Test-Path ..."`,
+// `ls x | findstr y`, `node -e "require.resolve('pkg')"`) reads the filesystem/module graph and mutates
+// nothing, so it must not trigger an approval prompt. Destructive/permission patterns are checked before
+// this, and the base whitelist only allows inspection verbs, so no mutation slips through.
+function isReadOnlyExistenceProbe(command) {
+  const wrapper = String(command || "").trim().match(/^(?:powershell|pwsh|cmd|bash|sh)(?:\.exe)?\s+(?:-command|-c|\/c|\/k)\s+(.+)$/i);
+  const inner = wrapper ? wrapper[1].trim().replace(/^["']|["']$/g, "") : String(command || "");
+  const stderrStripped = inner.replace(/\s+2>\s*(?:nul|\/dev\/null)\b/gi, "");
+  const chainStripped = stderrStripped.replace(/\s*(?:\|\||&&)\s*echo\s+[\w.\-/\\]+\s*$/i, "").trim();
+  const pipeStripped = chainStripped
+    .replace(/\s*\|\s*(?:findstr|find|grep|egrep|fgrep|select-string|sls|wc|head|tail|more|sort|uniq|select-object|measure-object|out-string)\b[^|&;<>`$]*$/i, "")
+    .trim();
+  if (/[&|;<>`$]/.test(pipeStripped)) return false;
+  return (
+    /^(?:dir|ls|type|cat|stat|Test-Path|Get-Item|Get-ChildItem|where|which)\b/i.test(pipeStripped) ||
+    /^test\s+-[ef]\b/i.test(pipeStripped) ||
+    /^node\s+(?:-e|--eval)\b.*require\.resolve/i.test(pipeStripped)
+  );
 }
 
 function normalizeRelativePathForFilter(relativePath) {
@@ -390,7 +413,7 @@ async function writeFile(root, relativePath, content) {
   const actual = await fsp.readFile(fullPath, "utf8");
   const stats = await fsp.stat(fullPath);
   const contentChanged = existedBefore ? before !== actual : true;
-  const verified = actual === String(content) && contentChanged;
+  const verified = actual === String(content);
   const diffResult = simpleDiff(before, actual);
   return {
     existedBefore,
@@ -398,12 +421,34 @@ async function writeFile(root, relativePath, content) {
     contentChanged,
     bytes: stats.size,
     modifiedAt: stats.mtime.toISOString(),
-    reason: verified ? undefined : actual !== String(content) ? "Read-back content did not match." : "Write succeeded but file content did not change.",
+    reason: verified ? undefined : "Read-back content did not match.",
     diff: diffResult.text,
     firstChangedLine: diffResult.firstChangedLine,
     lastChangedLine: diffResult.lastChangedLine,
     beforeContent: existedBefore && Buffer.byteLength(before, "utf8") <= maxSnapshotBytes ? before : existedBefore ? undefined : "",
   };
+}
+
+async function deleteProjectRoot(rawRoot) {
+  const root = normalizeRoot(rawRoot);
+  const home = normalizeRoot(os.homedir());
+  if (!root || !approvedRoots.has(root)) return { existed: false, verified: false, reason: "That folder is not connected." };
+  if (root === path.parse(root).root || root === home) {
+    return { existed: fs.existsSync(root), verified: false, reason: "Refusing to delete a filesystem root or the user home folder." };
+  }
+  const existed = fs.existsSync(root);
+  if (!existed) {
+    approvedRoots.delete(root);
+    return { existed: false, verified: true };
+  }
+  try {
+    await fsp.rm(root, { recursive: true, force: false });
+    const verified = !fs.existsSync(root);
+    if (verified) approvedRoots.delete(root);
+    return { existed: true, verified, reason: verified ? undefined : "Project folder still exists after deletion." };
+  } catch (error) {
+    return { existed: true, verified: false, reason: error instanceof Error ? error.message : "Project deletion failed." };
+  }
 }
 
 async function listProjectTree(root, maxEntries = 2000) {
@@ -603,6 +648,19 @@ function normalizeCommandText(command) {
   return String(command || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+// Mirror of lib/ai/mission/project-access.ts::commandPermissionIdentity — kept in sync by hand (standalone
+// process, no TS import). Canonicalizes risk-neutral install variations so an approval for
+// `npm install dayjs --save` also covers `npm install dayjs` / `npm i dayjs`, and a denial never loops.
+// Different packages, `--global`, `--force`, and other command families stay distinct.
+function commandPermissionIdentity(command) {
+  let text = normalizeCommandText(command);
+  if (/\b(npm|pnpm|yarn|bun)(\.cmd)?\s+(?:install|i|add)\b/.test(text)) {
+    text = text.replace(/\b(npm|pnpm|bun)(\.cmd)?\s+i\b/g, "$1 install");
+    text = text.replace(/\s+(?:--save(?:-dev|-prod|-exact|-optional|-peer)?|--no-save|--legacy-peer-deps|-[sdebop])\b/g, "");
+  }
+  return text.replace(/\s+/g, " ").trim();
+}
+
 function tokenizeCommand(command) {
   const tokens = [];
   const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
@@ -772,6 +830,13 @@ const shellMismatchPatterns = [
   /is not a valid statement separator/i,
   /the term '.*' is not recognized/i,
   /unexpected token .* in expression or statement/i,
+  // PowerShell's execution policy blocks the npm/npx/pnpm/yarn *.ps1 shims on many Windows machines
+  // ("running scripts is disabled on this system"). That's not a real command failure — the SAME command
+  // succeeds via cmd (which uses the .cmd shim), so treat it as a shell mismatch and fall back automatically
+  // instead of surfacing a spurious failure (and re-prompting when the model retries with a cmd wrapper).
+  /running scripts is disabled on this system/i,
+  /cannot be loaded because running scripts/i,
+  /about_execution_policies/i,
 ];
 
 function isShellMismatchFailure(stdout, stderr) {
@@ -833,9 +898,10 @@ function shellInvocation(shellId, command) {
 
 let stickyShellId;
 
-function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false) {
+function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false, signal) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
+    let abortHandler;
     // A dev/server command (keepAliveOnTimeout) must survive past its own grace-period timeout — detached so
     // it isn't tied to this request's process group, and never killed when the grace period elapses below.
     const spawnOptions = invocation.useShellOption
@@ -851,6 +917,7 @@ function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
       resolve({
         exitCode,
         stdout: stdout.length > 20_000 ? `${stdout.slice(0, 20_000)}\n[output truncated]` : stdout,
@@ -879,8 +946,22 @@ function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false) {
       setTimeout(() => finish(null), 500);
     }, timeoutMs);
 
-    child.stdout && child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr && child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    // Stop (client disconnect) must actually terminate a running child — a build/install/test/lint should
+    // not keep running after the mission was cancelled (RC-E1). Dev/server processes (keepAliveOnTimeout)
+    // are intentionally exempt: they're detached to outlive the request as the live preview.
+    if (signal && !keepAliveOnTimeout) {
+      abortHandler = () => {
+        if (settled) return;
+        if (typeof child.pid === "number") killProcessTree(child.pid);
+        else child.kill();
+        setTimeout(() => finish(null), 300);
+      };
+      if (signal.aborted) abortHandler();
+      else signal.addEventListener("abort", abortHandler, { once: true });
+    }
+
+    child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
     child.on("error", (error) => {
       stderr = stderr || error.message;
       finish(null);
@@ -889,16 +970,22 @@ function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false) {
   });
 }
 
-async function runCommandWithShellFallback(command, cwd, timeoutMs, keepAliveOnTimeout = false) {
+async function runCommandWithShellFallback(command, cwd, timeoutMs, keepAliveOnTimeout = false, signal) {
+  if (/^\s*node(?:\.exe)?\s+-e\s+/i.test(command)) {
+    const tokens = tokenizeCommand(command);
+    const result = await spawnCommand({ cmd: process.execPath, args: tokens.slice(1) }, cwd, timeoutMs, false, signal);
+    return { ...result, shellUsed: "direct-node" };
+  }
   const order = process.platform === "win32" ? windowsShellOrder(stickyShellId) : posixShellOrder(stickyShellId);
   const firstAttemptedShellId = order.find((id) => shellInvocation(id, command));
   let lastResult = null;
   let lastShellId;
 
   for (const shellId of order) {
+    if (signal?.aborted) break;
     const invocation = shellInvocation(shellId, command);
     if (!invocation) continue;
-    const result = await spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout);
+    const result = await spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout, signal);
     lastResult = result;
     lastShellId = shellId;
     const mismatch = result.exitCode !== 0 && isShellMismatchFailure(result.stdout, result.stderr);
@@ -911,13 +998,13 @@ async function runCommandWithShellFallback(command, cwd, timeoutMs, keepAliveOnT
   return { ...lastResult, shellUsed: lastShellId };
 }
 
-function runCommand(root, command, cwd = "", approvedCommands = [], approvedCategories = []) {
+function runCommand(root, command, cwd = "", approvedCommands = [], approvedCategories = [], signal) {
   const requestedCwd = resolveContained(root, cwd);
   if (!requestedCwd) return Promise.resolve({ exitCode: null, stdout: "", stderr: "Refusing to run outside the connected folder.", durationMs: 0, timedOut: false, skipped: "outside-root" });
   const dependencyPreflight = dependencyInstallAlreadySatisfied(command, requestedCwd);
   if (dependencyPreflight) return Promise.resolve(dependencyPreflight);
   const permission = decideCommandPermission(command);
-  const exactApproved = approvedCommands.some((entry) => normalizeCommandText(entry) === normalizeCommandText(command));
+  const exactApproved = approvedCommands.some((entry) => commandPermissionIdentity(entry) === commandPermissionIdentity(command));
   const categoryApproved = Boolean(permission.category && approvedCategories.includes(permission.category));
   const bypassed = permission.status === "permission-required" && (exactApproved || categoryApproved);
   if (!permission.allowed && !bypassed) {
@@ -933,7 +1020,7 @@ function runCommand(root, command, cwd = "", approvedCommands = [], approvedCate
     });
   }
   if (isLongRunningServerCommand(command)) {
-    return runCommandWithShellFallback(command, requestedCwd, devServerGracePeriodMs, true).then((result) => {
+    return runCommandWithShellFallback(command, requestedCwd, devServerGracePeriodMs, true, signal).then((result) => {
       if (!result.timedOut) return result;
       return {
         ...result,
@@ -944,7 +1031,7 @@ function runCommand(root, command, cwd = "", approvedCommands = [], approvedCate
     });
   }
 
-  return runCommandWithShellFallback(command, requestedCwd, commandTimeoutMs);
+  return runCommandWithShellFallback(command, requestedCwd, commandTimeoutMs, false, signal);
 }
 
 function requireApprovedRoot(res, root) {
@@ -958,7 +1045,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "OPTIONS") return send(res, 200, { ok: true });
     if (!authorized(req)) return send(res, 401, { error: "Unauthorized connector token." });
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    if (req.method === "GET" && url.pathname === "/health") return send(res, 200, { ok: true, approvedRoots: Array.from(approvedRoots), commands: true });
+    if (req.method === "GET" && url.pathname === "/health") return send(res, 200, { ok: true, approvedRoots: Array.from(approvedRoots), commands: true, validation: validationCapabilities() });
     if (req.method !== "POST") return send(res, 404, { error: "Unknown connector endpoint." });
     const body = await readJson(req);
     if (url.pathname === "/connect") return send(res, 200, connectRoot(body.path || ""));
@@ -977,6 +1064,10 @@ const server = http.createServer(async (req, res) => {
       if (!requireApprovedRoot(res, body.root)) return;
       return send(res, 200, await writeFile(body.root, body.path || "", body.content || ""));
     }
+    if (url.pathname === "/delete-root") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await deleteProjectRoot(body.root));
+    }
     if (url.pathname === "/search") {
       if (!requireApprovedRoot(res, body.root)) return;
       return send(res, 200, { hits: await searchFiles(body.root, body.query || "", body.maxResults || 20) });
@@ -987,7 +1078,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/run") {
       if (!requireApprovedRoot(res, body.root)) return;
-      return send(res, 200, await runCommand(body.root, String(body.command || ""), String(body.cwd || ""), Array.isArray(body.approvedCommands) ? body.approvedCommands : [], Array.isArray(body.approvedCategories) ? body.approvedCategories : []));
+      // Stop = the client aborts its request. Fire an AbortSignal on a premature disconnect (connection
+      // closed before we finished responding) so a running build/install/test child is actually killed
+      // (RC-E1). A normal completion closes the socket only after writableFinished, so it won't abort.
+      const runController = new AbortController();
+      res.on("close", () => { if (!res.writableFinished) runController.abort(); });
+      return send(res, 200, await runCommand(body.root, String(body.command || ""), String(body.cwd || ""), Array.isArray(body.approvedCommands) ? body.approvedCommands : [], Array.isArray(body.approvedCategories) ? body.approvedCategories : [], runController.signal));
     }
     if (url.pathname === "/preview/start") {
       if (!requireApprovedRoot(res, body.root)) return;
@@ -1000,6 +1096,27 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/preview/status") {
       if (!requireApprovedRoot(res, body.root)) return;
       return send(res, 200, await previewStatus(body.root, String(body.path || "")));
+    }
+    if (url.pathname === "/validation/capabilities") return send(res, 200, validationCapabilities());
+    if (url.pathname === "/validation/browser/run") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await runBrowserValidation(body));
+    }
+    if (url.pathname === "/validation/browser/compare") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await compareScreenshots(body.root, body.baselineScreenshot, body.actualScreenshot, body.diffName));
+    }
+    if (url.pathname === "/validation/android/run") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await runAndroidValidation(body));
+    }
+    if (url.pathname === "/validation/ios/run") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await runIosValidation(body));
+    }
+    if (url.pathname === "/validation/desktop/run") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await runDesktopValidation(body));
     }
     return send(res, 404, { error: "Unknown connector endpoint." });
   } catch (error) {

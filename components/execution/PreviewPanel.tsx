@@ -1,6 +1,6 @@
 "use client";
 
-import { ExternalLink, Gamepad2, Loader2, Monitor, PanelRightClose, Play, RefreshCw, Smartphone, Tablet } from "lucide-react";
+import { Download, ExternalLink, Gamepad2, Maximize2, Minimize2, Monitor, PanelRightClose, Play, RefreshCw, Smartphone, Tablet } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FactoryProjectResult } from "@/lib/factory/types";
 
@@ -25,7 +25,6 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
   if (execution.previewState === "starting") {
     return (
       <div className={`${wrap} flex flex-1 flex-col items-center justify-center gap-2 px-4 text-center text-xs leading-5 text-foundry-subtle`}>
-        <Loader2 size={16} className="animate-spin text-foundry-teal" />
         <p>Starting the preview server…</p>
       </div>
     );
@@ -50,14 +49,18 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
     return <ApiPlayground baseUrl={execution.previewUrl} fill={fill} />;
   }
 
+  if (execution.artifact || execution.previewPlatform === "desktop") {
+    return <div className={fill ? "p-3" : ""}><PreviewCompletionCard execution={execution} /></div>;
+  }
+
   if (execution.previewUrl) {
     const frameWidth = viewport === "mobile" ? "390px" : viewport === "tablet" ? "768px" : "100%";
     return (
       <div className={`${fill ? "flex min-h-0 flex-1 flex-col" : "mt-4 overflow-hidden rounded-md border border-white/10"}`}>
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">{execution.previewPlatform === "game" ? "Playable Preview" : "Live Preview"}</span>
-            <span className="hidden truncate font-mono text-[10.5px] text-foundry-subtle sm:inline">{execution.previewUrl}</span>
+            <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">{execution.previewPlatform === "game" ? "Playable Preview" : "Local Preview"}</span>
+            <a href={execution.previewUrl} target="_blank" rel="noreferrer" title={`Open ${execution.previewUrl}`} className="min-w-0 truncate font-mono text-[10.5px] text-foundry-subtle underline decoration-white/20 underline-offset-2 transition hover:text-foundry-ink">{execution.previewUrl}</a>
           </div>
           <div className="flex items-center gap-1">
             {([['desktop', Monitor], ['tablet', Tablet], ['mobile', Smartphone]] as const).map(([size, Icon]) => (
@@ -103,8 +106,34 @@ export function PreviewCompletionCard({ execution }: { execution: FactoryProject
         {execution.previewUrl ? <a href={execution.previewUrl} target="_blank" rel="noreferrer" className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22]"><ExternalLink size={14} />{label}</a> : platform === "desktop" && ready ? <button type="button" onClick={launchDesktop} disabled={launchState === "launching"} className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:opacity-60"><Play size={14} />{launchState === "launching" ? "Launching..." : launchState === "launched" ? "App launched" : "Launch desktop app"}</button> : null}
       </div>
       {launchState === "error" ? <p className="mt-2 text-xs text-foundry-amber">The desktop app could not be launched. Rebuild it and try again.</p> : null}
+      {execution.artifact ? (
+        <div className="mt-3 border-t border-foundry-teal/20 pt-3">
+          <div className="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
+            <ArtifactField label="Application" value={execution.projectName} />
+            <ArtifactField label="Platform" value={execution.artifact.platform} />
+            <ArtifactField label="Version" value={execution.artifact.version} />
+            <ArtifactField label="File" value={`${execution.artifact.name} · ${execution.artifact.fileType}`} />
+            <ArtifactField label="Size" value={formatArtifactSize(execution.artifact.sizeBytes)} />
+            <ArtifactField label="Build status" value="Verified on disk" />
+            <ArtifactField label="Created" value={new Date(execution.artifact.createdAt).toLocaleString()} />
+          </div>
+          <a href={execution.artifact.downloadUrl} download className="mt-3 inline-flex min-h-9 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22]">
+            <Download size={14} />Download for {execution.artifact.platform.toLowerCase().startsWith("win") ? "Windows" : execution.artifact.platform}
+          </a>
+        </div>
+      ) : null}
     </section>
   );
+}
+
+function ArtifactField({ label, value }: { label: string; value: string }) {
+  return <p className="min-w-0"><span className="block font-mono text-[10px] uppercase tracking-[0.06em] text-foundry-subtle">{label}</span><span className="mt-0.5 block break-all font-bold text-foundry-ink">{value}</span></p>;
+}
+
+function formatArtifactSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function previewActionLabel(platform: FactoryProjectResult["previewPlatform"]) {
@@ -123,7 +152,7 @@ function previewReadyTitle(platform: FactoryProjectResult["previewPlatform"]) {
   return "Interactive preview is ready";
 }
 
-export function EngineeringWorkspacePanel({ execution, onCollapse }: { execution: FactoryProjectResult | null; onCollapse: () => void }) {
+export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = false, onToggleFullScreen }: { execution: FactoryProjectResult | null; onCollapse: () => void; fullScreen?: boolean; onToggleFullScreen?: () => void }) {
   const previewUrl = execution?.previewUrl;
   const canPopOut = Boolean(previewUrl) && execution?.previewPlatform !== "api";
 
@@ -132,19 +161,23 @@ export function EngineeringWorkspacePanel({ execution, onCollapse }: { execution
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">
-            {execution?.previewPlatform === "api" ? "API Playground" : execution?.previewPlatform === "game" ? "Playable Preview" : "Interactive Preview"}
+            {execution?.previewPlatform === "api" ? "API Playground" : execution?.previewPlatform === "game" ? "Playable Preview" : "Local Interactive Preview"}
           </span>
-          {execution?.previewState === "ready" ? <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-foundry-teal" /> : null}
+          {execution?.previewState === "ready" ? <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-foundry-teal" /> : null}
+          {previewUrl ? <a href={previewUrl} target="_blank" rel="noreferrer" className="min-w-0 truncate font-mono text-[10px] text-foundry-subtle underline decoration-white/20 underline-offset-2 transition hover:text-foundry-ink" title={`Open ${previewUrl}`}>{previewUrl}</a> : null}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {canPopOut && previewUrl ? (
+            <a href={previewUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded px-2 py-1 text-[10.5px] font-bold text-foundry-teal transition hover:bg-foundry-teal/[0.1]" title="Open preview in a new tab"><ExternalLink size={14} />Open</a>
+          ) : null}
+          {onToggleFullScreen ? (
             <button
               type="button"
-              onClick={() => window.open(previewUrl, "_blank", "noopener,noreferrer")}
+              onClick={onToggleFullScreen}
               className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"
-              title="Open preview in a new tab"
+              title={fullScreen ? "Exit full-screen preview" : "Full-screen preview"}
             >
-              <ExternalLink size={14} />
+              {fullScreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
             </button>
           ) : null}
           <button

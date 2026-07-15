@@ -2,6 +2,9 @@ import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
 import { resolveModelForTier } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
+import { routingContext } from "@/lib/ai/routing/request-context";
+import { profileTask } from "@/lib/ai/routing/task-profiler";
+import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
 
 export type MissionIntent = "question" | "edit" | "debug" | "build" | "analyze" | "status" | "undo" | "deploy";
 
@@ -9,6 +12,7 @@ export type IntentClassification = {
   intent: MissionIntent;
   needsProjectInspection: boolean;
   rationale: string;
+  routingAssessment: DynamicTaskAssessment;
   usage?: RuntimeUsageRecord;
 };
 
@@ -48,8 +52,23 @@ const CLASSIFY_TOOL: NeutralTool = {
       },
       needs_project_inspection: { type: "boolean" },
       rationale: { type: "string" },
+      task_type: { type: "string", enum: ["inspect", "explain", "edit", "build", "debug", "refactor", "migrate", "review", "operate"] },
+      affected_scope: { type: "string", enum: ["single-location", "single-file", "few-files", "multi-subsystem", "project-wide"] },
+      estimated_files: { type: "integer", minimum: 1, maximum: 100 },
+      estimated_subsystems: { type: "integer", minimum: 1, maximum: 10 },
+      difficulty: { type: "number", minimum: 0, maximum: 1 },
+      uncertainty: { type: "number", minimum: 0, maximum: 1 },
+      risk: { type: "number", minimum: 0, maximum: 1 },
+      context_required: { type: "number", minimum: 0, maximum: 1 },
+      security_or_payment: { type: "boolean" },
+      migration: { type: "boolean" },
+      repetitive: { type: "boolean" },
+      project_creation: { type: "boolean" },
+      independent_review_needed: { type: "boolean" },
+      confidence: { type: "number", minimum: 0, maximum: 1 },
+      routing_reasons: { type: "array", items: { type: "string" }, maxItems: 4 },
     },
-    required: ["intent", "needs_project_inspection", "rationale"],
+    required: ["intent", "needs_project_inspection", "rationale", "task_type", "affected_scope", "estimated_files", "estimated_subsystems", "difficulty", "uncertainty", "risk", "context_required", "security_or_payment", "migration", "repetitive", "project_creation", "independent_review_needed", "confidence", "routing_reasons"],
   },
 };
 
@@ -66,6 +85,11 @@ const CLASSIFY_SYSTEM_PROMPT = [
   "Only 'edit', 'debug', 'build', and 'deploy' should ever result in file writes. Everything else must be read-only.",
   "Hard rule: if the user asks to add, make, change, update, move, create, fix, implement, allow, enable, replace, or wire project behavior, classify it as edit/build/debug/deploy unless they explicitly ask only for advice or explanation.",
   "Do not classify a change request as question/analyze just because it mentions inspection, summary, verification, events, or status as part of the requested fix.",
+  "Also assess only the CURRENT message's work. Previous project size or a prior model is never a reason to increase difficulty, risk, scope, or context.",
+  "Estimate affected files/subsystems from the requested change, not repository size. A new project is not automatically difficult.",
+  "Use low scores for searching, reading, formatting, summaries, explanations, repetitive edits, copy/style changes, and bounded scaffolds.",
+  "Use higher scores only for genuine coupling, difficult diagnosis, uncertainty, migrations, security/authentication, payments, data loss, or broad coordination.",
+  "Do not recommend a model or tier. Report normalized engineering facts; deterministic routing code chooses the model.",
 ].join("\n");
 
 export async function classifyIntent(input: {
@@ -75,6 +99,7 @@ export async function classifyIntent(input: {
   workspaceId?: string;
   userId?: string;
   provider?: ProviderId;
+  projectEvidence?: { likelyFiles: string[]; estimatedSubsystems: number; crossLayer: boolean };
 }): Promise<IntentClassification> {
   // provider defaults to "openai" — matches this function's behavior before the provider abstraction
   // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
@@ -87,10 +112,14 @@ export async function classifyIntent(input: {
       model,
       effort: effort ?? "low",
       system: [CLASSIFY_SYSTEM_PROMPT, input.hasProjectContext ? "A project is connected." : "No project is connected yet.", "Always call classify_intent with your answer. Do not respond with plain text."].join("\n"),
-      messages: [{ role: "user", content: [{ type: "text", text: input.message }] }],
+      messages: [{ role: "user", content: [{ type: "text", text: [
+        `Current user message:\n${input.message}`,
+        input.projectEvidence ? `Current-task working-set evidence (not total repository size):\nLikely files: ${input.projectEvidence.likelyFiles.slice(0, 20).join(", ") || "none located yet"}\nEstimated subsystems: ${input.projectEvidence.estimatedSubsystems}\nCross-layer evidence: ${input.projectEvidence.crossLayer}` : "",
+      ].filter(Boolean).join("\n\n") }] }],
       tools: [CLASSIFY_TOOL],
       toolChoice: "auto",
-      maxOutputTokens: 800,
+      maxOutputTokens: 700,
+      routing: routingContext(input.message, "classify", "fast", input.workspaceId),
     },
     { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 4 },
   );
@@ -98,7 +127,7 @@ export async function classifyIntent(input: {
   const call = result.toolCalls.find((item) => item.name === "classify_intent");
   const parsed = call?.arguments ? safeJsonParse(call.arguments) : undefined;
 
-  if (!parsed) {
+  if (!parsed || !isMissionIntent(parsed.intent)) {
     const detail = result.errorMessage;
     return {
       intent: guessIntentHeuristically(input.message),
@@ -106,6 +135,7 @@ export async function classifyIntent(input: {
       rationale: detail
         ? `Model classification was unavailable (${detail}); used a conservative heuristic fallback.`
         : "Model classification was unavailable; used a conservative heuristic fallback.",
+      routingAssessment: deterministicTaskAssessment(input.message, "heuristic-fallback"),
       usage: result.usage,
     };
   }
@@ -120,6 +150,7 @@ export async function classifyIntent(input: {
       intent: deterministicIntent,
       needsProjectInspection: true,
       rationale: `Deterministic edit-intent guard overrode ${parsed.intent}: the message asks Foundry to change the project.`,
+      routingAssessment: assessmentFromParsed(parsed),
       usage: result.usage,
     };
   }
@@ -128,6 +159,7 @@ export async function classifyIntent(input: {
     intent: parsed.intent,
     needsProjectInspection: Boolean(parsed.needs_project_inspection),
     rationale: String(parsed.rationale ?? ""),
+    routingAssessment: assessmentFromParsed(parsed),
     usage: result.usage,
   };
 }
@@ -147,7 +179,61 @@ export function guessIntentHeuristically(message: string): MissionIntent {
   return "edit";
 }
 
-function safeJsonParse(value: string): { intent: MissionIntent; needs_project_inspection?: boolean; rationale?: string } | undefined {
+type ParsedClassification = {
+  intent: MissionIntent; needs_project_inspection?: boolean; rationale?: string;
+  task_type?: DynamicTaskAssessment["taskType"]; affected_scope?: DynamicTaskAssessment["affectedScope"];
+  estimated_files?: number; estimated_subsystems?: number; difficulty?: number; uncertainty?: number; risk?: number; context_required?: number;
+  security_or_payment?: boolean; migration?: boolean; repetitive?: boolean; project_creation?: boolean; independent_review_needed?: boolean;
+  confidence?: number; routing_reasons?: string[];
+};
+
+export function deterministicTaskAssessment(message: string, source: DynamicTaskAssessment["source"] = "deterministic-obvious"): DynamicTaskAssessment {
+  const profile = profileTask({ message });
+  return {
+    taskType: normalizeTaskType(profile.taskType),
+    affectedScope: profile.scope.projectWide ? "project-wide" : profile.scope.crossLayer ? "multi-subsystem" : profile.scope.estimatedFiles <= 1 ? "single-file" : "few-files",
+    estimatedFiles: profile.scope.estimatedFiles,
+    estimatedSubsystems: profile.scope.estimatedSubsystems,
+    difficulty: profile.difficulty,
+    uncertainty: profile.ambiguity,
+    risk: profile.risk,
+    contextRequired: profile.contextNeed,
+    securityOrPayment: profile.risk >= 0.45,
+    migration: profile.taskType === "migration",
+    repetitive: /\b(?:repeat|same|every|all occurrences?|across these)\b/i.test(message),
+    projectCreation: profile.taskType === "project_creation",
+    independentReviewNeeded: false,
+    confidence: profile.confidence,
+    reasons: profile.reasons,
+    source,
+  };
+}
+
+function assessmentFromParsed(parsed: ParsedClassification): DynamicTaskAssessment {
+  return {
+    taskType: parsed.task_type ?? "edit",
+    affectedScope: parsed.affected_scope ?? "few-files",
+    estimatedFiles: boundedInteger(parsed.estimated_files, 1, 100, 3),
+    estimatedSubsystems: boundedInteger(parsed.estimated_subsystems, 1, 10, 1),
+    difficulty: boundedScore(parsed.difficulty, 0.5), uncertainty: boundedScore(parsed.uncertainty, 0.4), risk: boundedScore(parsed.risk, 0.25),
+    contextRequired: boundedScore(parsed.context_required, 0.5), securityOrPayment: Boolean(parsed.security_or_payment), migration: Boolean(parsed.migration),
+    repetitive: Boolean(parsed.repetitive), projectCreation: Boolean(parsed.project_creation), independentReviewNeeded: Boolean(parsed.independent_review_needed),
+    confidence: boundedScore(parsed.confidence, 0.6), reasons: Array.isArray(parsed.routing_reasons) ? parsed.routing_reasons.map(String).slice(0, 4) : [],
+    source: "dynamic-fast-classifier",
+  };
+}
+
+function normalizeTaskType(value: string): DynamicTaskAssessment["taskType"] {
+  if (value === "inspection" || value === "localized-edit" || value === "project_creation" || value === "implementation" || value === "migration" || value === "debugging") {
+    return value === "inspection" ? "inspect" : value === "localized-edit" ? "edit" : value === "project_creation" ? "build" : value === "migration" ? "migrate" : value === "debugging" ? "debug" : "edit";
+  }
+  return "explain";
+}
+function boundedScore(value: number | undefined, fallback: number) { return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback; }
+function boundedInteger(value: number | undefined, minimum: number, maximum: number, fallback: number) { return typeof value === "number" && Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, Math.round(value))) : fallback; }
+function isMissionIntent(value: unknown): value is MissionIntent { return typeof value === "string" && ["question", "edit", "debug", "build", "analyze", "status", "undo", "deploy"].includes(value); }
+
+function safeJsonParse(value: string): ParsedClassification | undefined {
   try {
     return JSON.parse(value);
   } catch {

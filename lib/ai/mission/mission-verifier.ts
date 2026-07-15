@@ -4,6 +4,8 @@ import type { ModelTier } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { FactoryNarrativeObject, FactoryObjectiveChecklistItem } from "@/lib/factory/types";
 import type { MissionExecutorResult } from "@/lib/ai/mission/executor";
+import { routingContext } from "@/lib/ai/routing/request-context";
+import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
 
 export type MissionVerification = {
   confidence: number;
@@ -78,9 +80,11 @@ export async function verifyMissionResult(input: {
   userId?: string;
   provider?: ProviderId;
   tier?: ModelTier;
+  routingAssessment?: DynamicTaskAssessment;
 }): Promise<MissionVerification> {
   const provider: ProviderId = input.provider ?? "openai";
-  const { model, effort } = resolveModelForTier(input.tier ?? "fast", { provider });
+  const verificationTier = input.tier ?? "fast";
+  const { model, effort } = resolveModelForTier(verificationTier, { provider });
 
   try {
     const result = await callManagedModel(
@@ -93,6 +97,7 @@ export async function verifyMissionResult(input: {
         tools: [VERIFY_TOOL],
         toolChoice: { name: "submit_verification" },
         maxOutputTokens: 600,
+        routing: routingContext(input.task, "verify", verificationTier, input.workspaceId, input.routingAssessment),
       },
       { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 2 },
     );

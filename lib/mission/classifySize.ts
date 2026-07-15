@@ -1,4 +1,4 @@
-import type { MissionSize } from "@/lib/mission/reducer";
+import type { MissionSize } from "@/lib/mission/model";
 
 /**
  * Decides whether a mission gets the full phased-plan/checklist UI or a condensed single-line view.

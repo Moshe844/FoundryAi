@@ -1,13 +1,9 @@
 import type { FactoryObjectiveChecklistItem } from "@/lib/factory/types";
 
 /**
- * Level 1 — Inspect/Explain: read and describe the code, propose changes as diffs, but never edit or run anything.
- * Level 2 — Safe Edits: edit files directly (with approval per the approval system) and verify via file
- *   read-back, but cannot run this stack's build/test/lint tooling in-session.
- * Level 3 — Run Build/Test: edit files AND execute the stack's build/test/lint commands in-session, with real
- *   output streamed back — but not yet multi-phase mission planning, checkpointing, or undo for this stack.
- * Level 4 — Full Mission Support: everything in 1-3, plus multi-phase mission planning, checkpointing, and
- *   undo across the full Mission Contract.
+ * Compatibility value retained for persisted briefs and badges. Every recognized/custom stack now enters
+ * Level 4's full mission workflow. Runtime/toolchain availability is represented separately by detected
+ * verification profiles and skipped evidence—not by disabling planning, edits, history, or undo.
  */
 export type StackCapabilityLevel = 1 | 2 | 3 | 4;
 
@@ -53,13 +49,9 @@ function isDotnetDesktopProject(content: string | undefined): boolean {
  * Detects the project's stack and the capability level Foundry currently supports for it. Never assume web/JS
  * by default — fall through every category before giving up.
  *
- * Target levels (concrete, not vague — see Section 17):
- * Level 4 (full mission support): HTML/CSS/JS, React, Next.js, Vue, Node, Python
- * Level 3 (edit + run build/test in-session, no multi-phase mission/checkpointing/undo yet): Angular, PHP,
- *   .NET Web API, Java/Spring, Go, Rust
- * Level 2 (safe edits + verified read-back, no commands): .NET WinForms/WPF, Android, Flutter, React Native,
- *   Electron, Tauri, SQL, Docker
- * Level 1 (inspect/explain only): Unity, Godot, Kubernetes, Terraform
+ * All detected ecosystems receive the full mission workflow. Whether compilation, device launch, engine
+ * validation, database execution, or infrastructure validation can run is discovered from the actual project
+ * and local environment and reported as passed/failed/skipped evidence.
  */
 export function detectStackProfile(input: StackDetectionInput): StackProfile {
   const names = input.rootEntries.map((name) => name.toLowerCase());
@@ -71,48 +63,51 @@ export function detectStackProfile(input: StackDetectionInput): StackProfile {
   if (has("next.config.js") || has("next.config.mjs") || has("next.config.ts") || hasDependency(pkg, "next")) {
     return { id: "nextjs", label: "Next.js", level: 4 };
   }
-  if (hasDependency(pkg, "react-native")) return { id: "react-native", label: "React Native", level: 2 };
-  if (hasDependency(pkg, "electron")) return { id: "electron", label: "Electron", level: 2 };
-  if (has("tauri.conf.json") || has("src-tauri")) return { id: "tauri", label: "Tauri", level: 2 };
-  if (has("angular.json")) return { id: "angular", label: "Angular", level: 3 };
+  if (has("astro.config.js") || has("astro.config.mjs") || has("astro.config.ts") || hasDependency(pkg, "astro")) {
+    return { id: "astro", label: "Astro", level: 4 };
+  }
+  if (hasDependency(pkg, "react-native")) return { id: "react-native", label: "React Native", level: 4 };
+  if (hasDependency(pkg, "electron")) return { id: "electron", label: "Electron", level: 4 };
+  if (has("tauri.conf.json") || has("src-tauri")) return { id: "tauri", label: "Tauri", level: 4 };
+  if (has("angular.json")) return { id: "angular", label: "Angular", level: 4 };
   if (has("vue.config.js") || has("vue.config.ts") || hasDependency(pkg, "vue")) return { id: "vue", label: "Vue", level: 4 };
   if (hasDependency(pkg, "react")) return { id: "react", label: "React", level: 4 };
   if (hasDependency(pkg, "express")) return { id: "node-express", label: "Node/Express", level: 4 };
   if (pkg) return { id: "node", label: "Node.js", level: 4 };
 
   // Mobile / desktop native
-  if (has("pubspec.yaml")) return { id: "flutter", label: "Flutter", level: 2 };
-  if (has("androidmanifest.xml")) return { id: "android", label: "Android (Java/Kotlin)", level: 2 };
+  if (has("pubspec.yaml")) return { id: "flutter", label: "Flutter", level: 4 };
+  if (has("androidmanifest.xml")) return { id: "android", label: "Android (Java/Kotlin)", level: 4 };
   if (endsWith(".sln") || endsWith(".csproj")) {
     const isDesktop = isDotnetDesktopProject(input.dotnetProjectFileContent);
     return isDesktop
-      ? { id: "dotnet-desktop", label: /wpf/i.test(input.dotnetProjectFileContent ?? "") ? ".NET WPF" : ".NET WinForms", level: 2 }
-      : { id: "dotnet-web", label: ".NET Web API", level: 3 };
+      ? { id: "dotnet-desktop", label: /wpf/i.test(input.dotnetProjectFileContent ?? "") ? ".NET WPF" : ".NET WinForms", level: 4 }
+      : { id: "dotnet-web", label: ".NET Web API", level: 4 };
   }
 
   // Backend
-  if (has("composer.json") || has("artisan")) return { id: "php", label: has("artisan") ? "PHP/Laravel" : "PHP", level: 3 };
+  if (has("composer.json") || has("artisan")) return { id: "php", label: has("artisan") ? "PHP/Laravel" : "PHP", level: 4 };
   if (has("pom.xml") || endsWith("build.gradle") || endsWith("build.gradle.kts")) {
     const isSpring = /spring-boot/i.test(input.javaBuildFileContent ?? "");
-    return { id: "java", label: isSpring ? "Java/Spring" : "Java", level: isSpring ? 3 : 2 };
+    return { id: "java", label: isSpring ? "Java/Spring" : "Java", level: 4 };
   }
   if (has("requirements.txt") || has("pyproject.toml") || has("manage.py")) {
     return { id: "python", label: has("manage.py") ? "Python/Django" : "Python", level: 4 };
   }
-  if (has("gemfile")) return { id: "ruby", label: "Ruby/Rails", level: 1 };
-  if (has("go.mod")) return { id: "go", label: "Go", level: 3 };
-  if (has("cargo.toml")) return { id: "rust", label: "Rust", level: 3 };
+  if (has("gemfile")) return { id: "ruby", label: "Ruby/Rails", level: 4 };
+  if (has("go.mod")) return { id: "go", label: "Go", level: 4 };
+  if (has("cargo.toml")) return { id: "rust", label: "Rust", level: 4 };
 
   // Other
-  if (has("project.godot")) return { id: "godot", label: "Godot", level: 1 };
-  if (has("assets") && has("projectsettings")) return { id: "unity", label: "Unity", level: 1 };
-  if (has("k8s") || has("kubernetes") || has("helm")) return { id: "kubernetes", label: "Kubernetes", level: 1 };
-  if (has("dockerfile") || has("docker-compose.yml") || has("docker-compose.yaml")) return { id: "docker", label: "Docker", level: 2 };
-  if (names.some((name) => name.endsWith(".tf"))) return { id: "terraform", label: "Terraform", level: 1 };
-  if (names.some((name) => name.endsWith(".sql")) || has("migrations")) return { id: "sql", label: "SQL/database project", level: 2 };
+  if (has("project.godot")) return { id: "godot", label: "Godot", level: 4 };
+  if (has("assets") && has("projectsettings")) return { id: "unity", label: "Unity", level: 4 };
+  if (has("k8s") || has("kubernetes") || has("helm")) return { id: "kubernetes", label: "Kubernetes", level: 4 };
+  if (has("dockerfile") || has("docker-compose.yml") || has("docker-compose.yaml")) return { id: "docker", label: "Docker", level: 4 };
+  if (names.some((name) => name.endsWith(".tf"))) return { id: "terraform", label: "Terraform", level: 4 };
+  if (names.some((name) => name.endsWith(".sql")) || has("migrations")) return { id: "sql", label: "SQL/database project", level: 4 };
   if (names.some((name) => name.endsWith(".html") || name.endsWith(".htm"))) return { id: "static-html", label: "Static HTML/CSS/JS", level: 4 };
 
-  return { id: "unknown", label: "Unknown project", level: 1 };
+  return { id: "unknown", label: "Custom project", level: 4 };
 }
 
 export function unsupportedEditingMessage(stack: StackProfile): string {
@@ -126,35 +121,36 @@ export function unsupportedCreationMessage(stack: StackProfile): string {
 /** Maps a stack name the user explicitly chose in the new-project wizard (e.g. "Next.js", "Python/FastAPI") to its capability level. Unlike detectStackProfile, this has no files to inspect — it classifies the choice itself. */
 export function capabilityLevelForStackChoice(stackName: string): StackProfile {
   const name = (stackName || "").toLowerCase();
+  if (/\bastro\b/.test(name)) return { id: "astro", label: "Astro", level: 4 };
   if (/next\.?js/.test(name)) return { id: "nextjs", label: "Next.js", level: 4 };
   if (/node\s*\/?\s*express|node\.js|express/.test(name)) return { id: "node-express", label: "Node/Express", level: 4 };
-  if (/html\s*\/\s*css\s*\/\s*js|static/.test(name)) return { id: "static-html", label: "Static HTML/CSS/JS", level: 4 };
+  if (/html\s*(?:\/|\+|,|and)\s*css(?:\s*(?:\/|\+|,|and)\s*(?:vanilla\s*)?(?:java\s*script|javascript|js))?|vanilla\s*(?:java\s*script|javascript|js)|static\s*(?:html|site|website)/.test(name)) return { id: "static-html", label: "Static HTML/CSS/JS", level: 4 };
   if (/phaser/.test(name)) return { id: "phaser", label: "Phaser (web game)", level: 4 };
-  if (/react\s*native/.test(name)) return { id: "react-native", label: "React Native", level: 2 };
+  if (/react\s*native/.test(name)) return { id: "react-native", label: "React Native", level: 4 };
   if (/react/.test(name)) return { id: "react", label: "React", level: 4 };
   if (/vue/.test(name)) return { id: "vue", label: "Vue", level: 4 };
-  if (/angular/.test(name)) return { id: "angular", label: "Angular", level: 3 };
-  if (/android/.test(name)) return { id: "android", label: /kotlin/.test(name) ? "Android (Kotlin)" : "Android (Java)", level: 2 };
-  if (/flutter/.test(name)) return { id: "flutter", label: "Flutter", level: 2 };
-  if (/web\s*api|asp\.?net/.test(name)) return { id: "dotnet-web", label: ".NET Web API", level: 3 };
-  if (/wpf/.test(name)) return { id: "dotnet-desktop", label: ".NET WPF", level: 2 };
-  if (/winforms/.test(name)) return { id: "dotnet-desktop", label: ".NET WinForms", level: 2 };
-  if (/\.net|dotnet/.test(name)) return { id: "dotnet-desktop", label: ".NET", level: 2 };
+  if (/angular/.test(name)) return { id: "angular", label: "Angular", level: 4 };
+  if (/android/.test(name)) return { id: "android", label: /kotlin/.test(name) ? "Android (Kotlin)" : "Android (Java)", level: 4 };
+  if (/flutter/.test(name)) return { id: "flutter", label: "Flutter", level: 4 };
+  if (/web\s*api|asp\.?net/.test(name)) return { id: "dotnet-web", label: ".NET Web API", level: 4 };
+  if (/wpf/.test(name)) return { id: "dotnet-desktop", label: ".NET WPF", level: 4 };
+  if (/winforms/.test(name)) return { id: "dotnet-desktop", label: ".NET WinForms", level: 4 };
+  if (/\.net|dotnet/.test(name)) return { id: "dotnet-desktop", label: ".NET", level: 4 };
   if (/fastapi|django|python/.test(name)) return { id: "python", label: "Python", level: 4 };
-  if (/laravel|php/.test(name)) return { id: "php", label: "PHP/Laravel", level: 3 };
-  if (/spring/.test(name)) return { id: "java", label: "Java/Spring", level: 3 };
-  if (/java\b/.test(name)) return { id: "java", label: "Java", level: 2 };
-  if (/electron/.test(name)) return { id: "electron", label: "Electron", level: 2 };
-  if (/tauri/.test(name)) return { id: "tauri", label: "Tauri", level: 2 };
-  if (/docker/.test(name)) return { id: "docker", label: "Docker", level: 2 };
-  if (/\bsql\b|database/.test(name)) return { id: "sql", label: "SQL/database project", level: 2 };
-  if (/unity/.test(name)) return { id: "unity", label: "Unity", level: 1 };
-  if (/godot/.test(name)) return { id: "godot", label: "Godot", level: 1 };
-  if (/kubernetes|k8s/.test(name)) return { id: "kubernetes", label: "Kubernetes", level: 1 };
-  if (/terraform/.test(name)) return { id: "terraform", label: "Terraform", level: 1 };
-  if (/rust/.test(name)) return { id: "rust", label: "Rust", level: 3 };
-  if (/^go$|golang/.test(name)) return { id: "go", label: "Go", level: 3 };
-  return { id: "custom", label: stackName?.trim() || "Custom", level: 1 };
+  if (/laravel|php/.test(name)) return { id: "php", label: "PHP/Laravel", level: 4 };
+  if (/spring/.test(name)) return { id: "java", label: "Java/Spring", level: 4 };
+  if (/java\b/.test(name)) return { id: "java", label: "Java", level: 4 };
+  if (/electron/.test(name)) return { id: "electron", label: "Electron", level: 4 };
+  if (/tauri/.test(name)) return { id: "tauri", label: "Tauri", level: 4 };
+  if (/docker/.test(name)) return { id: "docker", label: "Docker", level: 4 };
+  if (/\bsql\b|database/.test(name)) return { id: "sql", label: "SQL/database project", level: 4 };
+  if (/unity/.test(name)) return { id: "unity", label: "Unity", level: 4 };
+  if (/godot/.test(name)) return { id: "godot", label: "Godot", level: 4 };
+  if (/kubernetes|k8s/.test(name)) return { id: "kubernetes", label: "Kubernetes", level: 4 };
+  if (/terraform/.test(name)) return { id: "terraform", label: "Terraform", level: 4 };
+  if (/rust/.test(name)) return { id: "rust", label: "Rust", level: 4 };
+  if (/^go$|golang/.test(name)) return { id: "go", label: "Go", level: 4 };
+  return { id: "custom", label: stackName?.trim() || "Custom", level: 4 };
 }
 
 const bigScopePattern = /\b(refactor|restructure|redesign|migrate|migration|architecture|rewrite|overhaul|multiple files|several files|every page|all pages|throughout|entire (project|app|codebase)|new feature|from scratch)\b/i;
@@ -257,8 +253,9 @@ export function checklistForRequest(task: string, sourceModeLabel: string): Fact
 }
 
 function isDynamicFieldConfigurationRequest(text: string) {
-  return /\b(fields?|columns?|excel|spreadsheet|upload|mapping|transaction|tx|payload)\b/.test(text) &&
-    /\b(dynamic|config|configuration|frontend|ui|edit|add|remove|required|optional|hardcoded|hard-coded|server\.js)\b/.test(text);
+  return /\b(dynamic|configurable|configured|configuration|hardcoded|hard-coded)\b[^.\n]{0,60}\b(fields?|columns?|mapping)\b/.test(text) ||
+    /\b(add|edit|remove|required|optional)\b[^.\n]{0,40}\b(fields?|columns?)\b/.test(text) ||
+    /\b(excel|spreadsheet|upload|payload)\b[^.\n]{0,60}\b(field|column|mapping|schema)\b/.test(text);
 }
 
 function wantsAssetSeparation(text: string) {

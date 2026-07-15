@@ -1,5 +1,10 @@
 import type { ReasoningRequest } from "@/lib/ai/context";
 import type { ProviderId } from "@/lib/ai/providers/types";
+import { CapabilityRegistry } from "@/lib/ai/routing/capability-registry";
+import { liveRegistrySnapshot } from "@/lib/ai/routing/registry-state";
+import { selectModel } from "@/lib/ai/routing/selector";
+import { profileTask } from "@/lib/ai/routing/task-profiler";
+import type { TaskProfile } from "@/lib/ai/routing/types";
 
 export type ModelProfile = "fast" | "standard" | "advanced" | "autonomous";
 
@@ -12,10 +17,10 @@ export type ModelDecision = {
 type ModelConfig = Record<ModelProfile, string>;
 
 const defaultModelConfig: ModelConfig = {
-  fast: "gpt-5-mini",
-  standard: "gpt-5",
-  advanced: "gpt-5",
-  autonomous: "gpt-5",
+  fast: "",
+  standard: "",
+  advanced: "",
+  autonomous: "",
 };
 
 const fallbackOrder: Record<ModelProfile, ModelProfile[]> = {
@@ -25,16 +30,11 @@ const fallbackOrder: Record<ModelProfile, ModelProfile[]> = {
   autonomous: ["advanced", "standard", "fast"],
 };
 
-const profilePricingUsdPerMillion: Record<ModelProfile, { input: number; output: number }> = {
-  fast: { input: 0.25, output: 2 },
-  standard: { input: 1.25, output: 10 },
-  advanced: { input: 1.25, output: 10 },
-  autonomous: { input: 1.25, output: 10 },
-};
-
 export function modelForReasoningRequest(request: ReasoningRequest): ModelDecision {
-  const profile = profileForReasoningRequest(request);
-  return modelDecision(profile, "reasoning request");
+  const tier = tierForReasoningRequest(request);
+  const profile: ModelProfile = tier === "fast" ? "fast" : tier === "builder" ? "standard" : tier === "architect" ? "advanced" : "autonomous";
+  const resolved = resolveModelForTier(tier, { provider: "openai" });
+  return { profile, model: resolved.model, reason: `Fresh current-message classification selected ${tier}.` };
 }
 
 export function modelForRuntimePayload(payload: unknown, requestedModel = ""): ModelDecision {
@@ -59,8 +59,7 @@ export function fallbackModelForModel(model: string) {
 }
 
 export function pricingForModel(model: string) {
-  const profile = profileForModel(model);
-  return profilePricingUsdPerMillion[profile];
+  return pricingForProviderModel("openai", model);
 }
 
 export function profileForModel(model: string): ModelProfile {
@@ -79,72 +78,19 @@ export function getModelConfig(): ModelConfig {
 }
 
 function modelDecision(profile: ModelProfile, reason: string): ModelDecision {
+  const tier: ModelTier = profile === "fast" ? "fast" : profile === "standard" ? "builder" : profile === "advanced" ? "architect" : "enterprise-architect";
+  const resolved = resolveModelForTier(tier, { provider: "openai" });
   return {
     profile,
-    model: getModelConfig()[profile],
+    model: resolved.model,
     reason,
   };
 }
 
-function profileForReasoningRequest(request: ReasoningRequest): ModelProfile {
-  const text = [
-    request.userMessage,
-    request.missionTitle,
-    request.desiredOutcome,
-    request.attachments.map((attachment) => `${attachment.fileName} ${attachment.evidenceKind} ${attachment.fileType}`).join(" "),
-  ]
-    .join(" ")
-    .toLowerCase();
-  const readableAttachments = request.attachments.filter((attachment) => attachment.uploadStatus === "readable").length;
-  const hasImages = request.attachments.some((attachment) => attachment.uploadStatus === "image");
-
-  if (/\b(autonomous|execute plan|run the plan|self-review|verify everything|long-running|multi-step execution)\b/i.test(text)) {
-    return "autonomous";
-  }
-
-  if (
-    request.troubleshooting.active ||
-    readableAttachments >= 2 ||
-    hasImages ||
-    /\b(android|gradle|build failed|root cause|investigation|compare files|uploaded logs?|screenshots?|payment investigation|multi-file|correlat(?:e|ion)|large log)\b/i.test(text)
-  ) {
-    return "advanced";
-  }
-
-  if (request.desiredOutcome === "code" || /\b(refactor|architecture|explain code|compare two snippets|documentation|api explanation|moderate debugging)\b/i.test(text)) {
-    return "standard";
-  }
-
-  if (/\b(what is|define|flush dns|ping|restart windows|cmd|powershell|simple|basic syntax|small rewrite|show .*command)\b/i.test(text)) {
-    return "fast";
-  }
-
-  return "standard";
-}
-
 function profileForRuntimePayload(payload: unknown, requestedModel: string): ModelProfile {
-  const requestedProfile = requestedModel ? profileForModel(requestedModel) : undefined;
-  const text = JSON.stringify(payload).toLowerCase();
-
-  if (/\b(autonomous|execute plan|self-review|long-running|tool orchestration)\b/i.test(text)) return strongest(requestedProfile, "autonomous");
-  if (/\b(uploaded logs?|screenshots?|multi-file|android|gradle|build failed|root cause|investigation|large comparison|payment)\b/i.test(text)) {
-    return strongest(requestedProfile, "advanced");
-  }
-  if (/\b(refactor|architecture|explain code|compare|documentation|api explanation)\b/i.test(text)) return strongest(requestedProfile, "standard");
-  if (text.length < 12000 && /\b(simple answer|short answer|what is|how do i|verify|next step|command)\b/i.test(text)) return "fast";
-
-  return requestedProfile ?? "standard";
-}
-
-function strongest(left: ModelProfile | undefined, right: ModelProfile): ModelProfile {
-  const rank: Record<ModelProfile, number> = {
-    fast: 1,
-    standard: 2,
-    advanced: 3,
-    autonomous: 4,
-  };
-  if (!left) return right;
-  return rank[left] >= rank[right] ? left : right;
+  void requestedModel; // A prior/requested model is intentionally not a routing signal.
+  const tier = profileTask({ message: typeof payload === "string" ? payload : JSON.stringify(payload) }).recommendedIntelligenceTier;
+  return tier === "fast" ? "fast" : tier === "builder" ? "standard" : tier === "architect" ? "advanced" : "autonomous";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,48 +133,21 @@ export type TierModelEntry = { model: string; effort?: "low" | "medium" | "high"
  * mechanism keeps working for tier-based lookups exactly as it already does for profile-based ones,
  * rather than introducing a second, disconnected table that could silently drift out of sync with it.
  */
-export const TIER_MODEL_TABLE: Record<ModelTier, Record<"anthropic" | "google", TierModelEntry>> = {
-  fast: {
-    anthropic: { model: "claude-haiku-4-5" },
-    google: { model: "gemini-flash-lite-latest" },
-  },
-  builder: {
-    anthropic: { model: "claude-sonnet-5" },
-    google: { model: "gemini-pro-latest" },
-  },
-  architect: {
-    anthropic: { model: "claude-opus-4-8", effort: "high" },
-    google: { model: "gemini-pro-latest", effort: "high" },
-  },
-  "enterprise-architect": {
-    // Same models as Architect — the difference is workflow (planning-only use of the strong model,
-    // see the module comment for level 4 in the product spec), not a stronger model id, since no
-    // higher tier exists in any of the three providers' current lineups known to this repo.
-    anthropic: { model: "claude-opus-4-8", effort: "high" },
-    google: { model: "gemini-pro-latest", effort: "high" },
-  },
-  "super-reasoning": {
-    anthropic: { model: "claude-opus-4-8", effort: "high" },
-    google: { model: "gemini-pro-latest", effort: "high" },
-  },
-};
-
 export type TierResolution = { tier: ModelTier; provider: ProviderId; model: string; effort?: "low" | "medium" | "high" };
 
 export function resolveModelForTier(tier: ModelTier, opts?: { provider?: ProviderId }): TierResolution {
-  const provider = opts?.provider ?? "openai";
-  if (provider === "openai") {
-    const config = getModelConfig();
-    // fast -> the configured fast model; every other tier -> the configured "standard" model
-    // (defaultModelConfig already maps standard/advanced/autonomous to the same gpt-5 id), scaled by
-    // reasoning effort instead of a different model id, since no higher OpenAI model id is asserted
-    // anywhere else in this repo.
-    const model = tier === "fast" ? config.fast : config.standard;
-    const effort = tier === "fast" || tier === "builder" ? undefined : "high";
-    return { tier, provider, model, effort };
-  }
-  const entry = TIER_MODEL_TABLE[tier][provider];
-  return { tier, provider, model: entry.model, effort: entry.effort };
+  const registry = new CapabilityRegistry(liveRegistrySnapshot().models);
+  const profile = syntheticProfile(tier);
+  const disabledProviders: ProviderId[] | undefined = opts?.provider
+    ? (["openai", "anthropic", "google"] as ProviderId[]).filter((provider) => provider !== opts.provider)
+    : undefined;
+  const decision = selectModel(profile, registry, { preferredProvider: opts?.provider, disabledProviders });
+  if (decision) return { tier, provider: decision.provider, model: decision.model, effort: decision.effort };
+  throw new Error(`The live model registry has no validated ${tier} candidate${opts?.provider ? ` for ${opts.provider}` : ""}. Refresh provider models before routing.`);
+}
+
+function syntheticProfile(tier: ModelTier): TaskProfile {
+  return { intent: "change", taskType: tier === "fast" ? "localized-edit" : "implementation", requestedOutcome: "", scope: { estimatedFiles: tier === "fast" ? 1 : 3, estimatedSubsystems: 1, crossLayer: false, projectWide: false }, projectScale: 0, taskLocality: 1, difficulty: 0.5, ambiguity: 0, risk: 0, blastRadius: 0.2, contextNeed: 0.4, reasoningNeed: 0.5, toolUseNeed: 0.7, visualNeed: 0, verificationNeed: 0.5, reversibility: 0.8, failureHistory: 0, recommendedIntelligenceTier: tier, recommendedExecutionDepth: "standard", confidence: 1, reasons: ["explicit capability tier"] };
 }
 
 /**
@@ -239,22 +158,11 @@ export function resolveModelForTier(tier: ModelTier, opts?: { provider?: Provide
  * pricingForProviderModel, which reuses the existing profilePricingUsdPerMillion table above to avoid
  * two tables that could drift apart.
  */
-const NON_OPENAI_PRICING: Record<"anthropic" | "google", Record<string, { input: number; output: number }>> = {
-  anthropic: {
-    "claude-haiku-4-5": { input: 1, output: 5 },
-    "claude-sonnet-5": { input: 3, output: 15 },
-    "claude-opus-4-8": { input: 5, output: 25 },
-  },
-  google: {
-    "gemini-flash-lite-latest": { input: 0.1, output: 0.4 },
-    "gemini-pro-latest": { input: 1.25, output: 10 },
-  },
-};
-
 export function pricingForProviderModel(provider: ProviderId, model: string) {
-  if (provider === "openai") return pricingForModel(model);
-  const table = NON_OPENAI_PRICING[provider];
-  return table[model] ?? table[Object.keys(table)[0]];
+  const registered = liveRegistrySnapshot().models.find((candidate) => candidate.provider === provider && candidate.modelId === model);
+  if (registered?.inputUsdPerMillion != null && registered.outputUsdPerMillion != null) return { input: registered.inputUsdPerMillion, output: registered.outputUsdPerMillion };
+  const estimates = { "ultra-low": { input: 0.15, output: 1 }, low: { input: 0.5, output: 3 }, medium: { input: 1.5, output: 8 }, high: { input: 4, output: 20 }, premium: { input: 10, output: 50 } };
+  return estimates[registered?.costClass ?? "medium"];
 }
 
 /**
@@ -263,79 +171,23 @@ export function pricingForProviderModel(provider: ProviderId, model: string) {
  * vocabulary. Modifiers ("quick"/"be careful"/"big refactor") apply after the bucket match.
  */
 export function tierForReasoningRequest(request: ReasoningRequest): ModelTier {
-  const text = [
-    request.userMessage,
-    request.missionTitle,
-    request.desiredOutcome,
-    request.attachments.map((attachment) => `${attachment.fileName} ${attachment.evidenceKind} ${attachment.fileType}`).join(" "),
-  ]
-    .join(" ")
-    .toLowerCase();
-  const readableAttachments = request.attachments.filter((attachment) => attachment.uploadStatus === "readable").length;
-  const hasImages = request.attachments.some((attachment) => attachment.uploadStatus === "image");
-
-  const base = classifyTierFromText(text, { readableAttachments, hasImages, troubleshootingActive: request.troubleshooting.active, desiredOutcomeIsCode: request.desiredOutcome === "code" });
-  return applyTierModifiers(text, base);
+  return profileTask({
+    message: request.userMessage,
+    activeMission: [request.missionTitle, request.desiredOutcome].filter(Boolean).join(" — "),
+    likelyFiles: request.attachments.filter((attachment) => attachment.uploadStatus === "readable").map((attachment) => attachment.fileName),
+    failureHistory: request.troubleshooting.active ? 1 : 0,
+  }).recommendedIntelligenceTier;
 }
 
-/** 5-bucket remap of profileForRuntimePayload — same ratcheting ("strongest wins") behavior, extended to 5 ranks. */
+/** Fresh task-first payload classification. A requested tier is a ceiling, never prior-turn inertia. */
 export function tierForRuntimePayload(payload: unknown, requestedTier?: ModelTier): ModelTier {
-  const text = JSON.stringify(payload).toLowerCase();
-  const base = classifyTierFromText(text, { readableAttachments: 0, hasImages: false, troubleshootingActive: false, desiredOutcomeIsCode: false });
-  const withRequested = requestedTier ? strongestTier(requestedTier, base) : base;
-  return applyTierModifiers(text, withRequested);
+  const base = profileTask({ message: typeof payload === "string" ? payload : JSON.stringify(payload) }).recommendedIntelligenceTier;
+  return requestedTier ? lowerTier(base, requestedTier) : base;
 }
 
-const SUPER_REASONING_PATTERN =
-  /\b(500,?000\+?\s*lines|unknown legacy system|major production incident|multi-day migration|complex architecture design|cross-language project|deep performance debugging|security architecture|agent\/?runtime architecture|foundry (?:core|runtime|architecture))\b/i;
-const ENTERPRISE_ARCHITECT_PATTERN =
-  /\b(100,?000\+?\s*lines|large android app|large next\.?js|large saas app|multi-service backend|large refactor|architecture redesign|migrat(?:e|ion) from .{0,40}(?:to|into)|complex dependency upgrade|security-sensitive|payment[- ]processing|large codebase)\b/i;
-const ARCHITECT_PATTERN =
-  /\b(refactor (?:several|multiple) modules|unclear runtime issue|android|gradle|kotlin|payment sdk|auth system|multi-file|complex backend|backend\/?frontend coordination|large typescript|large react|database schema|hard build failures?|multi-step recovery|root cause|investigation)\b/i;
-const BUILDER_PATTERN =
-  /\b(add a feature|fix a bug|update .*component|add .*endpoint|node\/?express|small database change|form validation|refactor one module|fix build errors?|package configuration)\b/i;
-const FAST_PATTERN =
-  /\b(css|button color|small html|simple javascript|read(?:ing)? (?:one|two|1|2) files?|explain(?:ing)? an error|find(?:ing)? where|copy update|simple debugging|make it darker|small (?:css|text|copy) change)\b/i;
-
-function classifyTierFromText(
-  text: string,
-  signals: { readableAttachments: number; hasImages: boolean; troubleshootingActive: boolean; desiredOutcomeIsCode: boolean },
-): ModelTier {
-  if (SUPER_REASONING_PATTERN.test(text)) return "super-reasoning";
-  if (ENTERPRISE_ARCHITECT_PATTERN.test(text)) return "enterprise-architect";
-  if (FAST_PATTERN.test(text)) return "fast";
-  if (
-    signals.troubleshootingActive ||
-    signals.readableAttachments >= 2 ||
-    signals.hasImages ||
-    ARCHITECT_PATTERN.test(text) ||
-    /\b(build failed|payment sdk integration|android\/gradle\/kotlin)\b/i.test(text)
-  ) {
-    return "architect";
-  }
-  if (signals.desiredOutcomeIsCode || BUILDER_PATTERN.test(text) || /\b(refactor|architecture|api endpoint)\b/i.test(text)) return "builder";
-  if (/\b(what is|define|simple|basic syntax|small rewrite)\b/i.test(text)) return "fast";
-  return "builder";
-}
-
-/** Cost Rule + Auto Routing Rules modifiers: "quick" forces down, "be careful" forces up, "big refactor" ratchets to at least Architect. */
-function applyTierModifiers(text: string, tier: ModelTier): ModelTier {
-  let result = tier;
-  if (/\bquick\b/i.test(text) && tier !== "enterprise-architect" && tier !== "super-reasoning") {
-    result = "fast";
-  }
-  if (/\bbe careful\b/i.test(text)) {
-    result = strongestTier(result, "architect");
-  }
-  if (/\bbig refactor\b/i.test(text)) {
-    result = strongestTier(result, ENTERPRISE_ARCHITECT_PATTERN.test(text) ? "enterprise-architect" : "architect");
-  }
-  return result;
-}
-
-function strongestTier(left: ModelTier, right: ModelTier): ModelTier {
+function lowerTier(left: ModelTier, ceiling: ModelTier): ModelTier {
   const rank: Record<ModelTier, number> = { fast: 1, builder: 2, architect: 3, "enterprise-architect": 4, "super-reasoning": 5 };
-  return rank[left] >= rank[right] ? left : right;
+  return rank[left] <= rank[ceiling] ? left : ceiling;
 }
 
 export type AutoResolution = TierResolution & { autoSelected: true; reason: string };

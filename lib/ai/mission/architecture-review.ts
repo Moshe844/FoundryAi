@@ -3,6 +3,8 @@ import { resolveModelForTier } from "@/lib/ai/model-router";
 import type { ModelTier } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { FactoryObjectiveChecklistItem } from "@/lib/factory/types";
+import { routingContext } from "@/lib/ai/routing/request-context";
+import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
 
 export type ArchitectureReviewResult = {
   concerns: string[];
@@ -68,9 +70,11 @@ export async function reviewArchitecture(input: {
   userId?: string;
   provider?: ProviderId;
   tier?: ModelTier;
+  routingAssessment?: DynamicTaskAssessment;
 }): Promise<ArchitectureReviewResult> {
   const provider: ProviderId = input.provider ?? "openai";
-  const { model, effort } = resolveModelForTier(input.tier ?? "architect", { provider });
+  const reviewTier = input.tier ?? "architect";
+  const { model, effort } = resolveModelForTier(reviewTier, { provider });
 
   const userText = [
     `Objective: ${input.objective}`,
@@ -94,6 +98,7 @@ export async function reviewArchitecture(input: {
         tools: [REVIEW_TOOL],
         toolChoice: { name: "submit_architecture_review" },
         maxOutputTokens: 1500,
+        routing: routingContext(input.task, "review", reviewTier, input.workspaceId, input.routingAssessment),
       },
       { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 2 },
     );

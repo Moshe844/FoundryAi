@@ -1,27 +1,23 @@
 "use client";
 
+
 import {
-  AlertTriangle,
   AppWindow,
+  ArrowRight,
   BrainCircuit,
   Boxes,
   CheckCircle2,
-  CircleDot,
   Code2,
   Download,
   FolderGit2,
+  FolderOpen,
   Gamepad2,
   Globe2,
   History,
   LayoutDashboard,
-  Loader2,
-  Lock,
-  PanelRightOpen,
   Pencil,
   Settings,
-  Send as SendIcon,
   ShoppingBag,
-  SkipForward,
   Smartphone,
   Sparkles,
   Store,
@@ -30,31 +26,24 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
-import type { ExecutionMission, MissionState, PendingClarification } from "@/lib/mission-engine";
-import { deriveMissionDisplayStatus, getActiveExecutionMission, isSoftwareProjectMission, missionStateLabel, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
-import { continueOrResumeMission, recentProjects, type PersonalizedCard } from "@/lib/discovery/personalization";
+import type { ReactNode } from "react";
+import type { MissionState } from "@/lib/mission-engine";
+import { deriveMissionDisplayStatus, isSoftwareProjectMission, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
+import { continueOrResumeMission, recentProjects } from "@/lib/discovery/personalization";
 import { runDiscoveryEngine, seedDiscovery } from "@/lib/discovery/engine";
 import { FALLBACK_STACK_OPTIONS, type StackOption } from "@/lib/ai/project-discovery-llm";
 import { genericHistoryRecommendation, type HistoryRecommendation, type HistorySummaryItem } from "@/lib/discovery/history-recommendations";
-import { discoverProject } from "@/lib/ai/project-discovery";
+import { deriveQuestionsAndAssumptions, discoverProject } from "@/lib/ai/project-discovery";
 import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
 import { capabilityLevelForStackChoice, unsupportedCreationMessage } from "@/lib/factory/language-adapters";
-import { genericRecommendations } from "@/lib/ai/mission/recommendations";
-import type { MissionRecommendation } from "@/lib/ai/mission/recommendations";
 import type { StackProfile } from "@/lib/factory/language-adapters";
-import type { CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
-import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryFileReadResult, FactoryJournalEntry, FactoryObjectiveChecklistItem, FactoryProjectResult, FactoryUploadedFile, MissionClarification, StructuredDiscovery } from "@/lib/factory/types";
-import { EngineeringWorkspacePanel, PreviewCompletionCard, PreviewPanel } from "@/components/execution/PreviewPanel";
-import { ApprovalGate, BlockedCommandLine } from "@/components/execution/ApprovalPrompt";
-import { CodeViewTabs, DetailRow, ExecutionLevelToggle, ExecutionTimeline } from "@/components/execution/ExecutionTimeline";
+import type { FactoryExistingProjectRequest, FactoryFileReadResult, FactoryJournalEntry, FactoryProjectResult, FactoryUploadedFile, StructuredDiscovery } from "@/lib/factory/types";
+import { MissionCanvas } from "@/components/canvas/MissionCanvas";
 import { humanizeKey } from "@/components/execution/timelineUtils";
-import type { BlockedCommandAction, ExecutionLevel } from "@/components/execution/timelineUtils";
-import { ComposerModelSelector, ModelModeSelector, ModelSelectionChip } from "@/components/ModelModeSelector";
+import { ModelModeSelector, ModelSelectionChip } from "@/components/ModelModeSelector";
 import { useModelMode } from "@/lib/ai/model-mode";
 import type { ModelMode, TierResolution } from "@/lib/ai/model-router";
-import { MissionQualitySelector } from "@/components/MissionQualitySelector";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 
@@ -67,7 +56,7 @@ type BuildDashboardProps = {
   onDeleteMission?: (missionId: string) => void;
   onCreateProject?: (brief: string, files?: FactoryUploadedFile[], discovery?: StructuredDiscovery) => void | Promise<void>;
   onUpdateProjectExecution?: (missionId: string, result: FactoryProjectResult) => void;
-  onExecuteProject?: (missionId: string, task: string, approvalResponse?: ApprovalResponse) => void | Promise<void>;
+  onExecuteProject?: (missionId: string, task: string, approvalResponse?: ApprovalResponse, evidenceFiles?: File[]) => void | Promise<void>;
   onRollbackToEntry?: (missionId: string, projectId: string, entryId: string) => void | Promise<void>;
   onApproveCategory?: (missionId: string, category: string) => void;
   onApproveCommand?: (missionId: string, command: string) => void;
@@ -381,24 +370,6 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
   const connectedPath = connectedProject ? connectedPathForMission(connectedProject, execution) : "";
   const selectedProjectBrief = connectedProject && isSoftwareProjectMission(connectedProject) ? projectBriefFromMission(connectedProject) : "";
 
-  async function fetchFileContent(filePath: string): Promise<string | null> {
-    const virtualFile = execution?.files.find((file) => file.path === filePath && typeof file.content === "string");
-    if (virtualFile?.content !== undefined) return virtualFile.content;
-    const connectedFile = workspaceFiles.find((file) => file.path === filePath);
-    if (connectedFile && typeof connectedFile.content === "string") return connectedFile.content;
-    if (connectorInfo) return readAgentFile(connectorInfo.url, connectorInfo.token, connectorInfo.root, filePath);
-    const projectId = execution?.projectId;
-    if (!projectId) return null;
-    try {
-      const response = await fetch(`/api/factory/file?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(filePath)}`);
-      if (!response.ok) return null;
-      const result = (await response.json()) as FactoryFileReadResult;
-      return result.content;
-    } catch {
-      return null;
-    }
-  }
-
   async function readGeneratedFile(filePath: string, projectIdOverride?: string) {
     const virtualFile = execution?.files.find((file) => file.path === filePath && typeof file.content === "string");
     if (virtualFile?.content !== undefined) {
@@ -425,35 +396,45 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
       }
       return;
     }
-    if (connectedFile && typeof connectedFile.content !== "string") {
-      setSelectedFile({
-        projectId: connectedPath || "connected-project",
-        path: filePath,
-        content: "File content is not available for this older project record. Re-open/upload the project folder to let Foundry inspect and edit file contents.",
-      });
-      setFileReadError("");
+    const connectedProjectId = connectedPath.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1);
+    const projectIds = Array.from(new Set([projectIdOverride, execution?.projectId, connectedProjectId].filter((value): value is string => Boolean(value))));
+    if (!projectIds.length) {
+      setFileReadError("This project record has file metadata but no durable project id. Reconnect its folder to restore file access.");
       setFilePanelOpen(true);
       return;
     }
-    const projectId = projectIdOverride ?? execution?.projectId;
-    if (!projectId) return;
     setFileReadError("");
     try {
-      const response = await fetch(`/api/factory/file?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(filePath)}`);
-      if (!response.ok) throw new Error((await response.json() as { error?: string }).error ?? "Could not read file.");
-      setSelectedFile((await response.json()) as FactoryFileReadResult);
-      setFilePanelOpen(true);
+      let lastError = "Could not read file.";
+      for (const projectId of projectIds) {
+        const response = await fetch(`/api/factory/file?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(filePath)}`);
+        if (!response.ok) {
+          lastError = (await response.json() as { error?: string }).error ?? lastError;
+          continue;
+        }
+        setSelectedFile((await response.json()) as FactoryFileReadResult);
+        setFilePanelOpen(true);
+        return;
+      }
+      throw new Error(lastError);
     } catch (error) {
       setFileReadError(error instanceof Error ? error.message : "Could not read file.");
     }
   }
 
   function openFlow(template: BuildTemplate, initialDescription = "") {
-    const subtype = firstSubtypeFor(template.id);
+    const described = initialDescription.trim();
+    // When the caller already captured a description (dashboard prompt, history recommendation), mirror
+    // the seed the "What do you want to build?" step would apply, then skip straight past that step so
+    // the same question isn't asked twice.
+    const seed = described && template.id === "custom" ? seedDiscovery(initialDescription) : null;
+    const subtype = seed ? firstSubtypeForDetectedType(seed.domainGuess) : firstSubtypeFor(template.id);
     const appKind = initialDescription || appKindFor(template, subtype, "");
-    const projectName = template.id === "custom" ? "" : cleanProjectName(appKind);
+    const projectName = template.id === "custom"
+      ? (seed ? cleanProjectName(seed.domainGuess) : "")
+      : cleanProjectName(appKind);
     setActiveTemplate(template);
-    setFlowStep("kind");
+    setFlowStep(described ? "project" : "kind");
     setStart({
       template,
       projectMode: "new",
@@ -522,6 +503,9 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
   function createProject() {
     if (start) {
       void onCreateProject?.(projectBriefFor(start), start.uploadedFiles, structuredDiscoveryFor(start));
+      // The build starts immediately, so take the user to the live mission canvas immediately too.
+      // Leaving the Templates dashboard visible made real execution look disconnected or invisible.
+      setActiveView("workspace");
     } else {
       onCreateMission();
     }
@@ -531,7 +515,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
   return (
     <>
       <main
-        className="grid min-h-0 gap-4 overflow-hidden p-3 lg:grid-cols-[240px_minmax(0,1fr)] lg:p-4"
+        className="grid min-h-0 gap-4 overflow-y-auto p-3 lg:grid-cols-[240px_minmax(0,1fr)] lg:overflow-hidden lg:p-4"
       >
         <FactorySidebar
           missions={missions}
@@ -579,22 +563,24 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
             onOpenExistingProject={() => openExistingFlow("connect-existing")}
           />
         ) : connectedProject && selectedProjectBrief ? (
-            <ProjectBriefView
-              mission={connectedProject}
-              brief={selectedProjectBrief}
-              execution={execution}
-              connectedPath={connectedPath}
-              workspaceFiles={workspaceFiles}
-              queuedTask={queuedTask}
-            onStartProject={() => openFlow(buildTemplates.find((template) => template.id === "custom") ?? buildTemplates[0])}
+          <MissionCanvas
+            mission={connectedProject}
+            brief={selectedProjectBrief}
+            execution={execution}
+            connectedPath={connectedPath}
+            workspaceFiles={workspaceFiles}
+            queuedTask={queuedTask}
+            onStartProject={() => {
+              setActiveView("templates");
+              setFilePanelOpen(false);
+              setSelectedFile(null);
+            }}
             onViewFiles={() => setFilePanelOpen(true)}
-            onReadFile={readGeneratedFile}
-            onFetchFileContent={fetchFileContent}
-            onExecute={(task, approvalResponse) => {
+            onExecute={(task, approvalResponse, evidenceFiles) => {
               setActiveView("workspace");
               setFilePanelOpen(false);
               setSelectedFile(null);
-              void onExecuteProject?.(connectedProject.missionId, task, approvalResponse);
+              void onExecuteProject?.(connectedProject.missionId, task, approvalResponse, evidenceFiles);
             }}
             onApproveCategory={onApproveCategory ? (category) => onApproveCategory(connectedProject.missionId, category) : undefined}
             onApproveCommand={onApproveCommand ? (command) => onApproveCommand(connectedProject.missionId, command) : undefined}
@@ -651,7 +637,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
         />
       ) : null}
 
-      {filePanelOpen && (execution || selectedFile) ? (
+      {filePanelOpen && (execution || selectedFile || workspaceFiles.length > 0) ? (
         <FileTreePanel
           execution={execution}
           workspaceFiles={workspaceFiles}
@@ -696,7 +682,7 @@ function FactorySidebar({
   ];
 
   return (
-    <aside className={`glass-panel min-h-0 flex-col gap-4 p-3 ${hideOnMobile ? "hidden lg:flex" : "flex"}`} aria-label="Factory navigation">
+    <aside className={`glass-panel lg:min-h-0 flex-col gap-4 p-3 ${hideOnMobile ? "hidden lg:flex" : "flex"}`} aria-label="Factory navigation">
       <div className="px-1">
         <p className="section-kicker">Projects</p>
         <p className="mt-1 text-xs leading-5 text-foundry-subtle">Switch workspaces or start a new one.</p>
@@ -712,6 +698,7 @@ function FactorySidebar({
                 activeView === item.id ? "bg-white/[0.075] text-foundry-ink" : "text-foundry-muted hover:bg-white/[0.045] hover:text-foundry-ink"
               }`}
               type="button"
+              aria-current={activeView === item.id ? "page" : undefined}
               onClick={() => onViewChange(item.id)}
             >
               <Icon size={16} />
@@ -804,7 +791,7 @@ function JournalView({
   }, [projectId]);
 
   return (
-    <section className="min-h-0 overflow-auto rounded-xl border border-white/10 bg-[#101416]/90 shadow-workspace">
+    <section className="lg:min-h-0 lg:overflow-auto rounded-xl border border-white/10 bg-[#101416]/90 shadow-workspace">
       <div className="border-b border-white/10 px-4 py-4 sm:px-5">
         <p className="section-kicker">Permanent Record</p>
         <h1 className="mt-2 text-2xl font-extrabold text-foundry-ink">Execution Journal</h1>
@@ -895,7 +882,7 @@ function FactorySettingsView({
   const files = execution?.files.length ?? 0;
 
   return (
-    <section className="min-h-0 overflow-auto border border-white/10 bg-[#0c1011]/95 shadow-workspace">
+    <section className="lg:min-h-0 lg:overflow-auto border border-white/10 bg-[#0c1011]/95 shadow-workspace">
       <div className="border-b border-white/10 px-4 py-4 sm:px-5">
         <p className="section-kicker">Settings</p>
         <h1 className="mt-2 text-2xl font-extrabold text-foundry-ink">Workspace settings</h1>
@@ -947,22 +934,17 @@ function BuildCard({ template, onStart }: { template: BuildTemplate; onStart: ()
 
   return (
     <button
-      className="group min-h-[210px] rounded-lg border border-white/10 bg-white/[0.04] p-4 text-left transition hover:border-foundry-teal/35 hover:bg-white/[0.065] focus-visible:border-foundry-teal/45 focus-visible:outline-none"
+      className="group flex items-start gap-3 rounded-lg border border-white/10 bg-white/[0.03] p-3.5 text-left transition hover:border-foundry-teal/35 hover:bg-white/[0.06] focus-visible:border-foundry-teal/45 focus-visible:outline-none"
       type="button"
       onClick={onStart}
+      title={template.defaults.slice(0, 2).join(" · ")}
     >
-      <span className={`grid h-10 w-10 place-items-center rounded-md border ${accentClass}`}>
-        <Icon size={19} />
+      <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-md border ${accentClass}`}>
+        <Icon size={17} />
       </span>
-      <span className="mt-4 block text-base font-extrabold text-foundry-ink">{template.title}</span>
-      <span className="mt-2 block text-sm leading-6 text-foundry-muted">{template.description}</span>
-      <span className="mt-4 grid gap-1.5">
-        {template.defaults.slice(0, 2).map((item) => (
-          <span key={item} className="flex items-center gap-2 text-xs font-bold text-foundry-subtle">
-            <CircleDot size={12} className="text-foundry-teal" />
-            {item}
-          </span>
-        ))}
+      <span className="min-w-0">
+        <span className="block text-sm font-extrabold text-foundry-ink">{template.title}</span>
+        <span className="mt-1 block text-xs leading-5 text-foundry-muted">{template.description}</span>
       </span>
     </button>
   );
@@ -1051,98 +1033,237 @@ function FactoryHome({
   const localAgentInstalled = localAgentStatus === "installed" || localAgentStatus === "connected";
   const continueCard = continueOrResumeMission(missions, activeMissionId);
   const recentCards = recentProjects(missions, activeMissionId, continueCard ? 2 : 3).filter((card) => card.missionId !== continueCard?.missionId);
-  const personalizedCards = [continueCard, ...recentCards].filter((card): card is PersonalizedCard => Boolean(card));
   const { mode: modelMode, showModelNames } = useModelMode();
   const { recommendations: historyRecommendations, modelSelection: historyModelSelection } = useHistoryRecommendation(missions, modelMode);
 
+  const [prompt, setPrompt] = useState("");
+  const templateById = (id: string) => buildTemplates.find((template) => template.id === id) ?? customTemplate;
+  function startBuilding() {
+    const text = prompt.trim();
+    onOpenFlow(customTemplate, text);
+  }
+
+  // Quick shortcuts seed the same discovery flow a starter card does — just a template pre-selected.
+  const quickChips: Array<{ label: string; templateId: string }> = [
+    { label: "Inventory system", templateId: "inventory" },
+    { label: "Website", templateId: "website" },
+    { label: "Mobile app", templateId: "mobile" },
+    { label: "AI application", templateId: "ai" },
+    { label: "Something custom", templateId: "custom" },
+  ];
+
+  // Broad directions mirror the mockup; each opens the real flow with a representative template.
+  const directions: Array<{ label: string; hint: string; templateId: string; icon: LucideIcon; accent: "teal" | "amber" | "blue" }> = [
+    { label: "Business app", hint: "Inventory, POS, dashboards, internal tools", templateId: "dashboard", icon: LayoutDashboard, accent: "teal" },
+    { label: "Website", hint: "Marketing, portfolio, documentation, commerce", templateId: "website", icon: Globe2, accent: "blue" },
+    { label: "Mobile or desktop", hint: "Native, cross-platform, offline-first", templateId: "mobile", icon: Smartphone, accent: "amber" },
+    { label: "AI or custom", hint: "Agents, automation, APIs, anything else", templateId: "ai", icon: Sparkles, accent: "teal" },
+  ];
+
+  // Real completion from the mission's own plan checklist — never a fabricated percentage.
+  const continueProgress = (() => {
+    if (!continueCard) return null;
+    const mission = missions.find((item) => item.missionId === continueCard.missionId);
+    if (!mission) return null;
+    const status = deriveMissionDisplayStatus(mission);
+    const plan = status.activeExecutionMission?.plan ?? [];
+    const done = plan.filter((item) => item.status === "completed" || item.status === "skipped").length;
+    return { percent: plan.length ? Math.round((done / plan.length) * 100) : null, label: status.label };
+  })();
+
+  const runtimePill = localAgentInstalled
+    ? { text: "Runtime connected and ready", dotClass: "bg-foundry-teal", textClass: "text-foundry-teal", spin: false }
+    : localAgentStatus === "checking"
+      ? { text: "Checking runtime…", dotClass: "bg-foundry-subtle", textClass: "text-foundry-subtle", spin: true }
+      : localAgentStatus === "offline"
+        ? { text: "Local agent installed, but not running", dotClass: "bg-foundry-amber", textClass: "text-foundry-amber", spin: false }
+        : { text: "Local runtime not installed — cloud work still available", dotClass: "bg-foundry-subtle", textClass: "text-foundry-subtle", spin: false };
+
+  const accentBorder = (accent: "teal" | "amber" | "blue") =>
+    accent === "teal" ? "border-foundry-teal/30 text-foundry-teal" : accent === "amber" ? "border-foundry-amber/30 text-foundry-amber" : "border-foundry-blue/30 text-foundry-blue";
+
   return (
-    <section className="min-h-0 overflow-auto rounded-xl border border-white/10 bg-[#101416]/90 shadow-workspace">
-      <div className="border-b border-white/10 px-4 py-4 sm:px-5">
-        <p className="section-kicker">AI Software Factory</p>
-        <div className="mt-2 flex flex-wrap items-end justify-between gap-3">
-          <div>
-            <h1 className="text-2xl font-extrabold text-foundry-ink sm:text-3xl">Projects</h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-foundry-muted">
-              Create a new software project or open an existing one. Once you are inside a project, Foundry becomes the engineering teammate for build, debug, improve, analyze, deploy, preview, and export work.
-            </p>
-          </div>
-          {localAgentInstalled ? (
-            <button
-              className="inline-flex min-h-10 cursor-default items-center gap-2 rounded-md border border-white/15 bg-white/[0.045] px-3.5 text-sm font-extrabold text-foundry-subtle opacity-70"
-              type="button"
-              disabled
-              title="Foundry Local Agent is responding on this computer."
-            >
-              <CheckCircle2 size={16} />
-              Local Agent Downloaded
-            </button>
-          ) : localAgentStatus === "checking" ? (
-            <button
-              className="inline-flex min-h-10 cursor-default items-center gap-2 rounded-md border border-white/15 bg-white/[0.045] px-3.5 text-sm font-extrabold text-foundry-subtle"
-              type="button"
-              disabled
-            >
-              <Loader2 size={16} className="animate-spin" />
-              Checking Agent
-            </button>
-          ) : (
-            <a
-              className="inline-flex min-h-10 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3.5 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
-              href="/api/factory/agent/download?platform=windows"
-              download
-              onClick={(event) => {
-                event.currentTarget.href = `/api/factory/agent/download?platform=windows&v=${encodeURIComponent(String(Date.now()))}`;
+    <section className="lg:min-h-0 lg:overflow-auto rounded-xl border border-white/10 bg-[#101416]/90 shadow-workspace">
+      <div className="relative overflow-hidden border-b border-white/10 px-4 py-10 sm:px-6 sm:py-14">
+        <div className="pointer-events-none absolute inset-x-0 -top-24 mx-auto h-64 max-w-3xl rounded-full bg-foundry-teal/[0.08] blur-3xl" />
+        <div className="relative mx-auto flex max-w-3xl flex-col items-center text-center">
+          <span className="inline-flex items-center gap-2 rounded-full border border-white/12 bg-black/30 px-3 py-1 text-[11px] font-bold text-foundry-muted">
+            <span className={`h-1.5 w-1.5 rounded-full ${runtimePill.dotClass} ${runtimePill.spin ? "animate-pulse" : ""}`} />
+            <span className={runtimePill.textClass}>{runtimePill.text}</span>
+          </span>
+
+          <h1 className="mt-6 text-4xl font-extrabold leading-[1.05] tracking-tight text-foundry-ink sm:text-5xl">
+            Turn an idea into
+            <br />
+            <span className="bg-gradient-to-r from-foundry-teal via-foundry-ink to-foundry-blue bg-clip-text text-transparent">working software.</span>
+          </h1>
+          <p className="mt-4 max-w-xl text-sm leading-6 text-foundry-muted sm:text-base">
+            Describe what you want. Foundry will understand the project, choose the right architecture, build it, test it, and show you the result.
+          </p>
+
+          <div className="mt-8 flex w-full max-w-2xl items-center gap-2 rounded-xl border border-white/12 bg-black/30 p-2 transition focus-within:border-foundry-teal/45">
+            <input
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  startBuilding();
+                }
               }}
+              placeholder="What should we build?"
+              aria-label="Describe the project to build"
+              className="min-w-0 flex-1 bg-transparent px-3 py-2 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle"
+            />
+            <button
+              type="button"
+              onClick={startBuilding}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-foundry-teal px-4 py-2 text-sm font-extrabold text-black transition hover:bg-foundry-teal/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/50"
             >
-              <Download size={16} />
-              Download Local Agent
-            </a>
-          )}
+              Start building
+              <ArrowRight size={15} />
+            </button>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+            {quickChips.map((chip) => (
+              <button
+                key={chip.label}
+                type="button"
+                onClick={() => onOpenFlow(templateById(chip.templateId))}
+                className="rounded-full border border-white/12 bg-white/[0.03] px-3 py-1.5 text-xs font-semibold text-foundry-muted transition hover:border-foundry-teal/35 hover:bg-white/[0.06] hover:text-foundry-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
+              >
+                {chip.label}
+              </button>
+            ))}
+          </div>
+
+          {localAgentStatus === "offline" || localAgentStatus === "not-installed" ? (
+            <div className="mt-6 w-full max-w-xl rounded-lg border border-foundry-amber/30 bg-foundry-amber/[0.07] px-4 py-3 text-left">
+              <p className="text-sm font-extrabold text-foundry-ink">
+                {localAgentStatus === "offline" ? "Local agent installed, but not running" : "Local runtime not installed"}
+              </p>
+              <p className="mt-1 text-xs leading-5 text-foundry-muted">
+                {localAgentStatus === "offline" ? (
+                  <>Local execution is unavailable until the agent restarts. Run <code className="rounded bg-black/30 px-1 py-0.5 font-mono text-[11px] text-foundry-ink">npm run agent</code> in your Foundry folder, or re-download it. Cloud and read-only work still works.</>
+                ) : (
+                  <>Install Foundry&apos;s local agent once to build with real files, commands, and a dev server on this computer. Cloud and read-only work is available without it.</>
+                )}
+              </p>
+              <a
+                className="mt-2 inline-flex items-center gap-1.5 text-xs font-extrabold text-foundry-teal transition hover:text-foundry-ink"
+                href="/api/factory/agent/download?platform=windows"
+                download
+                onClick={(event) => {
+                  event.currentTarget.href = `/api/factory/agent/download?platform=windows&v=${encodeURIComponent(String(Date.now()))}`;
+                }}
+              >
+                <Download size={12} />
+                {localAgentStatus === "offline" ? "Re-download Local Agent" : "Download Local Agent"}
+              </a>
+            </div>
+          ) : null}
         </div>
       </div>
 
-      <div className="grid gap-5 p-4 sm:p-5">
-        <section className="grid gap-3 lg:grid-cols-2">
-          <button
-            className="min-h-[190px] rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.07] p-5 text-left transition hover:border-foundry-teal/45 hover:bg-foundry-teal/[0.11] focus-visible:border-foundry-teal/50 focus-visible:outline-none"
-            type="button"
-            onClick={() => onOpenFlow(customTemplate)}
-          >
-            <span className="grid h-11 w-11 place-items-center rounded-md border border-foundry-teal/30 bg-black/20 text-foundry-teal">
-              <Code2 size={20} />
-            </span>
-            <span className="mt-4 block text-xl font-extrabold text-foundry-ink">Create New Project</span>
-            <span className="mt-2 block text-sm leading-6 text-foundry-muted">
-              Choose a starter or describe what you want, then Foundry asks type, subtype, stack, name, instructions, and generates the project.
-            </span>
-          </button>
+      <div className="grid gap-6 p-4 sm:p-6">
+        <section className="grid gap-4 lg:grid-cols-3">
+          {continueCard ? (
+            <div className="flex flex-col rounded-xl border border-white/10 bg-white/[0.03] p-4">
+              <p className="section-kicker">Continue where you left off</p>
+              <h2 className="mt-2 text-lg font-extrabold text-foundry-ink">{continueCard.title}</h2>
+              <p className="mt-1 text-sm leading-6 text-foundry-muted">{continueCard.subtitle}</p>
+              {continueProgress?.percent != null ? (
+                <div className="mt-4">
+                  <div className="flex items-center justify-between text-[11px] font-bold text-foundry-subtle">
+                    <span>{continueProgress.percent}% complete</span>
+                    <span>{continueProgress.label}</span>
+                  </div>
+                  <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/10">
+                    <div className="h-full rounded-full bg-gradient-to-r from-foundry-teal to-foundry-blue" style={{ width: `${continueProgress.percent}%` }} />
+                  </div>
+                </div>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => onSelectMission(continueCard.missionId)}
+                className="mt-4 inline-flex items-center gap-1.5 self-start rounded-lg border border-white/15 bg-white/[0.055] px-3.5 py-2 text-sm font-extrabold text-foundry-ink transition hover:border-foundry-teal/40 hover:bg-foundry-teal/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
+              >
+                Resume mission
+                <ArrowRight size={15} />
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onOpenExistingFlow("connect-existing")}
+              className="flex flex-col rounded-xl border border-foundry-blue/25 bg-foundry-blue/[0.06] p-4 text-left transition hover:border-foundry-blue/45 hover:bg-foundry-blue/[0.1] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-blue/40"
+            >
+              <span className="grid h-10 w-10 place-items-center rounded-md border border-foundry-blue/30 bg-black/20 text-foundry-blue">
+                <FolderOpen size={18} />
+              </span>
+              <span className="mt-3 block text-lg font-extrabold text-foundry-ink">Open existing project</span>
+              <span className="mt-1 block text-sm leading-6 text-foundry-muted">Connect a local folder, open a workspace project, or upload files to work on here.</span>
+            </button>
+          )}
 
-          <button
-            className="min-h-[190px] rounded-lg border border-foundry-blue/25 bg-foundry-blue/[0.07] p-5 text-left transition hover:border-foundry-blue/45 hover:bg-foundry-blue/[0.11] focus-visible:border-foundry-blue/50 focus-visible:outline-none"
-            type="button"
-            onClick={() => onOpenExistingFlow("connect-existing")}
-          >
-            <span className="grid h-11 w-11 place-items-center rounded-md border border-foundry-blue/30 bg-black/20 text-foundry-blue">
-              <FolderGit2 size={20} />
-            </span>
-            <span className="mt-4 block text-xl font-extrabold text-foundry-ink">Open Existing Project</span>
-            <span className="mt-2 block text-sm leading-6 text-foundry-muted">
-              Open a Foundry workspace project, upload ZIP/project files now, or use GitHub/local folder connectors when those integrations arrive.
-            </span>
-          </button>
+          <div className="lg:col-span-2">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h2 className="text-sm font-extrabold text-foundry-ink">Start with a direction</h2>
+              <a href="#all-project-types" className="text-xs font-bold text-foundry-teal transition hover:text-foundry-ink">View all</a>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {directions.map((direction) => {
+                const Icon = direction.icon;
+                return (
+                  <button
+                    key={direction.label}
+                    type="button"
+                    onClick={() => onOpenFlow(templateById(direction.templateId))}
+                    className="rounded-xl border border-white/10 bg-white/[0.03] p-4 text-left transition hover:border-foundry-teal/35 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
+                  >
+                    <span className={`grid h-9 w-9 place-items-center rounded-md border bg-black/20 ${accentBorder(direction.accent)}`}>
+                      <Icon size={17} />
+                    </span>
+                    <span className="mt-3 block text-sm font-extrabold text-foundry-ink">{direction.label}</span>
+                    <span className="mt-1 block text-xs leading-5 text-foundry-muted">{direction.hint}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </section>
 
-        {personalizedCards.length ? (
+        {continueCard ? (
+          <section>
+            <button
+              type="button"
+              onClick={() => onOpenExistingFlow("connect-existing")}
+              className="flex w-full items-center gap-3 rounded-xl border border-foundry-blue/25 bg-foundry-blue/[0.05] p-4 text-left transition hover:border-foundry-blue/45 hover:bg-foundry-blue/[0.09] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-blue/40"
+            >
+              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md border border-foundry-blue/30 bg-black/20 text-foundry-blue">
+                <FolderOpen size={18} />
+              </span>
+              <span className="min-w-0">
+                <span className="block text-sm font-extrabold text-foundry-ink">Open an existing project instead</span>
+                <span className="mt-0.5 block text-xs leading-5 text-foundry-muted">Connect a local folder, open a workspace project, or upload files to work on here.</span>
+              </span>
+              <ArrowRight size={16} className="ml-auto shrink-0 text-foundry-subtle" />
+            </button>
+          </section>
+        ) : null}
+
+        {recentCards.length ? (
           <section>
             <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 className="text-sm font-extrabold text-foundry-ink">Pick Up Where You Left Off</h2>
+              <h2 className="text-sm font-extrabold text-foundry-ink">Recent projects</h2>
             </div>
-            <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-4">
-              {personalizedCards.map((card) => (
+            <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
+              {recentCards.map((card) => (
                 <button
                   key={card.id}
                   type="button"
-                  className="rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.06] p-4 text-left transition hover:border-foundry-teal/45 hover:bg-foundry-teal/[0.11] focus-visible:border-foundry-teal/50 focus-visible:outline-none"
+                  className="rounded-lg border border-white/10 bg-white/[0.03] p-4 text-left transition hover:border-foundry-teal/35 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
                   onClick={() => onSelectMission(card.missionId)}
                 >
                   <span className="block text-[13px] font-extrabold text-foundry-ink">{card.title}</span>
@@ -1175,12 +1296,12 @@ function FactoryHome({
           </section>
         ) : null}
 
-        <section>
+        <section id="all-project-types" className="scroll-mt-4">
           <div className="mb-3 flex items-center justify-between gap-3">
-            <h2 className="text-sm font-extrabold text-foundry-ink">Create New Project Starters</h2>
-            <span className="text-xs font-bold text-foundry-subtle">Optional shortcuts</span>
+            <h2 className="text-sm font-extrabold text-foundry-ink">All project types</h2>
+            <span className="text-xs font-bold text-foundry-subtle">Every one goes through the same discovery flow</span>
           </div>
-          <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-4">
+          <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
             {starterTemplates.map((template) => (
               <BuildCard key={template.id} template={template} onStart={() => onOpenFlow(template)} />
             ))}
@@ -1188,41 +1309,19 @@ function FactoryHome({
           </div>
         </section>
 
-        <section className="grid gap-3 lg:grid-cols-[minmax(0,1.05fr)_minmax(280px,0.95fr)]">
-          <div className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
-            <p className="section-kicker">Open Existing Project</p>
-            <h2 className="mt-2 text-lg font-extrabold text-foundry-ink">Bring a project into Foundry</h2>
-            <p className="mt-2 text-sm leading-6 text-foundry-muted">
-              Open a Foundry workspace project from the sidebar, upload ZIP/project files now, or prepare for GitHub and local folder connector support later. Debug, improve, refactor, analyze, and deploy happen after the project is open.
-            </p>
-            <button
-              className="mt-4 inline-flex min-h-10 items-center gap-2 rounded-md border border-white/15 bg-white/[0.055] px-3.5 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-blue/35 hover:bg-foundry-blue/10 hover:text-foundry-ink"
-              type="button"
-              onClick={() => onOpenExistingFlow("connect-existing")}
-            >
-              <FolderGit2 size={16} />
-              Open Project Flow
-            </button>
-          </div>
-
-          <div className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
+        {realEvents.length > 0 ? (
+          <section className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
             <p className="section-kicker">Recent Project Activity</p>
             <div className="mt-3 grid gap-2">
-              {realEvents.length > 0 ? (
-                realEvents.slice(-5).map((event, index) => (
-                  <div key={`${event}-${index}`} className="flex items-center gap-2 rounded-md bg-black/20 px-3 py-2 text-sm text-foundry-muted">
-                    <CheckCircle2 size={15} className="text-foundry-teal" />
-                    <span>{event}</span>
-                  </div>
-                ))
-              ) : (
-                <div className="rounded-md border border-dashed border-white/15 px-3 py-6 text-sm leading-6 text-foundry-subtle">
-                  No execution events yet. When Foundry creates files, edits code, runs commands, captures logs, fixes errors, or exposes a preview URL, those real events appear here.
+              {realEvents.slice(-5).map((event, index) => (
+                <div key={`${event}-${index}`} className="flex items-center gap-2 rounded-md bg-black/20 px-3 py-2 text-sm text-foundry-muted">
+                  <CheckCircle2 size={15} className="text-foundry-teal" />
+                  <span>{event}</span>
                 </div>
-              )}
+              ))}
             </div>
-          </div>
-        </section>
+          </section>
+        ) : null}
 
         <section>
           <div className="mb-3 flex items-center justify-between gap-3">
@@ -1252,1506 +1351,7 @@ function FactoryHome({
   );
 }
 
-function ProjectBriefView({
-  mission,
-  brief,
-  execution,
-  connectedPath,
-  workspaceFiles,
-  queuedTask,
-  onStartProject,
-  onViewFiles,
-  onReadFile,
-  onFetchFileContent,
-  onExecute,
-  onApproveCategory,
-  onApproveCommand,
-}: {
-  mission: MissionState;
-  brief: string;
-  execution: FactoryProjectResult | null;
-  connectedPath: string;
-  workspaceFiles: FactoryProjectResult["files"];
-  queuedTask?: string;
-  onStartProject: () => void;
-  onViewFiles: () => void;
-  onReadFile: (path: string) => void;
-  onFetchFileContent: (path: string) => Promise<string | null>;
-  onExecute: (task: string, approvalResponse?: ApprovalResponse) => void;
-  onApproveCategory?: (category: string) => void;
-  onApproveCommand?: (command: string) => void;
-}) {
-  const [task, setTask] = useState("");
-  const [executionLevel, setExecutionLevel] = useState<ExecutionLevel>("summary");
-  const [previewCollapsed, setPreviewCollapsed] = useState(false);
-  const [previewWidthPct, setPreviewWidthPct] = useState(40);
-  const activeTaskRef = useRef<HTMLDivElement | null>(null);
-  const composerRef = useRef<HTMLTextAreaElement | null>(null);
-  const workScrollRef = useRef<HTMLDivElement | null>(null);
-  const middleRowRef = useRef<HTMLDivElement | null>(null);
-  const timeline = projectTimelineFromMission(mission, execution);
-  // Single canonical status derivation — every busy/paused/label flag on this screen (header pill,
-  // composer pill, level toggle gating) reads from this one call so they can never contradict each other.
-  const missionStatus = deriveMissionDisplayStatus(mission);
-  const activeExecutionMission = missionStatus.activeExecutionMission;
-  const isExecutionLive = missionStatus.isBusy || missionStatus.isPausedForUser || missionStatus.isPausedForApproval;
-  const isExistingProject = /^Mode:\s*Work on existing project/im.test(brief);
-  const localPath = brief.match(/^Local project path:\s*(.+)$/im)?.[1]?.trim() ?? "";
-  const sourceMode = projectSourceModeForBrief(brief);
-  const browserFolderName = brief.match(/^Browser folder name:\s*(.+)$/im)?.[1]?.trim() ?? "";
-  const visibleFiles = execution?.files.length ? mergeConnectorFiles(workspaceFiles, execution.files) : workspaceFiles;
-  const editingTarget = browserFolderName || localPath || (sourceMode === "upload" && execution?.projectPath ? `${execution.projectPath} (Foundry copy)` : connectedPath || execution?.projectPath || "No editing target yet");
-  const activeFileEvent = liveFileIndicatorEvent(timeline, isExecutionLive);
-  const recentlyChangedPaths = useRecentlyChangedPaths(timeline);
-  const needsUserAction = missionStatus.isPausedForApproval || missionStatus.isPausedForUser;
-  const effectiveLevel: ExecutionLevel = isExecutionLive || needsUserAction ? "details" : executionLevel;
-  const connectorUrl = brief.match(/^Local connector URL:\s*(.+)$/im)?.[1]?.trim() ?? "";
-  const connectorToken = brief.match(/^Local connector token:\s*(.+)$/im)?.[1]?.trim() ?? "";
-  const connectorRoot = brief.match(/^Local connector root:\s*(.+)$/im)?.[1]?.trim() ?? "";
-  const liveAgentStatus = useLiveAgentStatus(sourceMode === "connector" ? connectorUrl : "", connectorToken, connectorRoot);
 
-  useEffect(() => {
-    composerRef.current?.focus();
-  }, [isExecutionLive, execution?.status, mission.messages.length]);
-
-  useEffect(() => {
-    // A mission paused waiting on the user must keep showing the detailed timeline — that's
-    // the only view with the approval buttons / clarification prompt. Never auto-collapse it
-    // to the summary card, no matter how long it's been since the mission actually ran.
-    if (!isExecutionLive && !needsUserAction) setExecutionLevel("summary");
-  }, [isExecutionLive, needsUserAction]);
-
-  // A preview panel only earns its place beside the conversation when there's a real artifact to
-  // show — not just because an execution object exists. "starting" still reserves the space (the
-  // preview is on its way); "unavailable"/absent collapses back to a full-width conversation.
-  const showPreview = execution?.previewState === "ready" || execution?.previewState === "starting" || execution?.previewState === "error";
-
-  function beginPreviewResize(event: ReactPointerEvent<HTMLDivElement>) {
-    event.preventDefault();
-    const row = middleRowRef.current;
-    if (!row) return;
-    const rowRect = row.getBoundingClientRect();
-    function onMove(moveEvent: PointerEvent) {
-      const fromRight = rowRect.right - moveEvent.clientX;
-      const pct = (fromRight / rowRect.width) * 100;
-      setPreviewWidthPct(Math.min(62, Math.max(22, pct)));
-    }
-    function onUp() {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    }
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  }
-
-  function runTask() {
-    const trimmed = task.trim();
-    if (!trimmed && isExecutionLive) return;
-    const nextTask = trimmed || (execution ? "Continue working on this project" : "Build the initial project");
-    setTask("");
-    onExecute(nextTask);
-  }
-
-  function stopTask() {
-    setTask("");
-    onExecute("stop");
-  }
-
-  return (
-    <section className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden border border-white/10 bg-[#0c1011]/95 shadow-workspace">
-      <div className="border-b border-white/10 px-4 py-3 sm:px-5">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h1 className="truncate text-xl font-extrabold text-foundry-ink sm:text-2xl">{projectTitleFor(mission)}</h1>
-            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs leading-5 text-foundry-muted">
-              <span className="break-all text-foundry-ink">{editingTarget}</span>
-              <span>{projectSourceCopy(sourceMode, Boolean(localPath), Boolean(execution?.projectPath))}</span>
-              {liveAgentStatus ? <AgentStatusBadge status={liveAgentStatus} /> : null}
-            </div>
-              {activeFileEvent ? <LiveFileIndicator event={activeFileEvent} /> : null}
-              {activeExecutionMission ? <MissionStatePill mission={activeExecutionMission} /> : null}
-          </div>
-          <div className="flex items-center gap-2">
-            {!isExecutionLive && !needsUserAction ? <ExecutionLevelToggle level={executionLevel} onChange={setExecutionLevel} /> : null}
-            <button className="inline-flex min-h-9 items-center gap-2 rounded-md border border-white/15 bg-white/[0.035] px-3 text-xs font-extrabold text-foundry-muted transition hover:border-foundry-blue/35 hover:bg-foundry-blue/10 hover:text-foundry-ink" type="button" onClick={onStartProject}>
-              <Code2 size={16} />
-              New Project
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div className="grid min-h-0 overflow-hidden lg:grid-cols-[280px_minmax(0,1fr)]">
-        <aside className="hidden min-h-0 grid-rows-[auto_minmax(0,1fr)] border-b border-white/10 bg-black/15 p-3 lg:grid lg:border-b-0 lg:border-r lg:p-4">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="section-kicker">Project</p>
-              <h2 className="mt-1 text-sm font-extrabold text-foundry-ink">{visibleFiles.length} files</h2>
-            </div>
-            <button className="text-xs font-extrabold text-foundry-teal" type="button" onClick={onViewFiles}>Open</button>
-          </div>
-          <ProjectFileTree files={visibleFiles} onReadFile={onReadFile} recentlyChangedPaths={recentlyChangedPaths} />
-        </aside>
-        <div ref={middleRowRef} className="flex min-h-0 min-w-0 overflow-hidden">
-          <div
-            ref={workScrollRef}
-            className="min-h-0 flex-1 overflow-auto p-3 pr-1 sm:p-4"
-            style={showPreview && !previewCollapsed ? { flexBasis: `${100 - previewWidthPct}%` } : undefined}
-          >
-            <ProjectWorkConversation
-              mission={mission}
-              execution={execution}
-              timeline={timeline}
-              activeExecutionMission={activeExecutionMission}
-              level={effectiveLevel}
-              isExecutionLive={isExecutionLive}
-              isExistingProject={isExistingProject}
-              showsOwnPreview={!showPreview}
-              activeTaskRef={activeTaskRef}
-              scrollContainerRef={workScrollRef}
-              onReadFile={onReadFile}
-              onFetchFileContent={onFetchFileContent}
-              onExecute={onExecute}
-              onSkipItem={(item) => onExecute(`The user asked to skip checklist item "${item.label}" — mark it skipped and continue with everything else.`)}
-              onApproveCommand={(event, action) => {
-                const command = event.command ?? event.title;
-                const category = event.details?.category as CommandPermissionCategory | undefined;
-                if (action === "skip") {
-                  onExecute(
-                    `Denied approval to run "${command}" - mark the checklist item that needed it as skipped (not blocked) and continue with every other item that can still be verified safely.`,
-                    { requestedCommand: command, decision: "deny" },
-                  );
-                  return;
-                }
-                if (action === "approve-category" && category) {
-                  onApproveCategory?.(category);
-                }
-                if (action === "approve-command") {
-                  onApproveCommand?.(command);
-                }
-                const decision = action === "approve-once" ? "approve-once" : action === "approve-category" ? "approve-category" : "approve-command";
-                onExecute(`Approved: run ${command}`, { requestedCommand: command, decision, category: decision === "approve-category" ? category : undefined });
-              }}
-            />
-          </div>
-
-          {showPreview && !previewCollapsed ? (
-            <>
-              <div
-                role="separator"
-                aria-orientation="vertical"
-                className="w-1.5 shrink-0 cursor-col-resize bg-white/5 transition hover:bg-foundry-teal/40 active:bg-foundry-teal/50"
-                onPointerDown={beginPreviewResize}
-              />
-              <div className="flex min-h-0 min-w-0 flex-col border-l border-white/10 bg-black/10" style={{ flexBasis: `${previewWidthPct}%` }}>
-                <EngineeringWorkspacePanel execution={execution} onCollapse={() => setPreviewCollapsed(true)} />
-              </div>
-            </>
-          ) : null}
-
-          {showPreview && previewCollapsed ? (
-            <button
-              type="button"
-              onClick={() => setPreviewCollapsed(false)}
-              className="flex w-9 shrink-0 flex-col items-center gap-2 border-l border-white/10 bg-black/15 py-4 text-foundry-subtle transition hover:bg-white/[0.04] hover:text-foundry-ink"
-              title="Show preview"
-            >
-              <PanelRightOpen size={15} />
-              <span className="[writing-mode:vertical-rl] text-[10.5px] font-extrabold uppercase tracking-[0.08em]">Preview</span>
-            </button>
-          ) : null}
-        </div>
-      </div>
-
-      <ProjectComposer
-        inputRef={composerRef}
-        task={task}
-        isBusy={missionStatus.isBusy}
-        statusLabel={missionStatus.label}
-        locked={missionStatus.isPausedForApproval}
-        queuedTask={queuedTask}
-        placeholder={needsUserAction && activeExecutionMission?.pending_mock_review ? "Tell Foundry what you'd like to improve…" : undefined}
-        canUndo={timeline.some((event) => !event.internal && event.kind === "edit" && event.status === "completed")}
-        onTaskChange={setTask}
-        onExecute={runTask}
-        onStop={stopTask}
-        onUndo={() => onExecute("Undo the last file change")}
-      />
-    </section>
-  );
-}
-
-function ProjectWorkConversation({
-  mission,
-  execution,
-  timeline,
-  activeExecutionMission,
-  level,
-  isExecutionLive,
-  isExistingProject,
-  showsOwnPreview,
-  activeTaskRef,
-  scrollContainerRef,
-  onReadFile,
-  onFetchFileContent,
-  onExecute,
-  onApproveCommand,
-  onSkipItem,
-}: {
-  mission: MissionState;
-  execution: FactoryProjectResult | null;
-  timeline: FactoryExecutionEvent[];
-  activeExecutionMission: ExecutionMission | undefined;
-  level: ExecutionLevel;
-  isExecutionLive: boolean;
-  isExistingProject: boolean;
-  showsOwnPreview: boolean;
-  activeTaskRef: RefObject<HTMLDivElement | null>;
-  scrollContainerRef: RefObject<HTMLDivElement | null>;
-  onReadFile: (path: string) => void;
-  onFetchFileContent: (path: string) => Promise<string | null>;
-  onExecute: (task: string) => void;
-  onApproveCommand?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
-  onSkipItem?: (item: FactoryObjectiveChecklistItem) => void;
-}) {
-  const requestMessages = mission.messages.filter((message) => message.tags?.includes("Project request"));
-  const timelineEndRef = useRef<HTMLDivElement | null>(null);
-  const [fullPlanOpen, setFullPlanOpen] = useState(false);
-  const activeChecklist = activeExecutionMission?.plan.length ? activeExecutionMission.plan : execution?.checklist ?? [];
-  const latestRequest = requestMessages.at(-1);
-  const previousExecutionMissions = mission.executionMissions.filter((item) => item.id !== activeExecutionMission?.id).slice().reverse();
-  const pendingMockReview = activeExecutionMission?.pending_mock_review;
-  // isExecutionLive is deliberately coarse elsewhere (it also covers "paused waiting on the user,"
-  // which still counts as an in-progress mission for the composer's busy state). Here we need the
-  // narrower distinction: is Foundry actively streaming work right now, or paused waiting on input?
-  // A mock-review pause is the latter — it should show the review panel, not the live timeline, and
-  // the moment a new turn starts actively running again, the panel needs to disappear immediately.
-  const missionStatus = deriveMissionDisplayStatus(mission);
-  const isPausedForUser = missionStatus.isPausedForUser || missionStatus.isPausedForApproval;
-  const isActivelyWorking = isExecutionLive && !isPausedForUser;
-  const pendingApprovalEvent = missionStatus.isPausedForApproval ? timeline.filter((event) => event.kind === "blocked").at(-1) : undefined;
-  // Keyed so a fresh fetch fires for each distinct pause (a new mock-review message, or the final
-  // completed build) — and, critically, this hook lives at the conversation level rather than inside
-  // the transient panel that displays it, so a fast-moving mock-review loop (pause → user reacts in a
-  // couple seconds → next phase starts) doesn't abort the in-flight LLM call before it ever resolves.
-  const recommendationsKey =
-    isActivelyWorking || !execution
-      ? ""
-      : pendingMockReview
-        ? `mock:${activeExecutionMission?.id}:${pendingMockReview.message}`
-        : execution.status === "passed"
-          ? `final:${execution.projectPath}:${execution.objective ?? ""}:${execution.files.length}`
-          : "";
-  const { mode: modelMode, showModelNames } = useModelMode();
-  const { recommendations, loading: recommendationsLoading, modelSelection: recommendationsModelSelection } = useMissionRecommendations(execution, recommendationsKey, modelMode);
-
-  useEffect(() => {
-    const container = scrollContainerRef.current;
-    const followTarget = timelineEndRef.current ?? activeTaskRef.current;
-    if (!container || !followTarget) return;
-    const frame = window.requestAnimationFrame(() => {
-      const containerRect = container.getBoundingClientRect();
-      const targetRect = followTarget.getBoundingClientRect();
-      const bottomOverflow = targetRect.bottom - containerRect.bottom + 16;
-      if (bottomOverflow > 0) {
-        container.scrollTo({ top: container.scrollTop + bottomOverflow, behavior: "smooth" });
-      }
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [activeTaskRef, execution?.status, isExecutionLive, latestRequest?.id, mission.liveWorkEvents.length, scrollContainerRef, timeline.length]);
-
-  // A brand-new turn must bring the user to it, not leave them scrolled wherever the previous mission
-  // left off. Keyed strictly on the new request's id (not on ongoing streaming), so this fires exactly
-  // once per new mission rather than fighting the bottom-follow effect above on every timeline update.
-  useEffect(() => {
-    if (!latestRequest?.id) return;
-    const frame = window.requestAnimationFrame(() => {
-      activeTaskRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [activeTaskRef, latestRequest?.id]);
-
-  if (!requestMessages.length) {
-    return (
-      <div className="grid min-h-full content-start gap-5 px-1 py-2">
-        <section ref={activeTaskRef} className="max-w-4xl border-b border-white/10 pb-5">
-          <h2 className="text-lg font-extrabold text-foundry-ink">Ready for the next instruction.</h2>
-          <p className="mt-2 text-sm leading-6 text-foundry-muted">
-            {isExistingProject
-              ? "Ask a question to inspect without edits, or describe a change and Foundry will work directly against the connected source mode."
-              : "Describe what to build. Foundry will create files only for new-project mode."}
-          </p>
-          {(isExecutionLive || level !== "summary") && (isExecutionLive || timeline.length) ? (
-            <div className="mt-4 border-l border-white/10 pl-4">
-              <ExecutionTimeline
-                timeline={timeline}
-                level={level}
-                fallbackEvents={mission.liveWorkEvents.length ? mission.liveWorkEvents : isExecutionLive ? ["Starting execution..."] : []}
-                endRef={timelineEndRef}
-                onReadFile={onReadFile}
-                onFetchFileContent={onFetchFileContent}
-                onApproveCommand={onApproveCommand}
-              />
-            </div>
-          ) : null}
-          {!isExecutionLive && level === "summary" && execution ? (
-            <div className="mt-4 border-l border-white/10 pl-4">
-              <MissionSummary execution={execution} timeline={timeline} onReadFile={onReadFile} onApproveCommand={onApproveCommand} />
-            </div>
-          ) : null}
-        </section>
-      </div>
-    );
-  }
-
-  const activeRequest = latestRequest ?? requestMessages[requestMessages.length - 1];
-  const latestAnswer = answerForProjectRequest(mission, activeRequest, undefined);
-
-  return (
-    <div className="grid gap-5 pb-6">
-      {previousExecutionMissions.length ? (
-        <PreviousMissionsPanel
-          missions={previousExecutionMissions}
-          disableUndo={isExecutionLive}
-          onUndo={(missionToUndo) =>
-            onExecute(
-              `Undo the specific changes from the mission "${missionToUndo.title}" (files: ${missionToUndo.files_touched.map((file) => file.path).join(", ") || "see that mission's history"}) — revert those file edits and confirm exactly what was reverted.`,
-            )
-          }
-        />
-      ) : null}
-      <section key={activeRequest.id} ref={activeTaskRef} className="max-w-4xl border-b border-white/10 pb-5">
-        <ProjectThreadMessage message={activeRequest} prominent />
-        <div className="mt-4 border-l border-white/10 pl-4">
-          {latestAnswer ? <ProjectThreadMessage message={latestAnswer} compact /> : null}
-          {missionStatus.isPausedForApproval ? <ApprovalGate event={pendingApprovalEvent} onApprove={onApproveCommand} /> : null}
-          {!missionStatus.isPausedForApproval && execution?.status === "needs-clarification" && execution.clarificationQuestions?.length ? (
-            <DecisionPrompt clarifications={execution.clarificationQuestions} onAnswer={onExecute} />
-          ) : !missionStatus.isPausedForApproval && execution?.status !== "needs-clarification" && mission.pendingClarification ? (
-            <DecisionPrompt
-              clarifications={[{ question: mission.pendingClarification.question, options: mission.pendingClarification.options }]}
-              onAnswer={(answer) => onExecute(resolveClarificationTask(mission.pendingClarification!, answer))}
-            />
-          ) : null}
-          {activeChecklist.length ? (
-            <MissionPlanSummary checklist={activeChecklist} isLive={isExecutionLive} onOpenFullPlan={() => setFullPlanOpen(true)} />
-          ) : null}
-          {(isExecutionLive || level !== "summary") && (isExecutionLive || timeline.length || mission.liveWorkEvents.length) ? (
-            <ExecutionTimeline
-              timeline={timeline}
-              level={level}
-              fallbackEvents={mission.liveWorkEvents.length ? mission.liveWorkEvents : ["Starting execution..."]}
-              endRef={timelineEndRef}
-              onReadFile={onReadFile}
-              onFetchFileContent={onFetchFileContent}
-              onApproveCommand={onApproveCommand}
-              suppressBlocked={missionStatus.isPausedForApproval}
-            />
-          ) : null}
-          {!isActivelyWorking && pendingMockReview ? (
-            <MockReviewPanel
-              pendingMockReview={pendingMockReview}
-              execution={execution}
-              onExecute={onExecute}
-              showsOwnPreview={showsOwnPreview}
-              recommendations={recommendations}
-              recommendationsLoading={recommendationsLoading}
-              modelSelection={recommendationsModelSelection}
-              showModelNames={showModelNames}
-            />
-          ) : null}
-          {!isExecutionLive && level === "summary" && execution ? (
-            <>
-              <MissionSummary execution={execution} timeline={timeline} onReadFile={onReadFile} onApproveCommand={onApproveCommand} />
-              {missionStatus.state === "complete" ? (
-                <PostBuildRecommendations
-                  recommendations={recommendations}
-                  loading={recommendationsLoading}
-                  onExecute={onExecute}
-                  modelSelection={recommendationsModelSelection}
-                  showModelNames={showModelNames}
-                />
-              ) : null}
-            </>
-          ) : null}
-        </div>
-      </section>
-      {fullPlanOpen ? (
-        <MissionPlanPanel
-          checklist={activeChecklist}
-          isLive={isExecutionLive}
-          onSkipItem={isExecutionLive ? onSkipItem : undefined}
-          onClose={() => setFullPlanOpen(false)}
-        />
-      ) : null}
-    </div>
-  );
-}
-
-function answerForProjectRequest(mission: MissionState, requestMessage: MissionState["messages"][number], nextRequestMessage: MissionState["messages"][number] | undefined) {
-  const startIndex = mission.messages.findIndex((message) => message.id === requestMessage.id);
-  if (startIndex < 0) return undefined;
-  const endIndex = nextRequestMessage ? mission.messages.findIndex((message) => message.id === nextRequestMessage.id) : mission.messages.length;
-
-  for (let index = startIndex + 1; index < endIndex; index += 1) {
-    const candidate = mission.messages[index];
-    if (candidate.tags?.includes("Project answer")) return candidate;
-  }
-  return undefined;
-}
-
-function ProjectThreadMessage({ message, prominent = false, compact = false }: { message: MissionState["messages"][number]; prominent?: boolean; compact?: boolean }) {
-  const isUser = message.tags?.includes("Project request") || message.author === "You";
-  const body = message.body.trim();
-  return (
-    <article className={`${prominent ? "-mx-3 border-b border-white/15 bg-[#0c1011] px-3 pb-3 pt-4 lg:sticky lg:-top-4 lg:z-20 lg:-mx-4 lg:px-4 lg:pt-5 lg:shadow-[0_12px_24px_rgba(0,0,0,0.42)]" : ""} ${compact ? "mb-4" : "max-w-4xl border-b border-white/10 pb-5"} ${isUser ? "" : "border-l border-white/10 pl-4"}`}>
-      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-foundry-subtle">
-        <p className="font-extrabold uppercase tracking-[0.08em]">{isUser ? "You" : "Foundry"}</p>
-        <span>{message.time}</span>
-      </div>
-      <MessageBody body={body} className={prominent ? "text-[15px] leading-7 text-foundry-ink" : "text-sm leading-6 text-foundry-muted"} />
-    </article>
-  );
-}
-
-function MessageBody({ body, className }: { body: string; className: string }) {
-  const [isOpen, setIsOpen] = useState(false);
-  const lineCount = body.split("\n").length;
-  const shouldCollapse = body.length > 400 || lineCount > 6;
-
-  if (!shouldCollapse) {
-    return <p className={`mt-2 whitespace-pre-wrap break-words ${className}`}>{body}</p>;
-  }
-
-  const preview = body.split("\n").filter((line) => line.trim()).slice(0, 2).join(" ").replace(/\s+/g, " ").trim().slice(0, 160);
-
-  return (
-    <details className={`mt-2 ${className}`} open={isOpen} onToggle={(event) => setIsOpen(event.currentTarget.open)}>
-      <summary className="cursor-pointer text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-teal">
-        {isOpen ? "Show less" : `${preview}... Show more`}
-      </summary>
-      <p className="mt-2 whitespace-pre-wrap break-words">{body}</p>
-    </details>
-  );
-}
-
-function ProjectComposer({
-  inputRef,
-  task,
-  isBusy,
-  statusLabel,
-  locked,
-  queuedTask,
-  placeholder,
-  canUndo,
-  onTaskChange,
-  onExecute,
-  onStop,
-  onUndo,
-}: {
-  inputRef: RefObject<HTMLTextAreaElement | null>;
-  task: string;
-  isBusy: boolean;
-  /** The exact same label the header MissionStatePill shows for this mission — never a separately
-   * computed "Working"/"Ready" binary, so the composer can never contradict the header. */
-  statusLabel: string;
-  /** Hard pause: a command approval is pending. Only Stop is available; free text cannot bypass it. */
-  locked?: boolean;
-  queuedTask?: string;
-  placeholder?: string;
-  canUndo?: boolean;
-  onTaskChange: (value: string) => void;
-  onExecute: () => void;
-  onStop: () => void;
-  onUndo?: () => void;
-}) {
-  return (
-    <div className="border-t border-white/10 bg-[#0b0f10]/95 p-3">
-      <div className="mb-2 flex flex-wrap items-center gap-2 text-xs font-extrabold uppercase tracking-[0.06em]">
-        <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${isBusy ? "border-foundry-teal/30 bg-foundry-teal/10 text-foundry-teal" : locked ? "border-foundry-amber/30 bg-foundry-amber/10 text-foundry-amber" : "border-white/15 bg-white/[0.04] text-foundry-muted"}`}>
-          <span className={`h-1.5 w-1.5 rounded-full ${isBusy ? "bg-foundry-teal" : locked ? "bg-foundry-amber" : "bg-foundry-muted"}`} />
-          {statusLabel}
-        </span>
-        {queuedTask ? (
-          <span className="inline-flex min-w-0 items-center gap-1.5 rounded-full border border-foundry-blue/30 bg-foundry-blue/10 px-2.5 py-1 text-foundry-blue">
-            <span className="truncate normal-case tracking-normal">Queued: {queuedTask}</span>
-          </span>
-        ) : null}
-        <span className="ml-auto flex items-center gap-2">
-          {canUndo && !isBusy && !locked && onUndo ? (
-            <button type="button" className="normal-case tracking-normal text-foundry-subtle underline-offset-2 hover:text-foundry-ink hover:underline" onClick={onUndo}>
-              Undo last change
-            </button>
-          ) : null}
-        </span>
-      </div>
-      <div className="flex min-w-0 items-end gap-2 rounded-md border border-foundry-teal/25 bg-black/30 p-2 focus-within:border-foundry-teal/60">
-        <textarea
-          ref={inputRef}
-          className="max-h-40 min-h-16 min-w-0 flex-1 resize-y border-0 bg-transparent p-2 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle disabled:cursor-not-allowed disabled:opacity-60"
-          value={task}
-          disabled={locked}
-          onChange={(event) => onTaskChange(event.target.value)}
-          placeholder={locked ? "Resolve the approval above to continue — or Stop." : isBusy ? "Foundry is working — send a follow-up, or type stop to interrupt it..." : placeholder ?? "Give Foundry a mission in this project..."}
-          onKeyDown={(event) => {
-            if (locked) return;
-            if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-              event.preventDefault();
-              onExecute();
-            }
-          }}
-        />
-        {isBusy || locked ? (
-          <button
-            className="min-h-11 rounded-md border border-red-400/35 bg-red-400/[0.12] px-4 text-sm font-extrabold text-red-200 transition hover:bg-red-400/[0.2]"
-            type="button"
-            title="Stops now. Send another message anytime to pick up where this left off."
-            onClick={onStop}
-          >
-            Stop
-          </button>
-        ) : null}
-        <button
-          className="inline-flex min-h-11 w-11 shrink-0 items-center justify-center rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.16] px-0 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:px-5"
-          type="button"
-          disabled={locked}
-          onClick={onExecute}
-        >
-          <SendIcon size={16} aria-hidden="true" className="sm:hidden" />
-          <span className="sr-only sm:not-sr-only">Send</span>
-        </button>
-      </div>
-      <div className="mt-2 flex min-h-8 flex-wrap items-center justify-between gap-2 px-1">
-        <ComposerModelSelector />
-        <MissionQualitySelector />
-      </div>
-    </div>
-  );
-}
-
-type ChecklistPhaseGroup = {
-  phase: string;
-  items: FactoryObjectiveChecklistItem[];
-};
-
-function groupChecklistByPhase(checklist: FactoryObjectiveChecklistItem[]): ChecklistPhaseGroup[] {
-  const groups: ChecklistPhaseGroup[] = [];
-  const indexByPhase = new Map<string, number>();
-  for (const item of checklist) {
-    const phase = item.phase?.trim() || "Tasks";
-    if (!indexByPhase.has(phase)) {
-      indexByPhase.set(phase, groups.length);
-      groups.push({ phase, items: [] });
-    }
-    groups[indexByPhase.get(phase) as number].items.push(item);
-  }
-  return groups;
-}
-
-const CHECKLIST_STATUS_META: Record<FactoryObjectiveChecklistItem["status"], { icon: LucideIcon; tone: string; label: string }> = {
-  pending: { icon: CircleDot, tone: "text-foundry-subtle", label: "Pending" },
-  running: { icon: Loader2, tone: "text-foundry-teal", label: "Active" },
-  completed: { icon: CheckCircle2, tone: "text-foundry-teal", label: "Done" },
-  blocked: { icon: AlertTriangle, tone: "text-red-300", label: "Blocked" },
-  skipped: { icon: SkipForward, tone: "text-foundry-subtle", label: "Skipped" },
-  "needs-approval": { icon: Lock, tone: "text-foundry-amber", label: "Needs approval" },
-};
-
-type MissionPlanProgress = {
-  phases: ChecklistPhaseGroup[];
-  total: number;
-  doneCount: number;
-  activeItemId: string | undefined;
-  activePhaseIndex: number;
-  activePhaseLabel: string;
-  activeItemLabel: string;
-  phaseCount: number;
-  allDone: boolean;
-};
-
-/** Single source of truth for "where is this mission" — shared by the compact MissionPlanSummary bar and the full MissionChecklistBoard so the two can never disagree about the active phase/item. */
-function missionPlanProgress(checklist: FactoryObjectiveChecklistItem[]): MissionPlanProgress {
-  const phases = groupChecklistByPhase(checklist);
-  const activeItemId = checklist.find((item) => item.status === "running")?.id ?? checklist.find((item) => item.status === "pending")?.id;
-  const activePhaseIndex = Math.max(0, phases.findIndex((group) => group.items.some((item) => item.id === activeItemId)));
-  const doneCount = checklist.filter((item) => item.status === "completed" || item.status === "skipped").length;
-  const activeItem = checklist.find((item) => item.id === activeItemId);
-  return {
-    phases,
-    total: checklist.length,
-    doneCount,
-    activeItemId,
-    activePhaseIndex,
-    activePhaseLabel: phases[activePhaseIndex]?.phase ?? "",
-    activeItemLabel: activeItem?.label ?? "",
-    phaseCount: phases.length,
-    allDone: checklist.length > 0 && doneCount === checklist.length,
-  };
-}
-
-/**
- * The compact, calm replacement for showing the whole checklist above the live timeline. A single slim
- * bar: progress + the current phase/step, with a button to open the full plan in a side panel. Renders
- * nothing for small tasks (<= 3 items) so a quick edit shows no plan chrome at all.
- */
-function MissionPlanSummary({
-  checklist,
-  isLive,
-  onOpenFullPlan,
-}: {
-  checklist: FactoryObjectiveChecklistItem[];
-  isLive: boolean;
-  onOpenFullPlan: () => void;
-}) {
-  if (checklist.length <= 3) return null;
-  const p = missionPlanProgress(checklist);
-
-  return (
-    <section className="mb-3 max-w-4xl rounded-md border border-white/10 bg-black/15 px-3 py-2">
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-[11px] font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">
-            Mission plan · {p.phaseCount > 1 ? `${Math.min(p.activePhaseIndex + 1, p.phaseCount)} of ${p.phaseCount} phases · ` : ""}{p.doneCount} of {p.total} done
-          </p>
-          <p className="mt-0.5 flex items-center gap-1.5 text-xs text-foundry-muted">
-            {p.allDone ? (
-              <CheckCircle2 size={12} className="shrink-0 text-foundry-teal" />
-            ) : isLive ? (
-              <Loader2 size={12} className="shrink-0 animate-spin text-foundry-teal" />
-            ) : (
-              <CircleDot size={12} className="shrink-0 text-foundry-subtle" />
-            )}
-            <span className="min-w-0 truncate">
-              {p.allDone ? "All phases complete" : <>Current: <span className="text-foundry-ink">{p.activePhaseLabel}{p.activeItemLabel ? ` → ${p.activeItemLabel}` : ""}</span></>}
-            </span>
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={onOpenFullPlan}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded border border-white/10 px-2 py-1 text-[10.5px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle transition hover:border-foundry-teal/35 hover:text-foundry-ink"
-        >
-          <PanelRightOpen size={12} /> View full plan
-        </button>
-      </div>
-    </section>
-  );
-}
-
-/** The full phased checklist, moved off the main canvas into a right-side slide-over so it never dominates the live work. Hosts the unchanged MissionChecklistBoard. */
-function MissionPlanPanel({
-  checklist,
-  isLive,
-  onSkipItem,
-  onClose,
-}: {
-  checklist: FactoryObjectiveChecklistItem[];
-  isLive: boolean;
-  onSkipItem?: (item: FactoryObjectiveChecklistItem) => void;
-  onClose: () => void;
-}) {
-  return (
-    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true">
-      <button type="button" aria-label="Close mission plan" className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative z-10 flex h-full w-full max-w-md flex-col border-l border-white/10 bg-[#0c1011] shadow-workspace">
-        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
-          <p className="text-sm font-extrabold text-foundry-ink">Mission plan</p>
-          <button type="button" onClick={onClose} className="text-xs font-bold text-foundry-subtle transition hover:text-foundry-ink">
-            Close
-          </button>
-        </div>
-        <div className="min-h-0 flex-1 overflow-auto p-4">
-          <MissionChecklistBoard checklist={checklist} isLive={isLive} onSkipItem={onSkipItem} />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Turns a follow-up clarify answer back into a self-contained task that resumes the SAME mission thread.
- * The answer leads (so the "You" turn reads naturally), with the original ambiguous request carried as
- * trailing context — which also keeps the imperative verb present so the intent router routes it to edit,
- * not back to clarify.
- */
-function resolveClarificationTask(pending: PendingClarification, answer: string) {
-  return `${answer}\n\n(This answers your question — "${pending.question}" — about my earlier request: ${pending.originalTask})`;
-}
-
-/**
- * One blocking decision at a time, pinned inline near the current work. Shows only the first pending
- * clarification with real clickable options when the producer supplied them, plus an always-present
- * free-text field. Answering routes through the normal message path (onAnswer -> onExecute), which
- * resumes the same mission rather than forking a new one. The rest stay hidden until this is answered.
- */
-function DecisionPrompt({ clarifications, onAnswer }: { clarifications: MissionClarification[]; onAnswer: (answer: string) => void }) {
-  const [custom, setCustom] = useState("");
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [answers, setAnswers] = useState<Array<{ question: string; answer: string }>>([]);
-  const current = clarifications[currentIndex];
-  if (!current) return null;
-  const remaining = clarifications.length - currentIndex - 1;
-
-  function submit(answer: string) {
-    const trimmed = answer.trim();
-    if (!trimmed) return;
-    const resolved = [...answers, { question: current.question, answer: trimmed }];
-    if (remaining > 0) {
-      setAnswers(resolved);
-      setCurrentIndex((index) => index + 1);
-      setCustom("");
-      return;
-    }
-    onAnswer([
-      "Resolved project decisions:",
-      ...resolved.map((item) => `- ${item.question}\n  Answer: ${item.answer}`),
-      "Continue the same mission using these decisions and carry the existing plan through implementation and verification.",
-    ].join("\n"));
-    setCustom("");
-  }
-
-  return (
-    <section className="my-3 max-w-4xl rounded-md border border-foundry-amber/35 bg-foundry-amber/[0.07] p-3.5">
-      <p className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-[0.08em] text-foundry-amber">
-        <AlertTriangle size={12} /> Foundry needs one decision
-      </p>
-      <p className="mt-2 text-sm leading-6 text-foundry-ink">{current.question}</p>
-      {current.options?.length ? (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {current.options.map((option) => (
-            <button
-              key={option}
-              type="button"
-              onClick={() => submit(option)}
-              className="max-w-full whitespace-normal rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.12] px-3 py-1.5 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
-            >
-              {option}
-            </button>
-          ))}
-        </div>
-      ) : null}
-      <form className="mt-3 flex items-end gap-2" onSubmit={(event) => { event.preventDefault(); submit(custom); }}>
-        <input
-          value={custom}
-          onChange={(event) => setCustom(event.target.value)}
-          placeholder={current.options?.length ? "Something else…" : "Type your answer…"}
-          className="min-h-9 flex-1 rounded-md border border-white/15 bg-black/30 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
-        />
-        <button
-          type="submit"
-          disabled={!custom.trim()}
-          className="min-h-9 shrink-0 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.16] px-4 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          Send
-        </button>
-      </form>
-      {remaining > 0 ? (
-        <p className="mt-2 text-[11px] text-foundry-subtle">{remaining} more {remaining === 1 ? "question" : "questions"} after this — I&apos;ll ask once this one is answered.</p>
-      ) : null}
-    </section>
-  );
-}
-
-/** Live, always-visible mission checklist: which phase is active, which item is active right now, and the full backlog — so nothing gets lost in a long multi-part request. Rendered inside MissionPlanPanel, not directly on the canvas. */
-function MissionChecklistBoard({
-  checklist,
-  isLive,
-  onSkipItem,
-}: {
-  checklist: FactoryObjectiveChecklistItem[];
-  isLive: boolean;
-  onSkipItem?: (item: FactoryObjectiveChecklistItem) => void;
-}) {
-  if (checklist.length <= 1) return null;
-
-  const { phases, activeItemId, activePhaseIndex, doneCount } = missionPlanProgress(checklist);
-
-  return (
-    <section className="mb-3 max-w-4xl rounded-md border border-white/10 bg-black/15 p-3">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-[11px] font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">
-          Mission checklist · {doneCount}/{checklist.length} resolved
-        </p>
-        {isLive ? <span className="flex items-center gap-1.5 text-[10px] font-extrabold uppercase tracking-[0.08em] text-foundry-teal"><Loader2 size={11} className="animate-spin" /> Working</span> : null}
-      </div>
-      <div className="mt-2 grid gap-2">
-        {phases.map((group, phaseIndex) => {
-          const phaseDone = group.items.every((item) => item.status === "completed" || item.status === "skipped");
-          const isActivePhase = phaseIndex === activePhaseIndex;
-          const collapsedByDefault = phaseDone && phaseIndex !== activePhaseIndex;
-          return (
-            <details key={group.phase} className="group rounded border border-white/5" open={!collapsedByDefault}>
-              {phases.length > 1 ? (
-                <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-2 py-1.5 text-xs font-bold text-foundry-ink">
-                  <span className="flex items-center gap-2">
-                    {phaseDone ? <CheckCircle2 size={13} className="text-foundry-teal" /> : isActivePhase ? <Loader2 size={13} className="animate-spin text-foundry-teal" /> : <CircleDot size={13} className="text-foundry-subtle" />}
-                    {group.phase}
-                  </span>
-                  <span className="text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">
-                    {group.items.filter((item) => item.status === "completed" || item.status === "skipped").length}/{group.items.length}
-                  </span>
-                </summary>
-              ) : null}
-              <div className="grid gap-0.5 px-2 pb-1.5 pt-1">
-                {group.items.map((item) => {
-                  const meta = CHECKLIST_STATUS_META[item.status];
-                  const Icon = meta.icon;
-                  const isActive = item.id === activeItemId;
-                  return (
-                    <div
-                      key={item.id}
-                      className={`flex items-start gap-2 rounded px-1.5 py-1 text-xs leading-5 ${isActive ? "bg-foundry-teal/[0.08] text-foundry-ink" : "text-foundry-muted"}`}
-                    >
-                      <Icon size={13} className={`mt-0.5 shrink-0 ${meta.tone} ${item.status === "running" ? "animate-spin" : ""}`} />
-                      <span className="min-w-0 flex-1">{item.label}</span>
-                      {isActive ? <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">Now</span> : null}
-                      {onSkipItem && (item.status === "pending" || item.status === "running") ? (
-                        <button
-                          type="button"
-                          className="shrink-0 rounded border border-white/10 px-1.5 py-0.5 text-[9.5px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle transition hover:border-white/30 hover:text-foundry-ink"
-                          onClick={() => onSkipItem(item)}
-                        >
-                          Skip
-                        </button>
-                      ) : null}
-                    </div>
-                  );
-                })}
-              </div>
-            </details>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function RunResultSummary({ execution }: { execution: FactoryProjectResult }) {
-  const changedFiles = execution.files.filter((file) => file.status === "created" || file.status === "edited");
-  const verifiedItems = execution.checklist?.filter((item) => item.status === "completed") ?? [];
-  const remainingItems = execution.checklist?.filter((item) => item.status === "blocked" || item.status === "pending") ?? [];
-  return (
-    <section className="mt-3 rounded-md border border-foundry-teal/20 bg-foundry-teal/[0.04] px-3 py-2">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">
-          Done · changed {changedFiles.length} file{changedFiles.length === 1 ? "" : "s"}
-        </p>
-        <span className="text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-teal">{execution.status}</span>
-      </div>
-      {execution.objective ? <p className="mt-2 text-sm font-semibold text-foundry-ink">{execution.objective}</p> : null}
-      {execution.checklist?.length ? (
-        <p className="mt-1 text-xs leading-5 text-foundry-muted">
-          Verified {verifiedItems.length}/{execution.checklist.length} objective items{remainingItems.length ? `; remaining: ${remainingItems.map((item) => item.label).join("; ")}` : "."}
-        </p>
-      ) : null}
-      <div className="mt-2 grid gap-1">
-        {changedFiles.length ? (
-          changedFiles.map((file) => (
-            <div key={file.path} className="flex items-center justify-between gap-3 rounded bg-black/20 px-2 py-1 text-xs">
-              <span className="min-w-0 truncate text-foundry-muted">{file.path}</span>
-              <span className="shrink-0 font-bold text-foundry-teal">{file.status}</span>
-            </div>
-          ))
-        ) : (
-          <p className="text-sm text-foundry-muted">No file changes were reported.</p>
-        )}
-      </div>
-      {execution.sourceMode === "uploaded-copy" || execution.projectPath.includes("\\projects\\") || execution.projectPath.includes("/projects/") ? (
-        <p className="mt-3 text-xs leading-5 text-foundry-subtle">Editing Foundry copy. Export to apply these changes outside Foundry.</p>
-      ) : execution.sourceMode === "local-folder" ? (
-        <p className="mt-3 text-xs leading-5 text-foundry-subtle">Edited the connected local folder directly; changes should appear in VS Code.</p>
-      ) : null}
-    </section>
-  );
-}
-
-function MissionSummary({
-  execution,
-  timeline,
-  onReadFile,
-  onApproveCommand,
-}: {
-  execution: FactoryProjectResult;
-  timeline: FactoryExecutionEvent[];
-  onReadFile?: (path: string) => void;
-  onApproveCommand?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
-}) {
-  const visibleTimeline = timeline.filter((event) => !event.internal);
-  const changedFiles = execution.files.filter((file) => file.status === "created" || file.status === "edited");
-  const checklist = execution.checklist ?? [];
-  const verifiedItems = checklist.filter((item) => item.status === "completed");
-  const remainingItems = checklist.filter((item) => item.status !== "completed");
-  const passed = execution.status === "passed";
-  const stopped = execution.status === "stopped";
-  const awaitingApproval = execution.status === "awaiting-approval";
-  const needsClarification = execution.status === "needs-clarification";
-  const sessionSummary = execution.sessionSummary;
-  const finalSummary = finalSummaryFromTimeline(visibleTimeline);
-  const requestedBehavior = requestSummaryForExecution(execution);
-  // A "passed" mission with no verification evidence at all is exactly the stub "looks good" failure mode
-  // this UI must never present as a confident result — see the verifyCompletion() gate this mirrors.
-  const verificationEmpty = passed && !(execution.verification?.length);
-  const headline = verificationEmpty
-    ? "Complete (unverified)"
-    : passed
-    ? "Behavior updated"
-    : awaitingApproval
-      ? "Waiting for your approval"
-      : needsClarification
-        ? "Needs your input"
-        : stopped
-          ? "Stopped by user"
-          : "Needs more work";
-
-  const errorEvent = visibleTimeline.find((event) => event.status === "error");
-  const approvalEvent = [...visibleTimeline].reverse().find((event) => event.kind === "blocked" && event.status === "warning" && event.command);
-  const issue =
-    execution.blocker ||
-    (errorEvent ? (errorEvent.details?.reason as string | undefined) || errorEvent.title : passed ? "No issues — the mission completed as requested." : "Mission did not reach a clear resolution.");
-
-  const filesInspected = visibleTimeline.filter((event) => event.kind === "inspection" && /^Read\b/i.test(event.title)).length;
-  const commandEvents = visibleTimeline.filter((event) => event.kind === "command" && event.status !== "running");
-  const commandsRun = execution.commands.length || commandEvents.length;
-  const buildChecks = visibleTimeline.filter((event) => event.kind === "build").length;
-
-  const actionsPerformed = sessionSummary?.changes.length
-    ? sessionSummary.changes
-    : visibleTimeline
-        .filter((event) => event.status === "completed" && (event.kind === "edit" || event.kind === "file" || event.kind === "command"))
-        .map((event) => event.title);
-
-  const lastBuildEvent = [...visibleTimeline].reverse().find((event) => event.kind === "build");
-  const verification = passed
-    ? lastBuildEvent
-      ? `Verified by ${lastBuildEvent.status === "completed" ? "a successful build" : "the build output"} and ${verifiedItems.length}/${checklist.length || verifiedItems.length} checked objective items.`
-      : checklist.length
-        ? `Verified by ${verifiedItems.length}/${checklist.length} checked objective items with recorded evidence.`
-        : "Verified by the completed file changes above."
-    : stopped
-      ? "Stopped before verification could complete."
-      : "Could not be fully verified — see remaining issues below.";
-
-  const timestamps = visibleTimeline.map((event) => new Date(event.timestamp).getTime()).filter((value) => Number.isFinite(value));
-  const durationMs = timestamps.length > 1 ? Math.max(...timestamps) - Math.min(...timestamps) : 0;
-  const buildDurationMs = buildDurationFromTimeline(visibleTimeline);
-  const retries = visibleTimeline.filter((event) => event.title === "Completion claim rejected").length;
-
-  // A fast-lane mission (a single-item checklist — see isLikelySmallSingleFileRequest /
-  // isLikelyTinyOperationalRequest) is "start my server," not "build an inventory system": the
-  // 8-section report below is exactly the "computerized" over-explanation that makes a one-line
-  // outcome feel like paperwork. Report it the way a person would — one or two sentences — and only
-  // add the specific section that's actually load-bearing (files changed, a pending approval, a
-  // clarifying question), never the full checklist/verification/time-metrics scaffold.
-  const isTinyMission = checklist.length <= 1;
-  if (isTinyMission) {
-    const toneClass = passed ? "border-foundry-teal/25 bg-foundry-teal/[0.03]" : stopped ? "border-foundry-amber/25 bg-foundry-amber/[0.03]" : "border-red-300/30 bg-red-400/[0.03]";
-    return (
-      <section className={`mt-4 overflow-hidden rounded-lg border px-4 py-3 text-[13.5px] leading-6 ${toneClass}`}>
-        <p className="text-foundry-ink">{sessionSummary?.outcome || finalSummary || issue}</p>
-        {verificationEmpty ? <p className="mt-2 text-xs leading-5 text-foundry-amber">Not verified against real file or command evidence — treat this as unconfirmed until you check it yourself.</p> : null}
-        {changedFiles.length ? (
-          <div className="mt-2.5 grid gap-1">
-            {changedFiles.map((file) => (
-              <div key={file.path} className="flex items-center justify-between gap-3 rounded bg-black/20 px-2 py-1 text-xs">
-                <span className="min-w-0 truncate font-mono text-foundry-muted">{file.path}</span>
-                <span className="shrink-0 font-bold text-foundry-teal">{file.status}</span>
-              </div>
-            ))}
-          </div>
-        ) : null}
-        {passed && execution.previewState ? <PreviewCompletionCard execution={execution} /> : null}
-        {/* Clarification questions are surfaced as an inline DecisionPrompt in the live conversation
-            area (one at a time), not duplicated here in the settled summary. */}
-        {awaitingApproval && approvalEvent ? (
-          <div className="mt-3">
-            <BlockedCommandLine event={approvalEvent} onApprove={onApproveCommand} />
-          </div>
-        ) : null}
-        {!passed && !awaitingApproval && !needsClarification && execution.blocker ? <p className="mt-2 text-xs leading-5 text-foundry-subtle">{execution.blocker}</p> : null}
-      </section>
-    );
-  }
-
-  return (
-    <section
-      className={`mt-4 grid gap-4 overflow-hidden rounded-lg border text-sm leading-6 ${passed ? "border-foundry-teal/25 bg-foundry-teal/[0.03]" : stopped ? "border-foundry-amber/25 bg-foundry-amber/[0.03]" : "border-red-300/30 bg-red-400/[0.03]"}`}
-    >
-      <header className="border-b border-white/10 px-4 py-3">
-        <p className="text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Mission Summary</p>
-        <h3 className="mt-1 text-base font-extrabold text-foundry-ink">{headline}</h3>
-      </header>
-
-      <div className="grid gap-4 px-4 pb-4">
-        <SummarySection title="User Request">
-          <p>{requestedBehavior}</p>
-        </SummarySection>
-
-        <SummarySection title={passed ? "Behavior Now" : "Current State"}>
-          <p>{sessionSummary?.outcome || finalSummary || issue}</p>
-          {verificationEmpty ? (
-            <p className="mt-2 text-foundry-amber">Nothing here was verified against real file or command evidence — treat this as unconfirmed until you check it yourself.</p>
-          ) : null}
-        </SummarySection>
-        {passed && execution.previewState ? <PreviewCompletionCard execution={execution} /> : null}
-
-        {/* Clarification questions render as an inline DecisionPrompt in the live conversation area
-            (one at a time, clickable), not here in the settled summary. */}
-
-        {awaitingApproval && approvalEvent ? (
-          <SummarySection title="Approval Required">
-            <BlockedCommandLine event={approvalEvent} onApprove={onApproveCommand} />
-          </SummarySection>
-        ) : null}
-
-        {sessionSummary?.preserved.length ? (
-          <SummarySection title="Preserved">
-            <ul className="grid gap-1">
-              {sessionSummary.preserved.map((item, index) => (
-                <li key={`${item}-${index}`} className="flex items-start gap-2">
-                  <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-foundry-blue" />
-                  <span>{item}</span>
-                </li>
-              ))}
-            </ul>
-          </SummarySection>
-        ) : null}
-
-        {actionsPerformed.length ? (
-          <SummarySection title={sessionSummary?.changes.length ? "Behavior Changes" : "Engineering Work"}>
-            <ul className="grid gap-1">
-              {actionsPerformed.map((title, index) => (
-                <li key={`${title}-${index}`} className="flex items-start gap-2">
-                  <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-foundry-teal" />
-                  <span>{title}</span>
-                </li>
-              ))}
-            </ul>
-          </SummarySection>
-        ) : null}
-
-        {sessionSummary?.flags.length ? (
-          <SummarySection title="Flags">
-            <ul className="grid gap-1">
-              {sessionSummary.flags.map((flag, index) => (
-                <li key={`${flag}-${index}`} className="flex items-start gap-2">
-                  <CircleDot size={14} className="mt-0.5 shrink-0 text-foundry-amber" />
-                  <span>{flag}</span>
-                </li>
-              ))}
-            </ul>
-          </SummarySection>
-        ) : null}
-
-        {changedFiles.length ? (
-          <SummarySection title={`Files Changed (${changedFiles.length})`}>
-            <div className="grid gap-1.5">
-              {changedFiles.map((file) => {
-                const matchingEvent = [...visibleTimeline].reverse().find((event) => event.filePath === file.path && (event.kind === "edit" || event.kind === "file"));
-                return (
-                  <details key={file.path} className="rounded-md border border-white/10 bg-black/20 px-2.5 py-1.5">
-                    <summary className="flex cursor-pointer list-none items-center justify-between gap-2">
-                      <span className="min-w-0 truncate font-mono text-xs text-foundry-ink">{file.path}</span>
-                      <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">{file.status}</span>
-                    </summary>
-                    {matchingEvent ? (
-                      <div className="mt-2">
-                        <div className="mb-2 grid gap-1 text-xs text-foundry-muted">
-                          {matchingEvent.details?.lineRange ? <DetailRow label="Lines" value={String(matchingEvent.details.lineRange)} /> : null}
-                          {matchingEvent.rationale ? <DetailRow label="Reason" value={matchingEvent.rationale} /> : null}
-                        </div>
-                        <CodeViewTabs event={matchingEvent} onReadFile={onReadFile} />
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-xs text-foundry-subtle">No captured change detail for this file.</p>
-                    )}
-                  </details>
-                );
-              })}
-            </div>
-          </SummarySection>
-        ) : null}
-
-        {execution.commands.length ? (
-          <SummarySection title="Commands Executed">
-            <div className="grid gap-1.5">
-              {execution.commands.map((command, index) => (
-                <div key={`${command.command}-${index}`} className="rounded-md border border-white/10 bg-black/20 px-2.5 py-1.5 font-mono text-xs">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="min-w-0 truncate text-[#d8f3ec]">{command.command}</span>
-                    <span className={`shrink-0 text-[10px] font-extrabold ${command.exitCode === 0 ? "text-foundry-teal" : "text-red-300"}`}>
-                      exit {command.exitCode ?? "—"}
-                      {command.durationMs ? ` · ${(command.durationMs / 1000).toFixed(1)}s` : ""}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </SummarySection>
-        ) : null}
-
-        <SummarySection title="Limitations">
-          {remainingItems.length || execution.blocker ? (
-            <ul className="grid gap-1">
-              {execution.blocker ? <li>{execution.blocker}</li> : null}
-              {remainingItems.map((item) => (
-                <li key={item.id}>
-                  {item.label}
-                  {item.evidence ? ` — ${item.evidence}` : ""}
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>No unresolved checklist items were recorded.</p>
-          )}
-        </SummarySection>
-
-        <SummarySection title="Verification Evidence">
-          <p>
-            {verification}
-          </p>
-          <p className="mt-1">
-            Evidence recorded: {filesInspected} file read{filesInspected === 1 ? "" : "s"}, {changedFiles.length} file change{changedFiles.length === 1 ? "" : "s"}, {commandsRun} command{commandsRun === 1 ? "" : "s"} run{buildChecks ? `, ${buildChecks} build check${buildChecks === 1 ? "" : "s"}` : ""}.
-          </p>
-        </SummarySection>
-
-        <SummarySection title="Time Metrics">
-          <p>
-            Duration {formatDurationMs(durationMs)} · {filesInspected} file location{filesInspected === 1 ? "" : "s"} inspected · {changedFiles.length} file{changedFiles.length === 1 ? "" : "s"} modified · {commandsRun} command{commandsRun === 1 ? "" : "s"} run
-            {retries ? ` · ${retries} retr${retries === 1 ? "y" : "ies"}` : ""}
-            {buildDurationMs ? ` · build took ${formatDurationMs(buildDurationMs)}` : ""}
-          </p>
-        </SummarySection>
-
-        {execution.sourceMode === "uploaded-copy" || execution.projectPath.includes("\\projects\\") || execution.projectPath.includes("/projects/") ? (
-          <p className="text-xs leading-5 text-foundry-subtle">Editing Foundry copy. Export to apply these changes outside Foundry.</p>
-        ) : execution.sourceMode === "local-folder" ? (
-          <p className="text-xs leading-5 text-foundry-subtle">Edited the connected local folder directly; changes should appear in VS Code.</p>
-        ) : null}
-      </div>
-    </section>
-  );
-}
-
-function SummarySection({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <section>
-      <p className="mb-1.5 text-[11px] font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">{title}</p>
-      <div className="text-[13px] leading-6 text-foundry-muted">{children}</div>
-    </section>
-  );
-}
-
-/**
- * Fetches domain-aware next-improvement recommendations after a mission finishes. Always starts
- * from the generic, stack-only heuristic list (instant, no network) and silently upgrades to the
- * LLM's domain-specific picks if that call succeeds — never blocks or shows an error state on
- * failure/missing key, matching the same silent-fallback contract as project discovery.
- *
- * The caller supplies `dedupeKey` and owns when it changes — this hook deliberately does NOT live
- * inside the transient panel that displays the result. A mock-review pause can end (user reacts,
- * next phase starts) well before an LLM round-trip finishes; if the fetch were tied to that panel's
- * mount lifetime it would get aborted every time, and the UI would never show anything but the
- * instant heuristic fallback — which is exactly why it looked permanently generic/static.
- */
-function useMissionRecommendations(
-  execution: FactoryProjectResult | null,
-  dedupeKey: string,
-  mode: ModelMode,
-): { recommendations: MissionRecommendation[]; loading: boolean; modelSelection: (TierResolution & { autoSelected: boolean; reason?: string }) | null } {
-  const [recommendations, setRecommendations] = useState<MissionRecommendation[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [modelSelection, setModelSelection] = useState<(TierResolution & { autoSelected: boolean; reason?: string }) | null>(null);
-  const fetchedForRef = useRef<string>("");
-
-  useEffect(() => {
-    // dedupeKey resets to "" the instant a new turn starts (BuildDashboard.tsx's recommendationsKey).
-    // Clear immediately rather than leaving the previous turn's suggestions on screen until (if ever)
-    // a future dedupeKey refetch happens to overwrite them.
-    if (!execution || !dedupeKey) {
-      fetchedForRef.current = "";
-      setRecommendations([]);
-      return;
-    }
-    if (fetchedForRef.current === dedupeKey) return;
-    fetchedForRef.current = dedupeKey;
-
-    const changedFiles = execution.files.filter((file) => file.status === "created" || file.status === "edited").map((file) => file.path);
-    const heuristic = genericRecommendations(execution.stack);
-    setRecommendations(heuristic);
-    setLoading(true);
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000);
-
-    fetch("/api/factory/recommendations", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      signal: controller.signal,
-      body: JSON.stringify({
-        heuristic,
-        mode,
-        context: {
-          brief: execution.objective || "",
-          objective: execution.objective || "",
-          stack: execution.stack,
-          changedFiles,
-          checklistLabels: (execution.checklist ?? []).map((item) => item.label),
-        },
-      }),
-    })
-      .then((response) => response.json())
-      .then((data) => {
-        if (data?.ok && Array.isArray(data.recommendations) && data.recommendations.length) {
-          setRecommendations(data.recommendations);
-        }
-        if (data?.modelSelection) setModelSelection(data.modelSelection);
-      })
-      .catch(() => {})
-      .finally(() => {
-        clearTimeout(timeout);
-        setLoading(false);
-      });
-
-    return () => clearTimeout(timeout);
-    // mode is intentionally excluded — see the matching note in useHistoryRecommendation above.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [execution, dedupeKey]);
-
-  return { recommendations, loading, modelSelection };
-}
-
-const businessValueLabel: Record<MissionRecommendation["businessValue"], string> = {
-  "very-high": "Very high",
-  high: "High",
-  medium: "Medium",
-};
-
-const businessValueTone: Record<MissionRecommendation["businessValue"], string> = {
-  "very-high": "border-foundry-teal/40 bg-foundry-teal/[0.12] text-foundry-teal",
-  high: "border-foundry-blue/35 bg-foundry-blue/[0.1] text-foundry-blue",
-  medium: "border-white/15 bg-white/[0.05] text-foundry-subtle",
-};
-
-/**
- * The only way recommendations are presented: a full reasoned card (what, why, effort, value), not
- * a bare label — this is the "wow, my engineer actually thought about what's next" moment, not a
- * row of cryptic chips.
- */
-function RecommendationCards({ recommendations, onApply }: { recommendations: MissionRecommendation[]; onApply: (recommendation: MissionRecommendation) => void }) {
-  if (!recommendations.length) return null;
-  return (
-    <div className="grid gap-2">
-      {recommendations.map((recommendation) => (
-        <button
-          key={recommendation.id}
-          type="button"
-          onClick={() => onApply(recommendation)}
-          className="group grid gap-1.5 rounded-lg border border-white/10 bg-white/[0.02] px-3.5 py-3 text-left transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.05]"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="flex items-center gap-1.5 text-[13.5px] font-extrabold text-foundry-ink">
-              <Sparkles size={13} className="shrink-0 text-foundry-teal opacity-70 transition group-hover:opacity-100" />
-              {recommendation.label}
-            </span>
-            <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-[0.06em] ${businessValueTone[recommendation.businessValue]}`}>
-              {businessValueLabel[recommendation.businessValue]}
-            </span>
-          </div>
-          {recommendation.why ? <p className="text-[12.5px] leading-5 text-foundry-muted">{recommendation.why}</p> : null}
-          <div className="flex items-center justify-between gap-2">
-            <span className="font-mono text-[11px] text-foundry-subtle">~{recommendation.estimatedMinutes} min</span>
-            <span className="text-[11px] font-extrabold uppercase tracking-[0.05em] text-foundry-teal opacity-0 transition group-hover:opacity-100">Add →</span>
-          </div>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function PostBuildRecommendations({
-  recommendations,
-  loading,
-  onExecute,
-  modelSelection,
-  showModelNames,
-}: {
-  recommendations: MissionRecommendation[];
-  loading: boolean;
-  onExecute: (task: string) => void;
-  modelSelection?: (TierResolution & { autoSelected: boolean; reason?: string }) | null;
-  showModelNames?: boolean;
-}) {
-  if (!recommendations.length) return null;
-
-  return (
-    <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.02] p-3.5">
-      <div className="flex items-center gap-1.5">
-        <p className="section-kicker">Next best improvements</p>
-        {loading ? <Loader2 size={11} className="animate-spin text-foundry-subtle" /> : null}
-        <ModelSelectionChip selection={modelSelection} showModelNames={Boolean(showModelNames)} />
-      </div>
-      <p className="mt-1 text-[12.5px] leading-5 text-foundry-muted">Pick one and Foundry starts immediately — no need to type it out.</p>
-      <div className="mt-2.5">
-        <RecommendationCards recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} />
-      </div>
-    </div>
-  );
-}
-
-function MockReviewPanel({
-  pendingMockReview,
-  execution,
-  onExecute,
-  showsOwnPreview,
-  recommendations,
-  recommendationsLoading,
-  modelSelection,
-  showModelNames,
-}: {
-  pendingMockReview: { message: string; preview_url?: string };
-  execution: FactoryProjectResult | null;
-  onExecute: (task: string) => void;
-  showsOwnPreview: boolean;
-  recommendations: MissionRecommendation[];
-  recommendationsLoading: boolean;
-  modelSelection?: (TierResolution & { autoSelected: boolean; reason?: string }) | null;
-  showModelNames?: boolean;
-}) {
-  function continueBuilding() {
-    onExecute("The first version looks good — continue building out the rest of the plan.");
-  }
-
-  return (
-    <div className="mt-4 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.05] p-3.5">
-      <p className="text-base font-extrabold text-foundry-ink">The first version is ready.</p>
-      <p className="mt-1.5 text-sm leading-6 text-foundry-ink">{pendingMockReview.message}</p>
-      {showsOwnPreview && execution ? <PreviewPanel execution={execution} /> : null}
-      {pendingMockReview.preview_url ? (
-        <a
-          className="mt-2 inline-flex items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-1.5 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
-          href={pendingMockReview.preview_url}
-          target="_blank"
-          rel="noreferrer"
-        >
-          Open preview in a new tab
-        </a>
-      ) : null}
-
-      {recommendations.length ? (
-        <div className="mt-3.5">
-          <div className="flex items-center gap-1.5">
-            <p className="section-kicker">While building it, I noticed a few things worth adding</p>
-            {recommendationsLoading ? <Loader2 size={11} className="animate-spin text-foundry-subtle" /> : null}
-            <ModelSelectionChip selection={modelSelection} showModelNames={Boolean(showModelNames)} />
-          </div>
-          <div className="mt-2">
-            <RecommendationCards recommendations={recommendations} onApply={(recommendation) => onExecute(recommendation.task)} />
-          </div>
-        </div>
-      ) : null}
-
-      <button className="mt-3.5 text-[12px] font-semibold text-foundry-subtle transition hover:text-foundry-ink hover:underline" type="button" onClick={continueBuilding}>
-        Or just continue with the plan as-is →
-      </button>
-    </div>
-  );
-}
-
-function finalSummaryFromTimeline(timeline: FactoryExecutionEvent[]) {
-  const summaryEvent = [...timeline].reverse().find((event) => event.kind === "summary" && event.status === "completed");
-  const summary = summaryEvent?.details?.summary;
-  return typeof summary === "string" && summary.trim() ? summary.trim() : "";
-}
-
-function requestSummaryForExecution(execution: FactoryProjectResult) {
-  return (execution.objective || "Complete the requested project work")
-    .replace(/^Complete goal:\s*/i, "")
-    .trim();
-}
-
-function buildDurationFromTimeline(timeline: FactoryExecutionEvent[]) {
-  const buildEvents = timeline.filter((event) => event.kind === "build");
-  const running = buildEvents.find((event) => event.status === "running");
-  const finished = [...buildEvents].reverse().find((event) => event.status === "completed" || event.status === "error");
-  if (!running || !finished) return 0;
-  const delta = new Date(finished.timestamp).getTime() - new Date(running.timestamp).getTime();
-  return delta > 0 ? delta : 0;
-}
-
-function formatDurationMs(ms: number) {
-  if (!ms) return "under a second";
-  const totalSeconds = Math.round(ms / 1000);
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}m ${seconds}s`;
-}
-
-function liveFileIndicatorEvent(timeline: FactoryExecutionEvent[], isExecutionLive: boolean): FactoryExecutionEvent | null {
-  if (!isExecutionLive) return null;
-  const visible = timeline.filter((event) => !event.internal && (event.kind === "edit" || event.kind === "file" || event.kind === "inspection"));
-  if (!visible.length) return null;
-  const running = [...visible].reverse().find((event) => event.status === "running");
-  if (running) return running;
-  const last = visible.at(-1);
-  if (last && Date.now() - new Date(last.timestamp).getTime() < 5000) return last;
-  return null;
-}
-
-function liveFileIndicatorVerb(event: FactoryExecutionEvent) {
-  if (event.kind === "inspection") return event.title.toLowerCase().startsWith("verified") ? "Verified" : event.status === "running" ? "Reading" : "Read";
-  if (event.kind === "file") return event.status === "running" ? "Creating" : "Created";
-  if (event.kind === "edit") return event.status === "running" ? "Editing" : "Saved";
-  return "Working on";
-}
-
-function LiveFileIndicator({ event }: { event: FactoryExecutionEvent }) {
-  const verb = liveFileIndicatorVerb(event);
-  const target = event.filePath || event.fileName || "";
-  return (
-    <span className="mt-1.5 inline-flex w-fit items-center gap-1.5 rounded-full border border-foundry-teal/25 bg-foundry-teal/[0.07] px-2.5 py-1 text-[11px] font-bold text-foundry-teal">
-      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-foundry-teal" />
-      {verb}
-      {target ? ` ${target}` : ""}
-    </span>
-  );
-}
-
-/** Hard pause, rendered as a prominent card at the top of the active mission — not buried as one more
- * timeline row. While this is showing, nothing else in the mission can proceed: the composer disables
- * free-text send (ProjectComposer's `locked`), and ExecutionTimeline suppresses its own inline copy of
- * the same blocked event so there is exactly one place to resolve it. */
-function useRecentlyChangedPaths(timeline: FactoryExecutionEvent[]) {
-  const [recent, setRecent] = useState<Record<string, number>>({});
-  const seenIdsRef = useRef(new Set<string>());
-
-  useEffect(() => {
-    let changed = false;
-    const now = Date.now();
-    const next = { ...recent };
-    for (const event of timeline) {
-      if (seenIdsRef.current.has(event.id)) continue;
-      seenIdsRef.current.add(event.id);
-      if ((event.kind === "edit" || event.kind === "file") && event.status === "completed" && event.filePath) {
-        next[event.filePath] = now;
-        changed = true;
-      }
-    }
-    if (changed) setRecent(next);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeline]);
-
-  useEffect(() => {
-    if (!Object.keys(recent).length) return;
-    const timer = window.setTimeout(() => {
-      const cutoff = Date.now() - 4000;
-      setRecent((current) => Object.fromEntries(Object.entries(current).filter(([, timestamp]) => timestamp > cutoff)));
-    }, 1000);
-    return () => window.clearTimeout(timer);
-  }, [recent]);
-
-  return recent;
-}
 
 type FileTreeNode = {
   name: string;
@@ -2856,7 +1456,7 @@ function FileTreePanel({
         </header>
         <div className="grid min-h-0 gap-0 md:grid-cols-[300px_minmax(0,1fr)]">
           <aside className="min-h-0 overflow-auto border-b border-white/10 p-3 md:border-b-0 md:border-r">
-            <ProjectFileTree files={execution?.files ?? workspaceFiles} onReadFile={onReadFile} />
+            <ProjectFileTree files={execution?.files.length ? execution.files : workspaceFiles} onReadFile={onReadFile} />
             <div className="hidden">
               {(execution?.files ?? (selectedFile ? [{ path: selectedFile.path, status: "created" as const, size: selectedFile.content.length }] : [])).map((file) => (
                 <button
@@ -2945,6 +1545,13 @@ type DiscoveryEngineOutcome = Awaited<ReturnType<typeof runDiscoveryEngine>>;
  */
 const discoveryRequestCache = new Map<string, Promise<DiscoveryEngineOutcome>>();
 
+function discoverySeedText(start: ProjectStart) {
+  if (start.template.id !== "custom") {
+    return `${defaultKindFor(start.template.id)}. Subtype: ${start.customSubtype.trim() || start.appKind || start.subtype}`;
+  }
+  return start.projectDescription.trim() || start.appKind;
+}
+
 function cachedRunDiscoveryEngine(key: string, run: () => Promise<DiscoveryEngineOutcome>): Promise<DiscoveryEngineOutcome> {
   const existing = discoveryRequestCache.get(key);
   if (existing) return existing;
@@ -2959,30 +1566,36 @@ function cachedRunDiscoveryEngine(key: string, run: () => Promise<DiscoveryEngin
 
 function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart; onUpdate: (update: Partial<ProjectStart>) => void; onAdvance: () => void }) {
   const [showEscape, setShowEscape] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   // "cancelled" means only "this mounted instance should stop touching state" — it must NOT abort the
   // underlying discovery request. React remounts this component (Strict Mode in dev + parent
   // re-renders); tying the network request's lifetime to the effect is exactly what made the fetch get
   // aborted before it reached the server every time. The request now lives in discoveryRequestCache,
   // independent of any single mount.
   const cancelledRef = useRef(false);
-  const { mode: modelMode } = useModelMode();
+
+  useEffect(() => {
+    const started = Date.now();
+    const timer = window.setInterval(() => setElapsedSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     cancelledRef.current = false;
     const escapeTimer = window.setTimeout(() => {
       if (!cancelledRef.current) setShowEscape(true);
-    }, 8000);
+    }, 5000);
     // Foundry is genuinely reasoning here even when the API call resolves in a
     // few hundred ms — without a floor the "thinking" beat can flash by unnoticed.
-    const minVisibleMs = 1800;
+    const minVisibleMs = start.template.id === "custom" ? 300 : 80;
     // A real gpt-5 analysis has been observed taking 60-80+ seconds; 110s is the hard ceiling. This is a
     // Promise.race that resolves to a heuristic fallback rather than aborting the shared request, so a
     // remount's own timer can never tear down an in-flight discovery the cache is serving.
-    const hardTimeoutMs = 110000;
+    const hardTimeoutMs = 25000;
     const startedAt = Date.now();
 
     async function refine() {
-      const seedText = start.projectDescription.trim() || start.appKind;
+      const seedText = discoverySeedText(start);
       if (!seedText.trim()) {
         const remaining = minVisibleMs - (Date.now() - startedAt);
         if (remaining > 0) await wait(remaining);
@@ -2994,7 +1607,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
       // as the fallback memo content if the LLM call fails, so the user never lands on a blank summary
       // step just because OPENAI_API_KEY is unset or the network hiccups.
       const heuristic = discoverProject(seedText);
-      const cacheKey = JSON.stringify([seedText, start.template.id, start.subtype, start.customSubtype, start.projectLocation, modelMode, start.uploadNames]);
+      const cacheKey = JSON.stringify(["fast-discovery-v3-stack-only", seedText, start.template.id, start.subtype, start.customSubtype, start.projectLocation, start.uploadNames]);
       try {
         const inspection = start.uploadNames.length ? inspectExistingSourceNames(start.uploadNames) : null;
         const result = await Promise.race([
@@ -3014,25 +1627,40 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
                 },
               },
               // Deliberately no AbortSignal — the request must outlive this effect's cleanup.
-              { mode: modelMode }
+              // Discovery is a bounded comparison task. The Fast reasoning tier preserves real AI
+              // stack analysis without making the user wait on a build-scale model; the selected
+              // execution tier still governs the actual architecture/build mission afterward.
+              { mode: "fast" }
             )
           ),
           wait(hardTimeoutMs).then((): DiscoveryEngineOutcome => ({ ok: false, error: "Discovery analysis exceeded the time budget." })),
         ]);
         if (!cancelledRef.current) {
+          const rawDiscovery = result.ok && result.discovery ? result.discovery : heuristic;
+          const resolvedDiscovery = reconcileKnownStarterDiscovery(rawDiscovery, start);
+          const resolvedStackOptions = Array.isArray(result.stackOptions) && result.stackOptions.length ? result.stackOptions : fallbackStackOptionsFor(resolvedDiscovery);
+          const recommendedOption = resolvedStackOptions.find((option) => option.recommended);
+          const resolvedStack = recommendedOption?.name || resolvedDiscovery.recommendedStack;
+          const authoritativeDiscovery = alignDiscoveryWithSelectionAndConstraints(resolvedDiscovery, start, resolvedStack);
           onUpdate({
-            discovery: result.ok && result.discovery ? result.discovery : heuristic,
+            discovery: authoritativeDiscovery,
+            // The recommendation and the selected value are one decision. Keeping the old
+            // seed stack here made the sidebar/build brief claim Next.js while the cards
+            // correctly recommended WPF (or another domain-specific stack).
+            stack: resolvedStack,
+            customStack: "",
+            projectName: start.projectNameTouched ? start.projectName : cleanProjectName(authoritativeDiscovery.projectType),
             alternativeStacks: Array.isArray(result.alternativeStacks) ? result.alternativeStacks : [],
             deploymentNote: typeof result.deploymentNote === "string" ? result.deploymentNote : "",
             lede: typeof result.lede === "string" ? result.lede : "",
-            stackOptions: Array.isArray(result.stackOptions) && result.stackOptions.length ? result.stackOptions : FALLBACK_STACK_OPTIONS,
+            stackOptions: resolvedStackOptions,
             modelSelection: result.modelSelection ?? null,
           });
         }
       } catch {
         // Network error or malformed response — fall back to the heuristic-only memo rather than
         // leaving start.discovery null and the summary step blank.
-        if (!cancelledRef.current) onUpdate({ discovery: heuristic });
+        if (!cancelledRef.current) onUpdate({ discovery: heuristic, projectName: start.projectNameTouched ? start.projectName : cleanProjectName(heuristic.projectType) });
       } finally {
         window.clearTimeout(escapeTimer);
         const remaining = minVisibleMs - (Date.now() - startedAt);
@@ -3055,43 +1683,28 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
     // step with a blank memo just because the user got impatient before Stage B resolved. The in-flight
     // request keeps running in the cache; it just no longer has a listener.
     if (!start.discovery) {
-      const seedText = start.projectDescription.trim() || start.appKind;
-      if (seedText.trim()) onUpdate({ discovery: discoverProject(seedText) });
+      const seedText = discoverySeedText(start);
+      if (seedText.trim()) {
+        const heuristic = discoverProject(seedText);
+        onUpdate({ discovery: heuristic, projectName: start.projectNameTouched ? start.projectName : cleanProjectName(heuristic.projectType) });
+      }
     }
     onAdvance();
   }
 
-  const reasoningLines = [
-    `Read the domain — ${start.appKind || "this project"}`,
-    "Weighed likely users and complexity",
-    "Drafting architecture and a first data model…",
-    "Choosing a stack it can honestly commit to",
-  ];
-
   return (
-    <FlowSection eyebrow="Foundry is thinking" title="Working out what this actually needs." body="A real analysis can take up to a minute or so. Foundry is reasoning about purpose, users, architecture, and an honest first stack recommendation — not asking you anything else yet.">
+    <FlowSection eyebrow="Project discovery" title="Understanding your project." body="Foundry is analyzing the description now. The decision memo opens automatically when the real result is ready.">
       <div className="flex items-start gap-7">
         <span
           className="mt-1 h-[46px] w-[46px] shrink-0 animate-breathe-slow rounded-full"
           style={{ background: "radial-gradient(circle at 35% 30%, #7cf0d4, #1f7a5c 70%)", boxShadow: "0 0 0 1px rgba(52,216,166,0.3), 0 0 40px -6px rgba(52,216,166,0.7)" }}
         />
-        <div className="grid gap-3.5">
-          {reasoningLines.map((line, index) => (
-            <div
-              key={line}
-              className={`flex animate-reveal items-center gap-2.5 font-mono text-[13px] ${index < 2 ? "text-foundry-ink" : index === 2 ? "text-foundry-ink" : "text-foundry-subtle opacity-40"}`}
-              style={{ animationDelay: `${index * 0.2 + 0.05}s` }}
-            >
-              {index < 2 ? (
-                <CheckCircle2 size={13} className="shrink-0 text-foundry-teal" />
-              ) : index === 2 ? (
-                <span className="h-1.5 w-1.5 shrink-0 animate-breathe rounded-full bg-foundry-amber" />
-              ) : (
-                <span className="w-[13px] shrink-0 text-center text-foundry-subtle">·</span>
-              )}
-              {line}
-            </div>
-          ))}
+        <div className="grid gap-2">
+          <p aria-live="polite" className="flex items-center gap-2.5 font-mono text-[13px] text-foundry-ink">
+            <span className="h-1.5 w-1.5 shrink-0 animate-breathe rounded-full bg-foundry-teal" />
+            Analyzing “{(start.projectDescription.trim() || start.appKind || "your project").replace(/\s+/g, " ").slice(0, 96)}{(start.projectDescription.trim() || start.appKind).length > 96 ? "…" : ""}”
+          </p>
+          <p className="text-xs leading-5 text-foundry-subtle">{elapsedSeconds < 2 ? "Sending the project context…" : `Waiting for the selected model · ${elapsedSeconds}s`}</p>
         </div>
       </div>
       {showEscape ? (
@@ -3109,7 +1722,6 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
 function DiscoveryRail({ start, stepIndex, steps }: { start: ProjectStart; stepIndex: number; steps: FlowStep[] }) {
   const idx = (target: FlowStep) => steps.indexOf(target);
   const starterLabel = start.template.id === "custom" ? "Custom project" : start.template.title.replace(/^Build\s+/i, "");
-  const locationResolved = stepIndex > idx("project");
   const styleValue = start.customStyle.trim() || start.styleChoice;
 
   const rows: Array<{ key: string; label: string; value: string; show: boolean; pending?: boolean }> = [
@@ -3124,7 +1736,10 @@ function DiscoveryRail({ start, stepIndex, steps }: { start: ProjectStart; stepI
     },
     { key: "stack", label: "Stack", value: selectedStackFor(start), show: stepIndex >= idx("stack") },
     { key: "style", label: "Style", value: styleValue, show: stepIndex >= idx("style") && Boolean(styleValue) },
-    { key: "location", label: "Where it lives", value: locationResolved ? locationLabel(start.projectLocation) : "Not chosen yet", show: true, pending: !locationResolved },
+    // ProjectStart always has an explicit location default. Reflect that choice in the
+    // rail immediately so the summary cannot contradict the active option or make
+    // Continue look like it silently selected a destination.
+    { key: "location", label: "Where it lives", value: locationLabel(start.projectLocation), show: true },
   ];
 
   return (
@@ -3210,7 +1825,7 @@ function ProjectStartFlow({
     // architecture language (e.g. "Next.js App Router with Server Actions") — replace it with a
     // stack-neutral description instead of leaving a wrong, stack-mismatched claim in the memo.
     const stackChanged = resolved !== start.discovery.recommendedStack;
-    const nextArchitecture = stackChanged ? genericArchitectureFor(resolved, start.discovery.dataModel) : start.discovery.architecture;
+    const nextArchitecture = stackChanged ? genericArchitectureFor(resolved, start.discovery.dataModel, start.discovery.projectType, start.discovery.mainFeatures) : start.discovery.architecture;
     onUpdate({
       stack: name,
       customStack,
@@ -3632,7 +2247,7 @@ function ProjectStartFlow({
                       onUpdate({
                         styleChoice: option,
                         customStyle: "",
-                        discovery: start.discovery ? { ...start.discovery, styleDirection: styleDescriptions[option] } : start.discovery,
+                        discovery: start.discovery ? applyConfirmedStyle(reconcileKnownStarterDiscovery(start.discovery, start), styleDescriptions[option]) : start.discovery,
                       })
                     }
                   >
@@ -3650,7 +2265,7 @@ function ProjectStartFlow({
                     onUpdate({
                       customStyle: event.target.value,
                       styleChoice: "",
-                      discovery: start.discovery && event.target.value.trim() ? { ...start.discovery, styleDirection: event.target.value } : start.discovery,
+                      discovery: start.discovery && event.target.value.trim() ? applyConfirmedStyle(reconcileKnownStarterDiscovery(start.discovery, start), event.target.value) : start.discovery,
                     })
                   }
                   placeholder="like the Linear app, but warmer"
@@ -3958,6 +2573,7 @@ function ExistingProjectFlow({
                       active={start.source === source.id}
                       label={source.label}
                       description={`${source.description} Status: ${source.status}.`}
+                      disabled={source.id === "github-later"}
                       onClick={() => selectExistingSource(source.id)}
                     />
                   ))}
@@ -4240,6 +2856,8 @@ function ExistingProjectFlow({
 
 type AgentStatus = "checking" | "not-installed" | "installed" | "connected" | "offline";
 
+const AGENT_SEEN_KEY = "foundry-local-agent-seen";
+
 function useLocalAgentInstallStatus(): AgentStatus {
   const [status, setStatus] = useState<AgentStatus>("checking");
 
@@ -4249,7 +2867,17 @@ function useLocalAgentInstallStatus(): AgentStatus {
     async function poll() {
       const health = await checkAgentHealth("http://127.0.0.1:3917", "");
       if (cancelled) return;
-      setStatus(health.ok ? "installed" : "not-installed");
+      if (health.ok) {
+        try { localStorage.setItem(AGENT_SEEN_KEY, "1"); } catch { /* ignore */ }
+        setStatus("installed");
+        return;
+      }
+      // A failed health check on a machine where the agent has responded before means
+      // "installed but not running" — not "never installed". Regressing to the download
+      // CTA in that case misleads the user about the actual fix (start the agent).
+      let seenBefore = false;
+      try { seenBefore = localStorage.getItem(AGENT_SEEN_KEY) === "1"; } catch { /* ignore */ }
+      setStatus(seenBefore ? "offline" : "not-installed");
     }
 
     void poll();
@@ -4259,38 +2887,6 @@ function useLocalAgentInstallStatus(): AgentStatus {
       window.clearInterval(interval);
     };
   }, []);
-
-  return status;
-}
-
-function useLiveAgentStatus(connectorUrl: string, connectorToken: string, connectorRoot: string): AgentStatus | null {
-  const [status, setStatus] = useState<AgentStatus | null>(null);
-
-  useEffect(() => {
-    if (!connectorUrl) {
-      setStatus(null);
-      return;
-    }
-    let cancelled = false;
-    setStatus("checking");
-
-    async function poll() {
-      const health = await checkAgentHealth(connectorUrl, connectorToken);
-      if (cancelled) return;
-      if (!health.ok) {
-        setStatus("offline");
-        return;
-      }
-      setStatus(connectorRoot && health.approvedRoots.includes(connectorRoot) ? "connected" : "installed");
-    }
-
-    void poll();
-    const interval = window.setInterval(poll, 10_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [connectorUrl, connectorToken, connectorRoot]);
 
   return status;
 }
@@ -4614,13 +3210,18 @@ function FlowSection({ eyebrow, title, body, children }: { eyebrow: string; titl
   );
 }
 
-function ChoiceButton({ active, label, description, onClick }: { active: boolean; label: string; description?: string; onClick: () => void }) {
+function ChoiceButton({ active, label, description, disabled = false, onClick }: { active: boolean; label: string; description?: string; disabled?: boolean; onClick: () => void }) {
   return (
     <button
       className={`min-h-11 rounded-lg border px-3.5 py-2.5 text-left text-[13.5px] font-semibold transition ${
-        active ? "border-foundry-teal/45 bg-foundry-teal/[0.08] text-foundry-ink" : "border-white/10 bg-white/[0.03] text-foundry-muted hover:border-white/20 hover:text-foundry-ink"
+        disabled
+          ? "cursor-not-allowed border-white/[0.06] bg-white/[0.015] text-foundry-subtle opacity-60"
+          : active
+            ? "border-foundry-teal/45 bg-foundry-teal/[0.08] text-foundry-ink"
+            : "border-white/10 bg-white/[0.03] text-foundry-muted hover:border-white/20 hover:text-foundry-ink"
       }`}
       type="button"
+      disabled={disabled}
       onClick={onClick}
     >
       <span className="block">{label}</span>
@@ -4823,7 +3424,7 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
 
   function applyAlternativeStack(name: string) {
     const stackChanged = name !== currentDiscovery.recommendedStack;
-    const nextArchitecture = stackChanged ? genericArchitectureFor(name, currentDiscovery.dataModel) : currentDiscovery.architecture;
+    const nextArchitecture = stackChanged ? genericArchitectureFor(name, currentDiscovery.dataModel, currentDiscovery.projectType, currentDiscovery.mainFeatures) : currentDiscovery.architecture;
     updateDiscovery({
       recommendedStack: name,
       architecture: nextArchitecture,
@@ -5068,7 +3669,10 @@ function firstSubtypeFor(id: TemplateId) {
 
 function appKindFor(template: BuildTemplate, subtype: string, customSubtype: string) {
   const chosenSubtype = customSubtype.trim() || (subtype === "Other / Custom" ? "Custom" : subtype);
-  return `${chosenSubtype} ${defaultKindFor(template.id)}`.trim();
+  // Starter subtype labels are already complete product descriptions (for example,
+  // "Warehouse inventory" or "SaaS dashboard"). Appending the template kind made
+  // customer-facing names and folder slugs repeat themselves.
+  return chosenSubtype === "Custom" || !chosenSubtype ? defaultKindFor(template.id) : chosenSubtype;
 }
 
 function kindStepTitle(template: BuildTemplate, appKind?: string) {
@@ -5267,7 +3871,10 @@ function selectedStackFor(start: ProjectStart) {
   return start.customStack.trim() || start.stack;
 }
 
-function genericArchitectureFor(stack: string, entities: string[]) {
+function genericArchitectureFor(stack: string, entities: string[], projectType = "", features: string[] = []) {
+  if (/\b(website|portfolio|marketing|landing|brochure|docs?|content|studio|agency)\b/i.test(`${projectType} ${features.join(" ")}`)) {
+    return `${stack} presentation site with reusable content sections, static-first pages, responsive media, accessible navigation, per-page SEO metadata, and a real inquiry path. Content editing stays outside the visitor experience unless an admin CMS is explicitly requested.`;
+  }
   const primaryEntities = entities.slice(0, 2).join(" and ") || "the core data";
   return `${stack} implementation with create/update/delete flows for ${primaryEntities}, optimistic UI feedback, and local-first storage until a real backend or multi-device sync is requested.`;
 }
@@ -5281,7 +3888,8 @@ function refreshArchitectureKeyFact(keyFacts: string[], oldStack: string, newSta
   const oldStackLower = oldStack.trim().toLowerCase();
   if (!oldStackLower) return keyFacts;
   const replacement = `${newStack} architecture`;
-  const swapped = keyFacts.map((fact) => (fact.toLowerCase().includes(oldStackLower) ? replacement : fact));
+  const frameworkFact = /\b(next(?:\.js)?|react|astro|nuxt|vue|svelte(?:kit)?|django|laravel|rails|spring|fastapi|flutter|electron|tauri)\b/i;
+  const swapped = keyFacts.map((fact) => (fact.toLowerCase().includes(oldStackLower) || frameworkFact.test(fact) ? replacement : fact));
   return swapped.filter((fact, index) => swapped.indexOf(fact) === index);
 }
 
@@ -5302,7 +3910,9 @@ function deploymentNoteFor(start: ProjectStart) {
   if (/unity|godot/.test(stack)) return "Exports to a game build target after prototype; not web-deployed.";
   if (/phaser/.test(stack)) return "Deploys as a browser-playable build to any static host.";
   if (/android|flutter|react native/.test(stack)) return "Builds to app-store packages (Google Play/App Store) after prototype.";
-  if (/next\.?js|react|vue|angular|astro|node|express|fastapi|django|laravel|php|html/.test(stack)) return "Deploys well to Vercel, Netlify, or any Node/static host.";
+  if (/node|express|fastapi|django|laravel|php|spring|gin|asp\.net/.test(stack)) return "Deploy as a long-running service or container on a Node/server runtime; serverless platforms require an explicit function adapter. This is not a static-host artifact.";
+  if (/next\.?js/.test(stack)) return "Deploy to a compatible Next.js runtime such as Vercel or a Node/container host; static export is available only when the application does not require server features.";
+  if (/react|vue|angular|astro|html/.test(stack)) return "Deploys as a web build to a compatible static host when no server runtime is required.";
   return "Deployment path depends on the final stack; Foundry will confirm before shipping.";
 }
 
@@ -5316,6 +3926,105 @@ function ledeFor(start: ProjectStart) {
 // domain / likely-users / complexity are deliberately excluded here — they're already
 // carried by the narrative lede and "What Foundry Already Knows", so repeating them as
 // their own decision group would just be the same understanding said twice.
+function reconcileKnownStarterDiscovery(discovery: ProjectDiscoveryResult, start: ProjectStart): ProjectDiscoveryResult {
+  if (start.template.id === "custom") return discovery;
+  const established = new Set<DiscoveryDimension>(["domain", "platform", "data-shape", "features"]);
+  const decisions = discovery.decisions.map((item) => established.has(item.dimension) && item.action === "ask"
+    ? { ...item, confidence: Math.max(90, item.confidence), source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined }
+    : item);
+  const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
+  return { ...discovery, decisions, questions, assumptions };
+}
+
+function alignDiscoveryWithSelectionAndConstraints(discovery: ProjectDiscoveryResult, start: ProjectStart, selectedStack: string): ProjectDiscoveryResult {
+  const brief = `${start.projectDescription} ${discovery.prompt}`;
+  const stackChanged = selectedStack.trim() !== "" && selectedStack.trim() !== discovery.recommendedStack.trim();
+  const architecture = stackChanged
+    ? genericArchitectureFor(selectedStack, discovery.dataModel, discovery.projectType, discovery.mainFeatures)
+    : discovery.architecture;
+  const excludesAuth = /\b(?:no|without)\s+(?:login|logins|authentication|auth|accounts?|user accounts?)\b/i.test(brief);
+  const excludesDatabase = /\b(?:no|without)\s+(?:a\s+)?(?:database|db|backend|server)\b/i.test(brief)
+    || /\bno\s+(?:login|auth|database|backend)(?:\s+or\s+(?:a\s+)?(?:login|auth|database|backend))+\b/i.test(brief);
+  const decisions = discovery.decisions.map((decision) => {
+    if (decision.dimension === "architecture" && stackChanged) {
+      return { ...decision, hypothesis: architecture, confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined };
+    }
+    if (decision.dimension === "auth-database-api" && (excludesAuth || excludesDatabase)) {
+      const excluded = [excludesAuth ? "authentication or user accounts" : "", excludesDatabase ? "a database or backend" : ""].filter(Boolean).join(" and ");
+      return {
+        ...decision,
+        hypothesis: `First version explicitly excludes ${excluded}; keep the project free of disconnected auth or persistence UI.`,
+        rationale: "The user's brief explicitly excluded this scope.",
+        confidence: 100,
+        source: "user-confirmed" as const,
+        action: "silent-infer" as const,
+        question: undefined,
+      };
+    }
+    return decision;
+  });
+  const explicitFeatures = [
+    /\bevent calendar\b/i,
+    /\bobserving guides?\b/i,
+    /\bmembership inquiry form\b/i,
+    /\binquiry form\b/i,
+    /\bcontact form\b/i,
+    /\bresponsive (?:design|layout|pages?|experience)\b/i,
+    /\baccessible (?:design|navigation|experience|site)\b/i,
+  ].map((pattern) => brief.match(pattern)?.[0]).filter((value): value is string => Boolean(value));
+  const mainFeatures = Array.from(new Map([...explicitFeatures, ...discovery.mainFeatures].map((feature) => [feature.toLowerCase(), feature])).values());
+  const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
+  const constraintFact = `First version excludes ${[excludesAuth ? "authentication/user accounts" : "", excludesDatabase ? "database/backend" : ""].filter(Boolean).join(" and ")}.`;
+  const keyFacts = (excludesAuth || excludesDatabase)
+    ? [...discovery.keyFacts.filter((fact) => !/\b(auth|login|account|database|backend|persistence)\b/i.test(fact)), constraintFact]
+    : discovery.keyFacts;
+  return {
+    ...discovery,
+    recommendedStack: selectedStack || discovery.recommendedStack,
+    architecture,
+    mainFeatures,
+    decisions,
+    questions,
+    assumptions,
+    keyFacts: stackChanged ? refreshArchitectureKeyFact(keyFacts, discovery.recommendedStack, selectedStack) : keyFacts,
+  };
+}
+
+function fallbackStackOptionsFor(discovery: ProjectDiscoveryResult): StackOption[] {
+  const evidence = `${discovery.projectType} ${discovery.prompt} ${discovery.architecture}`.toLowerCase();
+  const contentOnlyWeb = /\b(content|public|marketing|portfolio|club|venue|studio|website)\b/.test(evidence)
+    && /\b(no|without) (?:login|auth|database|backend)\b/.test(evidence);
+  if (contentOnlyWeb) {
+    return [
+      { name: "Astro + TypeScript", why: "Content-first pages, strong accessibility, and minimal client JavaScript fit a public site without a database.", recommended: true },
+      { name: "Next.js + TypeScript", why: "A strong alternative when the site is likely to add server features or richer application behavior later.", recommended: false },
+      { name: "Vite + React + TypeScript", why: "Useful when the experience needs more client-side interaction while remaining a static deployment.", recommended: false },
+      { name: "Static HTML + CSS + JavaScript", why: "The smallest dependency surface for a simple content site with only lightweight form behavior.", recommended: false },
+    ];
+  }
+  const recommended = discovery.recommendedStack.trim() || FALLBACK_STACK_OPTIONS[0].name;
+  return [
+    { name: recommended, why: `Matches the inferred ${discovery.projectType} architecture and first-version requirements.`, recommended: true },
+    ...FALLBACK_STACK_OPTIONS.filter((item) => item.name.toLowerCase() !== recommended.toLowerCase()).map((item) => ({ ...item, recommended: false })),
+  ].slice(0, 5);
+}
+
+function applyConfirmedStyle(discovery: ProjectDiscoveryResult, direction: string): ProjectDiscoveryResult {
+  const decisions = discovery.decisions.map((item) => item.dimension === "style"
+    ? {
+        ...item,
+        hypothesis: direction,
+        confidence: 100,
+        source: "user-confirmed" as const,
+        action: "silent-infer" as const,
+        rationale: "The user selected this visual direction during discovery.",
+        question: undefined,
+      }
+    : item);
+  const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
+  return { ...discovery, styleDirection: direction, decisions, questions, assumptions };
+}
+
 const sectionForDimension: Partial<Record<DiscoveryDimension, string>> = {
   platform: "Architectural Direction",
   architecture: "Architectural Direction",
@@ -5370,13 +4079,15 @@ function recommendationForStart(start: ProjectStart): StackRecommendation {
 }
 
 function cleanProjectName(value: string) {
-  return titleCase(
+  const cleaned = titleCase(
     value
       .replace(/\b(build|create|make|me|an?|the|with|for)\b/gi, " ")
       .replace(/\b(system|app|application|project)\b/gi, " $&")
       .replace(/\s+/g, " ")
       .trim(),
   );
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  return words.slice(0, 7).join(" ");
 }
 
 function customSubtypesForDetectedType(detectedType: string) {
@@ -5440,7 +4151,7 @@ function projectSourceCopy(sourceMode: "browser-local" | "local" | "connector" |
 }
 
 function projectExecutionFromMission(mission: MissionState): FactoryProjectResult | null {
-  const artifact = mission.createdArtifacts.find((item) => item.title === "Project Execution");
+  const artifact = [...mission.createdArtifacts].reverse().find((item) => item.title === "Project Execution");
   if (!artifact) return null;
 
   try {
@@ -5451,30 +4162,49 @@ function projectExecutionFromMission(mission: MissionState): FactoryProjectResul
 }
 
 function projectFilesForMission(mission: MissionState, execution: FactoryProjectResult | null): FactoryProjectResult["files"] {
-  if (execution?.files.length) return execution.files;
+  const merged = new Map<string, FactoryProjectResult["files"][number]>();
+  (execution?.files ?? []).forEach((file) => merged.set(normalizeProjectPath(file.path), { ...file, path: normalizeProjectPath(file.path) }));
 
   const uploadedArtifact = mission.createdArtifacts.find((item) => item.title === "Uploaded Project Files");
   if (uploadedArtifact) {
     try {
       const files = JSON.parse(uploadedArtifact.body) as FactoryUploadedFile[];
       if (Array.isArray(files)) {
-        return files.map((file) => ({
+        files.map((file) => ({
           path: normalizeProjectPath(file.path),
           status: "uploaded" as const,
           size: file.size ?? file.content?.length ?? 0,
           content: file.content,
-        })).filter((file) => file.path);
+        })).filter((file) => file.path).forEach((file) => { if (!merged.has(file.path)) merged.set(file.path, file); });
       }
     } catch {
       // Fall back to paths saved in the brief.
     }
   }
 
-  return selectedUploadPathsFromBrief(projectBriefFromMission(mission)).map((filePath) => ({
+  selectedUploadPathsFromBrief(projectBriefFromMission(mission)).map((filePath) => ({
     path: normalizeProjectPath(filePath),
     status: "uploaded" as const,
     size: 0,
-  })).filter((file) => file.path);
+  })).filter((file) => file.path).forEach((file) => { if (!merged.has(file.path)) merged.set(file.path, file); });
+
+  const liveEvents = mission.executionMissions.flatMap((item) => item.timeline);
+  liveEvents
+    .filter((event) => (event.kind === "file" || event.kind === "edit") && Boolean(event.filePath || event.fileName))
+    .forEach((event) => {
+      const filePath = normalizeProjectPath(event.filePath || event.fileName || "");
+      if (!filePath) return;
+      const existing = merged.get(filePath);
+      const detailsSize = typeof event.details?.bytes === "number" ? event.details.bytes : typeof event.details?.size === "number" ? event.details.size : undefined;
+      merged.set(filePath, {
+        path: filePath,
+        status: event.kind === "file" ? "created" : existing?.status === "created" ? "created" : "edited",
+        size: detailsSize ?? existing?.size ?? 0,
+        content: existing?.content,
+      });
+    });
+
+  return [...merged.values()];
 }
 
 function connectedPathForMission(mission: MissionState, execution: FactoryProjectResult | null) {
@@ -5546,106 +4276,6 @@ function normalizeProjectPath(filePath: string) {
   return filePath.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^\.?\//, "");
 }
 
-function projectTimelineFromMission(mission: MissionState, execution: FactoryProjectResult | null) {
-  const activeExecution = getActiveExecutionMission(mission);
-  if (activeExecution?.timeline?.length) return activeExecution.timeline;
-  const artifact = mission.createdArtifacts.find((item) => item.title === "Project Execution Timeline");
-  if (artifact) {
-    try {
-      return JSON.parse(artifact.body) as FactoryExecutionEvent[];
-    } catch {
-      return execution?.timeline ?? [];
-    }
-  }
-  return execution?.timeline ?? [];
-}
-
-function MissionStatePill({ mission }: { mission: ExecutionMission }) {
-  const isWaiting = mission.state === "waiting_for_approval" || mission.state === "waiting_for_user";
-  const isBlocked = mission.state === "blocked" || mission.state === "failed";
-  const tone = isWaiting
-    ? "border-foundry-amber/30 bg-foundry-amber/[0.08] text-foundry-amber"
-    : isBlocked
-      ? "border-red-400/30 bg-red-400/[0.08] text-red-200"
-      : mission.state === "complete"
-        ? "border-foundry-teal/30 bg-foundry-teal/[0.08] text-foundry-teal"
-        : "border-foundry-blue/30 bg-foundry-blue/[0.08] text-foundry-blue";
-  return (
-    <span className={`mt-1.5 inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-[0.06em] ${tone}`}>
-      {missionStateLabel(mission)}
-    </span>
-  );
-}
-
-
-function PreviousMissionsPanel({
-  missions,
-  onUndo,
-  disableUndo,
-}: {
-  missions: ExecutionMission[];
-  onUndo: (mission: ExecutionMission) => void;
-  disableUndo?: boolean;
-}) {
-  return (
-    <section className="max-w-4xl rounded-md border border-white/10 bg-black/15">
-      <div className="border-b border-white/10 px-3 py-2">
-        <p className="text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Previous Missions</p>
-      </div>
-      <div className="grid gap-1 p-2">
-        {missions.map((mission) => {
-          const canUndoThis = !disableUndo && mission.files_touched.length > 0;
-          return (
-            <details key={mission.id} className="rounded border border-white/5 bg-black/15">
-              <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-2.5 py-2 text-sm">
-                <span className="min-w-0 truncate font-bold text-foundry-ink">Previous mission: {mission.title}</span>
-                <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">{missionStateLabel(mission)}</span>
-              </summary>
-              <div className="grid gap-2 border-t border-white/10 px-2.5 py-2 text-xs leading-5 text-foundry-muted">
-                <DetailRow label="Request" value={mission.source_requirements.join("\n") || mission.title} />
-                <DetailRow label="Summary" value={mission.summary || mission.blocked_reason || "No final summary was recorded."} />
-                {mission.files_touched.length ? <DetailRow label="Files" value={mission.files_touched.map((file) => `${file.verified ? "verified" : "unverified"} ${file.path}`).join("\n")} /> : null}
-                {mission.commands_run.length ? (
-                  <DetailRow
-                    label="Commands"
-                    value={mission.commands_run.map((command) => `${command.command} (exit ${command.exitCode ?? "-"}) — ${command.approval_scope_label}`).join("\n")}
-                  />
-                ) : null}
-                {mission.verification.length ? <DetailRow label="Verification" value={mission.verification.map((item) => `${item.result}: ${item.evidence}`).join("\n")} /> : null}
-                {mission.parent_mission_id ? <DetailRow label="Continues" value={mission.parent_mission_id} /> : null}
-                {mission.preview_url ? (
-                  <div className="grid gap-1">
-                    <p className="text-[10px] font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Preview</p>
-                    <a
-                      className="inline-flex w-fit items-center gap-1.5 text-foundry-teal underline-offset-2 hover:underline"
-                      href={mission.preview_url}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Open the preview as it was for this mission
-                    </a>
-                  </div>
-                ) : null}
-                <div className="flex items-center gap-3 border-t border-white/5 pt-2">
-                  <button
-                    type="button"
-                    disabled={!canUndoThis}
-                    title={mission.files_touched.length ? undefined : "This mission didn't change any files, so there's nothing to undo."}
-                    className="text-xs font-extrabold text-foundry-subtle underline-offset-2 transition hover:text-foundry-ink hover:underline disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:no-underline"
-                    onClick={() => onUndo(mission)}
-                  >
-                    Undo this mission&apos;s changes
-                  </button>
-                </div>
-              </div>
-            </details>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
 function buildFileTree(files: FactoryProjectResult["files"]): FileTreeNode {
   const root: FileTreeNode = { name: "root", path: "", type: "folder", children: [] };
   files.forEach((file) => {
@@ -5664,16 +4294,6 @@ function buildFileTree(files: FactoryProjectResult["files"]): FileTreeNode {
     });
   });
   return root;
-}
-
-function timelineStyle(status: string) {
-  if (status === "completed") return { border: "border-foundry-teal/25", bg: "bg-foundry-teal/[0.055]", dot: "bg-foundry-teal/20 text-foundry-teal", text: "text-foundry-teal", icon: "ok" };
-  if (status === "error") return { border: "border-red-400/35", bg: "bg-red-500/[0.08]", dot: "bg-red-500/20 text-red-300", text: "text-red-300", icon: "x" };
-  if (status === "running") return { border: "border-foundry-blue/30", bg: "bg-foundry-blue/[0.07]", dot: "bg-foundry-blue/20 text-foundry-blue", text: "text-foundry-blue", icon: "..." };
-  if (status === "completed") return { border: "border-foundry-teal/25", bg: "bg-foundry-teal/[0.055]", dot: "bg-foundry-teal/20 text-foundry-teal", text: "text-foundry-teal", icon: "✓" };
-  if (status === "warning") return { border: "border-foundry-amber/30", bg: "bg-foundry-amber/[0.08]", dot: "bg-foundry-amber/20 text-foundry-amber", text: "text-foundry-amber", icon: "!" };
-  if (status === "error") return { border: "border-red-400/35", bg: "bg-red-500/[0.08]", dot: "bg-red-500/20 text-red-300", text: "text-red-300", icon: "×" };
-  return { border: "border-white/10", bg: "bg-white/[0.035]", dot: "bg-white/10 text-foundry-subtle", text: "text-foundry-subtle", icon: "-" };
 }
 
 /**

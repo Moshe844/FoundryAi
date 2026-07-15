@@ -3,6 +3,8 @@ import { answerQualityContract, instructionAnswerContract, sourceAnswerContract 
 import { isInstructionalRequest } from "@/lib/ai/intent-resolution";
 import { modelForProfile } from "@/lib/ai/model-router";
 import { looksLikeDiagnosticPaste } from "@/lib/mission-engine";
+import { refreshModelRegistry } from "@/lib/ai/routing/dynamic-router";
+import { callOpenAIResponsesManaged } from "@/lib/ai/foundry-runtime";
 
 type OpenAIContent = {
   type?: string;
@@ -59,6 +61,7 @@ export const openAIWebSearchProvider: SourceProvider = {
     return shouldUseSources(request);
   },
   async answerWithSources(request) {
+    await refreshModelRegistry();
     const urls = extractUrls(request.userMessage);
 
     if (urls.length > 0) {
@@ -175,14 +178,15 @@ async function answerWithWebSearch(request: SourceProviderRequest): Promise<Sour
     };
   }
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
+  const { response, data } = await callOpenAIResponsesManaged<OpenAIResponse>({
+    apiKey,
+    workspaceId: request.missionTitle || "source-search",
+    userId: "default-user",
+    maxAttempts: 1,
+    requestId: `source-search:${request.userMessage}`,
+    routingReason: implementationRequest ? "Fast source discovery followed by bounded Builder artifact generation." : "Search, source reading, and summaries always use Fast.",
     body: JSON.stringify({
-      model: modelForProfile(directLinkRequest ? "fast" : "standard").model,
+      model: modelForProfile(implementationRequest ? "standard" : "fast").model,
       tools: [{ type: "web_search" }],
       input: [
         {
@@ -210,8 +214,6 @@ async function answerWithWebSearch(request: SourceProviderRequest): Promise<Sour
       max_output_tokens: implementationRequest ? 3600 : directLinkRequest ? 700 : instructional ? 1800 : 900,
     }),
   });
-
-  const data = (await response.json().catch(() => ({}))) as OpenAIResponse;
 
   if (!response.ok) {
     return {
@@ -304,12 +306,13 @@ async function answerFromProvidedSourceText(
   const implementationRequest = isImplementationArtifactRequest(request.userMessage);
   if (!apiKey) return "I need the OpenAI API key configured before I can read and answer from sources.";
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
+  const { response, data } = await callOpenAIResponsesManaged<OpenAIResponse>({
+    apiKey,
+    workspaceId: request.missionTitle || "source-reading",
+    userId: "default-user",
+    maxAttempts: 1,
+    requestId: `source-reading:${request.userMessage}`,
+    routingReason: implementationRequest ? "Builder is used only for the requested implementation artifact." : "Provided-source reading and summarization use Fast.",
     body: JSON.stringify({
       model: modelForProfile(implementationRequest ? "standard" : "fast").model,
       input: [
@@ -347,8 +350,6 @@ async function answerFromProvidedSourceText(
       max_output_tokens: implementationRequest ? 3600 : directLinkRequest ? 700 : instructional ? 1800 : 900,
     }),
   });
-
-  const data = (await response.json().catch(() => ({}))) as OpenAIResponse;
 
   if (!response.ok) {
     return data.error?.message

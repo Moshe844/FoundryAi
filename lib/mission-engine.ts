@@ -5,13 +5,14 @@ export type { CommandApprovalScope } from "@/lib/ai/mission/command-permissions"
 import { classifyEvidenceKind, type WorkspaceAttachment } from "@/lib/files";
 import type { SourceReference } from "@/lib/sources/types";
 import type { VisualArtifact } from "@/lib/visual-artifacts";
+import { compactMissionIfNeeded } from "@/lib/ai/context-compaction/compactor";
+import type { CompactionState } from "@/lib/ai/context-compaction/types";
 
 export type { ExecutionMissionVerification } from "@/lib/factory/types";
 
-// Canonical mission state/type definitions now live in lib/mission/reducer.ts, the single source of
-// truth for how an ExecutionMission's fields change. Imported (and re-exported below) so the ~15
-// existing call sites importing these from lib/mission-engine keep working unchanged during the
-// execution-canvas rebuild.
+// The Mission Canvas data contract lives in lib/mission/model.ts. The persisted workspace in
+// WorkspaceShell is the sole live store; these re-exports keep older call sites stable while the
+// large shell is split along product-flow boundaries.
 import type {
   ExecutionMission,
   ExecutionMissionApproval,
@@ -20,7 +21,7 @@ import type {
   ExecutionMissionState,
   ExecutionMissionVerificationStatus,
   MissionSize,
-} from "@/lib/mission/reducer";
+} from "@/lib/mission/model";
 export type {
   ExecutionMission,
   ExecutionMissionApproval,
@@ -104,6 +105,7 @@ export type MissionState = {
     summary: string;
     updatedAt: string;
   };
+  compaction?: CompactionState;
   followUpContext: {
     type: FollowUpType;
     summary: string;
@@ -117,6 +119,13 @@ export type MissionState = {
    * starts (answering it resumes the same mission thread with the original request + the answer).
    */
   pendingClarification?: PendingClarification;
+  /** Latest accepted follow-up that could not start before a reload. Persisted so recovery never
+   * silently drops or blindly replays it. */
+  pendingFollowUp?: {
+    task: string;
+    evidenceAttachments: WorkspaceAttachment[];
+    queuedAt: string;
+  };
   createdAt: string;
   updatedAt: string;
 };
@@ -304,7 +313,7 @@ const initialMissionDate = new Date("2026-06-28T13:05:00.000Z");
 export function createInitialMission(now = initialMissionDate): MissionState {
   const iso = now.toISOString();
 
-  return {
+  return compactMissionIfNeeded({
     missionId: `mission-${now.getTime()}`,
     conversationTitle: "New Work Item",
     title: "New Work Item",
@@ -328,7 +337,7 @@ export function createInitialMission(now = initialMissionDate): MissionState {
     liveWorkEvents: [],
     createdAt: iso,
     updatedAt: iso,
-  };
+  });
 }
 
 export function classifyMessage(message: string, mission: MissionState): Classification {
@@ -380,7 +389,7 @@ export function applyUserMessage(
   const nextMessages = options.includeAssistantMessage === false ? [...visibleMessages, finalUserNote] : [...visibleMessages, finalUserNote, systemNote];
   const nextAttachments = mergeAttachments(baseMission.attachments, userNoteAttachments);
 
-  return {
+  return compactMissionIfNeeded({
     ...baseMission,
     conversationTitle,
     title,
@@ -401,7 +410,7 @@ export function applyUserMessage(
     },
     liveWorkEvents: events,
     updatedAt: iso,
-  };
+  });
 }
 
 export function appendAssistantMessage(
@@ -419,7 +428,7 @@ export function appendAssistantMessage(
   const artifact = createArtifactFromMessage(mission, message, now);
   const workMemory = updateWorkMemory(mission, body, now);
 
-  return {
+  return compactMissionIfNeeded({
     ...mission,
     messages: [...mission.messages, message],
     createdArtifacts: [artifact, ...mission.createdArtifacts],
@@ -428,7 +437,7 @@ export function appendAssistantMessage(
     workMemory,
     liveWorkEvents: ["Reading your question", "Checking current task context", "Preparing answer"],
     updatedAt: now.toISOString(),
-  };
+  });
 }
 
 function createEmptyWorkMemory(updatedAt: string): MissionState["workMemory"] {

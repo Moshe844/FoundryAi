@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createFactoryProject } from "@/lib/factory/runtime";
+import { completeExecution, failExecution, recordExecutionEvent, registerExecution } from "@/lib/factory/execution-control";
 import type { FactoryCreateRequest, FactoryExecutionEvent } from "@/lib/factory/types";
 
 export async function POST(request: Request) {
@@ -12,28 +13,49 @@ export async function POST(request: Request) {
 
     if (url.searchParams.get("stream") === "1") {
       const encoder = new TextEncoder();
+      const runtimeController = new AbortController();
+      const unregisterExecution = registerExecution(body.controlId, runtimeController);
+      let disconnected = false;
       const stream = new ReadableStream({
         start(controller) {
+          const sentEvents = new Set<string>();
           const send = (payload: unknown) => {
-            controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
+            if (!disconnected) controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
           };
 
           void createFactoryProject(
             body.brief ?? "",
             (event: FactoryExecutionEvent) => {
+              const key = event.details?.stage && /^Model\s*·/i.test(event.title) ? `model:${event.details.stage}:${event.title}` : event.id;
+              if (sentEvents.has(key)) return;
+              sentEvents.add(key);
+              recordExecutionEvent(body.controlId, event);
               send({ type: "event", event });
             },
             body.discovery,
             body.modelMode,
+            body.quality,
+            runtimeController.signal,
           )
             .then((result) => {
+              completeExecution(body.controlId, result);
               send({ type: "result", result });
-              controller.close();
+              if (!disconnected) controller.close();
             })
             .catch((error) => {
-              send({ type: "error", error: error instanceof Error ? error.message : "Factory project creation failed." });
-              controller.close();
+              const message = error instanceof Error ? error.message : "Factory project creation failed.";
+              failExecution(body.controlId, message);
+              send({ type: "error", error: message });
+              if (!disconnected) controller.close();
+            })
+            .finally(() => {
+              unregisterExecution();
             });
+        },
+        cancel() {
+          disconnected = true;
+          // Reload/navigation disconnects only this stream subscriber. The
+          // build remains active until completion or an explicit Stop request.
         },
       });
 
@@ -45,7 +67,7 @@ export async function POST(request: Request) {
       });
     }
 
-    const result = await createFactoryProject(body.brief, undefined, body.discovery, body.modelMode);
+    const result = await createFactoryProject(body.brief, undefined, body.discovery, body.modelMode, body.quality);
     return NextResponse.json(result);
   } catch (error) {
     return NextResponse.json(

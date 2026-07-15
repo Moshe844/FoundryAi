@@ -1,11 +1,13 @@
 import { execFileSync, execSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { decideCommandPermission, type CommandApprovalScope, type CommandPermissionCategory } from "./command-permissions";
+import { assessWriteVerification } from "./write-verification";
 
 const LONG_RUNNING_COMMAND_PATTERN =
-  /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
+  /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\b(?:python|python3|py)(?:\.exe)?\s+-m\s+http\.server\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
 
 function isLongRunningServerCommand(command: string) {
   return LONG_RUNNING_COMMAND_PATTERN.test(command);
@@ -35,6 +37,25 @@ export function normalizeCommandText(command: string) {
   return command.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+/**
+ * Permission-matching identity for a shell command. Builds on normalizeCommandText, then canonicalizes
+ * risk-neutral variations so an approval OR denial for `npm install dayjs` also covers `npm install dayjs
+ * --save`, `npm i dayjs`, etc. The spec requires deny not to loop and exact-command grants to ignore
+ * harmless formatting differences — without this, denying `npm install dayjs --save` failed to match the
+ * model's follow-up `npm install dayjs`, re-triggering the approval prompt (a soft loop). Scoped to JS
+ * package-manager installs and only collapses the install alias + save-family flags, which never change
+ * WHAT is installed or the risk; the package name and any risk-changing flag (`--global`, `--force`, a
+ * different package) remain, so genuinely different commands still read as distinct.
+ */
+export function commandPermissionIdentity(command: string) {
+  let text = normalizeCommandText(command);
+  if (/\b(npm|pnpm|yarn|bun)(\.cmd)?\s+(?:install|i|add)\b/.test(text)) {
+    text = text.replace(/\b(npm|pnpm|bun)(\.cmd)?\s+i\b/g, "$1 install");
+    text = text.replace(/\s+(?:--save(?:-dev|-prod|-exact|-optional|-peer)?|--no-save|--legacy-peer-deps|-[sdebop])\b/g, "");
+  }
+  return text.replace(/\s+/g, " ").trim();
+}
+
 /** Generalized detection for env/secret-shaped file paths — never hardcoded to one project's actual filenames. Matches dotenv files (.env, .env.local, .env.production, ...) and common secret-material filenames/extensions. */
 export function isSensitiveFilePath(relativePath: string): boolean {
   const basename = relativePath.replace(/\\/g, "/").split("/").pop() ?? relativePath;
@@ -48,7 +69,7 @@ export function isSensitiveFilePath(relativePath: string): boolean {
 
 function isCommandBypassAllowed(command: string, permission: { allowed: boolean; status?: string; category?: string }, options?: { approvedCommands?: string[]; approvedCategories?: string[] }) {
   if (permission.status !== "permission-required") return false;
-  const exactApproved = options?.approvedCommands?.some((entry) => normalizeCommandText(entry) === normalizeCommandText(command));
+  const exactApproved = options?.approvedCommands?.some((entry) => commandPermissionIdentity(entry) === commandPermissionIdentity(command));
   const categoryApproved = Boolean(permission.category && options?.approvedCategories?.includes(permission.category));
   return Boolean(exactApproved || categoryApproved);
 }
@@ -62,10 +83,10 @@ function approvalScopeFor(
   if (permission.status !== "permission-required") return undefined;
   const categoryApproved = Boolean(permission.category && options?.approvedCategories?.includes(permission.category));
   if (categoryApproved && permission.category) return { kind: "category", category: permission.category };
-  const exactApproved = options?.approvedCommands?.some((entry) => normalizeCommandText(entry) === normalizeCommandText(command));
+  const exactApproved = options?.approvedCommands?.some((entry) => commandPermissionIdentity(entry) === commandPermissionIdentity(command));
   if (exactApproved) {
-    const isStanding = options?.standingApprovedCommands?.some((entry) => normalizeCommandText(entry) === normalizeCommandText(command));
-    return isStanding ? { kind: "exact-command", command: normalizeCommandText(command) } : { kind: "one-time" };
+    const isStanding = options?.standingApprovedCommands?.some((entry) => commandPermissionIdentity(entry) === commandPermissionIdentity(command));
+    return isStanding ? { kind: "exact-command", command: commandPermissionIdentity(command) } : { kind: "one-time" };
   }
   return undefined;
 }
@@ -401,6 +422,8 @@ function isShellMismatchFailure(stdout: string, stderr: string) {
   return SHELL_MISMATCH_PATTERNS.some((pattern) => pattern.test(combined));
 }
 
+const backgroundServerPids = new Map<string, number>();
+const backgroundServerUrls = new Map<string, string>();
 let cachedGitBashPath: string | null | undefined;
 
 function findGitBashPath(): string | null {
@@ -432,6 +455,18 @@ function childProcessEnv(): NodeJS.ProcessEnv {
   // This runs in-process inside the Foundry dev/prod server — don't leak its own PORT
   // (or similar runtime-assigned vars) into spawned project commands like "next dev".
   delete env.PORT;
+  // Foundry often runs in development mode; leaking that into a customer's `next build`
+  // makes the canonical production command fail even though Next would set production itself.
+  Reflect.deleteProperty(env, "NODE_ENV");
+  // Native dependency installers can fall back to node-gyp, which downloads Node headers through
+  // a child Node process. Foundry itself is launched with --use-system-ca on managed Windows
+  // workstations, but CLI flags are not inherited by npm/node-gyp children. Carry the equivalent
+  // NODE_OPTIONS flag only on Node versions that support it so corporate/system trust roots remain
+  // available without weakening TLS verification.
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  if (process.platform === "win32" && nodeMajor >= 22 && !/(?:^|\s)--use-system-ca(?:\s|$)/.test(env.NODE_OPTIONS ?? "")) {
+    env.NODE_OPTIONS = `${env.NODE_OPTIONS ?? ""} --use-system-ca`.trim();
+  }
   return env;
 }
 
@@ -442,6 +477,7 @@ function spawnCommand(
   timeoutMs: number,
   keepAliveOnTimeout = false,
   signal?: AbortSignal,
+  onSpawn?: (pid: number) => void,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; durationMs: number; timedOut: boolean; aborted: boolean }> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
@@ -452,6 +488,7 @@ function spawnCommand(
     // A dev/server command (keepAliveOnTimeout) must survive past its own grace-period timeout — detached so
     // it isn't tied to this request's process group, and never killed when the grace period elapses below.
     const child = spawn(cmd, args, { cwd, windowsHide: true, env: childProcessEnv(), detached: keepAliveOnTimeout });
+    if (typeof child.pid === "number") onSpawn?.(child.pid);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -521,7 +558,13 @@ async function runCommandWithShellFallback(
   timeoutMs: number,
   keepAliveOnTimeout = false,
   signal?: AbortSignal,
+  onSpawn?: (pid: number) => void,
 ): Promise<ProjectCommandResult> {
+  if (/^\s*node(?:\.exe)?\s+-e\s+/i.test(command)) {
+    const tokens = tokenizeCommand(command);
+    const direct = await spawnCommand(process.execPath, tokens.slice(1), cwd, timeoutMs, false, signal);
+    return { ...direct, shellUsed: "direct-node" };
+  }
   const order = windowsShellOrder(session.stickyShellId);
   const firstAttemptedShellId = order.find((id) => shellInvocation(id, command));
   let lastResult: Awaited<ReturnType<typeof spawnCommand>> | null = null;
@@ -530,7 +573,7 @@ async function runCommandWithShellFallback(
   for (const shellId of order) {
     const invocation = shellInvocation(shellId, command);
     if (!invocation) continue;
-    const result = await spawnCommand(invocation.cmd, invocation.args, cwd, timeoutMs, keepAliveOnTimeout, signal);
+    const result = await spawnCommand(invocation.cmd, invocation.args, cwd, timeoutMs, keepAliveOnTimeout, signal, onSpawn);
     lastResult = result;
     if (result.aborted) {
       return { ...result, shellUsed: shellId, skipped: "aborted", stderr: result.stderr || "Stopped by user." };
@@ -584,11 +627,14 @@ export type ProjectCommandResult = {
 };
 export type ProjectSearchHit = { path: string; line?: number; preview?: string };
 export type ProjectDeleteResult = { existed: boolean; verified: boolean; reason?: string };
+export type BrowserValidationInput = { url: string; actions?: Array<{ action: string; selector?: string; value?: string; text?: string; key?: string; ms?: number; exact?: boolean; expected?: number }>; viewport?: { width: number; height: number }; screenshotName?: string; baselineScreenshot?: string };
+export type BrowserValidationResult = { available: boolean; verified: boolean; reason?: string; url?: string; title?: string; screenshotPath?: string; consoleErrors?: string[]; failedRequests?: Array<{ url: string; method: string; error: string }>; steps?: Array<{ action: string; target: string; ok: boolean; status?: number }>; visualComparison?: { comparable: boolean; changedPixels?: number; changedRatio?: number; diffPath?: string; reason?: string } };
+export type PlatformValidationResult = { available: boolean; verified?: boolean; reason?: string; action?: string; exitCode?: number | null; stdout?: string; stderr?: string; durationMs?: number; screenshotPath?: string; pid?: number; running?: boolean; interactionVerified?: boolean };
 
 export interface ProjectAccess {
   readonly mode: ProjectAccessMode;
   readonly rootLabel: string;
-  readonly capabilities: { canRunCommands: boolean; canSearch: boolean };
+  readonly capabilities: { canRunCommands: boolean; canSearch: boolean; canBrowserValidate?: boolean };
   listDir(relativePath: string): Promise<ProjectDirEntry[]>;
   readFile(relativePath: string, opts?: { offsetBytes?: number; limitBytes?: number }): Promise<ProjectReadResult>;
   writeFile(relativePath: string, content: string): Promise<ProjectWriteResult>;
@@ -600,6 +646,11 @@ export interface ProjectAccess {
   searchFiles?(query: string, opts?: { maxResults?: number }): Promise<ProjectSearchHit[]>;
   /** Deletes a file inside the project root. Optional — connections that don't support it (e.g. the local connector agent, until it's updated) simply omit this, and callers treat it as unsupported. */
   deleteFile?(relativePath: string): Promise<ProjectDeleteResult>;
+  /** Deletes the exact connected project root after a separate structured whole-project approval. Never inferred from ordinary file-delete permission. */
+  deleteRoot?(): Promise<ProjectDeleteResult>;
+  validateBrowser?(input: BrowserValidationInput): Promise<BrowserValidationResult>;
+  validatePlatform?(platform: "android" | "ios", input: Record<string, unknown>): Promise<PlatformValidationResult>;
+  validateDesktop?(input: Record<string, unknown>): Promise<PlatformValidationResult>;
 }
 
 const EXCLUDED_DIR_PATTERN = /(^|\/)(node_modules|\.git|\.next|dist|build|coverage|target|bin|obj)(\/|$)/i;
@@ -624,6 +675,11 @@ function resolveContained(root: string, relativePath: string) {
   const fullPath = path.resolve(root, cleaned || ".");
   if (fullPath !== root && !fullPath.startsWith(`${root}${path.sep}`)) return null;
   return fullPath;
+}
+
+function unsafeProjectRootDeletionTarget(root: string) {
+  const resolved = path.resolve(root);
+  return resolved === path.parse(resolved).root || resolved === path.resolve(homedir());
 }
 
 export function simpleDiff(before: string, after: string) {
@@ -661,7 +717,7 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
   return {
     mode,
     rootLabel: resolvedRoot,
-    capabilities: { canRunCommands: true, canSearch: true },
+    capabilities: { canRunCommands: true, canSearch: true, canBrowserValidate: true },
 
     async listDir(relativePath) {
       const fullPath = resolveContained(resolvedRoot, relativePath);
@@ -711,13 +767,20 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
         return { existedBefore: true, verified: false, contentChanged: false, reason: `${relativePath} is a directory, not a file. Choose a specific file path.` };
       }
       const before = existedBefore ? await readFile(fullPath, "utf8").catch(() => "") : "";
+      if (signal?.aborted) {
+        return { existedBefore, verified: false, contentChanged: false, reason: "Stopped by user before the file write started." };
+      }
       try {
         await mkdir(path.dirname(fullPath), { recursive: true });
         await writeFile(fullPath, content, "utf8");
+        if (signal?.aborted) {
+          if (existedBefore) await writeFile(fullPath, before, "utf8");
+          else await rm(fullPath, { force: true });
+          return { existedBefore, verified: false, contentChanged: false, reason: "Stopped by user; the in-flight file write was rolled back." };
+        }
         const details = await stat(fullPath);
         const actual = await readFile(fullPath, "utf8");
-        const contentChanged = existedBefore ? before !== actual : true;
-        const verified = actual === content && contentChanged;
+        const { contentChanged, verified } = assessWriteVerification(before, content, actual, existedBefore);
         const diffResult = simpleDiff(before, actual);
         return {
           existedBefore,
@@ -725,7 +788,7 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
           contentChanged,
           bytes: details.size,
           modifiedAt: details.mtime.toISOString(),
-          reason: verified ? undefined : actual !== content ? "Read-back content did not match what was written." : "Write succeeded but file content did not change.",
+          reason: verified ? undefined : "Read-back content did not match what was written.",
           diff: diffResult.text,
           firstChangedLine: diffResult.firstChangedLine,
           lastChangedLine: diffResult.lastChangedLine,
@@ -747,6 +810,21 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
         return { existed: true, verified: !existsSync(fullPath), reason: existsSync(fullPath) ? "File still exists after deletion." : undefined };
       } catch (error) {
         return { existed: true, verified: false, reason: error instanceof Error ? error.message : "Delete failed." };
+      }
+    },
+
+    async deleteRoot() {
+      if (unsafeProjectRootDeletionTarget(resolvedRoot)) {
+        return { existed: existsSync(resolvedRoot), verified: false, reason: "Refusing to delete a filesystem root or the user home folder." };
+      }
+      const existed = existsSync(resolvedRoot);
+      if (!existed) return { existed: false, verified: true };
+      if (signal?.aborted) return { existed: true, verified: false, reason: "Stopped by user before project deletion started." };
+      try {
+        await rm(resolvedRoot, { recursive: true, force: false });
+        return { existed: true, verified: !existsSync(resolvedRoot), reason: existsSync(resolvedRoot) ? "Project folder still exists after deletion." : undefined };
+      } catch (error) {
+        return { existed: true, verified: false, reason: error instanceof Error ? error.message : "Project deletion failed." };
       }
     },
 
@@ -778,11 +856,24 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
       const approvalScope = approvalScopeFor(command, permission, options);
 
       if (isLongRunningServerCommand(command)) {
-        const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, DEV_SERVER_GRACE_PERIOD_MS, true);
+        const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, DEV_SERVER_GRACE_PERIOD_MS, true, undefined, (pid) => backgroundServerPids.set(requestedCwd, pid));
+        const reportedUrls = Array.from(`${result.stdout}\n${result.stderr}`.matchAll(/https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/gi), (match) => match[0]);
+        // Next/Vite commonly print the occupied requested port before the final Local URL. The
+        // last loopback URL is the server that actually owns this project's detached process.
+        const reportedUrl = reportedUrls.at(-1);
+        if (reportedUrl) backgroundServerUrls.set(requestedCwd, reportedUrl);
         if (result.timedOut) {
           return { ...result, exitCode: 0, timedOut: false, approvalScope, stderr: `${result.stderr}\n[This looks like a long-running dev/server process — it's still running in the background rather than having failed or exited.]`.trim() };
         }
         return { ...result, approvalScope };
+      }
+
+      if (/\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?build\b/i.test(command)) {
+        const backgroundPid = backgroundServerPids.get(requestedCwd);
+        if (backgroundPid) {
+          killProcessTree(backgroundPid);
+          backgroundServerPids.delete(requestedCwd);
+        }
       }
 
       return { ...(await runCommandWithShellFallback(command, requestedCwd, shellSession, COMMAND_TIMEOUT_MS, false, signal)), approvalScope };
@@ -823,7 +914,82 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
       await visit(resolvedRoot);
       return hits;
     },
+
+    async validateBrowser(input) {
+      return validateServerBrowser(resolvedRoot, input);
+    },
   };
+}
+
+async function validateServerBrowser(root: string, input: BrowserValidationInput): Promise<BrowserValidationResult> {
+  let parsed: URL;
+  try {
+    parsed = new URL(input.url);
+  } catch {
+    return { available: true, verified: false, reason: "Browser validation requires a valid URL." };
+  }
+  if (!['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname)) {
+    return { available: true, verified: false, reason: "Server-side browser validation is restricted to loopback previews." };
+  }
+  const ownedServerUrl = backgroundServerUrls.get(root);
+  if (ownedServerUrl) {
+    const owned = new URL(ownedServerUrl);
+    if (parsed.port !== owned.port) {
+      return {
+        available: true,
+        verified: false,
+        reason: `The requested URL is not the dev server Foundry started for this project. Validate ${ownedServerUrl} instead; refusing to test an unrelated process on port ${parsed.port || "80"}.`,
+        url: ownedServerUrl,
+      };
+    }
+  }
+  try {
+    const { chromium } = await import("playwright");
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const viewport = { width: Math.max(320, Math.min(3840, input.viewport?.width ?? 1440)), height: Math.max(320, Math.min(2160, input.viewport?.height ?? 900)) };
+      const page = await browser.newPage({ viewport });
+      const consoleErrors: string[] = [];
+      const failedRequests: Array<{ url: string; method: string; error: string }> = [];
+      const steps: NonNullable<BrowserValidationResult['steps']> = [];
+      page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
+      page.on("pageerror", (error) => consoleErrors.push(error.message));
+      page.on("requestfailed", (request) => failedRequests.push({ url: request.url(), method: request.method(), error: request.failure()?.errorText ?? "request failed" }));
+      const response = await page.goto(input.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.locator("body").waitFor({ state: "visible", timeout: 5_000 });
+      steps.push({ action: "navigate", target: input.url, ok: Boolean(response?.ok()), status: response?.status() });
+      for (const action of (input.actions ?? []).slice(0, 50)) {
+        const locator = page.locator(action.selector || "body").first();
+        if (action.action === "click") await locator.click();
+        else if (action.action === "fill") await locator.fill(action.value ?? "");
+        else if (action.action === "type") await locator.pressSequentially(action.value ?? "");
+        else if (action.action === "press") await locator.press(action.key ?? "Enter");
+        else if (action.action === "check") await locator.check();
+        else if (action.action === "select") await locator.selectOption(action.value ?? "");
+        else if (action.action === "wait") await page.waitForTimeout(Math.max(0, Math.min(10_000, action.ms ?? 500)));
+        else if (action.action === "assert-text") await page.getByText(action.text ?? "", { exact: action.exact ?? false }).first().waitFor({ state: "visible" });
+        else if (action.action === "assert-count") {
+          const count = await page.locator(action.selector || "body").count();
+          if (count !== action.expected) throw new Error(`Expected ${action.selector} to match ${action.expected} element(s), but found ${count}.`);
+        } else throw new Error(`Unsupported browser action: ${action.action}`);
+        steps.push({ action: action.action, target: action.selector || action.text || "page", ok: true });
+      }
+      const artifactDir = path.join(root, ".foundry-artifacts", "validation");
+      await mkdir(artifactDir, { recursive: true });
+      const requestedScreenshotName = path.basename(input.screenshotName || "");
+      const screenshotName = !requestedScreenshotName || /^(?:null|undefined|none)$/i.test(requestedScreenshotName)
+        ? `browser-${Date.now()}.png`
+        : /\.(?:png|jpe?g|webp)$/i.test(requestedScreenshotName) ? requestedScreenshotName : `${requestedScreenshotName}.png`;
+      const screenshotPath = path.join(artifactDir, screenshotName);
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      const verified = Boolean(response?.ok()) && consoleErrors.length === 0 && failedRequests.length === 0;
+      return { available: true, verified, reason: verified ? undefined : "Rendered preview reported browser errors or failed requests.", url: page.url(), title: await page.title(), screenshotPath, consoleErrors, failedRequests, steps };
+    } finally {
+      await browser.close();
+    }
+  } catch (error) {
+    return { available: false, verified: false, reason: error instanceof Error ? error.message : "Browser validation failed." };
+  }
 }
 
 export type LocalConnectorConfig = {
@@ -867,7 +1033,7 @@ export function createLocalConnectorProjectAccess(config: LocalConnectorConfig, 
   return {
     mode: "local-folder",
     rootLabel: root,
-    capabilities: { canRunCommands: true, canSearch: true },
+    capabilities: { canRunCommands: true, canSearch: true, canBrowserValidate: true },
     async listDir(relativePath) {
       const result = await post<{ entries?: ProjectDirEntry[] }>("/list", { path: relativePath });
       return result.entries ?? [];
@@ -876,7 +1042,7 @@ export function createLocalConnectorProjectAccess(config: LocalConnectorConfig, 
       return post<ProjectReadResult>("/read", { path: relativePath, offsetBytes: opts.offsetBytes ?? 0, limitBytes: opts.limitBytes ?? MAX_READ_BYTES });
     },
     async writeFile(relativePath, content) {
-      return post<ProjectWriteResult>("/write", { path: relativePath, content });
+      return post<ProjectWriteResult>("/write", { path: relativePath, content }, signal);
     },
     async runCommand(command, cwd = "", options) {
       return post<ProjectCommandResult>(
@@ -894,6 +1060,19 @@ export function createLocalConnectorProjectAccess(config: LocalConnectorConfig, 
     async searchFiles(query, opts = {}) {
       const result = await post<{ hits?: ProjectSearchHit[] }>("/search", { query, maxResults: opts.maxResults ?? 20 });
       return result.hits ?? [];
+    },
+
+    async deleteRoot() {
+      return post<ProjectDeleteResult>("/delete-root", {}, signal);
+    },
+    async validateBrowser(input) {
+      return post<BrowserValidationResult>("/validation/browser/run", input as unknown as Record<string, unknown>, signal);
+    },
+    async validatePlatform(platform, input) {
+      return post<PlatformValidationResult>(`/validation/${platform}/run`, input, signal);
+    },
+    async validateDesktop(input) {
+      return post<PlatformValidationResult>("/validation/desktop/run", input, signal);
     },
   };
 }

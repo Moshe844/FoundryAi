@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
-import { apiKeyForProvider, envVarNameForProvider, providerForTier } from "@/lib/ai/providers/dispatch";
-import { TIER_DISPLAY, resolveModelForTier, tierForRuntimePayload } from "@/lib/ai/model-router";
+import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
+import { TIER_DISPLAY, tierForRuntimePayload } from "@/lib/ai/model-router";
+import { routePayloadDynamically } from "@/lib/ai/routing/dynamic-router";
 import type { ModelMode, ModelTier } from "@/lib/ai/model-router";
 import { HISTORY_RECOMMENDATION_SYSTEM_PROMPT, SUGGEST_NEXT_PROJECT_TOOL, historyRecommendationUserText, parseHistoryRecommendations } from "@/lib/discovery/history-recommendations";
 import type { HistoryRecommendation, HistorySummaryItem } from "@/lib/discovery/history-recommendations";
@@ -29,13 +30,11 @@ export async function POST(request: Request) {
     const mode: ModelMode = body.mode ?? DEFAULT_MODE;
     const autoSelected = mode === "auto";
     const tier: ModelTier = autoSelected ? tierForRuntimePayload(history) : mode;
-    if (!body.provider) {
-      const automatic = providerForTier(tier);
-      provider = automatic?.provider ?? provider;
-      apiKey = automatic?.apiKey;
-    }
+    const routed = await routePayloadDynamically(history, tier, body.provider);
+    provider = routed.decision.provider;
+    apiKey = apiKeyForProvider(provider);
     if (!apiKey) return NextResponse.json({ ok: false, error: "No configured AI provider is available.", recommendations: heuristic }, { status: 503 });
-    const { model, effort } = resolveModelForTier(tier, { provider });
+    const { model, effort } = routed.decision;
 
     const result = await callManagedModel(
       {

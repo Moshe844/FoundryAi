@@ -32,6 +32,7 @@ export function approvalScopeLabel(scope?: CommandApprovalScope): string {
 }
 
 const DESTRUCTIVE_COMMAND_PATTERNS: RegExp[] = [
+  /\bNODE_TLS_REJECT_UNAUTHORIZED\s*=\s*0\b/i,
   /\brm\s+-rf\s+(\/|~|\.\s*$)/i,
   /\brd\s+\/s\s+\/q\s+[a-z]:\\?\s*$/i,
   /\bformat\s+[a-z]:/i,
@@ -61,6 +62,9 @@ const PERMISSION_REQUIRED_PATTERNS: Array<{ pattern: RegExp; reason: string; cat
 ];
 
 const SAFE_COMMAND_PATTERNS: RegExp[] = [
+  // Pure directory listings are inspection. Anchor the whole command so a chained mutation cannot
+  // inherit this allowance (e.g. `dir & del ...` must still require approval).
+  /^\s*(?:dir(?:\s+\/[a-z]+)*(?:\s+[^&|;<>]+)?|ls(?:\s+-[a-z]+)*(?:\s+[^&|;<>]+)?|Get-ChildItem(?:\s+[^&|;<>]+)?)\s*$/i,
   /\b(npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:build|test|lint|typecheck|check|dev|start|preview)\b/i,
   /\b(node|python|python3|py|ruby|php|java|go|cargo|dotnet|mvn|gradle|pytest|vitest|jest|tsc|eslint|next|vite|astro|svelte-kit)\b/i,
   /\bgit\s+(?:status|log|diff|show|rev-parse|blame|shortlog|describe|ls-files|remote(?:\s+-v)?)\b/i,
@@ -72,6 +76,40 @@ const SAFE_COMMAND_PATTERNS: RegExp[] = [
   /\b(netstat|lsof|ss)\b/i,
   /\b(Get-NetTCPConnection|Test-NetConnection)\b/i,
 ];
+
+/**
+ * A read-only existence probe the model routinely emits before deciding whether a dependency actually
+ * needs installing — e.g. `dir node_modules\pkg 2>nul || echo NOT_FOUND`, `ls node_modules/pkg 2>/dev/null
+ * && echo FOUND`, `node -e "require.resolve('pkg')"`. These read the filesystem/module graph and mutate
+ * nothing, but the strict anchored dir/ls SAFE pattern rejects the `2>nul`/`|| echo` idiom, so they were
+ * falling through to an approval prompt — friction on the very "is this actually required?" check the
+ * install-approval flow depends on (Suite D). Allowed ONLY when the base is a read-only inspector, the only
+ * redirection is stderr-suppression, and the only chained part is a literal `echo <token>` — so a real
+ * chain like `dir & del x` still leaves residual metacharacters and is refused below.
+ */
+function isReadOnlyExistenceProbe(command: string): boolean {
+  // Unwrap a single shell wrapper — the model invokes the same existence check as `Test-Path X`,
+  // `powershell -Command "Test-Path X"`, `cmd /c "dir X"`, `bash -c "ls X"` interchangeably across runs.
+  // Safe to unwrap: destructive/permission patterns are already checked BEFORE this in
+  // decideCommandPermission, and the read-only base whitelist below only ever allows inspection verbs, so
+  // an inner mutation cannot slip through here.
+  const wrapper = command.trim().match(/^(?:powershell|pwsh|cmd|bash|sh)(?:\.exe)?\s+(?:-command|-c|\/c|\/k)\s+(.+)$/i);
+  const inner = wrapper ? wrapper[1].trim().replace(/^["']|["']$/g, "") : command;
+  const stderrStripped = inner.replace(/\s+2>\s*(?:nul|\/dev\/null)\b/gi, "");
+  const chainStripped = stderrStripped.replace(/\s*(?:\|\||&&)\s*echo\s+[\w.\-/\\]+\s*$/i, "").trim();
+  // A single pipe into a read-only filter (findstr/grep/Select-String/wc/...) is still read-only — the
+  // model commonly writes `dir node_modules | findstr pkg`. Strip one such trailing segment; a pipe into
+  // anything not on this filter list leaves the `|` in place and is refused by the metacharacter check.
+  const pipeStripped = chainStripped
+    .replace(/\s*\|\s*(?:findstr|find|grep|egrep|fgrep|select-string|sls|wc|head|tail|more|sort|uniq|select-object|measure-object|out-string)\b[^|&;<>`$]*$/i, "")
+    .trim();
+  if (/[&|;<>`$]/.test(pipeStripped)) return false;
+  return (
+    /^(?:dir|ls|type|cat|stat|Test-Path|Get-Item|Get-ChildItem|where|which)\b/i.test(pipeStripped) ||
+    /^test\s+-[ef]\b/i.test(pipeStripped) ||
+    /^node\s+(?:-e|--eval)\b.*require\.resolve/i.test(pipeStripped)
+  );
+}
 
 export function decideCommandPermission(command: string): CommandPermissionDecision {
   const trimmed = command.trim();
@@ -86,7 +124,7 @@ export function decideCommandPermission(command: string): CommandPermissionDecis
     return { allowed: false, status: "permission-required", reason: approvalMatch.reason, category: approvalMatch.category };
   }
 
-  if (SAFE_COMMAND_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+  if (SAFE_COMMAND_PATTERNS.some((pattern) => pattern.test(trimmed)) || isReadOnlyExistenceProbe(trimmed)) {
     return { allowed: true };
   }
 

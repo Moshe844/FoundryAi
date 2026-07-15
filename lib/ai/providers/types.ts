@@ -1,4 +1,6 @@
 import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
+import type { ModelTier } from "@/lib/ai/model-router";
+import type { DynamicTaskAssessment, RoutingBudget } from "@/lib/ai/routing/types";
 
 /**
  * Provider-agnostic shapes every call site should use instead of constructing raw OpenAI Responses
@@ -10,6 +12,7 @@ export type ProviderId = "openai" | "anthropic" | "google";
 
 export type NeutralContentPart =
   | { type: "text"; text: string }
+  | { type: "image"; dataUrl: string; mediaType?: string; fileName?: string }
   // thoughtSignature is Gemini-specific (opaque token tied to a thinking-enabled model's reasoning
   // for this exact function call) — other providers ignore it. Gemini 3.x rejects a later turn that
   // replays a functionCall without echoing back the signature it originally returned (confirmed via a
@@ -41,6 +44,18 @@ export type ManagedModelRequest = {
   toolChoice?: NeutralToolChoice;
   maxOutputTokens: number;
   effort?: "low" | "medium" | "high";
+  /** Stable project/mission/step prefix used by providers that support prompt caching. */
+  cacheKey?: string;
+  /** Fresh current-task evidence carried all the way to the provider boundary. */
+  routing?: {
+    requestId: string;
+    missionId?: string;
+    stage: "inspect" | "classify" | "plan" | "review" | "implement" | "verify" | "summarize";
+    task: string;
+    tier: ModelTier;
+    budget?: RoutingBudget;
+    dynamicAssessment?: DynamicTaskAssessment;
+  };
 };
 
 export type ManagedToolCall = { id?: string; name: string; arguments: string; thoughtSignature?: string };
@@ -53,6 +68,9 @@ export type ManagedModelResult = {
   usage: RuntimeUsageRecord;
   stopReason: "end" | "tool_call" | "length" | "error";
   errorMessage?: string;
+  /** Why every managed fallback failed. Transport failures are terminal for this logical call;
+   * repeating the same executor turn cannot repair the network and only doubles user wait time. */
+  failureKind?: "transport" | "provider" | "tool" | "guardrail";
 };
 
 export type ManagedCallOptions = {

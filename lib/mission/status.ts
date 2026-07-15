@@ -1,4 +1,7 @@
 import type { ExecutionMission, ExecutionMissionState, MissionState } from "@/lib/mission-engine";
+import { busyMissionStates, missionStateLabel } from "@/lib/mission/model";
+
+export { missionStateLabel } from "@/lib/mission/model";
 
 /**
  * Single source of truth for "which ExecutionMission is the active one" — every renderer and every
@@ -23,8 +26,6 @@ export type MissionDisplayStatus = {
   isPausedForApproval: boolean;
   activeExecutionMission: ExecutionMission | undefined;
 };
-
-const busyStates: ExecutionMissionState[] = ["understanding", "planning", "executing", "verifying", "undoing"];
 
 /**
  * The one function every status display in the UI must call — header pill, footer status bar,
@@ -51,7 +52,7 @@ export function deriveMissionDisplayStatus(mission: MissionState): MissionDispla
   return {
     state,
     label: missionStateLabel(activeExecutionMission),
-    isBusy: busyStates.includes(state),
+    isBusy: busyMissionStates.includes(state),
     isPausedForUser: state === "waiting_for_user",
     isPausedForApproval: state === "waiting_for_approval",
     activeExecutionMission,
@@ -59,12 +60,6 @@ export function deriveMissionDisplayStatus(mission: MissionState): MissionDispla
 }
 
 /** Human label for a single ExecutionMission's state — used by the header pill, the footer, and Previous Missions alike. */
-export function missionStateLabel(mission: ExecutionMission): string {
-  if (mission.state === "idle") return "Ready";
-  if (mission.state === "complete") return mission.verification_status === "passed" ? "Complete" : "Complete (unverified)";
-  return mission.state.replace(/_/g, " ").replace(/^./, (char) => char.toUpperCase());
-}
-
 /**
  * Relocated from components/BuildDashboard.tsx (Discovery Engine rebuild) so lib/discovery/* can
  * classify/rank mission history without importing a 6,500-line component file. Pure move, no

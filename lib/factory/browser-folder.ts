@@ -144,9 +144,19 @@ export async function executeBrowserFolderTask(brief: string, task: string, hand
       continue;
     }
     const contentChanged = before === null ? true : before !== readBack;
-    if (readBack === content && contentChanged) {
+    if (readBack === content) {
       verifiedFiles.push(filePath);
       const existedBefore = before !== null;
+      if (!contentChanged) {
+        await emit({
+          kind: "inspection",
+          status: "completed",
+          title: `${baseName(filePath)} already matched the requested content`,
+          filePath,
+          details: { bytes: stats.size, modifiedAt: new Date(stats.lastModified).toISOString(), noOp: true },
+        });
+        continue;
+      }
       const diff = simpleBrowserDiff(before ?? "", content);
       await emit({
         kind: existedBefore ? "edit" : "file",
@@ -177,7 +187,7 @@ export async function executeBrowserFolderTask(brief: string, task: string, hand
         status: "error",
         title: `Verification failed for ${baseName(filePath)}`,
         filePath,
-        details: { reason: readBack !== content ? "Read-back content did not match expected edited content." : "Write succeeded but file content did not change." },
+        details: { reason: "Read-back content did not match expected edited content." },
       });
     }
   }

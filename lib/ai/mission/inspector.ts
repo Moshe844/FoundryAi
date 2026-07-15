@@ -4,6 +4,8 @@ import { resolveModelForTier } from "@/lib/ai/model-router";
 import type { NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { ProjectAccess } from "@/lib/ai/mission/project-access";
 import type { FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus } from "@/lib/factory/types";
+import { routingContext } from "@/lib/ai/routing/request-context";
+import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
 
 export type InspectionResult = {
   answer: string;
@@ -52,11 +54,13 @@ export async function runReadOnlyInspection(input: {
   softBudgetMs?: number;
   provider?: ProviderId;
   tier?: import("@/lib/ai/model-router").ModelTier;
+  routingAssessment?: DynamicTaskAssessment;
 }): Promise<InspectionResult> {
   // provider defaults to "openai" — matches this function's behavior before the provider abstraction
   // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
   const provider: ProviderId = input.provider ?? "openai";
-  const { model, effort } = resolveModelForTier(input.tier ?? "builder", { provider });
+  const inspectionTier = input.tier ?? "fast";
+  const { model, effort } = resolveModelForTier(inspectionTier, { provider });
   const maxTurns = input.maxTurns ?? DEFAULT_MAX_TURNS;
   const softBudgetMs = input.softBudgetMs ?? DEFAULT_SOFT_BUDGET_MS;
   const startedAt = Date.now();
@@ -134,7 +138,8 @@ export async function runReadOnlyInspection(input: {
         messages: conversation,
         tools: INSPECTOR_TOOLS,
         toolChoice: mustAnswerNow ? { name: "answer" } : "auto",
-        maxOutputTokens: 1200,
+      maxOutputTokens: 1200,
+      routing: routingContext(input.message, "inspect", inspectionTier, input.workspaceId, input.routingAssessment),
       },
       { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 6 },
     );

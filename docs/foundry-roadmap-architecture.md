@@ -2,6 +2,10 @@
 
 Foundry is an AI Software Factory for creating, improving, debugging, analyzing, and deploying software projects.
 
+This roadmap is governed by the [Foundry Product Constitution](product-constitution.md).
+Roadmap priority and implementation decisions must reinforce its promise that
+Foundry feels like an elite engineering team rather than another AI tool.
+
 Phase 1 should establish the product shell and guided build dashboard without locking the product into uploaded-file-only workflows. Long term, Foundry must work against real local projects and real developer environments.
 
 ## Product Roadmap

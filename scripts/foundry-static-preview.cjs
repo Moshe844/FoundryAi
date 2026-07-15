@@ -4,6 +4,7 @@ const path = require("node:path");
 
 const root = path.resolve(process.argv[2] || ".");
 const port = Number(process.argv[3] || 0);
+const ownershipToken = process.argv[4] || "foundry-static-preview";
 const mime = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".ico": "image/x-icon", ".woff2": "font/woff2" };
 
 http.createServer((request, response) => {
@@ -18,10 +19,10 @@ http.createServer((request, response) => {
     const file = !statError && stats.isDirectory() ? path.join(target, "index.html") : target;
     fs.readFile(file, (error, content) => {
       if (error) {
-        response.writeHead(404, { "content-type": "text/plain; charset=utf-8" }).end("Not found");
+        response.writeHead(404, { "content-type": "text/plain; charset=utf-8", "x-foundry-preview": ownershipToken }).end("Not found");
         return;
       }
-      response.writeHead(200, { "content-type": mime[path.extname(file).toLowerCase()] || "application/octet-stream", "cache-control": "no-store" });
+      response.writeHead(200, { "content-type": mime[path.extname(file).toLowerCase()] || "application/octet-stream", "cache-control": "no-store", "x-foundry-preview": ownershipToken });
       response.end(content);
     });
   });

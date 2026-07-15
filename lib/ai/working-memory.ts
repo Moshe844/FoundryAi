@@ -20,11 +20,11 @@ type SelectedEvidence = {
 };
 
 const DEFAULT_BUDGET: ContextBudget = {
-  totalChars: 52000,
-  stateChars: 14000,
-  evidenceChars: 26000,
-  historyChars: 7000,
-  perFileChars: 9000,
+  totalChars: 26000,
+  stateChars: 7000,
+  evidenceChars: 13000,
+  historyChars: 3000,
+  perFileChars: 4500,
 };
 
 export function buildWorkingMemoryContext(request: ReasoningRequest, budget: ContextBudget = DEFAULT_BUDGET) {

@@ -3,6 +3,10 @@ import { callManagedModel } from "@/lib/ai/providers/dispatch";
 import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { FactoryObjectiveChecklistItem } from "@/lib/factory/types";
+import { isConcreteDebugRequest } from "@/lib/ai/mission/debug-intent";
+import { extractAtomicUserRequirements, requiresPolishedUiAcceptance } from "@/lib/ai/mission/requirement-contract";
+import { routingContext } from "@/lib/ai/routing/request-context";
+import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
 
 export type MissionPlan = {
   checklist: FactoryObjectiveChecklistItem[];
@@ -45,7 +49,7 @@ const PLAN_TOOL: NeutralTool = {
 export function isMultiPartRequest(task: string): boolean {
   const listLines = (task.match(/(^|\n)\s*(?:[-*•]|\d+[.):])\s+\S/g) ?? []).length;
   const andChains = (task.match(/\band\b/gi) ?? []).length;
-  return listLines >= 5 || task.length > 900 || andChains >= 8;
+  return extractAtomicUserRequirements(task).length > 1 || listLines >= 5 || task.length > 900 || andChains >= 8;
 }
 
 /** A request that reshapes how the project is built rather than what it does — a rewrite, migration, conversion, or full architecture change — generalized across any stack/framework/language pairing, never tied to a specific example like "WinForms to WPF". Deliberately matches "convert this to another language" without requiring the source to be named, since the user doesn't have to say what they're converting from. */
@@ -75,17 +79,20 @@ export async function planMission(input: {
   provider?: ProviderId;
   /** Defaults to "builder" — this function's fixed tier before quality-aware routing existed. A quality-aware caller passes tierForStage("plan", quality, complexity) (lib/ai/mission/orchestration.ts) instead. */
   tier?: ModelTier;
+  routingAssessment?: DynamicTaskAssessment;
 }): Promise<MissionPlan> {
   const canRunCommands = input.canRunCommands ?? true;
   if (isConcreteDebugRequest(input.task)) {
     return { checklist: debugInvestigationChecklist(input.task, canRunCommands), conflicts: [] };
   }
+  const atomicRequirements = extractAtomicUserRequirements(input.task);
   const multiPart = isMultiPartRequest(input.task);
   const highRisk = isHighRiskArchitectureRequest(input.task);
   // provider defaults to "openai" — matches this function's behavior before the provider abstraction
   // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
   const provider: ProviderId = input.provider ?? "openai";
-  const { model, effort } = resolveModelForTier(input.tier ?? "builder", { provider });
+  const planningTier = input.tier ?? "builder";
+  const { model, effort } = resolveModelForTier(planningTier, { provider });
 
   const system = [
     multiPart
@@ -103,6 +110,7 @@ export async function planMission(input: {
     "For concrete bug reports, errors, stack traces, failed uploads, parse errors, failed builds, or broken behavior, do not add product-design questions, README updates, logging tasks, reproduction scripts, or tests unless the user explicitly asked. Start with inspecting the existing code path, then the smallest repair, then direct verification.",
     "Give each item a short kebab-case id and a concise label written the way an engineer would describe the work, not a sub-task.",
     "If two requirements contradict each other (e.g. asking for two different databases, two different auth schemes for the same flow), or a requirement contradicts what the project snapshot shows already exists, do not silently pick one. Add a plain-language question describing the contradiction to `conflicts` instead, and still include a best-guess checklist so work isn't blocked entirely — the caller decides whether to pause on conflicts.",
+    "A missing implementation detail is not a contradiction. Never ask whether a requested prototype should use mock/local behavior or production persistence, which visual style to use, or where ordinary state should live when the current project and request support a reasonable implementation. Infer the smallest complete behavior that matches the existing stack and proceed.",
     "The project snapshot below is real, current data already gathered from this exact project — a file listing and, when this is a Node project, its actual package.json scripts. Before adding anything to `conflicts`, check whether the snapshot already answers it: a single package.json with one relevant script means there is exactly one app and one way to run it — don't ask which one, or invent a generic multi-service question ('frontend, backend, or all?') that doesn't match what's actually there. Only ask about something the snapshot and task genuinely leave undetermined.",
     "Always call set_checklist with your answer. Do not respond with plain text.",
   ].join("\n");
@@ -119,6 +127,7 @@ export async function planMission(input: {
       tools: [PLAN_TOOL],
       toolChoice: "auto",
       maxOutputTokens: multiPart ? 4000 : 1800,
+      routing: routingContext(input.task, "plan", planningTier, input.workspaceId, input.routingAssessment),
     },
     { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 4 },
   );
@@ -126,7 +135,9 @@ export async function planMission(input: {
   const call = result.toolCalls.find((item) => item.name === "set_checklist");
   const parsed = call?.arguments ? safeJsonParse(call.arguments) : undefined;
   const rawItems = parsed?.items ?? [];
-  const conflicts = Array.isArray(parsed?.conflicts) ? parsed.conflicts.map((item) => String(item).trim()).filter(Boolean) : [];
+  const conflicts = Array.isArray(parsed?.conflicts)
+    ? parsed.conflicts.map((item) => String(item).trim()).filter((item) => isGroundedRequirementConflict(input.task, item))
+    : [];
 
   const seen = new Set<string>();
   const checklist: FactoryObjectiveChecklistItem[] = rawItems
@@ -148,8 +159,24 @@ export async function planMission(input: {
   } else if (isUserFacingUiRequest(input.task)) {
     prependMissingChecklistItems(checklist, [
       { id: "inspect-current-ux", label: "Inspect the current UI structure and styling before editing", status: "pending", phase: foundationPhase },
-      { id: "polished-ui", label: "User-facing UI is intentionally designed and aligned", status: "pending", phase: foundationPhase },
+      {
+        id: "polished-ui",
+        label: requiresPolishedUiAcceptance(input.task)
+          ? "Requested UI is content-rich, responsive, intentionally structured, and visibly more than placeholder text or raw controls"
+          : "User-facing UI is intentionally designed and aligned",
+        status: "pending",
+        phase: foundationPhase,
+      },
     ]);
+  }
+
+  if (atomicRequirements.length > 1) {
+    checklist.unshift(...atomicRequirements.map((label, index) => ({
+      id: `user-requirement-${index + 1}`,
+      label: `User requirement: ${label}`,
+      status: "pending" as const,
+      phase: "Requested behavior",
+    })));
   }
 
   const numberedRequirements = extractNumberedRequirements(input.task);
@@ -205,14 +232,6 @@ function prependMissingChecklistItems(checklist: FactoryObjectiveChecklistItem[]
   checklist.unshift(...items.filter((item) => !existing.has(item.id)));
 }
 
-function isConcreteDebugRequest(task: string) {
-  return (
-    /\b(getting|seeing|hit|hitting|throws?|throwing|fails?|failing|failed|broken|crash(?:es|ing)?|bug|issue|problem|diagnose|debug)\b.{0,120}\b(error|exception|failure|failed|parse|parser|json|upload|request|response|stack|trace|console|terminal|build|compile)\b/i.test(task) ||
-    /\b(error|exception|failure|failed|parse|parser|json|upload|request|response|stack trace|traceback|console error|terminal error)\b.{0,120}\b(when|while|after|during|on|in|at)\b/i.test(task) ||
-    /\b(upload failed|json parse|unexpected character|syntaxerror|typeerror|referenceerror|uncaught|stack trace|traceback|build failed|compile failed|500|404|403|401)\b/i.test(task)
-  );
-}
-
 function debugInvestigationChecklist(task: string, canRunCommands: boolean): FactoryObjectiveChecklistItem[] {
   const target = debugTargetNoun(task);
   return [
@@ -252,8 +271,9 @@ function debugTargetNoun(task: string) {
 }
 
 function isDynamicFieldConfigurationRequest(task: string) {
-  return /\b(fields?|columns?|excel|spreadsheet|upload|mapping|transaction|tx|payload)\b/i.test(task) &&
-    /\b(dynamic|config|configuration|frontend|ui|edit|add|remove|required|optional|hardcoded|hard-coded|server\.js)\b/i.test(task);
+  return /\b(dynamic|configurable|configured|configuration|hardcoded|hard-coded)\b[^.\n]{0,60}\b(fields?|columns?|mapping)\b/i.test(task) ||
+    /\b(add|edit|remove|required|optional)\b[^.\n]{0,40}\b(fields?|columns?)\b/i.test(task) ||
+    /\b(excel|spreadsheet|upload|payload)\b[^.\n]{0,60}\b(field|column|mapping|schema)\b/i.test(task);
 }
 
 function isUserFacingUiRequest(task: string) {
@@ -289,4 +309,9 @@ function extractExplicitDecisionQuestions(task: string) {
 
 function normalizeDecisionSubject(question: string) {
   return question.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function isGroundedRequirementConflict(task: string, conflict: string) {
+  if (/\bask(?:\s+me)?\s+whether\b/i.test(task)) return true;
+  return /\b(?:contradict(?:s|ory|ion)?|incompatible|mutually exclusive|cannot both|can't both)\b/i.test(conflict);
 }

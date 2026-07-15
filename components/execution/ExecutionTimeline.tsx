@@ -23,10 +23,10 @@ import {
  */
 export function ExecutionLevelToggle({ level, onChange }: { level: ExecutionLevel; onChange: (level: ExecutionLevel) => void }) {
   const levels: Array<{ id: ExecutionLevel; label: string }> = [
-    { id: "summary", label: "Summary" },
-    { id: "details", label: "Details" },
-    { id: "code", label: "Code" },
-    { id: "command", label: "Command" },
+    { id: "summary", label: "Mission" },
+    { id: "details", label: "Evidence" },
+    { id: "code", label: "Changes" },
+    { id: "command", label: "Checks" },
   ];
   return (
     <div className="inline-flex items-center gap-0.5 rounded-md border border-white/10 bg-white/[0.03] p-0.5" role="tablist" aria-label="Execution level">
@@ -67,7 +67,14 @@ export function ExecutionTimeline({
    * timeline then omits its own inline copy so there's exactly one place to act on it, not two. */
   suppressBlocked?: boolean;
 }) {
-  const visibleTimeline = timeline.filter((event) => !event.internal);
+  const visibleTimeline = timeline.filter((event) => {
+    if (event.internal) return false;
+    if (!suppressBlocked) return true;
+    if (event.kind === "blocked") return false;
+    // Compatibility for missions persisted before approval events were canonicalized: those runs
+    // stored two warning rows. The ApprovalGate reconstructs their action, so hide both stale copies.
+    return !(event.status === "warning" && (/^Permission needed:/i.test(event.title) || /^Waiting for your approval$/i.test(event.title)));
+  });
   const narrativeEvents = visibleTimeline.filter((event) => event.kind !== "blocked" && isNarrativeEvent(event) && eventVisibleAtLevel(event, level));
   const traceEvents = visibleTimeline.filter((event) => event.kind !== "blocked" && executionTier(event) === "trace" && eventVisibleAtLevel(event, level));
   const blockedEvents = suppressBlocked ? [] : visibleTimeline.filter((event) => event.kind === "blocked" && eventVisibleAtLevel(event, level));
@@ -212,7 +219,7 @@ function NarrativeLine({ event }: { event: FactoryExecutionEvent }) {
           </span>
           <span className="text-[13.5px] font-bold leading-5 text-foundry-ink">{text}</span>
           {narrative?.source === "conflict" ? (
-            <span className="text-[11px] font-semibold normal-case tracking-normal text-foundry-amber/80">Type your answer in the message box below to continue.</span>
+            <span className="text-[11px] font-semibold normal-case tracking-normal text-foundry-amber/80">Resolve the decision below to continue.</span>
           ) : null}
         </span>
       </summary>

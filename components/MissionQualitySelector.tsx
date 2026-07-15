@@ -15,7 +15,7 @@ export function MissionQualitySelector() {
   const { quality, setQuality } = useMissionQuality();
 
   return (
-    <div className="flex items-center gap-1" role="group" aria-label="Mission quality level">
+    <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Mission quality level">
       {LEVELS.map((level) => {
         const display = QUALITY_LEVEL_DISPLAY[level];
         const active = level === quality;

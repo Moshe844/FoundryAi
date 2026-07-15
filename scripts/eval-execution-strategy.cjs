@@ -1,0 +1,24 @@
+const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
+const { mkdirSync, rmSync } = require("node:fs");
+const path = require("node:path");
+const root = path.resolve(__dirname, "..");
+const outDir = path.join(root, "tmp", "execution-strategy-test");
+rmSync(outDir, { recursive: true, force: true }); mkdirSync(outDir, { recursive: true });
+const sources = [path.join(root, "lib", "ai", "mission", "execution-strategy.ts")];
+const compile = spawnSync(process.execPath, [path.join(root, "node_modules", "typescript", "bin", "tsc"), ...sources, "--outDir", outDir, "--module", "commonjs", "--target", "es2022", "--skipLibCheck", "--esModuleInterop"], { cwd: root, encoding: "utf8" });
+if (compile.status !== 0) { console.error(compile.stdout); console.error(compile.stderr); process.exit(compile.status || 1); }
+const { createExecutionStrategy, tierForCapability } = require(path.join(outDir, "execution-strategy.js"));
+const base = { quality: "standard", fileCount: 0, estimatedArtifacts: 4, independentlyGeneratable: true, highRisk: false, securitySensitive: false, needsVisualValidation: true, repeatedFailures: 0 };
+const small = createExecutionStrategy({ ...base, kind: "new-project", complexity: "small" });
+assert.equal(small.workflow, "bounded-artifact"); assert.equal(small.concurrency, 4); assert.equal(tierForCapability(small, "plan", "architect"), "fast"); assert.equal(tierForCapability(small, "generate", "builder"), "fast");
+const thoroughSmall = createExecutionStrategy({ ...base, quality: "thorough", kind: "new-project", complexity: "small" });
+assert.equal(tierForCapability(thoroughSmall, "generate", "builder"), "fast", "quality changes verification depth, not intelligence for bounded simple generation");
+const focused = createExecutionStrategy({ ...base, kind: "existing-project", complexity: "small", fileCount: 3 });
+assert.equal(tierForCapability(focused, "implement", "builder"), "fast", "focused simple implementation uses Fast");
+const migration = createExecutionStrategy({ ...base, kind: "existing-project", complexity: "critical", highRisk: true, fileCount: 2000, independentlyGeneratable: false });
+assert.equal(migration.workflow, "staged-migration"); assert.equal(tierForCapability(migration, "plan", "fast"), "architect"); assert.equal(migration.concurrency, 1);
+const repair = createExecutionStrategy({ ...base, kind: "existing-project", complexity: "medium", fileCount: 80, repeatedFailures: 2 });
+assert.equal(tierForCapability(repair, "repair", "fast"), "architect");
+const question = createExecutionStrategy({ ...base, kind: "question", complexity: "trivial" }); assert.equal(question.workflow, "direct-answer");
+rmSync(outDir, { recursive: true, force: true }); console.log("execution strategy tests passed");

@@ -17,6 +17,7 @@ import { callOpenAIResponsesManaged } from "@/lib/ai/foundry-runtime";
 import { modelForReasoningRequest, modelForRepairTask } from "@/lib/ai/model-router";
 import { formatTroubleshootingSnapshot } from "@/lib/ai/troubleshooting";
 import { looksLikeDiagnosticPaste } from "@/lib/mission-engine";
+import { refreshModelRegistry } from "@/lib/ai/routing/dynamic-router";
 
 type OpenAIInputContent =
   | {
@@ -51,6 +52,7 @@ type OpenAIResponse = {
 };
 
 export async function generateReasonedAnswer(request: ReasoningRequest) {
+  await refreshModelRegistry();
   const apiKey = process.env.OPENAI_API_KEY;
   const answerPlan = createAnswerPlan(request);
   const needsRoomToAnswer = needsExpandedAnswer(request, answerPlan);
@@ -168,12 +170,31 @@ export async function generateReasonedAnswer(request: ReasoningRequest) {
 }
 
 async function finishReasonedAnswer(request: ReasoningRequest, draftAnswer: string, apiKey: string) {
-  const commandSafeAnswer = await repairCommandAnswerIfNeeded(request, draftAnswer, apiKey);
-  const troubleshootingSafeAnswer = await repairTroubleshootingAnswerIfNeeded(request, commandSafeAnswer, apiKey);
-  const evidenceSafeAnswer = await repairEvidenceContradictionAnswerIfNeeded(request, troubleshootingSafeAnswer, apiKey);
-  const snippetSafeAnswer = await repairFullSnippetAnswerIfNeeded(request, evidenceSafeAnswer, apiKey);
-  const structurallySafeAnswer = validateAnswerAgainstCurrentSnippet(request, validateGeneratedSnippets(snippetSafeAnswer), snippetSafeAnswer);
-  const finalAnswer = await enforceFinalAnswerContract(request, structurallySafeAnswer, apiKey);
+  // Response quality repair is bounded to one additional model call. Previously every detector ran
+  // sequentially and verification could trigger yet another call, turning one answer into as many as
+  // seven paid requests. Deterministic cleanup remains free and runs after the single prioritized repair.
+  let paidRepairUsed = false;
+  let repairedAnswer = draftAnswer;
+  if (detectEvidenceContradiction(request, repairedAnswer)) {
+    repairedAnswer = await repairEvidenceContradictionAnswerIfNeeded(request, repairedAnswer, apiKey);
+    paidRepairUsed = true;
+  } else if (needsTroubleshootingAnswerRepair(request, repairedAnswer)) {
+    repairedAnswer = await repairTroubleshootingAnswerIfNeeded(request, repairedAnswer, apiKey);
+    paidRepairUsed = true;
+  } else if (needsFullSnippetRepair(request, repairedAnswer)) {
+    repairedAnswer = await repairFullSnippetAnswerIfNeeded(request, repairedAnswer, apiKey);
+    paidRepairUsed = true;
+  } else if (needsCommandAnswerRepair(request, repairedAnswer)) {
+    repairedAnswer = await repairCommandAnswerIfNeeded(request, repairedAnswer, apiKey);
+    paidRepairUsed = true;
+  }
+
+  const structurallySafeAnswer = validateAnswerAgainstCurrentSnippet(request, validateGeneratedSnippets(repairedAnswer), repairedAnswer);
+  const contractViolation = finalAnswerContractViolation(request, structurallySafeAnswer);
+  const finalAnswer = contractViolation && !paidRepairUsed
+    ? await repairContractViolationAnswer(request, structurallySafeAnswer, contractViolation, apiKey)
+    : structurallySafeAnswer;
+  paidRepairUsed ||= Boolean(contractViolation);
   const finalEvidenceSafeAnswer = createEvidenceContradictionFallback(request, finalAnswer) || finalAnswer;
   const internalSafeAnswer = repairInternalRuleLeak(finalEvidenceSafeAnswer);
   const elevationSafeAnswer = repairUnsupportedElevationClaim(request, internalSafeAnswer);
@@ -182,11 +203,15 @@ async function finishReasonedAnswer(request: ReasoningRequest, draftAnswer: stri
   const verification = verifyFoundryResponse(request, renderSafeAnswer);
   if (verification.ok) return verification.answer;
 
-  const repaired = await repairVerificationFailureAnswer(request, renderSafeAnswer, formatResponseVerification(verification), apiKey);
-  const repairedVerification = verifyFoundryResponse(request, fencePlainTextCommands(validateGeneratedSnippets(repaired)));
-  if (repairedVerification.ok) return repairedVerification.answer;
+  if (!paidRepairUsed) {
+    const repaired = await repairVerificationFailureAnswer(request, renderSafeAnswer, formatResponseVerification(verification), apiKey);
+    const repairedVerification = verifyFoundryResponse(request, fencePlainTextCommands(validateGeneratedSnippets(repaired)));
+    if (repairedVerification.ok) return repairedVerification.answer;
+  }
 
-  return "The answer is still queued. Foundry will keep trying.";
+  // Do not resubmit the user's full context because a stylistic validator remained dissatisfied.
+  // Return the deterministically sanitized best answer and let the user decide whether to spend again.
+  return renderSafeAnswer;
 }
 
 async function repairVerificationFailureAnswer(
@@ -265,9 +290,18 @@ async function fetchOpenAIWithShortRetry(body: string, apiKey: string, request?:
     workspaceId,
     userId: "default-user",
     priority: "active",
+    maxAttempts: 1,
+    requestId: `${workspaceId}:${stableRequestHash(request?.userMessage ?? body)}`,
+    routingReason: "Fresh current-message classification at the direct answer provider boundary.",
   });
 
   return { response, data };
+}
+
+function stableRequestHash(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) { hash ^= value.charCodeAt(index); hash = Math.imul(hash, 16777619); }
+  return (hash >>> 0).toString(36);
 }
 
 function runtimeWorkspaceId(request?: ReasoningRequest) {
@@ -429,17 +463,6 @@ function repairElevationLine(line: string) {
     .replace(/\s{2,}/g, " ")
     .replace(/\s+([,.])/g, "$1")
     .trimEnd();
-}
-
-async function enforceFinalAnswerContract(request: ReasoningRequest, answer: string, apiKey: string) {
-  const violation = finalAnswerContractViolation(request, answer);
-  if (!violation) return answer;
-
-  const repaired = await repairContractViolationAnswer(request, answer, violation, apiKey);
-  const repairedViolation = finalAnswerContractViolation(request, repaired);
-  if (!repairedViolation) return repaired;
-
-  return repaired || answer;
 }
 
 function fencePlainTextCommands(answer: string) {
@@ -2296,6 +2319,7 @@ function formatReasoningContext(request: ReasoningRequest, answerPlan: AnswerPla
       "If the selected evidence is insufficient for an exact fix, ask for the smallest missing item.",
     ].join(" "),
     formatReasoningPacket(reasoningPacket),
+    request.compactedContext ? `Compacted mission/project memory (raw archive remains available by reference):\n${JSON.stringify(request.compactedContext)}` : "",
     toolchainNecessityContext ? "Toolchain/dependency necessity check:" : "",
     toolchainNecessityContext,
     "Internal answer plan:",

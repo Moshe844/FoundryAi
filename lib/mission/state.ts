@@ -10,8 +10,9 @@ export function computeMissionState(input: {
   rawStatus: FactoryBuildStatus;
   blocker?: string;
   verification: ExecutionMissionVerification[];
+  hasIncompletePlan?: boolean;
 }): { state: ExecutionMissionState; verification_status: ExecutionMissionVerificationStatus } {
-  const { rawStatus, blocker, verification } = input;
+  const { rawStatus, verification, hasIncompletePlan = false } = input;
   const verificationStatus = verificationStatusFrom(verification);
 
   // A pending approval is a hard pause, checked before anything else — nothing about verification
@@ -20,9 +21,15 @@ export function computeMissionState(input: {
   if (rawStatus === "needs-clarification" || rawStatus === "awaiting-mock-approval") return { state: "waiting_for_user", verification_status: verificationStatus };
   if (rawStatus === "stopped") return { state: "cancelled", verification_status: verificationStatus };
   if (rawStatus === "failed" || rawStatus === "unsupported") {
-    return { state: blocker ? "blocked" : "failed", verification_status: verificationStatus };
+    // A terminal execution failure is not a user-decision pause. Approvals and clarifications have
+    // their own explicit waiting states above; rendering an ordinary provider, tool, or budget
+    // failure as "Blocked" falsely tells the user that Foundry is waiting on them.
+    return { state: "failed", verification_status: verificationStatus };
   }
   if (rawStatus === "passed") {
+    // A server success flag cannot overrule durable mission state. Showing "Complete (unverified)"
+    // while the same canvas lists unfinished work destroys continuity and user trust.
+    if (hasIncompletePlan) return { state: "failed", verification_status: verificationStatus };
     // "complete" is computed, never asserted: only real when there is at least one passing
     // verification entry and nothing contradicts it. No evidence at all still renders as
     // "Complete (unverified)", never plain "Complete".
@@ -35,6 +42,7 @@ export function computeMissionState(input: {
 /** Summarizes a verification array into pass/fail/none, with no notion of mission state — used both by computeMissionState() and to backfill legacy persisted records that predate the verification_status field. */
 export function verificationStatusFrom(verification: ExecutionMissionVerification[]): ExecutionMissionVerificationStatus {
   if (verification.some((item) => item.result === "fail")) return "failed";
+  if (verification.some((item) => item.result === "skipped") && verification.some((item) => item.result === "pass")) return "partially-verified";
   if (verification.some((item) => item.result === "pass")) return "passed";
   return "none";
 }

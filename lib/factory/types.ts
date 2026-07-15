@@ -1,6 +1,8 @@
 import type { CommandApprovalScope, CommandPermissionCategory } from "@/lib/ai/mission/command-permissions";
 import type { MissionQualityLevel } from "@/lib/ai/mission/quality-level";
 import type { ModelMode } from "@/lib/ai/model-router";
+import type { EnvironmentReadiness } from "@/lib/toolchains/provisioner";
+import type { FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
 
 export type FactoryBuildStatus = "created" | "running" | "passed" | "failed" | "unsupported" | "stopped" | "awaiting-approval" | "needs-clarification" | "awaiting-mock-approval";
 
@@ -107,6 +109,17 @@ export type FactoryJournalEntry = {
 export type FactoryPreviewState = "unavailable" | "starting" | "ready" | "error";
 export type FactoryPreviewPlatform = "web" | "api" | "desktop" | "android" | "mobile" | "cli" | "database" | "game" | "report";
 
+export type FactoryArtifact = {
+  name: string;
+  platform: string;
+  version: string;
+  fileType: string;
+  sizeBytes: number;
+  createdAt: string;
+  buildStatus: "verified";
+  downloadUrl: string;
+};
+
 /** A single piece of real evidence backing (or refuting) mission completion. Built server-side from the same evidence the executor's completion gate inspects — never independently re-derived by the client. */
 export type ExecutionMissionVerification = {
   check_type: "file-read" | "build" | "test" | "lint" | "typecheck" | "preview" | "manual-evidence" | "checklist" | "command";
@@ -144,6 +157,10 @@ export type FactoryProjectResult = {
   previewState?: FactoryPreviewState;
   previewPlatform?: FactoryPreviewPlatform;
   previewReason?: string;
+  /** Server-derived metadata for an artifact that exists on disk. Never synthesize this client-side. */
+  artifact?: FactoryArtifact;
+  /** True only when a separately approved atomic action verified that the connected project root no longer exists. */
+  projectDeleted?: boolean;
   exportUrl?: string;
   timeline?: FactoryExecutionEvent[];
   sessionSummary?: FactorySessionSummary;
@@ -151,6 +168,19 @@ export type FactoryProjectResult = {
   clarificationQuestions?: MissionClarification[];
   /** Real verification evidence backing this result, built from the same checks the executor's completion gate used. Empty when nothing could be verified — the client must show "unverified" rather than guessing at pass/fail itself. */
   verification?: ExecutionMissionVerification[];
+  /** Provider-reported usage for the implementation loop. Discovery is reported by its own request. */
+  modelUsage?: Array<{
+    provider: "openai" | "anthropic" | "google";
+    model: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCostUsd: number;
+    cachedCalls: number;
+  }>;
+  executionTurns?: number;
+  /** Real local toolchain readiness plus trusted one-click setup recipes for this stack. */
+  environment?: EnvironmentReadiness;
 };
 
 /**
@@ -173,8 +203,11 @@ export type StructuredDiscovery = {
 
 export type FactoryCreateRequest = {
   brief: string;
+  /** Client mission id used to recover or explicitly stop an in-flight build. */
+  controlId?: string;
   discovery?: StructuredDiscovery;
   modelMode?: ModelMode;
+  quality?: MissionQualityLevel;
 };
 
 export type FactoryUploadedFile = {
@@ -186,6 +219,9 @@ export type FactoryUploadedFile = {
 /** Structured record of the mission this follow-up continues, sent verbatim instead of a flattened prose digest so the executor can act on real plan/decision state rather than re-deriving it from a paragraph. */
 export type MissionParentContext = {
   id: string;
+  /** The original user request(s) this mission is still carrying out. Approval replies must resume
+   * these requirements instead of replacing them with synthetic "Approved" text. */
+  source_requirements: string[];
   /** Free-text mirror of ExecutionMissionState (kept as a plain string here to avoid a circular import between lib/factory/types.ts and lib/mission-engine.ts). */
   state: string;
   plan: FactoryObjectiveChecklistItem[];
@@ -195,6 +231,8 @@ export type MissionParentContext = {
   decisions: string[];
   /** Rationale strings pulled from the narrative "finding" tier, most recent last, capped to a small number. */
   findings: string[];
+  /** Actions explicitly denied earlier in this mission. */
+  denied_actions?: string[];
   blocked_reason?: string;
   summary: string;
 };
@@ -203,6 +241,8 @@ export type FactoryExistingProjectRequest = {
   brief: string;
   task: string;
   files: FactoryUploadedFile[];
+  /** Client mission id used only to route an explicit Stop signal to this in-flight server execution. */
+  controlId?: string;
   localPath?: string;
   localConnector?: {
     url: string;
@@ -215,6 +255,8 @@ export type FactoryExistingProjectRequest = {
   approvedCommands?: string[];
   /** Structured record of the mission this follow-up continues. Replaces the old flattened missionDigest string. */
   parentMission?: MissionParentContext;
+  /** Canonical resolution record for this follow-up. The runtime must not re-resolve its target. */
+  followUpResolution?: FollowUpResolutionRecord;
   /** Whether this follow-up should revise the parent mission's still-open plan (carry_forward_plan) or replan from scratch (fresh_plan). Only meaningful when parentMission is present. */
   continuity?: "carry_forward_plan" | "fresh_plan";
   /** The user's structured answer to a pending command-approval prompt. Replaces parsing "Approved: run ..." / "Denied approval to run ..." back out of the task string. */
@@ -227,6 +269,8 @@ export type FactoryExistingProjectRequest = {
   quality?: MissionQualityLevel;
   /** Auto chooses from the real task; an explicit mode pins the intelligence tier. */
   modelMode?: ModelMode;
+  /** Current-turn screenshot/image evidence sent to the execution model, never written into the project. */
+  evidenceImages?: Array<{ fileName: string; mediaType: string; dataUrl: string }>;
 };
 
 export type FactoryFileReadResult = {

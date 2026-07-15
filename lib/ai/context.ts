@@ -6,6 +6,8 @@ import { buildTroubleshootingSnapshot, type TroubleshootingEvidenceSnapshot } fr
 import { buildEngineeringState, type EngineeringState } from "@/lib/ai/engineering-state";
 import { buildProjectState, type ProjectState } from "@/lib/ai/project-state";
 import { hasCompleteArtifactRequestShape, hasEvidenceUpdateShape, hasFollowUpIntentShape, hasResultUpdateShape, hasSuccessfulProgressUpdate } from "@/lib/ai/intent-resolution";
+import { buildContextPackage } from "@/lib/ai/context-compaction/compactor";
+import type { ContextPackage } from "@/lib/ai/context-compaction/types";
 
 export type ReasoningRequest = {
   missionTitle: string;
@@ -26,6 +28,7 @@ export type ReasoningRequest = {
   workMemory: MissionState["workMemory"];
   sources: SourceReference[];
   lastResult?: string;
+  compactedContext?: ContextPackage;
 };
 
 export type ReasoningAttachment = Pick<
@@ -158,7 +161,7 @@ export function createReasoningRequest(mission: MissionState, userMessage: strin
   const currentTurnUsesImageEvidence = shouldUseImageEvidenceForTurn(mission, userMessage, newAttachmentIds);
   const messagesBeforeCurrent = currentMessageIndex >= 0 ? mission.messages.slice(0, currentMessageIndex) : mission.messages;
   const priorMessages = messagesBeforeCurrent
-    .slice(-10)
+    .slice(mission.compaction ? -4 : -10)
     .map((message) => ({
       author: message.author,
       body: message.visualArtifact ? `${message.body}\n\n${formatVisualArtifactContext(message.visualArtifact)}` : message.body,
@@ -172,8 +175,8 @@ export function createReasoningRequest(mission: MissionState, userMessage: strin
     size: attachment.size,
     messageId: attachment.messageId,
     missionId: attachment.missionId,
-    rawText: trimForModel(attachment.rawText),
-    parsedStructure: attachment.parsedStructure,
+    rawText: newAttachmentIds.has(attachment.fileId) ? trimForModel(attachment.rawText) : "",
+    parsedStructure: newAttachmentIds.has(attachment.fileId) ? attachment.parsedStructure : undefined,
     evidenceIndex: rankEvidenceForObjective(attachment.evidenceIndex ?? [], userMessage),
     dataUrl: attachment.dataUrl,
     uploadStatus: attachment.uploadStatus,
@@ -223,6 +226,7 @@ export function createReasoningRequest(mission: MissionState, userMessage: strin
     workMemory: mission.workMemory,
     sources: mission.sources ?? [],
     lastResult: mission.lastResult || undefined,
+    compactedContext: buildContextPackage(mission, "builder"),
   };
 }
 

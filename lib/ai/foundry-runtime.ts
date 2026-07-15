@@ -1,5 +1,6 @@
 import crypto from "crypto";
-import { fallbackModelForModel, modelForRuntimePayload, pricingForModel } from "@/lib/ai/model-router";
+import { pricingForModel } from "@/lib/ai/model-router";
+import { DailySpendLimitError, releaseGlobalModelSpend, reserveGlobalModelSpend, settleGlobalModelSpend } from "@/lib/ai/routing/spend-ledger";
 
 type RuntimeOpenAIResponse = {
   output_text?: string;
@@ -13,6 +14,7 @@ type RuntimeOpenAIResponse = {
     input_tokens?: number;
     output_tokens?: number;
     total_tokens?: number;
+    input_tokens_details?: { cached_tokens?: number };
   };
 };
 
@@ -41,6 +43,7 @@ export type RuntimeUsageRecord = {
   contextCompressed: boolean;
   cached: boolean;
   createdAt: string;
+  routingReason?: string;
 };
 
 type ManagedCallOptions = {
@@ -53,6 +56,8 @@ type ManagedCallOptions = {
   fetchImpl?: typeof fetch;
   signal?: AbortSignal;
   timeoutMs?: number;
+  requestId?: string;
+  routingReason?: string;
 };
 
 type RuntimePlan = {
@@ -104,6 +109,7 @@ const runtimePlans: Record<RuntimePlan["name"], RuntimePlan> = {
 const queues = new Map<string, Promise<unknown>>();
 const usageRecords: RuntimeUsageRecord[] = [];
 const responseCache = new Map<string, { data: RuntimeOpenAIResponse; expiresAt: number; usage: RuntimeUsageRecord }>();
+const directCallBudgets = new Map<string, { calls: number; estimatedCostUsd: number; expiresAt: number }>();
 
 export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse = RuntimeOpenAIResponse>(
   options: ManagedCallOptions,
@@ -113,6 +119,8 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
   const plan = runtimePlanForWorkspace(workspaceId);
   const fetcher = options.fetchImpl ?? fetch;
   const prepared = prepareRequestBody(options.body, plan);
+  const requestId = options.requestId ?? crypto.randomUUID();
+  const estimatedAttemptCost = estimateUpperBoundCost(prepared.body, prepared.model);
   const cacheKey = cacheKeyFor(prepared.body);
   const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 90_000);
   const callSignal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
@@ -131,15 +139,35 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
 
   return enqueueRuntimeCall(workspaceId, plan.concurrentRequests, async () => {
     const started = Date.now();
-    const maxAttempts = Math.max(1, options.maxAttempts ?? 6);
+    // A retry can be another fully billed large-context request. Default to one provider request;
+    // operators must explicitly opt into paid transport/rate-limit retries.
+    const maxAttempts = process.env.FOUNDRY_ALLOW_PAID_RETRIES === "true"
+      ? Math.max(1, options.maxAttempts ?? 2)
+      : 1;
     let activeBody = prepared.body;
-    let activeModel = prepared.model;
+    const activeModel = prepared.model;
     let lastResponse = new Response(null, { status: 503 });
     let lastData = {} as T;
     let rateLimitCount = 0;
     let failureCount = 0;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let globalReservation;
+      try {
+        globalReservation = reserveGlobalModelSpend(estimatedAttemptCost);
+      } catch (error) {
+        const message = error instanceof DailySpendLimitError ? error.message : "The daily model-spend guard could not reserve this request.";
+        lastData = { error: { message } } as T;
+        failureCount += 1;
+        break;
+      }
+      const guardError = reserveDirectAttempt(requestId, estimatedAttemptCost);
+      if (guardError) {
+        releaseGlobalModelSpend(globalReservation);
+        lastData = { error: { message: guardError } } as T;
+        failureCount += 1;
+        break;
+      }
       let response: Response;
       let data: T;
       try {
@@ -154,6 +182,7 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
         });
         data = (await response.json().catch(() => ({}))) as T;
       } catch (error) {
+        releaseGlobalModelSpend(globalReservation);
         failureCount += 1;
         const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : undefined;
         const networkMessage = error instanceof Error ? `Network request to the AI provider failed: ${error.message}${cause ? ` (${cause})` : ""}` : "Network request to the AI provider failed.";
@@ -182,7 +211,9 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
           cached: false,
           rateLimitCount,
           failureCount,
+          routingReason: options.routingReason,
         });
+        settleGlobalModelSpend(globalReservation, usage.estimatedCostUsd);
         usageRecords.push(usage);
         maybeCacheResponse(cacheKey, data, usage, activeBody);
         return {
@@ -194,27 +225,14 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
         };
       }
 
+      // Provider errors normally contain no metered usage. Release the pessimistic reservation;
+      // another attempt, when explicitly enabled, must reserve independently.
+      releaseGlobalModelSpend(globalReservation);
+
       if (response.status === 429 || isRateLimitResponse(data)) {
         rateLimitCount += 1;
-        const fallback = fallbackModelForModel(activeModel);
-        if (fallback && fallback.model !== activeModel && canSafelyFallback(activeBody)) {
-          const routed = replaceModel(activeBody, fallback.model);
-          activeBody = routed.body;
-          activeModel = routed.model;
-        }
         if (attempt < maxAttempts) {
           await delay(Math.min(Math.max(retryDelayFromRateLimit(data.error?.message) || retryDelayFromHeader(response.headers.get("retry-after")) || attempt * 750, 250), 6000));
-          continue;
-        }
-      }
-
-      if (isModelUnavailableResponse(response.status, data)) {
-        const fallback = fallbackModelForModel(activeModel);
-        if (fallback && fallback.model !== activeModel && canSafelyFallback(activeBody) && attempt < maxAttempts) {
-          const routed = replaceModel(activeBody, fallback.model);
-          activeBody = routed.body;
-          activeModel = routed.model;
-          failureCount += 1;
           continue;
         }
       }
@@ -246,6 +264,7 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
       cached: false,
       rateLimitCount,
       failureCount: Math.max(1, failureCount),
+      routingReason: options.routingReason,
     });
     usageRecords.push(usage);
 
@@ -253,7 +272,9 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
       response: lastResponse,
       data: lastData,
       status: rateLimitCount ? "queued" as const : "failed" as const,
-      statusMessage: rateLimitCount ? "Provider is busy, retrying..." : "The answer is still queued. Foundry will keep trying.",
+      statusMessage: rateLimitCount
+        ? "The provider is busy. No automatic paid retry was made."
+        : "The provider request failed. No automatic paid retry was made.",
       usage,
     };
   });
@@ -272,7 +293,7 @@ export function prepareRequestBody(rawBody: string, plan: RuntimePlan = runtimeP
   }
 
   const requestedModel = String((parsed as { model?: string }).model ?? "unknown");
-  const model = modelForRuntimePayload(parsed, requestedModel).model;
+  const model = requestedModel;
   (parsed as { model?: string }).model = model;
 
   const outputBudget = Math.min(Number((parsed as { max_output_tokens?: number }).max_output_tokens ?? plan.maxOutputTokens), plan.maxOutputTokens);
@@ -413,24 +434,8 @@ function compressText(value: string, maxChars: number) {
   return `${lineCompressed.slice(0, headChars).trimEnd()}${middle}${lineCompressed.slice(-tailChars).trimStart()}`;
 }
 
-function replaceModel(body: string, model: string) {
-  const parsed = safeJsonParse(body) as { model?: string } | undefined;
-  if (!parsed) return { body, model };
-  parsed.model = model;
-  return { body: JSON.stringify(parsed), model };
-}
-
-function canSafelyFallback(body: string) {
-  return !/\b(surgical|legal|medical|financial|must be exact|high stakes|security incident)\b/i.test(body);
-}
-
 function isRateLimitResponse(data: RuntimeOpenAIResponse) {
   return /\brate.?limit|tokens per min|\btpm\b|too many requests/i.test([data.error?.message, data.error?.type, data.error?.code].filter(Boolean).join(" "));
-}
-
-function isModelUnavailableResponse(status: number, data: RuntimeOpenAIResponse) {
-  const errorText = [data.error?.message, data.error?.type, data.error?.code].filter(Boolean).join(" ");
-  return (status === 400 || status === 404) && /\b(?:model|profile|requested model|selected model)\b.{0,120}\b(?:not found|unavailable|unsupported|does not exist|invalid|access|not have access)\b|\b(?:model_not_found|invalid_model|unsupported_model)\b/i.test(errorText);
 }
 
 function repairRejectedRequestBody(body: string, status: number, data: RuntimeOpenAIResponse) {
@@ -485,6 +490,7 @@ function createUsageRecord(input: {
   cached: boolean;
   rateLimitCount: number;
   failureCount: number;
+  routingReason?: string;
 }): RuntimeUsageRecord {
   const inputTokens = input.data.usage?.input_tokens ?? estimateTokens(input.body);
   const outputTokens = input.data.usage?.output_tokens ?? estimateTokens(extractRuntimeText(input.data));
@@ -506,9 +512,40 @@ function createUsageRecord(input: {
     rateLimitCount: input.rateLimitCount,
     failureCount: input.failureCount,
     contextCompressed: input.contextCompressed,
-    cached: input.cached,
+    cached: input.cached || (input.data.usage?.input_tokens_details?.cached_tokens ?? 0) > 0,
     createdAt: new Date().toISOString(),
+    routingReason: input.routingReason,
   };
+}
+
+function estimateUpperBoundCost(body: string, model: string) {
+  const parsed = safeJson(body) as { max_output_tokens?: number } | undefined;
+  const pricing = pricingForModel(model);
+  return ((Math.ceil(body.length / 4) * pricing.input) + ((parsed?.max_output_tokens ?? 1000) * pricing.output)) / 1_000_000;
+}
+
+function reserveDirectAttempt(requestId: string, estimatedCostUsd: number) {
+  const now = Date.now();
+  for (const [key, value] of directCallBudgets) if (value.expiresAt < now) directCallBudgets.delete(key);
+  const budget = directCallBudgets.get(requestId) ?? { calls: 0, estimatedCostUsd: 0, expiresAt: now + 30 * 60_000 };
+  const maxCalls = positiveEnv("FOUNDRY_MAX_MODEL_CALLS_PER_REQUEST", 4);
+  const maxCost = positiveEnv("FOUNDRY_MAX_ESTIMATED_COST_USD_PER_REQUEST", 0.25);
+  if (budget.calls >= maxCalls) return `Model-call limit reached (${maxCalls}) for this request.`;
+  if (budget.estimatedCostUsd + estimatedCostUsd > maxCost) return `Estimated request cost would exceed the $${maxCost.toFixed(2)} limit.`;
+  budget.calls += 1;
+  budget.estimatedCostUsd += estimatedCostUsd;
+  budget.expiresAt = now + 30 * 60_000;
+  directCallBudgets.set(requestId, budget);
+  return undefined;
+}
+
+function positiveEnv(name: string, fallback: number) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function safeJson(value: string): unknown {
+  try { return JSON.parse(value); } catch { return undefined; }
 }
 
 function maybeCacheResponse(cacheKey: string, data: RuntimeOpenAIResponse, usage: RuntimeUsageRecord, body: string) {

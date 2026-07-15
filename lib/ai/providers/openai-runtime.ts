@@ -18,6 +18,7 @@ export async function callOpenAIManaged(request: ManagedModelRequest, options: M
 
   const body = JSON.stringify({
     model: request.model,
+    ...((request.cacheKey ?? options.workspaceId) ? { prompt_cache_key: request.cacheKey ?? options.workspaceId } : {}),
     ...(request.effort ? { reasoning: { effort: request.effort } } : {}),
     ...(request.tools ? { tools: translateTools(request.tools, "openai"), tool_choice: translateToolChoice(request.toolChoice, "openai") ?? "auto" } : {}),
     max_output_tokens: request.maxOutputTokens,
@@ -36,6 +37,8 @@ export async function callOpenAIManaged(request: ManagedModelRequest, options: M
     maxAttempts: options.maxAttempts,
     signal: options.signal,
     timeoutMs: options.timeoutMs,
+    requestId: request.routing?.requestId,
+    routingReason: request.routing ? `Fresh ${request.routing.stage} routing selected ${request.routing.tier} for the current task.` : undefined,
   });
 
   const parsed = parseToolCalls(result.data, "openai");
@@ -61,6 +64,10 @@ function renderOpenAIMessage(message: NeutralMessage): unknown[] {
   const textParts = message.content.filter((part) => part.type === "text");
   if (textParts.length) {
     items.push({ role: message.role, content: textParts.map((part) => ({ type: message.role === "assistant" ? "output_text" : "input_text", text: part.text })) });
+  }
+  const imageParts = message.content.filter((part) => part.type === "image");
+  if (imageParts.length) {
+    items.push({ role: message.role, content: imageParts.map((part) => ({ type: "input_image", image_url: part.dataUrl })) });
   }
   for (const part of message.content) {
     if (part.type === "tool_use") {

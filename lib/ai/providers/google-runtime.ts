@@ -73,7 +73,7 @@ export async function callGoogleManaged(request: ManagedModelRequest, options: M
         rateLimitCount,
         failureCount,
         contextCompressed: false,
-        cached: false,
+        cached: (data.usageMetadata?.cachedContentTokenCount ?? 0) > 0,
         createdAt: new Date().toISOString(),
       };
       const finishReason = data.candidates?.[0]?.finishReason;
@@ -130,8 +130,8 @@ export async function callGoogleManaged(request: ManagedModelRequest, options: M
 }
 
 type GoogleGenerateContentResponse = {
-  candidates?: Array<{ content?: { parts?: Array<{ text?: string; functionCall?: { name?: string; args?: unknown } }> }; finishReason?: string }>;
-  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+  candidates?: Array<{ content?: { parts?: Array<{ text?: string; functionCall?: { name?: string; args?: unknown }; thoughtSignature?: string }> }; finishReason?: string }>;
+  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; cachedContentTokenCount?: number };
   error?: { code?: number; status?: string; message?: string };
 };
 
@@ -149,14 +149,32 @@ function renderGoogleContents(messages: NeutralMessage[]) {
     }
   }
 
-  return messages.map((message) => ({
-    role: message.role === "assistant" ? "model" : "user",
-    parts: message.content.map((part) => {
+  return messages.map((message) => {
+    const firstToolUseIndex = message.content.findIndex((part) => part.type === "tool_use");
+    return {
+      role: message.role === "assistant" ? "model" : "user",
+      parts: message.content.map((part, partIndex) => {
       if (part.type === "text") return { text: part.text };
-      if (part.type === "tool_use") return { functionCall: { name: part.name, args: safeJsonParse(part.arguments) }, ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
+      if (part.type === "image") {
+        const parsed = parseDataUrl(part.dataUrl);
+        return { inlineData: { mimeType: parsed.mediaType, data: parsed.data } };
+      }
+      if (part.type === "tool_use") {
+        // A fallback may inherit valid tool history created by OpenAI or Anthropic, which naturally
+        // has no Gemini thought signature. Google's REST contract explicitly permits this sentinel
+        // for cross-model/custom history. Only the first call in a parallel call group needs it.
+        const thoughtSignature = part.thoughtSignature || (partIndex === firstToolUseIndex ? "skip_thought_signature_validator" : undefined);
+        return { functionCall: { name: part.name, args: safeJsonParse(part.arguments) }, ...(thoughtSignature ? { thoughtSignature } : {}) };
+      }
       return { functionResponse: { name: nameForToolUseId.get(part.toolUseId) ?? "unknown_tool", response: { content: part.content, isError: part.isError || undefined } } };
-    }),
-  }));
+      }),
+    };
+  });
+}
+
+function parseDataUrl(value: string) {
+  const match = value.match(/^data:([^;,]+);base64,([\s\S]+)$/);
+  return { mediaType: match?.[1] ?? "image/png", data: match?.[2] ?? "" };
 }
 
 function safeJsonParse(value: string): unknown {

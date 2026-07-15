@@ -1,41 +1,33 @@
 import { NextResponse } from "next/server";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
-import { apiKeyForProvider, envVarNameForProvider, providerForTier } from "@/lib/ai/providers/dispatch";
-import { TIER_DISPLAY, resolveModelForTier, tierForRuntimePayload } from "@/lib/ai/model-router";
+import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
+import { routePayloadDynamically } from "@/lib/ai/routing/dynamic-router";
 import type { ModelMode, ModelTier } from "@/lib/ai/model-router";
 import { RECOMMENDATIONS_SYSTEM_PROMPT, SUGGEST_IMPROVEMENTS_TOOL, parseRecommendations, recommendationsUserText } from "@/lib/ai/mission/recommendations";
 import type { MissionRecommendation, RecommendationContext } from "@/lib/ai/mission/recommendations";
 import type { ProviderId } from "@/lib/ai/providers/types";
 
-const DEFAULT_MODE: ModelMode = "fast";
-
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as { context?: RecommendationContext; heuristic?: MissionRecommendation[]; provider?: ProviderId; mode?: ModelMode };
-    const heuristic = body.heuristic ?? [];
-    if (!heuristic.length) {
-      return NextResponse.json({ ok: false, error: "A heuristic recommendation list is required." }, { status: 400 });
-    }
 
     // provider defaults to "openai" — see app/api/factory/intent/route.ts for the same pattern and rationale.
     let provider: ProviderId = body.provider ?? "openai";
     let apiKey = apiKeyForProvider(provider);
     if (body.provider && !apiKey) {
-      return NextResponse.json({ ok: false, error: `${envVarNameForProvider(provider)} is not configured.`, recommendations: heuristic }, { status: 503 });
+      return NextResponse.json({ ok: false, error: `${envVarNameForProvider(provider)} is not configured.`, recommendations: [] }, { status: 503 });
     }
 
     const context = compactContext(body.context);
-    // mode defaults to "fast" — the fixed tier this route always used before the mode selector existed.
-    const mode: ModelMode = body.mode ?? DEFAULT_MODE;
-    const autoSelected = mode === "auto";
-    const tier: ModelTier = autoSelected ? tierForRuntimePayload(context) : mode;
-    if (!body.provider) {
-      const automatic = providerForTier(tier);
-      provider = automatic?.provider ?? provider;
-      apiKey = automatic?.apiKey;
-    }
-    if (!apiKey) return NextResponse.json({ ok: false, error: "No configured AI provider is available.", recommendations: heuristic }, { status: 503 });
-    const { model, effort } = resolveModelForTier(tier, { provider });
+    // Suggestions are optional summarization work, never implementation or architecture. Keep this
+    // call Fast regardless of repository size or the tier used by the mission that just finished.
+    const autoSelected = body.mode === "auto";
+    const tier: ModelTier = "fast";
+    const routed = await routePayloadDynamically(context, tier, body.provider);
+    provider = routed.decision.provider;
+    apiKey = apiKeyForProvider(provider);
+    if (!apiKey) return NextResponse.json({ ok: false, error: "No configured AI provider is available.", recommendations: [] }, { status: 503 });
+    const { model, effort } = routed.decision;
 
     const result = await callManagedModel(
       {
@@ -52,7 +44,7 @@ export async function POST(request: Request) {
     );
 
     const call = result.toolCalls.find((item) => item.name === "suggest_improvements");
-    const recommendations = parseRecommendations(call?.arguments, heuristic);
+    const recommendations = parseRecommendations(call?.arguments, []);
 
     return NextResponse.json({
       ok: true,
@@ -63,7 +55,7 @@ export async function POST(request: Request) {
         provider,
         model,
         autoSelected,
-        reason: autoSelected ? `Auto-classified as ${TIER_DISPLAY[tier].label} from the project context.` : undefined,
+        reason: "Post-run recommendations are always routed to Fast.",
       },
     });
   } catch (error) {

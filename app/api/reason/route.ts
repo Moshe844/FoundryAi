@@ -4,6 +4,8 @@ import type { ReasoningRequest } from "@/lib/ai/context";
 import { normalizeReasoningRequest } from "@/lib/ai/request-normalization";
 import { isRetryableServiceAnswer, createProviderBusyResult } from "@/lib/ai/service-result";
 import { answerWithSources, needsSources } from "@/lib/sources/provider";
+import { refreshModelRegistry } from "@/lib/ai/routing/dynamic-router";
+import { modelForAutoRequest } from "@/lib/ai/model-router";
 
 export async function POST(request: Request) {
   try {
@@ -21,13 +23,15 @@ export async function POST(request: Request) {
       return NextResponse.json(result);
     }
 
+    await refreshModelRegistry();
+    const modelSelection = modelForAutoRequest(body, { provider: "openai" });
     const answer = await generateReasonedAnswer(body);
 
     if (isRetryableServiceAnswer(answer)) {
       return NextResponse.json(createProviderBusyResult());
     }
 
-    return NextResponse.json({ answer, sources: [] });
+    return NextResponse.json({ answer, sources: [], modelSelection });
   } catch (error) {
     if (isRetryableRouteError(error)) {
       return NextResponse.json({ answer: "", sources: [], retryable: true, retryAfterMs: 900 });

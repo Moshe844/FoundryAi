@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
-import { apiKeyForProvider, envVarNameForProvider, providerForTier } from "@/lib/ai/providers/dispatch";
-import { resolveModelForTier, tierForRuntimePayload } from "@/lib/ai/model-router";
+import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
+import { routePayloadDynamically } from "@/lib/ai/routing/dynamic-router";
 import type { ModelMode } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
+import { normalizeFollowUpResolution } from "@/lib/mission/classifyFollowUp";
+import type { FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
 
 const projectIntentValues = ["question", "inspection", "diagnose", "status", "debug", "edit", "undo", "continue", "retrospective", "clarify"] as const;
 
@@ -15,18 +17,24 @@ type ProjectIntentContext = {
   lastResult?: string;
   source?: string;
   execution?: {
+    id?: string;
     status?: string;
     objective?: string;
     blocker?: string;
     changedFiles?: string[];
     checklist?: Array<{ label?: string; status?: string; evidence?: string }>;
+    createdAt?: string;
+    updatedAt?: string;
   } | null;
   recentMissionMemory?: Array<{
+    id?: string;
     task?: string;
     status?: string;
     summary?: string;
     filesChanged?: Array<{ path?: string; status?: string; rationale?: string }>;
     commandsRun?: Array<{ command?: string; exitCode?: number | null }>;
+    createdAt?: string;
+    updatedAt?: string;
   }>;
 };
 
@@ -67,8 +75,15 @@ const RESOLVE_PROJECT_TURN_INTENT_TOOL: NeutralTool = {
         items: { type: "string" },
         description: "Only when intent is clarify: 2-4 short, concrete, mutually-exclusive choices the user can click to resolve the question (e.g. the specific paths the fork splits into). Omit or leave empty when the answer is genuinely open-ended and only free text makes sense.",
       },
+      referenced_execution_id: { type: "string", description: "Exact execution id from mission_state that this turn refers to; empty for new work." },
+      referenced_action_description: { type: "string", description: "Factual short description of the referenced recorded action; empty for new work." },
+      relevant_files: { type: "array", items: { type: "string" }, description: "Only file paths from mission_state directly connected to this follow-up. Never invent a path." },
+      expected_scope: { type: "string", description: "The precise boundary of work this instruction authorizes." },
+      destructive: { type: "boolean", description: "True for delete, remove, undo, revert, reset, replacement, or other loss-producing work." },
+      reference_confidence: { type: "number", minimum: 0, maximum: 1 },
+      planned_action: { type: "string", description: "The exact next action consistent with the resolved target and scope." },
     },
-    required: ["intent", "execution_mode", "confidence", "rationale", "continuity", "clarifying_question"],
+    required: ["intent", "execution_mode", "confidence", "rationale", "continuity", "clarifying_question", "referenced_execution_id", "referenced_action_description", "relevant_files", "expected_scope", "destructive", "reference_confidence", "planned_action"],
   },
 };
 
@@ -80,6 +95,13 @@ type ResolveToolResult = {
   continuity?: "carry_forward_plan" | "fresh_plan" | "not_applicable";
   clarifying_question?: string;
   clarify_options?: string[];
+  referenced_execution_id?: string;
+  referenced_action_description?: string;
+  relevant_files?: string[];
+  expected_scope?: string;
+  destructive?: boolean;
+  reference_confidence?: number;
+  planned_action?: string;
 };
 
 const SYSTEM_PROMPT = [
@@ -104,6 +126,8 @@ const SYSTEM_PROMPT = [
   "Resolve short replies such as yes, do it, continue, stop, or no using the mission state and previous execution.",
   "For edit/debug/continue intents, set continuity: carry_forward_plan when this message revises, corrects, or continues the work described in mission_state.execution (e.g. 'actually don't use that package', 'now add validation', 'switch it to .NET' while a mission is still open) — it should not restart from a blank plan. Set fresh_plan when it's an unrelated new request. Set not_applicable for every other intent.",
   "Always call resolve_project_turn_intent. Do not answer in prose.",
+  "Resolve the concrete prior execution and file target before acting. Use only execution ids and paths present in mission_state. If more than one target is plausible, choose clarify rather than guessing.",
+  "A destructive or pronoun-based mutation needs reference_confidence >= 0.72 and an actual referenced_execution_id. Otherwise choose clarify with one focused question.",
 ].join("\n");
 
 export async function POST(request: Request) {
@@ -117,15 +141,17 @@ export async function POST(request: Request) {
     // provider defaults to "openai" — matches today's behavior exactly. The optional body.provider
     // override exists only for Phase A verification (forcing a real Anthropic/Google request against
     // this route); it is not yet exposed anywhere in the UI (that lands with the mode selector).
-    const tier = body.mode && body.mode !== "auto" ? body.mode : tierForRuntimePayload({ message, context: body.context });
-    const automatic = body.provider ? undefined : providerForTier(tier);
-    const provider: ProviderId = body.provider ?? automatic?.provider ?? "openai";
-    const apiKey = body.provider ? apiKeyForProvider(provider) : automatic?.apiKey;
+    // Intent resolution is a small structured classification task. Project size and the user's
+    // selected implementation tier must never turn this bookkeeping call into Builder/premium spend.
+    const tier = "fast" as const;
+    const routed = await routePayloadDynamically({ message, context: body.context }, tier, body.provider);
+    const provider: ProviderId = routed.decision.provider;
+    const apiKey = apiKeyForProvider(provider);
     if (!apiKey) {
       return NextResponse.json({ ok: false, error: `${envVarNameForProvider(provider)} is not configured.` }, { status: 503 });
     }
 
-    const { model, effort } = resolveModelForTier(tier, { provider });
+    const { model, effort } = routed.decision;
 
     const result = await callManagedModel(
       {
@@ -146,9 +172,7 @@ export async function POST(request: Request) {
         ],
         tools: [RESOLVE_PROJECT_TURN_INTENT_TOOL],
         toolChoice: { name: "resolve_project_turn_intent" },
-        // Reasoning models count hidden reasoning against this budget. Higher manual tiers need
-        // enough room left to emit the required tool call after thinking.
-        maxOutputTokens: 3000,
+        maxOutputTokens: 700,
       },
       { apiKey, workspaceId: "factory-intent", userId: "local-user", maxAttempts: 3 },
     );
@@ -157,7 +181,12 @@ export async function POST(request: Request) {
     const parsed = call?.arguments ? safeJsonParse(call.arguments) : undefined;
     const intent = normalizeProjectIntent(parsed?.intent);
 
-    const modelSelection = { tier, provider, model, autoSelected: body.mode === "auto" };
+    const modelSelection = {
+      tier,
+      provider: result.usage.provider ?? provider,
+      model: result.usage.model ?? model,
+      autoSelected: body.mode === "auto",
+    };
 
     if (!intent) {
       return NextResponse.json({
@@ -174,18 +203,42 @@ export async function POST(request: Request) {
         ? String(parsed?.rationale ?? "")
         : `Product policy corrected ${intent} to ${finalIntent}: a concrete imperative change request (or a real project error report) starts an edit/debug mission — any conflicting requirements are resolved inside the mission's decision prompt — unless the user explicitly asked for read-only explanation. ${String(parsed?.rationale ?? "")}`.trim();
 
+    const referencedMemory = body.context?.recentMissionMemory?.find((item) => item.id === parsed?.referenced_execution_id);
+    const resolution = normalizeFollowUpResolution(
+      {
+        currentIntent: finalIntent,
+        referencedPriorAction: parsed?.referenced_execution_id
+          ? {
+              executionId: parsed.referenced_execution_id,
+              description: String(parsed.referenced_action_description || referencedMemory?.summary || referencedMemory?.task || "").trim(),
+              createdAt: referencedMemory?.createdAt,
+              updatedAt: referencedMemory?.updatedAt,
+            }
+          : null,
+        relevantFiles: Array.isArray(parsed?.relevant_files) ? parsed.relevant_files.map(String) : [],
+        expectedScope: String(parsed?.expected_scope ?? ""),
+        destructive: Boolean(parsed?.destructive),
+        referenceConfidence: clampConfidence(parsed?.reference_confidence),
+        plannedAction: String(parsed?.planned_action ?? message),
+        continuity: finalIntent === intent ? parsed?.continuity ?? "not_applicable" : "not_applicable",
+        rationale,
+        clarifyingQuestion: finalIntent === "clarify" ? String(parsed?.clarifying_question ?? "").trim() : "",
+        clarifyingOptions: finalIntent === "clarify" && Array.isArray(parsed?.clarify_options) ? parsed.clarify_options.map(String) : [],
+      } satisfies Partial<FollowUpResolutionRecord>,
+      message,
+      body.context ?? {},
+    );
+
     return NextResponse.json({
       ok: true,
-      intent: finalIntent,
-      executionMode: finalIntent === intent ? parsed?.execution_mode ?? executionModeForIntent(finalIntent) : executionModeForIntent(finalIntent),
+      intent: resolution.currentIntent,
+      executionMode: executionModeForIntent(resolution.currentIntent),
       confidence: clampConfidence(parsed?.confidence),
-      rationale,
-      continuity: finalIntent === intent ? parsed?.continuity ?? "not_applicable" : "not_applicable",
-      clarifyingQuestion: finalIntent === "clarify" ? String(parsed?.clarifying_question ?? "").trim() : "",
-      clarifyingOptions:
-        finalIntent === "clarify" && Array.isArray(parsed?.clarify_options)
-          ? parsed.clarify_options.map((option) => String(option).trim()).filter(Boolean).slice(0, 4)
-          : [],
+      rationale: resolution.rationale,
+      continuity: resolution.continuity,
+      clarifyingQuestion: resolution.clarifyingQuestion,
+      clarifyingOptions: resolution.clarifyingOptions,
+      resolution,
       usage: result.usage,
       modelSelection,
     });
@@ -209,6 +262,7 @@ function compactProjectIntentContext(context: ProjectIntentContext | undefined):
     source: truncate(context?.source, 120),
     execution: execution
       ? {
+          id: truncate(execution.id, 120),
           status: truncate(execution.status, 80),
           objective: truncate(execution.objective, 800),
           blocker: truncate(execution.blocker, 800),
@@ -218,9 +272,12 @@ function compactProjectIntentContext(context: ProjectIntentContext | undefined):
             status: truncate(item.status, 60),
             evidence: truncate(item.evidence, 260),
           })),
+          createdAt: truncate(execution.createdAt, 80),
+          updatedAt: truncate(execution.updatedAt, 80),
         }
       : null,
     recentMissionMemory: context?.recentMissionMemory?.slice(-5).map((run) => ({
+      id: truncate(run.id, 120),
       task: truncate(run.task, 300),
       status: truncate(run.status, 80),
       summary: truncate(run.summary, 600),
@@ -233,6 +290,8 @@ function compactProjectIntentContext(context: ProjectIntentContext | undefined):
         command: truncate(command.command, 260),
         exitCode: command.exitCode,
       })),
+      createdAt: truncate(run.createdAt, 80),
+      updatedAt: truncate(run.updatedAt, 80),
     })),
   };
 }
@@ -285,7 +344,7 @@ function looksLikeImperativeMutation(message: string) {
 }
 
 function looksLikeServerActionRequest(message: string) {
-  return /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,30}\b(?:server|app|project|service|api|backend|frontend|dev server|application)\b/i.test(message);
+  return /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,40}\b(?:server|app|project|service|api|backend|frontend|dev server|application|build|tests?|lint|linter|typecheck|checks?)\b/i.test(message);
 }
 
 function isConnectedProjectContext(context: ProjectIntentContext | undefined) {
