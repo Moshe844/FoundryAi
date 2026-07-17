@@ -10,8 +10,9 @@ import { useEffect, useState } from "react";
  * the screen is allowed to feel a stall.
  */
 
-export const SILENCE_AFTER_MS = 12_000;
-export const STALL_AFTER_MS = 60_000;
+export const SILENCE_AFTER_MS = 5_000;
+export const ATTENTION_AFTER_MS = 30_000;
+export const STALL_AFTER_MS = 180_000;
 
 /** Seconds since `timestamp`, ticking once a second while `active`. */
 export function useElapsedSince(timestamp: string | undefined, active: boolean): number {
@@ -39,18 +40,24 @@ export function isStalled(elapsedMs: number): boolean {
 
 export function LiveActivityRow({ text, elapsedMs }: { text: string; elapsedMs: number }) {
   if (elapsedMs >= STALL_AFTER_MS) {
-    const minutes = Math.floor(elapsedMs / 60_000);
     return (
       <p className="canvas-enter font-mono text-[13px] leading-6 text-foundry-amber" role="status">
-        no activity for {minutes}m — the engine may be stalled; you can stop or keep waiting
+        Still on: {text} · no new engine event for {formatElapsed(elapsedMs)}. You can stop this run if the provider is not responding.
       </p>
     );
   }
   return (
     <p className="canvas-enter font-mono text-[13px] leading-6 text-foundry-muted" role="status">
-      <span className="mr-2 inline-block h-1.5 w-1.5 rounded-full bg-foundry-teal align-middle" aria-hidden="true" />
-      {text}
-      {elapsedMs >= SILENCE_AFTER_MS ? <span className="text-foundry-subtle"> · {Math.floor(elapsedMs / 1000)}s</span> : null}
+      <span className="mr-2 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-foundry-teal align-middle" aria-hidden="true" />
+      {elapsedMs >= ATTENTION_AFTER_MS ? "Still working on: " : ""}{text}
+      {elapsedMs >= SILENCE_AFTER_MS ? <span className="text-foundry-subtle"> · {formatElapsed(elapsedMs)} since last update</span> : null}
     </p>
   );
+}
+
+function formatElapsed(elapsedMs: number) {
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }

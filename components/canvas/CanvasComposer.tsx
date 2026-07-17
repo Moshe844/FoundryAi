@@ -1,7 +1,7 @@
 "use client";
 
-import { Paperclip, Square } from "lucide-react";
-import { useRef } from "react";
+import { File, Paperclip, Square, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { ComposerModelSelector } from "@/components/ModelModeSelector";
 import { MissionQualitySelector } from "@/components/MissionQualitySelector";
@@ -27,6 +27,7 @@ export function CanvasComposer({
   onStop,
   onUndo,
   onAddEvidence,
+  onRemoveEvidence,
   onClearEvidence,
 }: {
   inputRef: RefObject<HTMLTextAreaElement | null>;
@@ -42,13 +43,14 @@ export function CanvasComposer({
   onSend: () => void;
   onStop: () => void;
   onUndo: () => void;
-  onAddEvidence: (files: FileList | null) => void;
+  onAddEvidence: (files: FileList | File[] | null) => void;
+  onRemoveEvidence: (index: number) => void;
   onClearEvidence: () => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   return (
-    <div className="border-t border-white/8 bg-black/20 px-4 pb-4 pt-3 sm:px-6">
+    <div className="border-t border-overlay/8 bg-shade/20 px-4 pb-4 pt-3 sm:px-6">
       {projectUnavailable ? (
         <p className="mb-2 text-[12px] leading-5 text-foundry-subtle">This project folder was deleted. Its verified mission record remains here; start a new project to continue working.</p>
       ) : pausedForApproval ? (
@@ -59,23 +61,47 @@ export function CanvasComposer({
         <p className="mb-2 text-[12px] leading-5 text-foundry-subtle">queued — will pick this up next: “{queuedTask}”</p>
       ) : null}
 
-      {evidenceFiles.length ? (
-        <div className="mb-2 flex flex-wrap items-center gap-2">
-          {evidenceFiles.map((file) => (
-            <span key={file.name} className="rounded border border-white/12 bg-white/[0.04] px-2 py-0.5 text-[11px] text-foundry-muted">{file.name}</span>
-          ))}
-          <button type="button" onClick={onClearEvidence} className="text-[11px] text-foundry-subtle underline transition hover:text-foundry-ink">clear</button>
-        </div>
-      ) : null}
-
       <div className="mx-auto flex w-full max-w-[760px] items-end gap-2">
-        <div className="flex min-h-[52px] flex-1 items-end rounded-lg border border-white/12 bg-black/30 transition focus-within:border-foundry-teal/45">
+        <div className="min-w-0 flex-1 overflow-hidden rounded-lg border border-overlay/12 bg-shade/30 transition focus-within:border-foundry-teal/45">
+          {evidenceFiles.length ? (
+            <div className="border-b border-overlay/8 bg-overlay/[0.025] p-2.5">
+              <div className="mb-2 flex items-center justify-between gap-3 px-0.5">
+                <span className="text-[11px] font-semibold text-foundry-muted">
+                  {evidenceFiles.length} file{evidenceFiles.length === 1 ? "" : "s"} attached
+                </span>
+                <button type="button" onClick={onClearEvidence} className="text-[11px] text-foundry-subtle transition hover:text-foundry-ink">
+                  Remove all
+                </button>
+              </div>
+              <div className={`grid gap-2 ${evidenceFiles.length === 1 ? "grid-cols-1" : "grid-cols-2 sm:grid-cols-3"}`}>
+                {evidenceFiles.map((file, index) => (
+                  <StagedFile
+                    key={`${file.name}:${file.size}:${file.lastModified}:${index}`}
+                    file={file}
+                    index={index}
+                    single={evidenceFiles.length === 1}
+                    onRemove={onRemoveEvidence}
+                  />
+                ))}
+              </div>
+            </div>
+          ) : null}
+          <div className="flex min-h-[52px] items-end">
           <textarea
             ref={inputRef}
             value={value}
             rows={1}
             disabled={projectUnavailable}
             onChange={(event) => onChange(event.target.value)}
+            onPaste={(event) => {
+              const pastedImages = Array.from(event.clipboardData.items)
+                .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+                .map((item) => item.getAsFile())
+                .filter((file): file is File => Boolean(file));
+              if (!pastedImages.length) return;
+              event.preventDefault();
+              onAddEvidence(pastedImages);
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
@@ -88,17 +114,17 @@ export function CanvasComposer({
           />
           <button
             type="button"
-            title="Attach a screenshot or image as evidence"
+            title="Attach files or images"
             disabled={projectUnavailable}
             onClick={() => fileInputRef.current?.click()}
-            className="mb-2.5 mr-2 rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"
+            className="mb-2.5 mr-2 rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"
           >
             <Paperclip size={15} />
           </button>
+          </div>
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
             multiple
             disabled={projectUnavailable}
             className="hidden"
@@ -112,7 +138,7 @@ export function CanvasComposer({
           <button
             type="button"
             onClick={onStop}
-            className="inline-flex h-[52px] shrink-0 items-center gap-2 rounded-lg border border-white/15 bg-white/[0.04] px-4 text-xs font-bold text-foundry-muted transition hover:border-red-300/40 hover:text-red-200"
+            className="inline-flex h-[52px] shrink-0 items-center gap-2 rounded-lg border border-overlay/15 bg-overlay/[0.04] px-4 text-xs font-bold text-foundry-muted transition hover:border-red-300/40 hover:text-red-200"
             title="Request a graceful stop (Ctrl+.)"
           >
             <Square size={12} />
@@ -140,4 +166,60 @@ export function CanvasComposer({
       </div>
     </div>
   );
+}
+
+function StagedFile({
+  file,
+  index,
+  single,
+  onRemove,
+}: {
+  file: File;
+  index: number;
+  single: boolean;
+  onRemove: (index: number) => void;
+}) {
+  const [source, setSource] = useState("");
+  const isImage = file.type.startsWith("image/") || /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name);
+
+  useEffect(() => {
+    if (!isImage) {
+      setSource("");
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    setSource(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file, isImage]);
+
+  return (
+    <figure className={`group relative overflow-hidden rounded-lg border border-overlay/12 bg-shade/35 ${single ? "max-w-[460px]" : ""}`}>
+      {isImage && source ? (
+        // This short-lived local Object URL previews an unsent clipboard or file attachment.
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={source} alt={file.name || "Screenshot ready to send"} className={`w-full object-contain ${single ? "max-h-52" : "h-28"}`} />
+      ) : (
+        <div className={`flex flex-col items-center justify-center gap-2 px-3 text-center text-foundry-muted ${single ? "h-40" : "h-28"}`}>
+          <File size={single ? 30 : 24} />
+          <span className="max-w-full truncate text-[11px] font-semibold">{file.name || "Attached file"}</span>
+          <span className="text-[10px] text-foundry-subtle">{formatFileSize(file.size)}</span>
+        </div>
+      )}
+      <figcaption className="truncate border-t border-overlay/8 px-2.5 py-1.5 text-[10px] text-foundry-subtle">{file.name || "Pasted screenshot"}</figcaption>
+      <button
+        type="button"
+        onClick={() => onRemove(index)}
+        aria-label={`Remove ${file.name || "screenshot"}`}
+        className="absolute right-1.5 top-1.5 grid h-7 w-7 place-items-center rounded-full border border-overlay/15 bg-shade/75 text-overlay/75 opacity-90 shadow-lg transition hover:border-overlay/30 hover:bg-black hover:text-white sm:opacity-0 sm:group-hover:opacity-100 sm:focus:opacity-100"
+      >
+        <X size={13} />
+      </button>
+    </figure>
+  );
+}
+
+function formatFileSize(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }

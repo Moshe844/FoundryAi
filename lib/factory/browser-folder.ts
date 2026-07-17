@@ -651,7 +651,7 @@ function idbRequest<T = unknown>(request: IDBRequest<T>) {
 
 function isUsefulPath(filePath: string) {
   const normalized = filePath.replace(/\\/g, "/").toLowerCase();
-  if (/(^|\/)(node_modules|\.git|\.next|dist|build|coverage|target|bin|obj)(\/|$)/.test(normalized)) return false;
+  if (/(^|\/)(node_modules|\.git|\.next|\.next-build|\.turbo|\.cache|dist|build|out|coverage|target|bin|obj)(\/|$)/.test(normalized)) return false;
   if (/(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum|cargo\.lock)$/.test(normalized)) return true;
   return /\.(html|css|js|mjs|cjs|json|md|txt|ts|tsx|jsx|vue|svelte|py|php|cs|java|kt|kts|go|rs|rb|swift|dart|xml|toml|gradle|properties|yml|yaml)$/i.test(normalized);
 }

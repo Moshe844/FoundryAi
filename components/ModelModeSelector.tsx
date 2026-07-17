@@ -75,7 +75,7 @@ export function ModelModeSelector() {
   }
 
   return (
-    <section className="grid gap-3 border-b border-white/10 pb-5">
+    <section className="grid gap-3 border-b border-overlay/10 pb-5">
       <div className="flex items-center justify-between gap-3">
         <h2 className="text-sm font-extrabold text-foundry-ink">Model routing</h2>
         <label className="flex items-center gap-2 text-xs font-bold text-foundry-subtle">
@@ -87,7 +87,7 @@ export function ModelModeSelector() {
         Sets the maximum intelligence level. Auto inspects the mission and relevant project working set, then chooses the least expensive validated model for each step.
       </p>
       {dailySpend ? (
-        <div className={`rounded-md border px-3 py-2 text-xs ${dailySpend.blocked ? "border-amber-400/35 bg-amber-400/[0.08] text-amber-100" : "border-white/10 bg-white/[0.03] text-foundry-muted"}`}>
+        <div className={`rounded-md border px-3 py-2 text-xs ${dailySpend.blocked ? "border-amber-400/35 bg-amber-400/[0.08] text-amber-100" : "border-overlay/10 bg-overlay/[0.03] text-foundry-muted"}`}>
           <span className="font-extrabold">Foundry recorded today: ${dailySpend.actualCostUsd.toFixed(2)} of ${dailySpend.limitUsd.toFixed(2)}</span>
           <span className="ml-2">${dailySpend.remainingUsd.toFixed(2)} available{dailySpend.reservedCostUsd ? ` Â· $${dailySpend.reservedCostUsd.toFixed(2)} currently reserved` : ""}</span>
           {dailySpend.blocked ? <span className="mt-1 block">Paid model calls are stopped. Raise FOUNDRY_DAILY_MODEL_BUDGET_USD only when you explicitly authorize more spend.</span> : null}
@@ -103,7 +103,7 @@ export function ModelModeSelector() {
               type="button"
               onClick={() => setMode(candidate)}
               className={`rounded-md border p-3 text-left transition ${
-                active ? "border-foundry-teal/45 bg-foundry-teal/[0.1]" : "border-white/10 bg-white/[0.03] hover:border-foundry-teal/30 hover:bg-white/[0.05]"
+                active ? "border-foundry-teal/45 bg-foundry-teal/[0.1]" : "border-overlay/10 bg-overlay/[0.03] hover:border-foundry-teal/30 hover:bg-overlay/[0.05]"
               }`}
             >
               <span className="flex items-center gap-1.5 text-sm font-extrabold text-foundry-ink">
@@ -116,7 +116,7 @@ export function ModelModeSelector() {
         })}
       </div>
       <div className="flex flex-wrap items-center gap-3">
-        <button type="button" onClick={validateModels} disabled={validation.loading} className="inline-flex items-center gap-2 rounded-md border border-white/15 bg-white/[0.03] px-3 py-2 text-xs font-bold text-foundry-ink transition hover:border-foundry-teal/35 disabled:opacity-60">
+        <button type="button" onClick={validateModels} disabled={validation.loading} className="inline-flex items-center gap-2 rounded-md border border-overlay/15 bg-overlay/[0.03] px-3 py-2 text-xs font-bold text-foundry-ink transition hover:border-foundry-teal/35 disabled:opacity-60">
           <RefreshCw size={13} className={validation.loading ? "animate-spin" : ""} />
           Validate configured models
         </button>
@@ -140,7 +140,7 @@ export function ComposerModelSelector() {
           aria-label="Model intelligence"
           value={mode}
           onChange={(event) => setMode(event.target.value as ModelMode)}
-          className="min-h-8 max-w-[250px] appearance-none truncate rounded-md border border-white/15 bg-[#111718] py-1 pl-2.5 pr-8 text-xs font-bold text-foundry-ink outline-none transition hover:border-foundry-teal/35 focus:border-foundry-teal/60"
+          className="min-h-8 max-w-[250px] appearance-none truncate rounded-md border border-overlay/15 bg-foundry-raised py-1 pl-2.5 pr-8 text-xs font-bold text-foundry-ink outline-none transition hover:border-foundry-teal/35 focus:border-foundry-teal/60"
         >
           {MODES.map((candidate) => {
             const option = displayFor(candidate);
@@ -205,7 +205,7 @@ export function ModelSelectionChip({
   const label = selection.autoSelected ? `${AUTO_DISPLAY.emoji} Auto (selected: ${tierDisplay.emoji} ${tierDisplay.label})` : `${tierDisplay.emoji} ${tierDisplay.label}`;
 
   return (
-    <span className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10px] font-bold text-foundry-subtle" title={showModelNames ? selection.reason : `Selected ${selection.provider}/${selection.model}`}>
+    <span className="inline-flex items-center gap-1 rounded-full border border-overlay/10 bg-overlay/[0.04] px-2 py-0.5 text-[10px] font-bold text-foundry-subtle" title={showModelNames ? selection.reason : `Selected ${selection.provider}/${selection.model}`}>
       {label}
       <span className="text-foundry-muted">· {selection.provider}/{selection.model}</span>
     </span>

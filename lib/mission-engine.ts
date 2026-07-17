@@ -136,6 +136,9 @@ export type PendingClarification = {
   options?: string[];
   /** The original ambiguous request, kept so answering can resume with full context (routes to edit, not clarify). */
   originalTask: string;
+  /** The concrete interpretation Foundry proposed. Accepting the card executes this task directly;
+   * the synthetic answer wrapper is never reclassified or rendered as the user's request. */
+  resolvedTask?: string;
 };
 
 type Classification = {

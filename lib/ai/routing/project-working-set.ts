@@ -9,7 +9,10 @@ export type ProjectWorkingSet = {
   evidence: string[];
 };
 
-const TERMS_TO_IGNORE = new Set(["this", "that", "with", "from", "into", "make", "change", "update", "build", "fix", "add", "the", "and", "for"]);
+const TERMS_TO_IGNORE = new Set([
+  "this", "that", "with", "from", "into", "after", "make", "change", "update", "build", "fix", "add", "edit", "editing", "implement", "proceed", "project", "require", "user", "not", "the", "and", "for",
+]);
+const GENERATED_PATH_PATTERN = /(^|\/)(node_modules|\.git|\.next|\.next-build|\.turbo|\.cache|\.pytest_cache|__pycache__|\.mypy_cache|\.ruff_cache|\.tox|\.nox|\.venv|venv|site-packages|dist|build|out|coverage|target|bin|obj)(\/|$)/i;
 const INDEX_TTL_MS = 60_000;
 const repositoryIndexCache = new Map<string, { expiresAt: number; root: Awaited<ReturnType<ProjectAccess["listDir"]>>; fileCount: number; searches: Map<string, Awaited<ReturnType<NonNullable<ProjectAccess["searchFiles"]>>>> }>();
 
@@ -30,7 +33,22 @@ export async function discoverProjectWorkingSet(access: ProjectAccess, task: str
         return found;
       }))).flat()
     : [];
-  const likelyFiles = [...new Set(hits.map((hit) => hit.path))].slice(0, 30);
+  const sourceHits = hits.filter((hit) => !GENERATED_PATH_PATTERN.test(hit.path.replace(/\\/g, "/")));
+  const behavioralTask = /\b(?:click|button|form|upload|process|interaction|handler|submit|navigate|open|close|enable|disable)\b/i.test(task);
+  const hitCounts = new Map<string, { count: number; first: number }>();
+  sourceHits.forEach((hit, index) => {
+    const current = hitCounts.get(hit.path);
+    hitCounts.set(hit.path, current ? { count: current.count + 1, first: current.first } : { count: 1, first: index });
+  });
+  const likelyFiles = Array.from(hitCounts.entries())
+    .sort(([leftPath, left], [rightPath, right]) => {
+      const score = (filePath: string, value: { count: number }) => value.count * 10
+        + (behavioralTask && /\.(?:[cm]?[jt]sx?|vue|svelte|astro|html)$/i.test(filePath) ? 8 : 0)
+        - (/\.(?:md|mdx|rst|txt)$/i.test(filePath) ? 12 : 0);
+      return score(rightPath, right) - score(leftPath, left) || left.first - right.first;
+    })
+    .map(([filePath]) => filePath)
+    .slice(0, 30);
   const topDirectories = new Set(likelyFiles.map((file) => file.replace(/\\/g, "/").split("/")[0]).filter(Boolean));
   const layers = new Set(likelyFiles.map(layerForPath).filter(Boolean));
   const projectWide = /\b(entire|whole|all files|project-wide|system-wide|design system|migrate|migration)\b/i.test(task);
@@ -40,13 +58,13 @@ export async function discoverProjectWorkingSet(access: ProjectAccess, task: str
     estimatedSubsystems: Math.max(1, topDirectories.size),
     crossLayer: layers.size >= 2,
     projectWide,
-    evidence: hits.slice(0, 12).map((hit) => `${hit.path}${hit.line ? `:${hit.line}` : ""}`),
+    evidence: sourceHits.slice(0, 12).map((hit) => `${hit.path}${hit.line ? `:${hit.line}` : ""}`),
   };
 }
 
 async function estimateFileCount(access: ProjectAccess, root: Awaited<ReturnType<ProjectAccess["listDir"]>>) {
   let count = root.filter((entry) => entry.kind === "file").length;
-  for (const directory of root.filter((entry) => entry.kind === "directory").slice(0, 40)) {
+  for (const directory of root.filter((entry) => entry.kind === "directory" && !GENERATED_PATH_PATTERN.test(`${entry.name}/`)).slice(0, 40)) {
     const children = await access.listDir(directory.name).catch(() => []);
     count += children.filter((entry) => entry.kind === "file").length;
     count += children.filter((entry) => entry.kind === "directory").length * 5;

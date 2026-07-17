@@ -3,11 +3,12 @@ import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { decideCommandPermission, type CommandApprovalScope, type CommandPermissionCategory } from "./command-permissions";
 import { assessWriteVerification } from "./write-verification";
 
 const LONG_RUNNING_COMMAND_PATTERN =
-  /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\b(?:python|python3|py)(?:\.exe)?\s+-m\s+http\.server\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
+  /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\b(?:npx|pnpx|bunx)(?:\.cmd)?\s+(?:--yes\s+)?(?:serve|http-server)\b|\b(?:python|python3|py)(?:\.exe)?\s+-m\s+http\.server\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
 
 function isLongRunningServerCommand(command: string) {
   return LONG_RUNNING_COMMAND_PATTERN.test(command);
@@ -38,6 +39,31 @@ export function normalizeCommandText(command: string) {
 }
 
 /**
+ * Coding models sometimes append a POSIX-only output preview (`| tail -5` / `| head -20`) to an
+ * otherwise portable command. On Windows that decoration can make a valid install or build fail
+ * before the underlying tool starts. Remove only these presentation-only terminal suffixes; never
+ * rewrite semantic pipes or command chains.
+ */
+export function normalizeCommandForExecution(command: string, platform = process.platform) {
+  let normalized = command.trim();
+  if (platform !== "win32") return normalized;
+  const outputPreviewSuffix = /\s+(?:2>&1\s*)?\|\s*(?:tail|head)\s+(?:(?:-n|--lines)\s+)?-?\d+\s*$/i;
+  while (outputPreviewSuffix.test(normalized)) normalized = normalized.replace(outputPreviewSuffix, "").trim();
+  return normalized;
+}
+
+function leadingPosixMkdir(command: string) {
+  const chainIndex = command.indexOf("&&");
+  const mkdirCommand = (chainIndex >= 0 ? command.slice(0, chainIndex) : command).trim();
+  const remainder = chainIndex >= 0 ? command.slice(chainIndex + 2).trim() : "";
+  const tokens = tokenizeCommand(mkdirCommand);
+  if (tokens.length < 3 || tokens[0].toLowerCase() !== "mkdir" || tokens[1] !== "-p") return undefined;
+  const directories = tokens.slice(2);
+  if (directories.some((entry) => !entry || !/^[A-Za-z0-9_ .\/\\:-]+$/.test(entry) || /[&|<>;%!^]/.test(entry))) return undefined;
+  return { directories, remainder };
+}
+
+/**
  * Permission-matching identity for a shell command. Builds on normalizeCommandText, then canonicalizes
  * risk-neutral variations so an approval OR denial for `npm install dayjs` also covers `npm install dayjs
  * --save`, `npm i dayjs`, etc. The spec requires deny not to loop and exact-command grants to ignore
@@ -48,7 +74,7 @@ export function normalizeCommandText(command: string) {
  * different package) remain, so genuinely different commands still read as distinct.
  */
 export function commandPermissionIdentity(command: string) {
-  let text = normalizeCommandText(command);
+  let text = normalizeCommandText(normalizeCommandForExecution(command));
   if (/\b(npm|pnpm|yarn|bun)(\.cmd)?\s+(?:install|i|add)\b/.test(text)) {
     text = text.replace(/\b(npm|pnpm|bun)(\.cmd)?\s+i\b/g, "$1 install");
     text = text.replace(/\s+(?:--save(?:-dev|-prod|-exact|-optional|-peer)?|--no-save|--legacy-peer-deps|-[sdebop])\b/g, "");
@@ -596,7 +622,7 @@ async function runCommandWithShellFallback(
 export type ProjectAccessMode = "local-folder" | "uploaded-copy";
 
 export type ProjectDirEntry = { name: string; kind: "file" | "directory"; size?: number };
-export type ProjectReadResult = { exists: boolean; content: string; truncated: boolean; totalBytes: number };
+export type ProjectReadResult = { exists: boolean; content: string; truncated: boolean; totalBytes: number; contentHash?: string };
 const MAX_SNAPSHOT_BYTES = 200_000;
 
 export type ProjectWriteResult = {
@@ -626,7 +652,35 @@ export type ProjectCommandResult = {
   approvalScope?: CommandApprovalScope;
 };
 export type ProjectSearchHit = { path: string; line?: number; preview?: string };
-export type ProjectDeleteResult = { existed: boolean; verified: boolean; reason?: string };
+export type ProjectLockOwner = { pid: number; name: string; currentDirectory?: string };
+export type ProjectDeleteResult = { existed: boolean; verified: boolean; reason?: string; lockOwners?: ProjectLockOwner[] };
+export type ProjectLockStopResult = { verified: boolean; stopped: ProjectLockOwner[]; reason?: string };
+
+function windowsDirectoryLockOwners(root: string): ProjectLockOwner[] {
+  if (process.platform !== "win32") return [];
+  const script = path.join(process.cwd(), "scripts", "find-windows-process-cwds.ps1");
+  try {
+    const output = execFileSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Path", root], {
+      encoding: "utf8",
+      timeout: 8_000,
+      windowsHide: true,
+    }).trim();
+    if (!output) return [];
+    const parsed = JSON.parse(output) as ProjectLockOwner | ProjectLockOwner[];
+    return (Array.isArray(parsed) ? parsed : [parsed]).filter((owner) => Number(owner.pid) > 0 && owner.name && owner.pid !== process.pid);
+  } catch {
+    return [];
+  }
+}
+
+function actionableDeletionFailure(root: string, error: unknown): ProjectDeleteResult {
+  const lockOwners = windowsDirectoryLockOwners(root);
+  const failure = error instanceof Error ? error.message : "Project deletion failed.";
+  const nextStep = lockOwners.length
+    ? ` The folder is held open by ${lockOwners.map((owner) => `${owner.name} (PID ${owner.pid})`).join(", ")}. Save any work, close ${lockOwners.map((owner) => owner.name).join(" and ")}, then retry deletion. Foundry did not force-close an external app because that could discard unsaved work.`
+    : " Close any terminal, editor, or file manager using this folder, then retry deletion.";
+  return { existed: true, verified: false, reason: `${failure}${nextStep}`, lockOwners };
+}
 export type BrowserValidationInput = { url: string; actions?: Array<{ action: string; selector?: string; value?: string; text?: string; key?: string; ms?: number; exact?: boolean; expected?: number }>; viewport?: { width: number; height: number }; screenshotName?: string; baselineScreenshot?: string };
 export type BrowserValidationResult = { available: boolean; verified: boolean; reason?: string; url?: string; title?: string; screenshotPath?: string; consoleErrors?: string[]; failedRequests?: Array<{ url: string; method: string; error: string }>; steps?: Array<{ action: string; target: string; ok: boolean; status?: number }>; visualComparison?: { comparable: boolean; changedPixels?: number; changedRatio?: number; diffPath?: string; reason?: string } };
 export type PlatformValidationResult = { available: boolean; verified?: boolean; reason?: string; action?: string; exitCode?: number | null; stdout?: string; stderr?: string; durationMs?: number; screenshotPath?: string; pid?: number; running?: boolean; interactionVerified?: boolean };
@@ -638,6 +692,8 @@ export interface ProjectAccess {
   listDir(relativePath: string): Promise<ProjectDirEntry[]>;
   readFile(relativePath: string, opts?: { offsetBytes?: number; limitBytes?: number }): Promise<ProjectReadResult>;
   writeFile(relativePath: string, content: string): Promise<ProjectWriteResult>;
+  /** Writes a binary project asset from base64 and verifies the exact bytes on disk. */
+  writeBinary?(relativePath: string, base64: string): Promise<ProjectWriteResult>;
   runCommand?(
     command: string,
     cwd?: string,
@@ -648,12 +704,83 @@ export interface ProjectAccess {
   deleteFile?(relativePath: string): Promise<ProjectDeleteResult>;
   /** Deletes the exact connected project root after a separate structured whole-project approval. Never inferred from ordinary file-delete permission. */
   deleteRoot?(): Promise<ProjectDeleteResult>;
+  stopRootLockOwners?(processIds: number[]): Promise<ProjectLockStopResult>;
   validateBrowser?(input: BrowserValidationInput): Promise<BrowserValidationResult>;
   validatePlatform?(platform: "android" | "ios", input: Record<string, unknown>): Promise<PlatformValidationResult>;
   validateDesktop?(input: Record<string, unknown>): Promise<PlatformValidationResult>;
 }
 
-const EXCLUDED_DIR_PATTERN = /(^|\/)(node_modules|\.git|\.next|dist|build|coverage|target|bin|obj)(\/|$)/i;
+/** Read-only project access for browser uploads. It gives the semantic inspector the same list/read/
+ * search contract as a connected folder without writing a temporary copy or granting mutation tools. */
+export function createUploadedProjectAccess(files: Array<{ path: string; content: string; size?: number }>, rootLabel = "Uploaded project"): ProjectAccess {
+  const stored = new Map<string, string>();
+  for (const file of files) {
+    const normalized = file.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    if (!normalized || normalized.split("/").some((part) => !part || part === "." || part === "..")) continue;
+    stored.set(normalized, file.content);
+  }
+
+  return {
+    mode: "uploaded-copy",
+    rootLabel,
+    capabilities: { canRunCommands: false, canSearch: true },
+    async listDir(relativePath) {
+      const base = relativePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      const prefix = base ? `${base}/` : "";
+      const entries = new Map<string, ProjectDirEntry>();
+      for (const [filePath, content] of stored) {
+        if (!filePath.startsWith(prefix)) continue;
+        const remainder = filePath.slice(prefix.length);
+        if (!remainder) continue;
+        const [name, ...rest] = remainder.split("/");
+        if (!name) continue;
+        entries.set(name, rest.length ? { name, kind: "directory" } : { name, kind: "file", size: Buffer.byteLength(content) });
+      }
+      return [...entries.values()].sort((left, right) => left.kind === right.kind ? left.name.localeCompare(right.name) : left.kind === "directory" ? -1 : 1);
+    },
+    async readFile(relativePath, opts) {
+      const normalized = relativePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      const content = stored.get(normalized);
+      if (content === undefined) return { exists: false, content: "", truncated: false, totalBytes: 0 };
+      const source = Buffer.from(content, "utf8");
+      const offset = Math.max(0, opts?.offsetBytes ?? 0);
+      const limit = Math.max(0, opts?.limitBytes ?? source.byteLength);
+      const selected = source.subarray(offset, Math.min(source.byteLength, offset + limit));
+      return {
+        exists: true,
+        content: selected.toString("utf8"),
+        truncated: offset > 0 || offset + selected.byteLength < source.byteLength,
+        totalBytes: source.byteLength,
+        contentHash: createHash("sha256").update(source).digest("hex"),
+      };
+    },
+    async writeFile(relativePath) {
+      return {
+        existedBefore: stored.has(relativePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")),
+        verified: false,
+        contentChanged: false,
+        reason: "Uploaded-project inspection is read-only.",
+      };
+    },
+    async searchFiles(query, opts) {
+      const needle = query.trim().toLowerCase();
+      if (!needle) return [];
+      const maxResults = Math.max(1, Math.min(opts?.maxResults ?? 30, 100));
+      const hits: ProjectSearchHit[] = [];
+      for (const [filePath, content] of stored) {
+        const lines = content.split(/\r?\n/);
+        for (let index = 0; index < lines.length && hits.length < maxResults; index += 1) {
+          if (!lines[index].toLowerCase().includes(needle)) continue;
+          hits.push({ path: filePath, line: index + 1, preview: lines[index].trim().slice(0, 240) });
+        }
+        if (hits.length >= maxResults) break;
+      }
+      return hits;
+    },
+  };
+}
+
+const EXCLUDED_DIR_PATTERN = /(^|\/)(node_modules|\.git|\.next|\.next-build|\.turbo|\.cache|\.pytest_cache|__pycache__|\.mypy_cache|\.ruff_cache|\.tox|\.nox|\.venv|venv|site-packages|dist|build|out|coverage|target|bin|obj)(\/|$)/i;
 const MAX_READ_BYTES = 20_000;
 const MAX_SEARCH_FILE_BYTES = 300_000;
 const COMMAND_TIMEOUT_MS = 120_000;
@@ -752,7 +879,13 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
         const offset = Math.max(0, opts.offsetBytes ?? 0);
         const limit = Math.max(1, Math.min(opts.limitBytes ?? MAX_READ_BYTES, MAX_READ_BYTES));
         const sliced = raw.slice(offset, offset + limit);
-        return { exists: true, content: sliced, truncated: offset + limit < raw.length || offset > 0, totalBytes };
+        return {
+          exists: true,
+          content: sliced,
+          truncated: offset + limit < raw.length || offset > 0,
+          totalBytes,
+          contentHash: createHash("sha256").update(raw).digest("hex"),
+        };
       } catch {
         return { exists: false, content: "", truncated: false, totalBytes: 0 };
       }
@@ -799,6 +932,44 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
       }
     },
 
+    async writeBinary(relativePath, base64) {
+      const fullPath = resolveContained(resolvedRoot, relativePath);
+      if (!fullPath) return { existedBefore: false, verified: false, contentChanged: false, reason: "Refusing to write outside the project root." };
+      if (fullPath === resolvedRoot) return { existedBefore: true, verified: false, contentChanged: false, reason: "A file path is required. Refusing to write to the project root itself." };
+      const existedBefore = existsSync(fullPath);
+      if (existedBefore && (await stat(fullPath)).isDirectory()) {
+        return { existedBefore: true, verified: false, contentChanged: false, reason: `${relativePath} is a directory, not a file. Choose a specific file path.` };
+      }
+      const before = existedBefore ? await readFile(fullPath).catch(() => Buffer.alloc(0)) : Buffer.alloc(0);
+      if (signal?.aborted) return { existedBefore, verified: false, contentChanged: false, reason: "Stopped by user before the asset write started." };
+      try {
+        const expected = Buffer.from(base64, "base64");
+        if (!expected.length) return { existedBefore, verified: false, contentChanged: false, reason: "The attached asset contained no decodable bytes." };
+        await mkdir(path.dirname(fullPath), { recursive: true });
+        await writeFile(fullPath, expected);
+        if (signal?.aborted) {
+          if (existedBefore) await writeFile(fullPath, before);
+          else await rm(fullPath, { force: true });
+          return { existedBefore, verified: false, contentChanged: false, reason: "Stopped by user; the in-flight asset write was rolled back." };
+        }
+        const actual = await readFile(fullPath);
+        const verified = actual.equals(expected);
+        const contentChanged = !existedBefore || !before.equals(actual);
+        const details = await stat(fullPath);
+        return {
+          existedBefore,
+          verified,
+          contentChanged,
+          bytes: details.size,
+          modifiedAt: details.mtime.toISOString(),
+          reason: verified ? undefined : "Read-back bytes did not match the attached asset.",
+          beforeContent: undefined,
+        };
+      } catch (error) {
+        return { existedBefore, verified: false, contentChanged: false, reason: error instanceof Error ? error.message : "Asset write failed." };
+      }
+    },
+
     async deleteFile(relativePath) {
       const fullPath = resolveContained(resolvedRoot, relativePath);
       if (!fullPath) return { existed: false, verified: false, reason: "Refusing to delete outside the project root." };
@@ -821,14 +992,40 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
       if (!existed) return { existed: false, verified: true };
       if (signal?.aborted) return { existed: true, verified: false, reason: "Stopped by user before project deletion started." };
       try {
-        await rm(resolvedRoot, { recursive: true, force: false });
+        await rm(resolvedRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
         return { existed: true, verified: !existsSync(resolvedRoot), reason: existsSync(resolvedRoot) ? "Project folder still exists after deletion." : undefined };
       } catch (error) {
-        return { existed: true, verified: false, reason: error instanceof Error ? error.message : "Project deletion failed." };
+        return actionableDeletionFailure(resolvedRoot, error);
       }
+    },
+    async stopRootLockOwners(processIds) {
+      const requested = new Set(processIds.filter((pid) => Number.isInteger(pid) && pid > 0));
+      const currentOwners = windowsDirectoryLockOwners(resolvedRoot);
+      const targets = currentOwners.filter((owner) => requested.has(owner.pid) && owner.pid !== process.pid);
+      if (!targets.length) return { verified: false, stopped: [], reason: "The approved lock-owning processes are no longer attached to this project." };
+      const protectedNames = new Set(["system", "registry", "csrss", "wininit", "services", "lsass", "explorer"]);
+      if (targets.some((owner) => protectedNames.has(owner.name.toLowerCase()))) {
+        return { verified: false, stopped: [], reason: "Foundry refuses to force-close a protected Windows process." };
+      }
+      const stopped: ProjectLockOwner[] = [];
+      for (const owner of targets) {
+        try {
+          execFileSync("taskkill.exe", ["/pid", String(owner.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true, timeout: 8_000 });
+          stopped.push(owner);
+        } catch {
+          // Verify the remaining owners below; taskkill can race with normal app shutdown.
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const remaining = windowsDirectoryLockOwners(resolvedRoot).filter((owner) => requested.has(owner.pid));
+      return remaining.length
+        ? { verified: false, stopped, reason: `Could not stop ${remaining.map((owner) => `${owner.name} (PID ${owner.pid})`).join(", ")}.` }
+        : { verified: true, stopped };
     },
 
     async runCommand(command, cwd, options) {
+      command = normalizeCommandForExecution(command);
+      const portableMkdir = process.platform === "win32" ? leadingPosixMkdir(command) : undefined;
       const requestedCwd = cwd ? resolveContained(resolvedRoot, cwd) : resolvedRoot;
       if (!requestedCwd) {
         return { exitCode: null, stdout: "", stderr: "Refusing to run a command outside the project root.", durationMs: 0, timedOut: false, skipped: "outside-root" };
@@ -854,6 +1051,22 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
       }
       commandsRun += 1;
       const approvalScope = approvalScopeFor(command, permission, options);
+      if (portableMkdir) {
+        try {
+          for (const directory of portableMkdir.directories) {
+            const target = path.resolve(requestedCwd, directory);
+            const relative = path.relative(resolvedRoot, target);
+            if (relative.startsWith("..") || path.isAbsolute(relative)) {
+              return { exitCode: null, stdout: "", stderr: "Refusing to create a directory outside the project root.", durationMs: 0, timedOut: false, skipped: "outside-root" };
+            }
+            await mkdir(target, { recursive: true });
+          }
+          command = portableMkdir.remainder;
+          if (!command) return { exitCode: 0, stdout: `Created ${portableMkdir.directories.join(", ")}.`, stderr: "", durationMs: 0, timedOut: false, approvalScope };
+        } catch (error) {
+          return { exitCode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), durationMs: 0, timedOut: false, approvalScope };
+        }
+      }
 
       if (isLongRunningServerCommand(command)) {
         const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, DEV_SERVER_GRACE_PERIOD_MS, true, undefined, (pid) => backgroundServerPids.set(requestedCwd, pid));
@@ -886,7 +1099,7 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
 
       async function visit(current: string) {
         if (hits.length >= maxResults) return;
-        const entries = await readdir(current, { withFileTypes: true });
+        const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
         for (const entry of entries) {
           if (hits.length >= maxResults) return;
           const fullPath = path.join(current, entry.name);
@@ -1044,6 +1257,9 @@ export function createLocalConnectorProjectAccess(config: LocalConnectorConfig, 
     async writeFile(relativePath, content) {
       return post<ProjectWriteResult>("/write", { path: relativePath, content }, signal);
     },
+    async writeBinary(relativePath, base64) {
+      return post<ProjectWriteResult>("/write-binary", { path: relativePath, base64 }, signal);
+    },
     async runCommand(command, cwd = "", options) {
       return post<ProjectCommandResult>(
         "/run",
@@ -1064,6 +1280,9 @@ export function createLocalConnectorProjectAccess(config: LocalConnectorConfig, 
 
     async deleteRoot() {
       return post<ProjectDeleteResult>("/delete-root", {}, signal);
+    },
+    async stopRootLockOwners(processIds) {
+      return post<ProjectLockStopResult>("/stop-root-locks", { processIds }, signal);
     },
     async validateBrowser(input) {
       return post<BrowserValidationResult>("/validation/browser/run", input as unknown as Record<string, unknown>, signal);

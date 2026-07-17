@@ -27,7 +27,13 @@ export function profileTask(input: TaskContext): TaskProfile {
   if (input.dynamicAssessment) return profileFromDynamicAssessment(input, input.dynamicAssessment, failureHistory);
   const style = /\b(color|colour|blue|green|spacing|css|copy|typo|spelling|darker|lighter|rename|config value)\b/.test(text);
   const locate = /\b(where is|find|locate|defined)\b/.test(text);
-  const cheapOperation = style || locate || /\b(search|index|read|format|prettify|summari[sz]e|spellcheck|list files|what is|what does|simple question|explain this)\b/.test(text);
+  // Ordinary read-only questions are Fast work even when they do not contain one of the old
+  // narrow phrases ("what is", "explain this"). Without this, natural questions such as
+  // "How do I ping an IP address?" fell through to the Builder default. Risk, migrations,
+  // concurrency, cross-layer scope, and failure history are still evaluated below and can
+  // independently escalate a genuinely difficult question.
+  const ordinaryQuestion = /^(?:how\s+(?:do|can|should|would)\s+i\b|how\s+to\b|what\b|why\b|when\b|where\b|which\b|who\b|can\s+you\s+explain\b|could\s+you\s+explain\b|is\s+(?:it|this|that|there)\b|are\s+(?:there|these|those)\b|do\s+i\b|does\s+(?:it|this|that)\b)/.test(text.trim());
+  const cheapOperation = style || locate || ordinaryQuestion || /\b(search|index|read|format|prettify|summari[sz]e|spellcheck|list files|what is|what does|simple question|explain this)\b/.test(text);
   const concurrency = /\b(concurr\w*|race condition|intermittent|los(?:e|es|t) transactions?|deadlock)\b/.test(text);
   const sensitive = /\b(auth\w*|payment|security|data loss|transactions?)\b/.test(riskText);
   const migration = /\b(migrat\w*|redesign\w*|whole design system|multi-service|shared infrastructure|winforms|wpf)\b/.test(text);
@@ -130,7 +136,7 @@ function profileFromDynamicAssessment(input: TaskContext, assessment: DynamicTas
     contextNeed: clamp(assessment.contextRequired),
     reasoningNeed: clamp(Math.max(difficulty, risk, ambiguity)),
     toolUseNeed: assessment.taskType === "explain" ? 0.3 : 0.7,
-    visualNeed: 0,
+    visualNeed: assessment.visualOutcome ? 1 : 0,
     verificationNeed: assessment.securityOrPayment ? 1 : assessment.taskType === "edit" || assessment.taskType === "build" || assessment.taskType === "debug" ? 0.7 : 0.35,
     reversibility: assessment.migration ? 0.2 : assessment.repetitive ? 0.9 : 0.65,
     failureHistory,

@@ -43,6 +43,10 @@ export function computeMissionState(input: {
 export function verificationStatusFrom(verification: ExecutionMissionVerification[]): ExecutionMissionVerificationStatus {
   if (verification.some((item) => item.result === "fail")) return "failed";
   if (verification.some((item) => item.result === "skipped") && verification.some((item) => item.result === "pass")) return "partially-verified";
-  if (verification.some((item) => item.result === "pass")) return "passed";
+  const passing = verification.filter((item) => item.result === "pass");
+  if (passing.some((item) => ["build", "test", "lint", "typecheck", "preview", "command"].includes(item.check_type))) return "passed";
+  // A checklist claim or file read-back proves that work was recorded on disk, not that the
+  // resulting product runs. Preserve that useful evidence without presenting it as full verification.
+  if (passing.length) return "partially-verified";
   return "none";
 }

@@ -22,6 +22,8 @@ export type DynamicTaskAssessment = {
   repetitive: boolean;
   projectCreation: boolean;
   independentReviewNeeded: boolean;
+  /** Semantic classifier signal: success depends on the rendered user-facing experience. */
+  visualOutcome: boolean;
   confidence: number;
   reasons: string[];
   source: "dynamic-fast-classifier" | "deterministic-obvious" | "heuristic-fallback";

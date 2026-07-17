@@ -5,6 +5,7 @@ import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import { routingContext } from "@/lib/ai/routing/request-context";
 import { profileTask } from "@/lib/ai/routing/task-profiler";
 import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
+import { explicitReadOnlyProjectIntent } from "@/lib/mission/classifyFollowUp";
 
 export type MissionIntent = "question" | "edit" | "debug" | "build" | "analyze" | "status" | "undo" | "deploy";
 
@@ -16,7 +17,10 @@ export type IntentClassification = {
   usage?: RuntimeUsageRecord;
 };
 
-const EXPLICIT_ADVICE_PATTERN = /\b(?:only|just)\s+(?:explain|advise|inspect|review|analy[sz]e|tell me|show me|summarize)\b|\b(?:how would|how should|what would be the best way to|what should i)\b/i;
+// Advice/recommendation phrasings and explicit do-not-act qualifiers. A message matching this is a
+// question about a change, not a request to make one — the deterministic mutation guard must stand
+// down and let the read-only classification survive (test B08/B09).
+const EXPLICIT_ADVICE_PATTERN = /\b(?:only|just)\s+(?:explain|advise|inspect|review|analy[sz]e|tell me|show me|summarize)\b|\b(?:how would|how should|what would be the best way to|what should i|would it be better|is it better|would you recommend|do you (?:think|recommend)|should (?:i|we|it)|what do you think|advice only)\b|\b(?:don'?t|do not)\s+(?:change|implement|edit|touch|modify|apply)\b/i;
 const DEBUG_PATTERN = /\b(?:fix|repair|bug|error|crash|broken|exception|stack trace|failing|failed)\b/i;
 const BUILD_PATTERN = /\b(?:create|build|scaffold|generate(?: a new)?|set up|make a new)\b/i;
 const MUTATION_PATTERN =
@@ -29,7 +33,7 @@ const READ_ONLY_PATTERN = /\b(?:can you see|what does|what is this|explain|tell 
 
 export function deterministicMutationIntent(message: string): MissionIntent | undefined {
   const text = message.trim();
-  if (!text || EXPLICIT_ADVICE_PATTERN.test(text)) return undefined;
+  if (!text || explicitReadOnlyProjectIntent(text) || EXPLICIT_ADVICE_PATTERN.test(text)) return undefined;
   if (/\b(?:undo|revert|roll back|rollback)\b/i.test(text)) return "undo";
   if (/\b(?:deploy|production|release|ship it|hosting)\b/i.test(text) && /\b(?:deploy|ship|release|publish|prepare)\b/i.test(text)) return "deploy";
   if (BUILD_PATTERN.test(text)) return "build";
@@ -65,10 +69,11 @@ const CLASSIFY_TOOL: NeutralTool = {
       repetitive: { type: "boolean" },
       project_creation: { type: "boolean" },
       independent_review_needed: { type: "boolean" },
+      visual_outcome: { type: "boolean" },
       confidence: { type: "number", minimum: 0, maximum: 1 },
       routing_reasons: { type: "array", items: { type: "string" }, maxItems: 4 },
     },
-    required: ["intent", "needs_project_inspection", "rationale", "task_type", "affected_scope", "estimated_files", "estimated_subsystems", "difficulty", "uncertainty", "risk", "context_required", "security_or_payment", "migration", "repetitive", "project_creation", "independent_review_needed", "confidence", "routing_reasons"],
+    required: ["intent", "needs_project_inspection", "rationale", "task_type", "affected_scope", "estimated_files", "estimated_subsystems", "difficulty", "uncertainty", "risk", "context_required", "security_or_payment", "migration", "repetitive", "project_creation", "independent_review_needed", "visual_outcome", "confidence", "routing_reasons"],
   },
 };
 
@@ -83,7 +88,10 @@ const CLASSIFY_SYSTEM_PROMPT = [
   "undo: the user wants a previous change reverted.",
   "deploy: the user wants to ship/release/production-prep the project.",
   "Only 'edit', 'debug', 'build', and 'deploy' should ever result in file writes. Everything else must be read-only.",
+  "Set visual_outcome true whenever success depends on what a user sees or experiences in a rendered interface, regardless of the user's exact vocabulary.",
   "Hard rule: if the user asks to add, make, change, update, move, create, fix, implement, allow, enable, replace, or wire project behavior, classify it as edit/build/debug/deploy unless they explicitly ask only for advice or explanation.",
+  "Manual how-to questions describe steps the user will perform themselves and are read-only, even when those steps contain add/create/change verbs.",
+  "Explicit no-change constraints are authoritative: explanation, review, and architecture requests that say not to change files must be question/analyze.",
   "Do not classify a change request as question/analyze just because it mentions inspection, summary, verification, events, or status as part of the requested fix.",
   "Also assess only the CURRENT message's work. Previous project size or a prior model is never a reason to increase difficulty, risk, scope, or context.",
   "Estimate affected files/subsystems from the requested change, not repository size. A new project is not automatically difficult.",
@@ -101,6 +109,17 @@ export async function classifyIntent(input: {
   provider?: ProviderId;
   projectEvidence?: { likelyFiles: string[]; estimatedSubsystems: number; crossLayer: boolean };
 }): Promise<IntentClassification> {
+  const enforcedReadOnlyIntent = explicitReadOnlyProjectIntent(input.message);
+  if (enforcedReadOnlyIntent) {
+    return {
+      intent: enforcedReadOnlyIntent === "question" ? "question" : "analyze",
+      needsProjectInspection: enforcedReadOnlyIntent === "inspection",
+      rationale: enforcedReadOnlyIntent === "inspection"
+        ? "Deterministic read-only guard: inspect relevant project evidence and answer without mutation."
+        : "Deterministic read-only guard: answer the manual guidance request without project mutation.",
+      routingAssessment: deterministicTaskAssessment(input.message, "deterministic-obvious"),
+    };
+  }
   // provider defaults to "openai" — matches this function's behavior before the provider abstraction
   // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
   const provider: ProviderId = input.provider ?? "openai";
@@ -166,6 +185,8 @@ export async function classifyIntent(input: {
 
 export function guessIntentHeuristically(message: string): MissionIntent {
   const text = message.toLowerCase();
+  const enforcedReadOnlyIntent = explicitReadOnlyProjectIntent(message);
+  if (enforcedReadOnlyIntent) return enforcedReadOnlyIntent === "question" ? "question" : "analyze";
   const deterministicIntent = deterministicMutationIntent(message);
   if (deterministicIntent) return deterministicIntent;
   if (/\b(can you see|what does|what is this|explain|tell me about|do you understand)\b/.test(text)) return "question";
@@ -183,7 +204,7 @@ type ParsedClassification = {
   intent: MissionIntent; needs_project_inspection?: boolean; rationale?: string;
   task_type?: DynamicTaskAssessment["taskType"]; affected_scope?: DynamicTaskAssessment["affectedScope"];
   estimated_files?: number; estimated_subsystems?: number; difficulty?: number; uncertainty?: number; risk?: number; context_required?: number;
-  security_or_payment?: boolean; migration?: boolean; repetitive?: boolean; project_creation?: boolean; independent_review_needed?: boolean;
+  security_or_payment?: boolean; migration?: boolean; repetitive?: boolean; project_creation?: boolean; independent_review_needed?: boolean; visual_outcome?: boolean;
   confidence?: number; routing_reasons?: string[];
 };
 
@@ -203,6 +224,7 @@ export function deterministicTaskAssessment(message: string, source: DynamicTask
     repetitive: /\b(?:repeat|same|every|all occurrences?|across these)\b/i.test(message),
     projectCreation: profile.taskType === "project_creation",
     independentReviewNeeded: false,
+    visualOutcome: profile.visualNeed >= 0.35,
     confidence: profile.confidence,
     reasons: profile.reasons,
     source,
@@ -217,7 +239,7 @@ function assessmentFromParsed(parsed: ParsedClassification): DynamicTaskAssessme
     estimatedSubsystems: boundedInteger(parsed.estimated_subsystems, 1, 10, 1),
     difficulty: boundedScore(parsed.difficulty, 0.5), uncertainty: boundedScore(parsed.uncertainty, 0.4), risk: boundedScore(parsed.risk, 0.25),
     contextRequired: boundedScore(parsed.context_required, 0.5), securityOrPayment: Boolean(parsed.security_or_payment), migration: Boolean(parsed.migration),
-    repetitive: Boolean(parsed.repetitive), projectCreation: Boolean(parsed.project_creation), independentReviewNeeded: Boolean(parsed.independent_review_needed),
+    repetitive: Boolean(parsed.repetitive), projectCreation: Boolean(parsed.project_creation), independentReviewNeeded: Boolean(parsed.independent_review_needed), visualOutcome: Boolean(parsed.visual_outcome),
     confidence: boundedScore(parsed.confidence, 0.6), reasons: Array.isArray(parsed.routing_reasons) ? parsed.routing_reasons.map(String).slice(0, 4) : [],
     source: "dynamic-fast-classifier",
   };

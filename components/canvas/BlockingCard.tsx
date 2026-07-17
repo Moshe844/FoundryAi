@@ -22,7 +22,7 @@ export function BlockingCard({
   onApprove: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
 }) {
   if (blocking.kind === "approval") {
-    const deletionPath = blocking.event.details?.actionKind === "delete-project"
+    const deletionPath = blocking.event.details?.actionKind === "delete-project" || blocking.event.details?.actionKind === "delete-project-lock"
       ? String(blocking.event.details?.projectPath || blocking.event.filePath || "the connected project")
       : "";
     return (
@@ -75,7 +75,7 @@ function QuestionCard({
 
   return (
     <section
-      className="canvas-enter my-4 w-full rounded-lg bg-white/[0.045] p-5 shadow-[0_8px_30px_rgba(0,0,0,0.25)]"
+      className="canvas-enter my-4 w-full rounded-lg bg-overlay/[0.045] p-5 shadow-[0_8px_30px_rgba(0,0,0,0.25)]"
       aria-live="assertive"
       role="group"
       aria-label="Foundry is waiting on your decision"
@@ -90,7 +90,7 @@ function QuestionCard({
               role="radio"
               aria-checked="false"
               onClick={() => submit(option)}
-              className="min-h-[44px] w-full rounded-md border border-white/10 bg-white/[0.02] px-3.5 py-2 text-left text-sm font-medium leading-5 text-foundry-ink transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.06]"
+              className="min-h-[44px] w-full rounded-md border border-overlay/10 bg-overlay/[0.02] px-3.5 py-2 text-left text-sm font-medium leading-5 text-foundry-ink transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.06]"
             >
               {option}
             </button>
@@ -108,7 +108,7 @@ function QuestionCard({
           value={custom}
           onChange={(event) => setCustom(event.target.value)}
           placeholder={current.options?.length ? "or tell me something else…" : "Type your answer…"}
-          className="min-h-10 flex-1 rounded-md border border-white/12 bg-black/30 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+          className="min-h-10 flex-1 rounded-md border border-overlay/12 bg-shade/30 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
           aria-label="Custom answer"
         />
         <button

@@ -41,11 +41,20 @@ export type ExecutionMissionFileTouch = {
   verified: boolean;
   status?: "created" | "edited" | "uploaded";
   evidence?: string;
+  /** Complete-file SHA-256 recorded after a verified mission write. */
+  contentHash?: string;
 };
 
 export type ExecutionMissionCommandRun = FactoryCommandEvent & {
   approved_by?: "user" | "system" | "project-scope" | "exact-command" | "auto-safe";
   approval_scope_label: string;
+};
+
+export type DeliveredProjectFile = {
+  path: string;
+  content: string;
+  mediaType: string;
+  size: number;
 };
 
 export type ExecutionMission = {
@@ -66,6 +75,8 @@ export type ExecutionMission = {
   preview_url?: string;
   undo_snapshot?: string;
   summary: string;
+  /** Real project files explicitly delivered in response to a send/share/download request. */
+  delivered_files?: DeliveredProjectFile[];
   parent_mission_id?: string;
   /** Unique server-side execution snapshot for this exact turn, never the reusable project id. */
   control_id?: string;

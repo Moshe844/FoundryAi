@@ -20,7 +20,7 @@ export async function callOpenAIManaged(request: ManagedModelRequest, options: M
     model: request.model,
     ...((request.cacheKey ?? options.workspaceId) ? { prompt_cache_key: request.cacheKey ?? options.workspaceId } : {}),
     ...(request.effort ? { reasoning: { effort: request.effort } } : {}),
-    ...(request.tools ? { tools: translateTools(request.tools, "openai"), tool_choice: translateToolChoice(request.toolChoice, "openai") ?? "auto" } : {}),
+    ...(request.tools?.length ? { tools: translateTools(request.tools, "openai"), tool_choice: translateToolChoice(request.toolChoice, "openai") ?? "auto" } : {}),
     max_output_tokens: request.maxOutputTokens,
     input,
   });
@@ -39,6 +39,7 @@ export async function callOpenAIManaged(request: ManagedModelRequest, options: M
     timeoutMs: options.timeoutMs,
     requestId: request.routing?.requestId,
     routingReason: request.routing ? `Fresh ${request.routing.stage} routing selected ${request.routing.tier} for the current task.` : undefined,
+    budgetManagedExternally: true,
   });
 
   const parsed = parseToolCalls(result.data, "openai");

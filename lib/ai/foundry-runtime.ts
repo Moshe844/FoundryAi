@@ -58,6 +58,12 @@ type ManagedCallOptions = {
   timeoutMs?: number;
   requestId?: string;
   routingReason?: string;
+  /**
+   * The multi-provider dispatcher already reserved the logical call in both the mission ledger and
+   * the daily spend ledger. Provider adapters set this so the legacy direct OpenAI entry point does
+   * not reserve the same paid call a second time or apply its unrelated direct-call ceiling.
+   */
+  budgetManagedExternally?: boolean;
 };
 
 type RuntimePlan = {
@@ -152,21 +158,23 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
     let failureCount = 0;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      let globalReservation;
-      try {
-        globalReservation = reserveGlobalModelSpend(estimatedAttemptCost);
-      } catch (error) {
-        const message = error instanceof DailySpendLimitError ? error.message : "The daily model-spend guard could not reserve this request.";
-        lastData = { error: { message } } as T;
-        failureCount += 1;
-        break;
-      }
-      const guardError = reserveDirectAttempt(requestId, estimatedAttemptCost);
-      if (guardError) {
-        releaseGlobalModelSpend(globalReservation);
-        lastData = { error: { message: guardError } } as T;
-        failureCount += 1;
-        break;
+      let globalReservation: ReturnType<typeof reserveGlobalModelSpend> | undefined;
+      if (!options.budgetManagedExternally) {
+        try {
+          globalReservation = reserveGlobalModelSpend(estimatedAttemptCost);
+        } catch (error) {
+          const message = error instanceof DailySpendLimitError ? error.message : "The daily model-spend guard could not reserve this request.";
+          lastData = { error: { message } } as T;
+          failureCount += 1;
+          break;
+        }
+        const guardError = reserveDirectAttempt(requestId, estimatedAttemptCost);
+        if (guardError) {
+          releaseGlobalModelSpend(globalReservation);
+          lastData = { error: { message: guardError } } as T;
+          failureCount += 1;
+          break;
+        }
       }
       let response: Response;
       let data: T;
@@ -182,7 +190,7 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
         });
         data = (await response.json().catch(() => ({}))) as T;
       } catch (error) {
-        releaseGlobalModelSpend(globalReservation);
+        if (globalReservation) releaseGlobalModelSpend(globalReservation);
         failureCount += 1;
         const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : undefined;
         const networkMessage = error instanceof Error ? `Network request to the AI provider failed: ${error.message}${cause ? ` (${cause})` : ""}` : "Network request to the AI provider failed.";
@@ -212,8 +220,9 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
           rateLimitCount,
           failureCount,
           routingReason: options.routingReason,
+          billable: true,
         });
-        settleGlobalModelSpend(globalReservation, usage.estimatedCostUsd);
+        if (globalReservation) settleGlobalModelSpend(globalReservation, usage.estimatedCostUsd);
         usageRecords.push(usage);
         maybeCacheResponse(cacheKey, data, usage, activeBody);
         return {
@@ -227,7 +236,7 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
 
       // Provider errors normally contain no metered usage. Release the pessimistic reservation;
       // another attempt, when explicitly enabled, must reserve independently.
-      releaseGlobalModelSpend(globalReservation);
+      if (globalReservation) releaseGlobalModelSpend(globalReservation);
 
       if (response.status === 429 || isRateLimitResponse(data)) {
         rateLimitCount += 1;
@@ -265,6 +274,7 @@ export async function callOpenAIResponsesManaged<T extends RuntimeOpenAIResponse
       rateLimitCount,
       failureCount: Math.max(1, failureCount),
       routingReason: options.routingReason,
+      billable: Boolean(lastData.usage),
     });
     usageRecords.push(usage);
 
@@ -295,6 +305,14 @@ export function prepareRequestBody(rawBody: string, plan: RuntimePlan = runtimeP
   const requestedModel = String((parsed as { model?: string }).model ?? "unknown");
   const model = requestedModel;
   (parsed as { model?: string }).model = model;
+
+  // Foundry routes across models whose Responses API capabilities differ. Sampling controls are
+  // optional, do not materially affect the product contract, and some reasoning/Codex models reject
+  // them outright. Normalize them away before the first paid request so capability mismatches never
+  // consume a failed call or depend on a paid retry to repair the request.
+  ["temperature", "top_p", "presence_penalty", "frequency_penalty"].forEach((key) => {
+    delete (parsed as Record<string, unknown>)[key];
+  });
 
   const outputBudget = Math.min(Number((parsed as { max_output_tokens?: number }).max_output_tokens ?? plan.maxOutputTokens), plan.maxOutputTokens);
   (parsed as { max_output_tokens?: number }).max_output_tokens = outputBudget;
@@ -491,9 +509,10 @@ function createUsageRecord(input: {
   rateLimitCount: number;
   failureCount: number;
   routingReason?: string;
+  billable: boolean;
 }): RuntimeUsageRecord {
-  const inputTokens = input.data.usage?.input_tokens ?? estimateTokens(input.body);
-  const outputTokens = input.data.usage?.output_tokens ?? estimateTokens(extractRuntimeText(input.data));
+  const inputTokens = input.data.usage?.input_tokens ?? (input.billable ? estimateTokens(input.body) : 0);
+  const outputTokens = input.data.usage?.output_tokens ?? (input.billable ? estimateTokens(extractRuntimeText(input.data)) : 0);
   const totalTokens = input.data.usage?.total_tokens ?? inputTokens + outputTokens;
   const pricing = pricingForModel(input.model);
   const estimatedCostUsd = ((inputTokens * pricing.input) + (outputTokens * pricing.output)) / 1_000_000;
@@ -508,7 +527,7 @@ function createUsageRecord(input: {
     outputTokens,
     totalTokens,
     estimatedCostUsd: Number(estimatedCostUsd.toFixed(6)),
-    requestCount: 1,
+    requestCount: input.billable ? 1 : 0,
     rateLimitCount: input.rateLimitCount,
     failureCount: input.failureCount,
     contextCompressed: input.contextCompressed,

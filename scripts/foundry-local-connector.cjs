@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 const http = require("node:http");
-const { spawn, execSync } = require("node:child_process");
+const { spawn, spawnSync, execSync } = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
+const crypto = require("node:crypto");
 const { validationCapabilities, runBrowserValidation, compareScreenshots, runAndroidValidation, runIosValidation, runDesktopValidation } = require("./local-agent-validation.cjs");
 
 const initialRoot = process.env.FOUNDRY_CONNECTOR_ROOT || process.argv[2] || "";
@@ -43,6 +44,59 @@ function killProcessTree(pid) {
   }
 }
 const previewProcesses = new Map();
+const previewRegistryDirectory = path.join(os.tmpdir(), "foundry-local-preview-records-v1");
+
+function previewRecordPath(previewPath) {
+  const identity = process.platform === "win32" ? path.resolve(previewPath).toLowerCase() : path.resolve(previewPath);
+  return path.join(previewRegistryDirectory, `${crypto.createHash("sha256").update(identity).digest("hex")}.json`);
+}
+
+function persistPreviewRecord(previewPath, preview) {
+  try {
+    fs.mkdirSync(previewRegistryDirectory, { recursive: true });
+    fs.writeFileSync(previewRecordPath(previewPath), JSON.stringify({ previewPath: path.resolve(previewPath), ...preview, recordedAt: Date.now() }), "utf8");
+  } catch {
+    // Runtime deletion still has in-memory ownership; persistence only adds restart recovery.
+  }
+}
+
+function forgetPreviewRecord(previewPath) {
+  try {
+    fs.rmSync(previewRecordPath(previewPath), { force: true });
+  } catch {
+    // A missing/stale record is already forgotten.
+  }
+}
+
+function restorePreviewRecords() {
+  let records = [];
+  try {
+    records = fs.readdirSync(previewRegistryDirectory).filter((name) => name.endsWith(".json"));
+  } catch {
+    return;
+  }
+  for (const recordName of records) {
+    const recordPath = path.join(previewRegistryDirectory, recordName);
+    try {
+      const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+      if (!record.previewPath || !record.pid || !record.port || Date.now() - Number(record.recordedAt || 0) > 86_400_000 || !processIsRunning(record.pid)) {
+        fs.rmSync(recordPath, { force: true });
+        continue;
+      }
+      previewProcesses.set(path.resolve(record.previewPath), {
+        port: Number(record.port),
+        pid: Number(record.pid),
+        ownershipToken: record.ownershipToken,
+        kind: record.kind === "app" ? "app" : "static",
+        previewUrl: String(record.previewUrl || `http://127.0.0.1:${record.port}`),
+      });
+    } catch {
+      try { fs.rmSync(recordPath, { force: true }); } catch { /* Ignore an unreadable stale record. */ }
+    }
+  }
+}
+
+restorePreviewRecords();
 const excludedDirPattern = /(^|\/)(node_modules|\.git|\.next|dist|build|coverage|target|bin|obj)(\/|$)/i;
 const destructiveCommandPatterns = [
   /\brm\s+-rf\s+(\/|~|\.\s*$)/i,
@@ -400,7 +454,13 @@ async function readFile(root, relativePath, offsetBytes = 0, limitBytes = 20_000
   const totalBytes = Buffer.byteLength(raw, "utf8");
   const offset = Math.max(0, Number(offsetBytes) || 0);
   const limit = Math.max(1, Math.min(Number(limitBytes) || 20_000, maxReadBytes));
-  return { exists: true, content: raw.slice(offset, offset + limit), truncated: offset + limit < raw.length || offset > 0, totalBytes };
+  return {
+    exists: true,
+    content: raw.slice(offset, offset + limit),
+    truncated: offset + limit < raw.length || offset > 0,
+    totalBytes,
+    contentHash: crypto.createHash("sha256").update(raw).digest("hex"),
+  };
 }
 
 async function writeFile(root, relativePath, content) {
@@ -429,6 +489,28 @@ async function writeFile(root, relativePath, content) {
   };
 }
 
+async function writeBinary(root, relativePath, base64) {
+  const fullPath = resolveContained(root, relativePath);
+  if (!fullPath) return { existedBefore: false, verified: false, contentChanged: false, reason: "Refusing to write outside the connected folder." };
+  const existedBefore = fs.existsSync(fullPath);
+  const before = existedBefore ? await fsp.readFile(fullPath).catch(() => Buffer.alloc(0)) : Buffer.alloc(0);
+  const expected = Buffer.from(String(base64 || ""), "base64");
+  if (!expected.length) return { existedBefore, verified: false, contentChanged: false, reason: "The attached asset contained no decodable bytes." };
+  await fsp.mkdir(path.dirname(fullPath), { recursive: true });
+  await fsp.writeFile(fullPath, expected);
+  const actual = await fsp.readFile(fullPath);
+  const stats = await fsp.stat(fullPath);
+  const verified = actual.equals(expected);
+  return {
+    existedBefore,
+    verified,
+    contentChanged: !existedBefore || !before.equals(actual),
+    bytes: stats.size,
+    modifiedAt: stats.mtime.toISOString(),
+    reason: verified ? undefined : "Read-back bytes did not match the attached asset.",
+  };
+}
+
 async function deleteProjectRoot(rawRoot) {
   const root = normalizeRoot(rawRoot);
   const home = normalizeRoot(os.homedir());
@@ -441,14 +523,69 @@ async function deleteProjectRoot(rawRoot) {
     approvedRoots.delete(root);
     return { existed: false, verified: true };
   }
-  try {
-    await fsp.rm(root, { recursive: true, force: false });
-    const verified = !fs.existsSync(root);
-    if (verified) approvedRoots.delete(root);
-    return { existed: true, verified, reason: verified ? undefined : "Project folder still exists after deletion." };
-  } catch (error) {
-    return { existed: true, verified: false, reason: error instanceof Error ? error.message : "Project deletion failed." };
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await stopPreviewsForRoot(root);
+    try {
+      await fsp.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      if (!fs.existsSync(root)) {
+        approvedRoots.delete(root);
+        return { existed: true, verified: true };
+      }
+      lastError = new Error("Project folder still exists after deletion.");
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < 1) await new Promise((resolve) => setTimeout(resolve, 150));
   }
+  const lockOwners = findWindowsDirectoryLockOwners(root);
+  const lockMessage = lockOwners.length
+    ? ` The folder is held open by ${lockOwners.map((owner) => `${owner.name} (PID ${owner.pid})`).join(", ")}. Save any work, close ${lockOwners.map((owner) => owner.name).join(" and ")}, then retry deletion. Foundry did not force-close an external app because that could discard unsaved work.`
+    : " Close any terminal, editor, or file manager using this folder, then retry deletion.";
+  const failure = lastError instanceof Error ? lastError.message : "Project deletion failed after releasing Foundry-owned project processes and retrying.";
+  return { existed: true, verified: false, reason: `${failure}${lockMessage}`, lockOwners };
+}
+
+function findWindowsDirectoryLockOwners(root) {
+  if (process.platform !== "win32") return [];
+  const script = path.join(__dirname, "find-windows-process-cwds.ps1");
+  try {
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Path", root], {
+      encoding: "utf8",
+      timeout: 8_000,
+      windowsHide: true,
+    });
+    if (result.status !== 0 || !result.stdout.trim()) return [];
+    const parsed = JSON.parse(result.stdout.trim());
+    return (Array.isArray(parsed) ? parsed : [parsed]).filter((owner) => Number(owner?.pid) > 0 && owner?.name && Number(owner.pid) !== process.pid);
+  } catch {
+    return [];
+  }
+}
+
+async function stopWindowsDirectoryLockOwners(root, processIds) {
+  const requested = new Set((Array.isArray(processIds) ? processIds : []).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0));
+  const currentOwners = findWindowsDirectoryLockOwners(root);
+  const targets = currentOwners.filter((owner) => requested.has(Number(owner.pid)) && Number(owner.pid) !== process.pid);
+  if (!targets.length) return { verified: false, stopped: [], reason: "The approved lock-owning processes are no longer attached to this project." };
+  const protectedNames = new Set(["system", "registry", "csrss", "wininit", "services", "lsass", "explorer"]);
+  if (targets.some((owner) => protectedNames.has(String(owner.name).toLowerCase()))) {
+    return { verified: false, stopped: [], reason: "Foundry refuses to force-close a protected Windows process." };
+  }
+  const stopped = [];
+  for (const owner of targets) {
+    try {
+      killProcessTree(Number(owner.pid));
+      stopped.push(owner);
+    } catch {
+      // Verify remaining owners below.
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const remaining = findWindowsDirectoryLockOwners(root).filter((owner) => requested.has(Number(owner.pid)));
+  return remaining.length
+    ? { verified: false, stopped, reason: `Could not stop ${remaining.map((owner) => `${owner.name} (PID ${owner.pid})`).join(", ")}.` }
+    : { verified: true, stopped };
 }
 
 async function listProjectTree(root, maxEntries = 2000) {
@@ -487,14 +624,35 @@ async function listProjectTree(root, maxEntries = 2000) {
   return { entries, truncated };
 }
 
-function isPortAvailable(port) {
+function canBindPreviewHost(port, host) {
   return new Promise((resolve) => {
     const net = require("node:net");
     const probe = net.createServer();
-    probe.once("error", () => resolve(false));
+    probe.once("error", (error) => resolve(error && (error.code === "EAFNOSUPPORT" || error.code === "EADDRNOTAVAIL")));
     probe.once("listening", () => probe.close(() => resolve(true)));
-    probe.listen(port, "127.0.0.1");
+    probe.listen(port, host);
   });
+}
+
+async function isPortAvailable(port) {
+  // `localhost` may resolve to ::1 in Chromium while a preview server binds only 127.0.0.1. A port
+  // is owned only when it is free on both loopback families; otherwise two unrelated projects can
+  // appear to share one URL and the browser may render whichever family it resolves first.
+  const activeListener = async (host) => new Promise((resolve) => {
+    const net = require("node:net");
+    const socket = net.createConnection({ port, host });
+    const finish = (listening) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.setTimeout(250);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+  if ((await activeListener("127.0.0.1")) || (await activeListener("::1"))) return false;
+  return (await canBindPreviewHost(port, "127.0.0.1")) && (await canBindPreviewHost(port, "::1"));
 }
 
 async function findPreviewPort() {
@@ -529,13 +687,26 @@ function probeHttpReady(port, attempts = 6, delayMs = 400) {
   });
 }
 
-async function hasRunnableDevScript(fullPath) {
+async function detectedPreviewCommand(fullPath) {
   const pkgPath = path.join(fullPath, "package.json");
-  if (!fs.existsSync(pkgPath)) return false;
+  if (!fs.existsSync(pkgPath)) return undefined;
   try {
     const pkg = JSON.parse(await fsp.readFile(pkgPath, "utf8"));
     const scripts = pkg.scripts || {};
-    return Boolean(scripts.dev || scripts.start || scripts.preview);
+    if (scripts.dev) return "npm run dev";
+    if (scripts.start) return "npm start";
+    if (scripts.preview) return "npm run preview";
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function processIsRunning(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
   } catch {
     return false;
   }
@@ -556,34 +727,64 @@ async function startPreview(root, relativePath, command) {
   const key = fullPath;
   const existing = previewProcesses.get(key);
   if (existing) {
+    if (!processIsRunning(existing.pid)) {
+      previewProcesses.delete(key);
+      forgetPreviewRecord(key);
+    } else {
     const ready = await probeHttpReady(existing.port, 2, 300);
+    const previewUrl = existing.previewUrl || `http://127.0.0.1:${existing.port}`;
     return ready
-      ? { state: "ready", previewUrl: `http://localhost:${existing.port}` }
-      : { state: "starting", previewUrl: `http://localhost:${existing.port}`, reason: "The dev server is still starting up." };
+      ? { state: "ready", previewUrl }
+      : { state: "starting", previewUrl, reason: "The dev server is still starting up." };
+    }
   }
 
-  const canRunDev = Boolean(command) || (await hasRunnableDevScript(fullPath));
-  if (!canRunDev) {
+  const detectedCommand = command || await detectedPreviewCommand(fullPath);
+  if (!detectedCommand) {
     const entryFile = findEntryHtmlFile(fullPath);
     if (!entryFile) return { state: "error", reason: "No dev script and no HTML entry file were found, so there is nothing to preview yet." };
-    return { state: "ready", reason: `No dev server needed — confirmed ${entryFile} exists on disk. Open it directly.` };
+    const port = await findPreviewPort();
+    const ownershipToken = crypto.randomBytes(16).toString("hex");
+    const staticServer = path.join(__dirname, "foundry-static-preview.cjs");
+    const child = spawn(process.execPath, [staticServer, fullPath, String(port), ownershipToken], {
+      cwd: fullPath,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    if (!child.pid) return { state: "error", reason: "Could not start the owned static preview server." };
+    const previewUrl = `http://127.0.0.1:${port}`;
+    previewProcesses.set(key, { port, pid: child.pid, ownershipToken, kind: "static", previewUrl });
+    persistPreviewRecord(key, { port, pid: child.pid, ownershipToken, kind: "static", previewUrl });
+    const ready = await probeHttpReady(port, 6, 250);
+    if (!ready) {
+      return { state: "starting", previewUrl, port, reason: `The static preview for ${entryFile} is still starting.` };
+    }
+    return { state: "ready", previewUrl, port, ownershipToken };
   }
 
   const port = await findPreviewPort();
-  const devCommand = command || "npm run dev";
+  const devCommand = detectedCommand;
   let spawnFailed = false;
-  const child = spawn(devCommand, ["--", "-p", String(port)], { cwd: fullPath, shell: true, detached: true, stdio: "ignore", windowsHide: true });
+  const previewExecutable = process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : devCommand;
+  const previewArguments = process.platform === "win32"
+    ? ["/d", "/s", "/c", `${devCommand} -- -p ${port}`]
+    : ["--", "-p", String(port)];
+  const child = spawn(previewExecutable, previewArguments, { cwd: fullPath, shell: false, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, PORT: String(port) } });
   child.once("error", () => {
     spawnFailed = true;
   });
   child.unref();
   if (spawnFailed) return { state: "error", reason: "Could not start the dev server process." };
-  previewProcesses.set(key, { port, pid: child.pid });
+  const previewUrl = `http://127.0.0.1:${port}`;
+  previewProcesses.set(key, { port, pid: child.pid, kind: "app", previewUrl });
+  persistPreviewRecord(key, { port, pid: child.pid, kind: "app", previewUrl });
   const ready = await probeHttpReady(port, 6, 400);
   if (!ready) {
-    return { state: "starting", previewUrl: `http://localhost:${port}`, port, reason: "The dev server was started but has not responded yet — it may still be compiling." };
+    return { state: "starting", previewUrl, port, reason: "The dev server was started but has not responded yet — it may still be compiling." };
   }
-  return { state: "ready", previewUrl: `http://localhost:${port}`, port };
+  return { state: "ready", previewUrl, port };
 }
 
 function stopPreview(root, relativePath) {
@@ -591,13 +792,42 @@ function stopPreview(root, relativePath) {
   const key = fullPath || relativePath;
   const existing = previewProcesses.get(key);
   if (!existing) return { state: "unavailable" };
+  if (!processIsRunning(existing.pid)) {
+    previewProcesses.delete(key);
+    forgetPreviewRecord(key);
+    return { state: "error", reason: "The project preview process exited before its HTTP server became ready." };
+  }
   try {
-    if (existing.pid) process.kill(existing.pid);
+    if (existing.pid) killProcessTree(existing.pid);
   } catch {
     // Process may have already exited.
   }
   previewProcesses.delete(key);
+  forgetPreviewRecord(key);
   return { state: "unavailable" };
+}
+
+async function stopPreviewsForRoot(root) {
+  const canonicalRoot = normalizeRoot(root);
+  const stoppedPids = [];
+  for (const [previewPath, preview] of previewProcesses.entries()) {
+    const relative = path.relative(canonicalRoot, path.resolve(previewPath));
+    const belongsToRoot = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    if (!belongsToRoot) continue;
+    if (preview.pid && processIsRunning(preview.pid)) {
+      killProcessTree(preview.pid);
+      stoppedPids.push(preview.pid);
+    }
+    previewProcesses.delete(previewPath);
+    forgetPreviewRecord(previewPath);
+  }
+
+  // taskkill is synchronous, but Windows can retain a process working-directory handle for a
+  // brief moment after the process exits. Wait for Foundry-owned processes to be gone before rm.
+  for (let attempt = 0; attempt < 20 && stoppedPids.some(processIsRunning); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return stoppedPids.length;
 }
 
 async function previewStatus(root, relativePath) {
@@ -606,9 +836,10 @@ async function previewStatus(root, relativePath) {
   const existing = previewProcesses.get(key);
   if (!existing) return { state: "unavailable" };
   const ready = await probeHttpReady(existing.port, 1, 0);
+  const previewUrl = existing.previewUrl || `http://127.0.0.1:${existing.port}`;
   return ready
-    ? { state: "ready", previewUrl: `http://localhost:${existing.port}` }
-    : { state: "starting", previewUrl: `http://localhost:${existing.port}`, reason: "The dev server has not responded to a health check yet." };
+    ? { state: "ready", previewUrl }
+    : { state: "starting", previewUrl, reason: "The dev server has not responded to a health check yet." };
 }
 
 async function searchFiles(root, query, maxResults = 20) {
@@ -648,12 +879,31 @@ function normalizeCommandText(command) {
   return String(command || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function normalizeCommandForExecution(command, platform = process.platform) {
+  let normalized = String(command || "").trim();
+  if (platform !== "win32") return normalized;
+  const outputPreviewSuffix = /\s+(?:2>&1\s*)?\|\s*(?:tail|head)\s+(?:(?:-n|--lines)\s+)?-?\d+\s*$/i;
+  while (outputPreviewSuffix.test(normalized)) normalized = normalized.replace(outputPreviewSuffix, "").trim();
+  return normalized;
+}
+
+function leadingPosixMkdir(command) {
+  const chainIndex = command.indexOf("&&");
+  const mkdirCommand = (chainIndex >= 0 ? command.slice(0, chainIndex) : command).trim();
+  const remainder = chainIndex >= 0 ? command.slice(chainIndex + 2).trim() : "";
+  const tokens = tokenizeCommand(mkdirCommand);
+  if (tokens.length < 3 || tokens[0].toLowerCase() !== "mkdir" || tokens[1] !== "-p") return undefined;
+  const directories = tokens.slice(2);
+  if (directories.some((entry) => !entry || !/^[A-Za-z0-9_ .\/\\:-]+$/.test(entry) || /[&|<>;%!^]/.test(entry))) return undefined;
+  return { directories, remainder };
+}
+
 // Mirror of lib/ai/mission/project-access.ts::commandPermissionIdentity — kept in sync by hand (standalone
 // process, no TS import). Canonicalizes risk-neutral install variations so an approval for
 // `npm install dayjs --save` also covers `npm install dayjs` / `npm i dayjs`, and a denial never loops.
 // Different packages, `--global`, `--force`, and other command families stay distinct.
 function commandPermissionIdentity(command) {
-  let text = normalizeCommandText(command);
+  let text = normalizeCommandText(normalizeCommandForExecution(command));
   if (/\b(npm|pnpm|yarn|bun)(\.cmd)?\s+(?:install|i|add)\b/.test(text)) {
     text = text.replace(/\b(npm|pnpm|bun)(\.cmd)?\s+i\b/g, "$1 install");
     text = text.replace(/\s+(?:--save(?:-dev|-prod|-exact|-optional|-peer)?|--no-save|--legacy-peer-deps|-[sdebop])\b/g, "");
@@ -999,6 +1249,8 @@ async function runCommandWithShellFallback(command, cwd, timeoutMs, keepAliveOnT
 }
 
 function runCommand(root, command, cwd = "", approvedCommands = [], approvedCategories = [], signal) {
+  command = normalizeCommandForExecution(command);
+  const portableMkdir = process.platform === "win32" ? leadingPosixMkdir(command) : undefined;
   const requestedCwd = resolveContained(root, cwd);
   if (!requestedCwd) return Promise.resolve({ exitCode: null, stdout: "", stderr: "Refusing to run outside the connected folder.", durationMs: 0, timedOut: false, skipped: "outside-root" });
   const dependencyPreflight = dependencyInstallAlreadySatisfied(command, requestedCwd);
@@ -1018,6 +1270,22 @@ function runCommand(root, command, cwd = "", approvedCommands = [], approvedCate
       reason: permission.reason,
       category: permission.category,
     });
+  }
+  if (portableMkdir) {
+    try {
+      for (const directory of portableMkdir.directories) {
+        const target = path.resolve(requestedCwd, directory);
+        const relative = path.relative(path.resolve(root), target);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) {
+          return Promise.resolve({ exitCode: null, stdout: "", stderr: "Refusing to create a directory outside the connected folder.", durationMs: 0, timedOut: false, skipped: "outside-root" });
+        }
+        fs.mkdirSync(target, { recursive: true });
+      }
+      command = portableMkdir.remainder;
+      if (!command) return Promise.resolve({ exitCode: 0, stdout: `Created ${portableMkdir.directories.join(", ")}.`, stderr: "", durationMs: 0, timedOut: false });
+    } catch (error) {
+      return Promise.resolve({ exitCode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), durationMs: 0, timedOut: false });
+    }
   }
   if (isLongRunningServerCommand(command)) {
     return runCommandWithShellFallback(command, requestedCwd, devServerGracePeriodMs, true, signal).then((result) => {
@@ -1064,9 +1332,17 @@ const server = http.createServer(async (req, res) => {
       if (!requireApprovedRoot(res, body.root)) return;
       return send(res, 200, await writeFile(body.root, body.path || "", body.content || ""));
     }
+    if (url.pathname === "/write-binary") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await writeBinary(body.root, body.path || "", body.base64 || ""));
+    }
     if (url.pathname === "/delete-root") {
       if (!requireApprovedRoot(res, body.root)) return;
       return send(res, 200, await deleteProjectRoot(body.root));
+    }
+    if (url.pathname === "/stop-root-locks") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await stopWindowsDirectoryLockOwners(normalizeRoot(body.root), body.processIds));
     }
     if (url.pathname === "/search") {
       if (!requireApprovedRoot(res, body.root)) return;

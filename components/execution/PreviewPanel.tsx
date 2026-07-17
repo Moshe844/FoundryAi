@@ -12,15 +12,17 @@ import type { FactoryProjectResult } from "@/lib/factory/types";
 export function PreviewPanel({ execution, fill = false }: { execution: FactoryProjectResult; fill?: boolean }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const [viewport, setViewport] = useState<"desktop" | "tablet" | "mobile">("desktop");
-  const previousUrlRef = useRef(execution.previewUrl);
+  const latestReadyEventId = [...(execution.timeline ?? [])].reverse().find((event) => event.kind === "preview" && event.status === "completed" && /preview ready/i.test(event.title))?.id ?? "";
+  const previewGeneration = `${execution.previewUrl ?? ""}|${latestReadyEventId}`;
+  const previousGenerationRef = useRef(previewGeneration);
   const wrap = fill ? "" : "mt-4";
 
   useEffect(() => {
-    if (execution.previewUrl && execution.previewUrl !== previousUrlRef.current) {
-      previousUrlRef.current = execution.previewUrl;
+    if (execution.previewUrl && execution.previewState === "ready" && previewGeneration !== previousGenerationRef.current) {
       setRefreshKey((current) => current + 1);
     }
-  }, [execution.previewUrl]);
+    previousGenerationRef.current = previewGeneration;
+  }, [execution.previewState, execution.previewUrl, previewGeneration]);
 
   if (execution.previewState === "starting") {
     return (
@@ -41,7 +43,7 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
 
   if (!execution.previewState || execution.previewState === "unavailable") {
     return execution.previewReason ? (
-      <p className={`${wrap} rounded-md border border-dashed border-white/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>Preview: {execution.previewReason}</p>
+      <p className={`${wrap} rounded-md border border-dashed border-overlay/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>Preview: {execution.previewReason}</p>
     ) : null;
   }
 
@@ -56,43 +58,52 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
   if (execution.previewUrl) {
     const frameWidth = viewport === "mobile" ? "390px" : viewport === "tablet" ? "768px" : "100%";
     return (
-      <div className={`${fill ? "flex min-h-0 flex-1 flex-col" : "mt-4 overflow-hidden rounded-md border border-white/10"}`}>
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
+      <div className={`${fill ? "flex min-h-0 flex-1 flex-col" : "mt-4 overflow-hidden rounded-md border border-overlay/10"}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-overlay/10 bg-shade/20 px-3 py-1.5">
           <div className="flex min-w-0 items-center gap-2">
             <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">{execution.previewPlatform === "game" ? "Playable Preview" : "Local Preview"}</span>
-            <a href={execution.previewUrl} target="_blank" rel="noreferrer" title={`Open ${execution.previewUrl}`} className="min-w-0 truncate font-mono text-[10.5px] text-foundry-subtle underline decoration-white/20 underline-offset-2 transition hover:text-foundry-ink">{execution.previewUrl}</a>
+            <a href={execution.previewUrl} target="_blank" rel="noreferrer" title={`Open ${execution.previewUrl}`} className="min-w-0 truncate font-mono text-[10.5px] text-foundry-subtle underline decoration-overlay/20 underline-offset-2 transition hover:text-foundry-ink">{execution.previewUrl}</a>
           </div>
           <div className="flex items-center gap-1">
             {([['desktop', Monitor], ['tablet', Tablet], ['mobile', Smartphone]] as const).map(([size, Icon]) => (
-              <button key={size} type="button" title={`${size} preview`} onClick={() => setViewport(size)} className={`rounded p-1.5 transition ${viewport === size ? "bg-foundry-teal/[0.16] text-foundry-teal" : "text-foundry-subtle hover:bg-white/[0.06] hover:text-foundry-ink"}`}>
+              <button key={size} type="button" title={`${size} preview`} onClick={() => setViewport(size)} className={`rounded p-1.5 transition ${viewport === size ? "bg-foundry-teal/[0.16] text-foundry-teal" : "text-foundry-subtle hover:bg-overlay/[0.06] hover:text-foundry-ink"}`}>
                 <Icon size={13} />
               </button>
             ))}
-            <button type="button" title="Reload preview" onClick={() => setRefreshKey((current) => current + 1)} className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"><RefreshCw size={13} /></button>
-            <button type="button" title="Open preview in a new tab" onClick={() => window.open(execution.previewUrl, "_blank", "noopener,noreferrer")} className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"><ExternalLink size={13} /></button>
+            <button type="button" title="Reload preview" onClick={() => setRefreshKey((current) => current + 1)} className="rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"><RefreshCw size={13} /></button>
+            <button type="button" title="Open preview in a new tab" onClick={() => window.open(execution.previewUrl, "_blank", "noopener,noreferrer")} className="rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"><ExternalLink size={13} /></button>
           </div>
         </div>
-        <div className={`${fill ? "min-h-0 flex-1" : "h-72"} overflow-auto bg-[#050707] p-2`}>
+        <div className={`${fill ? "min-h-0 flex-1" : "h-72"} overflow-auto bg-foundry-bg p-2`}>
           <iframe key={refreshKey} src={execution.previewUrl} className="mx-auto h-full max-w-full border-0 bg-white transition-[width] duration-200" style={{ width: frameWidth }} title="Interactive live preview" />
         </div>
       </div>
     );
   }
 
-  return <p className={`${wrap} rounded-md border border-dashed border-white/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>{execution.previewReason || "Open index.html from the project folder to preview this static project."}</p>;
+  return <p className={`${wrap} rounded-md border border-dashed border-overlay/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>{execution.previewReason || "Open index.html from the project folder to preview this static project."}</p>;
 }
 
 export function PreviewCompletionCard({ execution }: { execution: FactoryProjectResult }) {
   const [launchState, setLaunchState] = useState<"idle" | "launching" | "launched" | "error">("idle");
+  const [launchError, setLaunchError] = useState("");
   const platform = execution.previewPlatform ?? "web";
   const ready = execution.previewState === "ready" || execution.previewState === "starting";
   const label = previewActionLabel(platform);
   async function launchDesktop() {
     setLaunchState("launching");
+    setLaunchError("");
     try {
-      const response = await fetch("/api/factory/preview", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: execution.projectId, action: "launch-desktop" }) });
-      setLaunchState(response.ok ? "launched" : "error");
-    } catch {
+      const response = await fetch("/api/factory/preview", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: execution.projectId, projectPath: execution.projectPath, action: "launch-desktop" }) });
+      const result = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (response.ok && result.ok) {
+        setLaunchState("launched");
+      } else {
+        setLaunchError(result.error || "Windows did not accept the desktop launch request.");
+        setLaunchState("error");
+      }
+    } catch (error) {
+      setLaunchError(error instanceof Error ? error.message : "Foundry could not reach its desktop launcher.");
       setLaunchState("error");
     }
   }
@@ -105,7 +116,7 @@ export function PreviewCompletionCard({ execution }: { execution: FactoryProject
         </div>
         {execution.previewUrl ? <a href={execution.previewUrl} target="_blank" rel="noreferrer" className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22]"><ExternalLink size={14} />{label}</a> : platform === "desktop" && ready ? <button type="button" onClick={launchDesktop} disabled={launchState === "launching"} className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:opacity-60"><Play size={14} />{launchState === "launching" ? "Launching..." : launchState === "launched" ? "App launched" : "Launch desktop app"}</button> : null}
       </div>
-      {launchState === "error" ? <p className="mt-2 text-xs text-foundry-amber">The desktop app could not be launched. Rebuild it and try again.</p> : null}
+      {launchState === "error" ? <p className="mt-2 text-xs text-foundry-amber">Desktop launch failed: {launchError}</p> : null}
       {execution.artifact ? (
         <div className="mt-3 border-t border-foundry-teal/20 pt-3">
           <div className="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
@@ -158,13 +169,13 @@ export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = 
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-2">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-overlay/10 bg-shade/20 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">
             {execution?.previewPlatform === "api" ? "API Playground" : execution?.previewPlatform === "game" ? "Playable Preview" : "Local Interactive Preview"}
           </span>
           {execution?.previewState === "ready" ? <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-foundry-teal" /> : null}
-          {previewUrl ? <a href={previewUrl} target="_blank" rel="noreferrer" className="min-w-0 truncate font-mono text-[10px] text-foundry-subtle underline decoration-white/20 underline-offset-2 transition hover:text-foundry-ink" title={`Open ${previewUrl}`}>{previewUrl}</a> : null}
+          {previewUrl ? <a href={previewUrl} target="_blank" rel="noreferrer" className="min-w-0 truncate font-mono text-[10px] text-foundry-subtle underline decoration-overlay/20 underline-offset-2 transition hover:text-foundry-ink" title={`Open ${previewUrl}`}>{previewUrl}</a> : null}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {canPopOut && previewUrl ? (
@@ -174,7 +185,7 @@ export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = 
             <button
               type="button"
               onClick={onToggleFullScreen}
-              className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"
+              className="rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"
               title={fullScreen ? "Exit full-screen preview" : "Full-screen preview"}
             >
               {fullScreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
@@ -183,7 +194,7 @@ export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = 
           <button
             type="button"
             onClick={onCollapse}
-            className="rounded p-1.5 text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"
+            className="rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"
             title="Collapse preview"
           >
             <PanelRightClose size={14} />
@@ -230,7 +241,7 @@ export function ApiPlayground({ baseUrl, fill = false }: { baseUrl: string; fill
     <div className="grid gap-2 p-3">
       <div className="flex gap-2">
         <select
-          className="rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-xs font-bold text-foundry-ink"
+          className="rounded-md border border-overlay/10 bg-shade/20 px-2 py-1.5 text-xs font-bold text-foundry-ink"
           value={method}
           onChange={(event) => setMethod(event.target.value)}
         >
@@ -239,7 +250,7 @@ export function ApiPlayground({ baseUrl, fill = false }: { baseUrl: string; fill
           ))}
         </select>
         <input
-          className="flex-1 rounded-md border border-white/10 bg-black/20 px-2 py-1.5 font-mono text-xs text-foundry-ink outline-none focus:border-foundry-teal/40"
+          className="flex-1 rounded-md border border-overlay/10 bg-shade/20 px-2 py-1.5 font-mono text-xs text-foundry-ink outline-none focus:border-foundry-teal/40"
           value={path}
           onChange={(event) => setPath(event.target.value)}
           placeholder="/api/resource"
@@ -255,7 +266,7 @@ export function ApiPlayground({ baseUrl, fill = false }: { baseUrl: string; fill
       </div>
       {method !== "GET" && method !== "HEAD" ? (
         <textarea
-          className="min-h-[3rem] resize-y rounded-md border border-white/10 bg-black/20 p-2 font-mono text-xs text-foundry-ink outline-none focus:border-foundry-teal/40"
+          className="min-h-[3rem] resize-y rounded-md border border-overlay/10 bg-shade/20 p-2 font-mono text-xs text-foundry-ink outline-none focus:border-foundry-teal/40"
           value={body}
           onChange={(event) => setBody(event.target.value)}
           placeholder='{"key": "value"}'
@@ -263,7 +274,7 @@ export function ApiPlayground({ baseUrl, fill = false }: { baseUrl: string; fill
       ) : null}
       {error ? <p className="text-xs leading-5 text-red-300">{error}</p> : null}
       {response ? (
-        <div className="rounded-md border border-white/10 bg-black/30 p-2">
+        <div className="rounded-md border border-overlay/10 bg-shade/30 p-2">
           <p className="font-mono text-[11px] font-bold text-foundry-teal">Status: {response.status}</p>
           <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-foundry-muted">{response.body}</pre>
         </div>
@@ -274,8 +285,8 @@ export function ApiPlayground({ baseUrl, fill = false }: { baseUrl: string; fill
   if (fill) return fields;
 
   return (
-    <div className="mt-4 overflow-hidden rounded-md border border-white/10">
-      <div className="flex items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
+    <div className="mt-4 overflow-hidden rounded-md border border-overlay/10">
+      <div className="flex items-center justify-between gap-2 border-b border-overlay/10 bg-shade/20 px-3 py-1.5">
         <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">API Playground</span>
         <span className="truncate font-mono text-[10.5px] text-foundry-subtle">{baseUrl}</span>
       </div>

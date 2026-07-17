@@ -4,6 +4,7 @@
 import {
   AppWindow,
   ArrowRight,
+  ChevronDown,
   BrainCircuit,
   Boxes,
   CheckCircle2,
@@ -15,7 +16,9 @@ import {
   Globe2,
   History,
   LayoutDashboard,
+  File,
   Pencil,
+  Paperclip,
   Settings,
   ShoppingBag,
   Smartphone,
@@ -23,19 +26,23 @@ import {
   Store,
   Trash2,
   Webhook,
+  X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { strFromU8, unzipSync } from "fflate";
 import type { MissionState } from "@/lib/mission-engine";
 import { deriveMissionDisplayStatus, isSoftwareProjectMission, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
 import { continueOrResumeMission, recentProjects } from "@/lib/discovery/personalization";
-import { runDiscoveryEngine, seedDiscovery } from "@/lib/discovery/engine";
+import { runDiscoveryEngine } from "@/lib/discovery/engine";
 import { FALLBACK_STACK_OPTIONS, type StackOption } from "@/lib/ai/project-discovery-llm";
-import { genericHistoryRecommendation, type HistoryRecommendation, type HistorySummaryItem } from "@/lib/discovery/history-recommendations";
+import { platformStackOptionsForProject, reconcilePlatformStackOptions } from "@/lib/discovery/platform-stack-policy";
+import { genericHistoryRecommendation, type HistoryRecommendation } from "@/lib/discovery/history-recommendations";
 import { deriveQuestionsAndAssumptions, discoverProject } from "@/lib/ai/project-discovery";
 import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
+import { generatedWorkspaceForMission } from "@/lib/factory/live-project";
 import { capabilityLevelForStackChoice, unsupportedCreationMessage } from "@/lib/factory/language-adapters";
 import type { StackProfile } from "@/lib/factory/language-adapters";
 import type { FactoryExistingProjectRequest, FactoryFileReadResult, FactoryJournalEntry, FactoryProjectResult, FactoryUploadedFile, StructuredDiscovery } from "@/lib/factory/types";
@@ -43,7 +50,7 @@ import { MissionCanvas } from "@/components/canvas/MissionCanvas";
 import { humanizeKey } from "@/components/execution/timelineUtils";
 import { ModelModeSelector, ModelSelectionChip } from "@/components/ModelModeSelector";
 import { useModelMode } from "@/lib/ai/model-mode";
-import type { ModelMode, TierResolution } from "@/lib/ai/model-router";
+import type { TierResolution } from "@/lib/ai/model-router";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 
@@ -54,9 +61,10 @@ type BuildDashboardProps = {
   onSelectMission: (missionId: string) => void;
   onCreateMission: () => void;
   onDeleteMission?: (missionId: string) => void;
-  onCreateProject?: (brief: string, files?: FactoryUploadedFile[], discovery?: StructuredDiscovery) => void | Promise<void>;
+  onCreateProject?: (brief: string, files?: FactoryUploadedFile[], discovery?: StructuredDiscovery, evidenceFiles?: File[]) => void | Promise<void>;
   onUpdateProjectExecution?: (missionId: string, result: FactoryProjectResult) => void;
-  onExecuteProject?: (missionId: string, task: string, approvalResponse?: ApprovalResponse, evidenceFiles?: File[]) => void | Promise<void>;
+  onPreviewStateChange?: (missionId: string, preview: Pick<FactoryProjectResult, "previewState" | "previewUrl" | "previewPlatform" | "previewReason">) => void;
+  onExecuteProject?: (missionId: string, task: string, approvalResponse?: ApprovalResponse, evidenceFiles?: File[], control?: { retryExecutionId?: string; undoExecutionId?: string }) => void | Promise<void>;
   onRollbackToEntry?: (missionId: string, projectId: string, entryId: string) => void | Promise<void>;
   onApproveCategory?: (missionId: string, category: string) => void;
   onApproveCommand?: (missionId: string, command: string) => void;
@@ -103,7 +111,9 @@ type ProjectStart = {
   stack: string;
   customStack: string;
   instructions: string;
+  instructionFiles: File[];
   discovery: ProjectDiscoveryResult | null;
+  discoveryProvenance: "pending" | "model" | "rough";
   discoveryAnswers: Record<string, string>;
   /** Dynamically-authored stack choices from the Discovery Engine's LLM pass — empty until UnderstandingStep resolves, seeded with a small universal fallback until then. Replaces the old static per-category stackRecommendations table. */
   stackOptions: StackOption[];
@@ -326,7 +336,7 @@ const projectSubtypeOptions: Record<TemplateId, string[]> = {
   custom: ["Web app", "Business app", "Internal tool", "AI app", "Backend/API", "Desktop app"],
 };
 
-export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelectMission, onCreateMission, onDeleteMission, onCreateProject, onExecuteProject, onRollbackToEntry, onApproveCategory, onApproveCommand }: BuildDashboardProps) {
+export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelectMission, onCreateMission, onDeleteMission, onCreateProject, onExecuteProject, onPreviewStateChange, onRollbackToEntry, onApproveCategory, onApproveCommand }: BuildDashboardProps) {
   const [activeTemplate, setActiveTemplate] = useState<BuildTemplate | null>(null);
   const [existingStart, setExistingStart] = useState<ExistingProjectStart | null>(null);
   const [flowStep, setFlowStep] = useState<FlowStep>("kind");
@@ -337,24 +347,37 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
   const [activeView, setActiveView] = useState<FactoryView>("workspace");
   const connectedProject = missions.find((mission) => mission.missionId === activeMissionId) ?? missions[0];
   const hasConnectedProject = Boolean(connectedProject && connectedProject.messages.length + connectedProject.attachments.length + connectedProject.createdArtifacts.length > 0);
-  const realEvents = connectedProject?.liveWorkEvents ?? [];
   const execution = connectedProject ? projectExecutionFromMission(connectedProject) : null;
   const connectorInfo = connectedProject ? connectorInfoFromMission(connectedProject) : null;
   const [connectorTreeFiles, setConnectorTreeFiles] = useState<FactoryProjectResult["files"]>([]);
   const [connectorTreeForMissionId, setConnectorTreeForMissionId] = useState("");
+  const [connectorTreeError, setConnectorTreeError] = useState("");
+  const [connectorTreeLoading, setConnectorTreeLoading] = useState(false);
 
   useEffect(() => {
     if (!connectedProject || !connectorInfo) {
       setConnectorTreeFiles([]);
       setConnectorTreeForMissionId("");
+      setConnectorTreeError("");
+      setConnectorTreeLoading(false);
       return;
     }
     let cancelled = false;
     const missionId = connectedProject.missionId;
-    void listAgentTree(connectorInfo.url, connectorInfo.token, connectorInfo.root).then((result) => {
-      if (cancelled || !result.ok) return;
+    setConnectorTreeLoading(true);
+    setConnectorTreeError("");
+    void listAgentTreeWithRetry(connectorInfo.url, connectorInfo.token, connectorInfo.root).then((result) => {
+      if (cancelled) return;
+      setConnectorTreeLoading(false);
+      if (!result.ok) {
+        setConnectorTreeFiles([]);
+        setConnectorTreeForMissionId(missionId);
+        setConnectorTreeError(result.error || "Could not load files from the Local Agent.");
+        return;
+      }
       setConnectorTreeFiles(result.entries.map((entry) => ({ path: entry.path, status: "uploaded" as const, size: entry.size })));
       setConnectorTreeForMissionId(missionId);
+      setConnectorTreeError("");
     });
     return () => {
       cancelled = true;
@@ -367,8 +390,41 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
     connectedProject && connectorTreeForMissionId === connectedProject.missionId && connectorTreeFiles.length
       ? mergeConnectorFiles(connectorTreeFiles, baseWorkspaceFiles)
       : baseWorkspaceFiles;
+  const firstWorkspaceFilePath = workspaceFiles[0]?.path ?? "";
   const connectedPath = connectedProject ? connectedPathForMission(connectedProject, execution) : "";
   const selectedProjectBrief = connectedProject && isSoftwareProjectMission(connectedProject) ? projectBriefFromMission(connectedProject) : "";
+
+  useEffect(() => {
+    setFilePanelOpen(false);
+    setSelectedFile(null);
+    setFileReadError("");
+  }, [connectedProject?.missionId]);
+
+  function openProjectFiles() {
+    setFilePanelOpen(true);
+    setFileReadError("");
+    if (!selectedFile && workspaceFiles.length) {
+      void readGeneratedFile(workspaceFiles[0].path);
+    } else if (!workspaceFiles.length) {
+      setFileReadError(connectorInfo
+        ? connectorTreeLoading ? "" : connectorTreeError || "No readable project files were found in the connected folder."
+        : "No readable project files are stored in this workspace. Re-import the project folder or a ZIP containing supported text source files.");
+    }
+  }
+
+  useEffect(() => {
+    if (!filePanelOpen || selectedFile) return;
+    if (firstWorkspaceFilePath) {
+      setFileReadError("");
+      void readGeneratedFile(firstWorkspaceFilePath);
+      return;
+    }
+    if (connectorInfo && !connectorTreeLoading && connectorTreeForMissionId === connectedProject?.missionId) {
+      setFileReadError(connectorTreeError || "No readable project files were found in the connected folder.");
+    }
+    // readGeneratedFile intentionally follows the currently rendered connector/workspace snapshot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filePanelOpen, selectedFile, firstWorkspaceFilePath, connectorTreeLoading, connectorTreeForMissionId, connectorTreeError, connectedProject?.missionId]);
 
   async function readGeneratedFile(filePath: string, projectIdOverride?: string) {
     const virtualFile = execution?.files.find((file) => file.path === filePath && typeof file.content === "string");
@@ -387,12 +443,12 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
     }
     if (connectorInfo) {
       setFileReadError("");
-      const content = await readAgentFile(connectorInfo.url, connectorInfo.token, connectorInfo.root, filePath);
-      if (content !== null) {
-        setSelectedFile({ projectId: connectedPath || "connected-project", path: filePath, content });
+      const read = await readAgentFile(connectorInfo.url, connectorInfo.token, connectorInfo.root, filePath);
+      if (read.content !== null) {
+        setSelectedFile({ projectId: connectedPath || "connected-project", path: filePath, content: read.content });
         setFilePanelOpen(true);
       } else {
-        setFileReadError("Could not read that file from the connected local agent.");
+        setFileReadError(read.error || "Could not read that file from the connected Local Agent.");
       }
       return;
     }
@@ -427,14 +483,15 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
     // When the caller already captured a description (dashboard prompt, history recommendation), mirror
     // the seed the "What do you want to build?" step would apply, then skip straight past that step so
     // the same question isn't asked twice.
-    const seed = described && template.id === "custom" ? seedDiscovery(initialDescription) : null;
-    const subtype = seed ? firstSubtypeForDetectedType(seed.domainGuess) : firstSubtypeFor(template.id);
+    const subtype = firstSubtypeFor(template.id);
     const appKind = initialDescription || appKindFor(template, subtype, "");
     const projectName = template.id === "custom"
-      ? (seed ? cleanProjectName(seed.domainGuess) : "")
+      ? (described ? cleanProjectName(initialDescription) : "")
       : cleanProjectName(appKind);
     setActiveTemplate(template);
     setFlowStep(described ? "project" : "kind");
+    const platformStackOptions = platformStackOptionsForProject(template.id);
+    const initialStackOptions = platformStackOptions.length ? platformStackOptions : FALLBACK_STACK_OPTIONS;
     setStart({
       template,
       projectMode: "new",
@@ -454,15 +511,17 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
       localConnectorToken: "",
       localConnectorRoot: "",
       appKind,
-      stack: FALLBACK_STACK_OPTIONS[0].name,
+      stack: initialStackOptions[0].name,
       customStack: "",
       instructions: "",
+      instructionFiles: [],
       // A starter card is now just a seed hint into the same Discovery Engine as freeform text — the
       // full heuristic no longer runs synchronously here. discovery stays null (DiscoveryRail shows a
       // Stage-A seed guess instead) until UnderstandingStep's LLM call actually resolves it.
       discovery: null,
+      discoveryProvenance: "pending",
       discoveryAnswers: {},
-      stackOptions: FALLBACK_STACK_OPTIONS,
+      stackOptions: initialStackOptions,
       alternativeStacks: [],
       deploymentNote: "",
       lede: "",
@@ -502,7 +561,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
 
   function createProject() {
     if (start) {
-      void onCreateProject?.(projectBriefFor(start), start.uploadedFiles, structuredDiscoveryFor(start));
+      void onCreateProject?.(projectBriefFor(start), start.uploadedFiles, structuredDiscoveryFor(start), start.instructionFiles);
       // The build starts immediately, so take the user to the live mission canvas immediately too.
       // Leaving the Templates dashboard visible made real execution look disconnected or invisible.
       setActiveView("workspace");
@@ -536,7 +595,6 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
 
         {activeView === "templates" ? (
           <FactoryHome
-            realEvents={realEvents}
             missions={missions}
             activeMissionId={activeMissionId}
             onOpenFlow={openFlow}
@@ -568,6 +626,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
             brief={selectedProjectBrief}
             execution={execution}
             connectedPath={connectedPath}
+            localConnector={connectorInfo ? { url: connectorInfo.url, token: connectorInfo.token, rootLabel: connectorInfo.root } : undefined}
             workspaceFiles={workspaceFiles}
             queuedTask={queuedTask}
             onStartProject={() => {
@@ -575,19 +634,31 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
               setFilePanelOpen(false);
               setSelectedFile(null);
             }}
-            onViewFiles={() => setFilePanelOpen(true)}
+            onViewFiles={openProjectFiles}
             onExecute={(task, approvalResponse, evidenceFiles) => {
               setActiveView("workspace");
               setFilePanelOpen(false);
               setSelectedFile(null);
               void onExecuteProject?.(connectedProject.missionId, task, approvalResponse, evidenceFiles);
             }}
+            onRetry={(task, executionId) => {
+              setActiveView("workspace");
+              setFilePanelOpen(false);
+              setSelectedFile(null);
+              void onExecuteProject?.(connectedProject.missionId, task, undefined, [], { retryExecutionId: executionId });
+            }}
+            onUndo={(executionId) => {
+              setActiveView("workspace");
+              setFilePanelOpen(false);
+              setSelectedFile(null);
+              void onExecuteProject?.(connectedProject.missionId, "Undo the last file change", undefined, [], { undoExecutionId: executionId });
+            }}
+            onPreviewStateChange={(preview) => onPreviewStateChange?.(connectedProject.missionId, preview)}
             onApproveCategory={onApproveCategory ? (category) => onApproveCategory(connectedProject.missionId, category) : undefined}
             onApproveCommand={onApproveCommand ? (command) => onApproveCommand(connectedProject.missionId, command) : undefined}
           />
         ) : (
           <FactoryHome
-            realEvents={realEvents}
             missions={missions}
             activeMissionId={activeMissionId}
             onOpenFlow={openFlow}
@@ -637,13 +708,14 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
         />
       ) : null}
 
-      {filePanelOpen && (execution || selectedFile || workspaceFiles.length > 0) ? (
+      {filePanelOpen ? (
         <FileTreePanel
           execution={execution}
           workspaceFiles={workspaceFiles}
           connectedPath={connectedPath}
           selectedFile={selectedFile}
           error={fileReadError}
+          loading={Boolean(connectorInfo && connectorTreeLoading && !selectedFile)}
           onClose={() => setFilePanelOpen(false)}
           onReadFile={readGeneratedFile}
         />
@@ -668,6 +740,9 @@ function FactorySidebar({
 }) {
   const projectMissions = missions.filter(isSoftwareProjectMission);
   const activeMission = missions.find((mission) => mission.missionId === activeMissionId);
+  // Deleting a chat is irreversible (the mission history is gone from the workspace), so the trash
+  // button only stages the id here and a confirmation dialog performs the actual delete.
+  const [pendingDelete, setPendingDelete] = useState<{ missionId: string; title: string } | null>(null);
   const visibleProjects =
     projectMissions.length > 0
       ? projectMissions
@@ -682,20 +757,21 @@ function FactorySidebar({
   ];
 
   return (
+    <>
     <aside className={`glass-panel lg:min-h-0 flex-col gap-4 p-3 ${hideOnMobile ? "hidden lg:flex" : "flex"}`} aria-label="Factory navigation">
       <div className="px-1">
         <p className="section-kicker">Projects</p>
         <p className="mt-1 text-xs leading-5 text-foundry-subtle">Switch workspaces or start a new one.</p>
       </div>
 
-      <nav className="grid gap-1.5 border-t border-white/10 pt-3" aria-label="Workspace views">
+      <nav className="grid gap-1.5 border-t border-overlay/10 pt-3" aria-label="Workspace views">
         {navItems.map((item) => {
           const Icon = item.icon;
           return (
             <button
               key={item.id}
               className={`flex min-h-10 items-center gap-3 rounded-md px-3 text-left text-sm font-semibold transition ${
-                activeView === item.id ? "bg-white/[0.075] text-foundry-ink" : "text-foundry-muted hover:bg-white/[0.045] hover:text-foundry-ink"
+                activeView === item.id ? "bg-overlay/[0.075] text-foundry-ink" : "text-foundry-muted hover:bg-overlay/[0.045] hover:text-foundry-ink"
               }`}
               type="button"
               aria-current={activeView === item.id ? "page" : undefined}
@@ -708,7 +784,7 @@ function FactorySidebar({
         })}
       </nav>
 
-      <section className="min-h-0 border-t border-white/10 pt-3">
+      <section className="min-h-0 border-t border-overlay/10 pt-3">
         <div className="mb-2 flex items-center justify-between gap-2 px-3">
           <p className="text-[11px] font-extrabold uppercase tracking-[0.08em] text-foundry-muted">Workspaces</p>
           <button className="icon-button h-7 w-7" type="button" title="New workspace" aria-label="New workspace" onClick={onCreateMission}>
@@ -720,7 +796,7 @@ function FactorySidebar({
             <div
               key={mission.missionId}
               className={`group grid min-h-12 grid-cols-[minmax(0,1fr)_auto] items-center rounded-md transition ${
-                activeMissionId === mission.missionId ? "bg-white/[0.075] text-foundry-ink" : "text-foundry-muted hover:bg-white/[0.045] hover:text-foundry-ink"
+                activeMissionId === mission.missionId ? "bg-overlay/[0.075] text-foundry-ink" : "text-foundry-muted hover:bg-overlay/[0.045] hover:text-foundry-ink"
               }`}
             >
               <button className="min-w-0 px-3 py-2 text-left" type="button" onClick={() => onSelectMission(mission.missionId)}>
@@ -729,11 +805,11 @@ function FactorySidebar({
               </button>
               {onDeleteMission ? (
                 <button
-                  className="mr-1 grid h-8 w-8 place-items-center rounded-md text-foundry-subtle opacity-70 transition hover:bg-white/10 hover:text-foundry-ink group-hover:opacity-100"
+                  className="mr-1 grid h-8 w-8 place-items-center rounded-md text-foundry-subtle opacity-70 transition hover:bg-overlay/10 hover:text-foundry-ink group-hover:opacity-100"
                   type="button"
                   title={`Delete ${projectTitleFor(mission)}`}
                   aria-label={`Delete ${projectTitleFor(mission)}`}
-                  onClick={() => onDeleteMission(mission.missionId)}
+                  onClick={() => setPendingDelete({ missionId: mission.missionId, title: projectTitleFor(mission) })}
                 >
                   <Trash2 size={14} />
                 </button>
@@ -741,13 +817,68 @@ function FactorySidebar({
             </div>
           ))}
           {projectMissions.length === 0 ? (
-            <div className="rounded-md border border-dashed border-white/15 px-3 py-4 text-xs leading-5 text-foundry-subtle">
+            <div className="rounded-md border border-dashed border-overlay/15 px-3 py-4 text-xs leading-5 text-foundry-subtle">
               Old chat threads are hidden here. New factory projects will appear after you start a build.
             </div>
           ) : null}
         </div>
       </section>
     </aside>
+
+    {pendingDelete ? (
+      <div
+        className="fixed inset-0 z-50 grid place-items-center bg-shade/60 p-4 backdrop-blur-sm"
+        role="presentation"
+        onClick={() => setPendingDelete(null)}
+      >
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="delete-chat-title"
+          aria-describedby="delete-chat-body"
+          className="w-full max-w-sm rounded-xl border border-overlay/12 bg-foundry-raised p-5 shadow-2xl"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") setPendingDelete(null);
+          }}
+        >
+          <div className="flex items-start gap-3">
+            <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md border border-red-400/30 bg-red-400/[0.08] text-red-300">
+              <Trash2 size={18} />
+            </span>
+            <div className="min-w-0">
+              <h2 id="delete-chat-title" className="text-base font-extrabold leading-6 text-foundry-ink">
+                Delete &ldquo;{pendingDelete.title}&rdquo;?
+              </h2>
+              <p id="delete-chat-body" className="mt-1.5 text-sm leading-6 text-foundry-muted">
+                This removes the chat and its mission history from Foundry and can&rsquo;t be undone. Files the project already created on disk are not deleted.
+              </p>
+            </div>
+          </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <button
+              autoFocus
+              type="button"
+              className="rounded-md border border-overlay/15 bg-overlay/[0.05] px-3.5 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-overlay/[0.09] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/50"
+              onClick={() => setPendingDelete(null)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="rounded-md border border-red-400/40 bg-red-500/15 px-3.5 py-2 text-sm font-extrabold text-red-200 transition hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/50"
+              onClick={() => {
+                onDeleteMission?.(pendingDelete.missionId);
+                setPendingDelete(null);
+              }}
+            >
+              Delete chat
+            </button>
+          </div>
+        </div>
+      </div>
+    ) : null}
+    </>
   );
 }
 
@@ -791,8 +922,8 @@ function JournalView({
   }, [projectId]);
 
   return (
-    <section className="lg:min-h-0 lg:overflow-auto rounded-xl border border-white/10 bg-[#101416]/90 shadow-workspace">
-      <div className="border-b border-white/10 px-4 py-4 sm:px-5">
+    <section className="lg:min-h-0 lg:overflow-auto rounded-xl border border-overlay/10 bg-foundry-raised/90 shadow-workspace">
+      <div className="border-b border-overlay/10 px-4 py-4 sm:px-5">
         <p className="section-kicker">Permanent Record</p>
         <h1 className="mt-2 text-2xl font-extrabold text-foundry-ink">Execution Journal</h1>
         <p className="mt-2 max-w-2xl text-sm leading-6 text-foundry-muted">
@@ -802,13 +933,13 @@ function JournalView({
 
       <div className="grid gap-2 p-4 sm:p-5">
         {!projectId ? (
-          <div className="rounded-md border border-dashed border-white/15 px-3 py-6 text-sm leading-6 text-foundry-subtle">Open a project to see its execution journal.</div>
+          <div className="rounded-md border border-dashed border-overlay/15 px-3 py-6 text-sm leading-6 text-foundry-subtle">Open a project to see its execution journal.</div>
         ) : loading ? (
           <div className="px-3 py-6 text-sm text-foundry-muted">Loading journal...</div>
         ) : error ? (
           <div className="rounded-md border border-red-400/25 bg-red-400/[0.05] px-3 py-3 text-sm text-red-200">{error}</div>
         ) : entries.length === 0 ? (
-          <div className="rounded-md border border-dashed border-white/15 px-3 py-6 text-sm leading-6 text-foundry-subtle">No durable history recorded for this project yet.</div>
+          <div className="rounded-md border border-dashed border-overlay/15 px-3 py-6 text-sm leading-6 text-foundry-subtle">No durable history recorded for this project yet.</div>
         ) : (
           entries.map((entry) => (
             <JournalRow key={entry.id} entry={entry} onReadFile={onReadFile} onRollback={onRollback} />
@@ -832,12 +963,12 @@ function JournalRow({
   const canRollback = Boolean(onRollback && !entry.reverted && event.filePath && (event.kind === "edit" || event.kind === "file") && event.status === "completed");
 
   return (
-    <div className={`rounded-md border px-3 py-2 ${entry.reverted ? "border-white/5 bg-black/10 opacity-60" : "border-white/10 bg-black/20"}`}>
+    <div className={`rounded-md border px-3 py-2 ${entry.reverted ? "border-overlay/5 bg-shade/10 opacity-60" : "border-overlay/10 bg-shade/20"}`}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2 text-xs">
           <span className="font-mono text-[10px] text-foundry-subtle">{new Date(entry.timestamp).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
           <span className="min-w-0 truncate font-semibold text-foundry-ink">{event.title}</span>
-          {entry.reverted ? <span className="rounded-full border border-white/15 px-1.5 py-0.5 text-[10px] font-bold text-foundry-subtle">reverted</span> : null}
+          {entry.reverted ? <span className="rounded-full border border-overlay/15 px-1.5 py-0.5 text-[10px] font-bold text-foundry-subtle">reverted</span> : null}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {event.filePath ? (
@@ -882,14 +1013,14 @@ function FactorySettingsView({
   const files = execution?.files.length ?? 0;
 
   return (
-    <section className="lg:min-h-0 lg:overflow-auto border border-white/10 bg-[#0c1011]/95 shadow-workspace">
-      <div className="border-b border-white/10 px-4 py-4 sm:px-5">
+    <section className="lg:min-h-0 lg:overflow-auto border border-overlay/10 bg-foundry-surface/95 shadow-workspace">
+      <div className="border-b border-overlay/10 px-4 py-4 sm:px-5">
         <p className="section-kicker">Settings</p>
         <h1 className="mt-2 text-2xl font-extrabold text-foundry-ink">Workspace settings</h1>
       </div>
 
       <div className="grid max-w-4xl gap-5 p-4 sm:p-5">
-        <section className="grid gap-3 border-b border-white/10 pb-5">
+        <section className="grid gap-3 border-b border-overlay/10 pb-5">
           <h2 className="text-sm font-extrabold text-foundry-ink">Current project</h2>
           <SummaryRow label="Workspace" value={mission ? projectTitleFor(mission) : "No workspace selected"} />
           <SummaryRow label="Editing target" value={editingTarget} />
@@ -902,7 +1033,7 @@ function FactorySettingsView({
 
         <section className="grid gap-3 sm:grid-cols-2">
           <button
-            className="min-h-24 rounded-md border border-white/10 bg-white/[0.035] p-4 text-left transition hover:border-foundry-teal/35 hover:bg-foundry-teal/[0.08]"
+            className="min-h-24 rounded-md border border-overlay/10 bg-overlay/[0.035] p-4 text-left transition hover:border-foundry-teal/35 hover:bg-foundry-teal/[0.08]"
             type="button"
             onClick={onOpenTemplates}
           >
@@ -910,7 +1041,7 @@ function FactorySettingsView({
             <span className="mt-2 block text-xs leading-5 text-foundry-muted">Create a new project from a starter or custom brief.</span>
           </button>
           <button
-            className="min-h-24 rounded-md border border-white/10 bg-white/[0.035] p-4 text-left transition hover:border-foundry-blue/35 hover:bg-foundry-blue/[0.08]"
+            className="min-h-24 rounded-md border border-overlay/10 bg-overlay/[0.035] p-4 text-left transition hover:border-foundry-blue/35 hover:bg-foundry-blue/[0.08]"
             type="button"
             onClick={onOpenExistingProject}
           >
@@ -934,7 +1065,7 @@ function BuildCard({ template, onStart }: { template: BuildTemplate; onStart: ()
 
   return (
     <button
-      className="group flex items-start gap-3 rounded-lg border border-white/10 bg-white/[0.03] p-3.5 text-left transition hover:border-foundry-teal/35 hover:bg-white/[0.06] focus-visible:border-foundry-teal/45 focus-visible:outline-none"
+      className="group flex items-start gap-3 rounded-lg border border-overlay/10 bg-overlay/[0.03] p-3.5 text-left transition hover:border-foundry-teal/35 hover:bg-overlay/[0.06] focus-visible:border-foundry-teal/45 focus-visible:outline-none"
       type="button"
       onClick={onStart}
       title={template.defaults.slice(0, 2).join(" · ")}
@@ -950,77 +1081,19 @@ function BuildCard({ template, onStart }: { template: BuildTemplate; onStart: ()
   );
 }
 
-/**
- * Mirrors useMissionRecommendations()'s pattern (line ~2110) but scoped to cross-project history
- * instead of a single just-completed project. Fires once per FactoryHome mount when there's enough
- * history to be worth an LLM call (2+ past projects) — see lib/discovery/history-recommendations.ts.
- */
-function useHistoryRecommendation(missions: MissionState[], mode: ModelMode): { recommendations: HistoryRecommendation[]; loading: boolean; modelSelection: TierResolution & { autoSelected: boolean; reason?: string } | null } {
-  const [recommendations, setRecommendations] = useState<HistoryRecommendation[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [modelSelection, setModelSelection] = useState<(TierResolution & { autoSelected: boolean; reason?: string }) | null>(null);
-  const fetchedRef = useRef(false);
-
-  useEffect(() => {
-    const projectMissions = missions.filter(isSoftwareProjectMission);
-    if (projectMissions.length < 2 || fetchedRef.current) return;
-    fetchedRef.current = true;
-
-    const heuristic = genericHistoryRecommendation(missions);
-    setRecommendations(heuristic);
-    setLoading(true);
-
-    const history: HistorySummaryItem[] = projectMissions.slice(0, 10).map((mission) => {
-      const brief = projectBriefFromMission(mission);
-      const stack = brief.match(/^Selected stack:\s*(.+)$/im)?.[1]?.trim() ?? "Unknown";
-      return {
-        title: projectTitleFor(mission),
-        domain: seedDiscovery(mission.objective || mission.title).domainGuess,
-        stack,
-        status: deriveMissionDisplayStatus(mission).label,
-      };
-    });
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
-
-    fetch("/api/factory/history-recommendation", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      signal: controller.signal,
-      body: JSON.stringify({ history, heuristic, mode }),
-    })
-      .then((response) => response.json())
-      .then((data) => {
-        if (data?.ok && Array.isArray(data.recommendations) && data.recommendations.length) {
-          setRecommendations(data.recommendations);
-        }
-        if (data?.modelSelection) setModelSelection(data.modelSelection);
-      })
-      .catch(() => {})
-      .finally(() => {
-        clearTimeout(timeout);
-        setLoading(false);
-      });
-
-    return () => clearTimeout(timeout);
-    // mode is intentionally excluded — this fetch runs once per mount (fetchedRef), matching the
-    // existing dedupe contract; changing mode mid-session takes effect on the next mount, not live.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [missions]);
-
-  return { recommendations, loading, modelSelection };
+/** Home-page personalization must never consume project-execution budget merely because the user
+ * opened Templates. Richer model-authored recommendations belong behind an explicit user action. */
+function useHistoryRecommendation(missions: MissionState[]): { recommendations: HistoryRecommendation[]; loading: boolean; modelSelection: TierResolution & { autoSelected: boolean; reason?: string } | null } {
+  return { recommendations: genericHistoryRecommendation(missions), loading: false, modelSelection: null };
 }
 
 function FactoryHome({
-  realEvents,
   missions,
   activeMissionId,
   onOpenFlow,
   onOpenExistingFlow,
   onSelectMission,
 }: {
-  realEvents: string[];
   missions: MissionState[];
   activeMissionId?: string;
   onOpenFlow: (template: BuildTemplate, initialDescription?: string) => void;
@@ -1033,31 +1106,55 @@ function FactoryHome({
   const localAgentInstalled = localAgentStatus === "installed" || localAgentStatus === "connected";
   const continueCard = continueOrResumeMission(missions, activeMissionId);
   const recentCards = recentProjects(missions, activeMissionId, continueCard ? 2 : 3).filter((card) => card.missionId !== continueCard?.missionId);
-  const { mode: modelMode, showModelNames } = useModelMode();
-  const { recommendations: historyRecommendations, modelSelection: historyModelSelection } = useHistoryRecommendation(missions, modelMode);
+  const { showModelNames } = useModelMode();
+  const { recommendations: historyRecommendations, modelSelection: historyModelSelection } = useHistoryRecommendation(missions);
 
   const [prompt, setPrompt] = useState("");
+  const [templatesOpen, setTemplatesOpen] = useState(false);
   const templateById = (id: string) => buildTemplates.find((template) => template.id === id) ?? customTemplate;
   function startBuilding() {
     const text = prompt.trim();
     onOpenFlow(customTemplate, text);
   }
 
-  // Quick shortcuts seed the same discovery flow a starter card does — just a template pre-selected.
-  const quickChips: Array<{ label: string; templateId: string }> = [
-    { label: "Inventory system", templateId: "inventory" },
-    { label: "Website", templateId: "website" },
-    { label: "Mobile app", templateId: "mobile" },
-    { label: "AI application", templateId: "ai" },
-    { label: "Something custom", templateId: "custom" },
+  // The two entry points the hero prompt does NOT already cover. "Build something new" lived here
+  // once but duplicated the prompt directly above it, so the prompt is now the single path to a new
+  // project. Each option is a thin wrapper over an existing handler — no new paths.
+  const beginOptions: Array<{ label: string; hint: string; cta: string; icon: LucideIcon; accent: "teal" | "amber" | "blue"; onSelect: () => void }> = [
+    {
+      label: "Open an existing project",
+      hint: "Connect a folder, upload files, or continue work already on your computer.",
+      cta: "Open",
+      icon: FolderOpen,
+      accent: "blue",
+      onSelect: () => onOpenExistingFlow("connect-existing"),
+    },
+    {
+      label: "Use a ready-made template",
+      hint: "Start faster with a website, business app, mobile app, dashboard, or AI app.",
+      cta: "Browse",
+      icon: LayoutDashboard,
+      accent: "teal",
+      onSelect: () => {
+        setTemplatesOpen(true);
+        requestAnimationFrame(() => document.getElementById("all-project-types")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+      },
+    },
   ];
 
-  // Broad directions mirror the mockup; each opens the real flow with a representative template.
+  const beginTone = (accent: "teal" | "amber" | "blue") =>
+    accent === "amber"
+      ? "border-foundry-amber/25 bg-foundry-amber/[0.06] hover:border-foundry-amber/45 hover:shadow-[0_12px_30px_rgb(var(--foundry-amber)/0.14)] focus-visible:ring-foundry-amber/40"
+      : accent === "blue"
+        ? "border-foundry-blue/25 bg-foundry-blue/[0.06] hover:border-foundry-blue/45 hover:shadow-[0_12px_30px_rgb(var(--foundry-blue)/0.14)] focus-visible:ring-foundry-blue/40"
+        : "border-foundry-teal/25 bg-foundry-teal/[0.06] hover:border-foundry-teal/45 hover:shadow-[0_12px_30px_rgb(var(--foundry-teal)/0.14)] focus-visible:ring-foundry-teal/40";
+
+  // Broad directions; each opens the real discovery flow with a representative template.
   const directions: Array<{ label: string; hint: string; templateId: string; icon: LucideIcon; accent: "teal" | "amber" | "blue" }> = [
-    { label: "Business app", hint: "Inventory, POS, dashboards, internal tools", templateId: "dashboard", icon: LayoutDashboard, accent: "teal" },
-    { label: "Website", hint: "Marketing, portfolio, documentation, commerce", templateId: "website", icon: Globe2, accent: "blue" },
-    { label: "Mobile or desktop", hint: "Native, cross-platform, offline-first", templateId: "mobile", icon: Smartphone, accent: "amber" },
-    { label: "AI or custom", hint: "Agents, automation, APIs, anything else", templateId: "ai", icon: Sparkles, accent: "teal" },
+    { label: "Website", hint: "Marketing site, portfolio, documentation, landing page, or online store.", templateId: "website", icon: Globe2, accent: "blue" },
+    { label: "Business app", hint: "Inventory, POS, CRM, dashboard, reports, forms, and internal tools.", templateId: "dashboard", icon: LayoutDashboard, accent: "teal" },
+    { label: "Mobile or desktop app", hint: "Installable apps for Windows, macOS, Android, or iPhone.", templateId: "mobile", icon: Smartphone, accent: "amber" },
+    { label: "AI or custom project", hint: "Agents, automation, APIs, data tools, games, and anything unusual.", templateId: "ai", icon: Sparkles, accent: "teal" },
   ];
 
   // Real completion from the mission's own plan checklist — never a fabricated percentage.
@@ -1083,25 +1180,25 @@ function FactoryHome({
     accent === "teal" ? "border-foundry-teal/30 text-foundry-teal" : accent === "amber" ? "border-foundry-amber/30 text-foundry-amber" : "border-foundry-blue/30 text-foundry-blue";
 
   return (
-    <section className="lg:min-h-0 lg:overflow-auto rounded-xl border border-white/10 bg-[#101416]/90 shadow-workspace">
-      <div className="relative overflow-hidden border-b border-white/10 px-4 py-10 sm:px-6 sm:py-14">
-        <div className="pointer-events-none absolute inset-x-0 -top-24 mx-auto h-64 max-w-3xl rounded-full bg-foundry-teal/[0.08] blur-3xl" />
+    <section className="lg:min-h-0 lg:overflow-auto rounded-xl border border-overlay/10 bg-foundry-bg shadow-workspace">
+      <div className="relative overflow-hidden px-4 py-12 sm:px-6 sm:py-16">
+        <div className="pointer-events-none absolute inset-x-0 -top-32 mx-auto h-72 max-w-3xl rounded-full bg-foundry-amber/[0.07] blur-3xl" />
         <div className="relative mx-auto flex max-w-3xl flex-col items-center text-center">
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/12 bg-black/30 px-3 py-1 text-[11px] font-bold text-foundry-muted">
+          <span className="inline-flex items-center gap-2 rounded-full border border-foundry-teal/25 bg-foundry-teal/[0.09] px-3 py-1 text-[11px] font-bold">
             <span className={`h-1.5 w-1.5 rounded-full ${runtimePill.dotClass} ${runtimePill.spin ? "animate-pulse" : ""}`} />
             <span className={runtimePill.textClass}>{runtimePill.text}</span>
           </span>
 
-          <h1 className="mt-6 text-4xl font-extrabold leading-[1.05] tracking-tight text-foundry-ink sm:text-5xl">
+          <h1 className="mt-6 text-4xl font-extrabold leading-[1.06] tracking-tight text-foundry-ink sm:text-[3.25rem]">
             Turn an idea into
             <br />
-            <span className="bg-gradient-to-r from-foundry-teal via-foundry-ink to-foundry-blue bg-clip-text text-transparent">working software.</span>
+            <span className="bg-gradient-to-r from-foundry-amber via-foundry-amber to-foundry-teal bg-clip-text text-transparent">working software.</span>
           </h1>
           <p className="mt-4 max-w-xl text-sm leading-6 text-foundry-muted sm:text-base">
             Describe what you want. Foundry will understand the project, choose the right architecture, build it, test it, and show you the result.
           </p>
 
-          <div className="mt-8 flex w-full max-w-2xl items-center gap-2 rounded-xl border border-white/12 bg-black/30 p-2 transition focus-within:border-foundry-teal/45">
+          <div className="mt-8 flex w-full max-w-2xl items-center gap-2 rounded-2xl border border-overlay/10 bg-foundry-surface p-2 shadow-[0_10px_34px_rgb(var(--foundry-overlay)/0.07)] transition focus-within:border-foundry-amber/45">
             <input
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
@@ -1111,31 +1208,18 @@ function FactoryHome({
                   startBuilding();
                 }
               }}
-              placeholder="What should we build?"
+              placeholder="Example: Build me a simple inventory app for my store…"
               aria-label="Describe the project to build"
-              className="min-w-0 flex-1 bg-transparent px-3 py-2 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle"
+              className="min-w-0 flex-1 bg-transparent px-3.5 py-2.5 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle"
             />
             <button
               type="button"
               onClick={startBuilding}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-foundry-teal px-4 py-2 text-sm font-extrabold text-black transition hover:bg-foundry-teal/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/50"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-foundry-amber px-4 py-2.5 text-sm font-extrabold text-foundry-bg shadow-sm transition hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-amber/50"
             >
               Start building
               <ArrowRight size={15} />
             </button>
-          </div>
-
-          <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-            {quickChips.map((chip) => (
-              <button
-                key={chip.label}
-                type="button"
-                onClick={() => onOpenFlow(templateById(chip.templateId))}
-                className="rounded-full border border-white/12 bg-white/[0.03] px-3 py-1.5 text-xs font-semibold text-foundry-muted transition hover:border-foundry-teal/35 hover:bg-white/[0.06] hover:text-foundry-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
-              >
-                {chip.label}
-              </button>
-            ))}
           </div>
 
           {localAgentStatus === "offline" || localAgentStatus === "not-installed" ? (
@@ -1145,7 +1229,7 @@ function FactoryHome({
               </p>
               <p className="mt-1 text-xs leading-5 text-foundry-muted">
                 {localAgentStatus === "offline" ? (
-                  <>Local execution is unavailable until the agent restarts. Run <code className="rounded bg-black/30 px-1 py-0.5 font-mono text-[11px] text-foundry-ink">npm run agent</code> in your Foundry folder, or re-download it. Cloud and read-only work still works.</>
+                  <>Local execution is unavailable until the agent restarts. Run <code className="rounded bg-shade/30 px-1 py-0.5 font-mono text-[11px] text-foundry-ink">npm run agent</code> in your Foundry folder, or re-download it. Cloud and read-only work still works.</>
                 ) : (
                   <>Install Foundry&apos;s local agent once to build with real files, commands, and a dev server on this computer. Cloud and read-only work is available without it.</>
                 )}
@@ -1166,185 +1250,158 @@ function FactoryHome({
         </div>
       </div>
 
-      <div className="grid gap-6 p-4 sm:p-6">
-        <section className="grid gap-4 lg:grid-cols-3">
-          {continueCard ? (
-            <div className="flex flex-col rounded-xl border border-white/10 bg-white/[0.03] p-4">
-              <p className="section-kicker">Continue where you left off</p>
-              <h2 className="mt-2 text-lg font-extrabold text-foundry-ink">{continueCard.title}</h2>
-              <p className="mt-1 text-sm leading-6 text-foundry-muted">{continueCard.subtitle}</p>
-              {continueProgress?.percent != null ? (
-                <div className="mt-4">
-                  <div className="flex items-center justify-between text-[11px] font-bold text-foundry-subtle">
-                    <span>{continueProgress.percent}% complete</span>
-                    <span>{continueProgress.label}</span>
-                  </div>
-                  <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/10">
-                    <div className="h-full rounded-full bg-gradient-to-r from-foundry-teal to-foundry-blue" style={{ width: `${continueProgress.percent}%` }} />
-                  </div>
-                </div>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => onSelectMission(continueCard.missionId)}
-                className="mt-4 inline-flex items-center gap-1.5 self-start rounded-lg border border-white/15 bg-white/[0.055] px-3.5 py-2 text-sm font-extrabold text-foundry-ink transition hover:border-foundry-teal/40 hover:bg-foundry-teal/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
-              >
-                Resume mission
-                <ArrowRight size={15} />
-              </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              onClick={() => onOpenExistingFlow("connect-existing")}
-              className="flex flex-col rounded-xl border border-foundry-blue/25 bg-foundry-blue/[0.06] p-4 text-left transition hover:border-foundry-blue/45 hover:bg-foundry-blue/[0.1] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-blue/40"
-            >
-              <span className="grid h-10 w-10 place-items-center rounded-md border border-foundry-blue/30 bg-black/20 text-foundry-blue">
-                <FolderOpen size={18} />
-              </span>
-              <span className="mt-3 block text-lg font-extrabold text-foundry-ink">Open existing project</span>
-              <span className="mt-1 block text-sm leading-6 text-foundry-muted">Connect a local folder, open a workspace project, or upload files to work on here.</span>
-            </button>
-          )}
+      <div className="mx-auto grid w-full max-w-5xl gap-6 px-4 pb-8 sm:px-6">
+        <section>
+          <h2 className="text-base font-extrabold text-foundry-ink">Or choose how you want to begin</h2>
+          <p className="mt-0.5 text-xs text-foundry-subtle">Only the most important choices are shown here.</p>
 
-          <div className="lg:col-span-2">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 className="text-sm font-extrabold text-foundry-ink">Start with a direction</h2>
-              <a href="#all-project-types" className="text-xs font-bold text-foundry-teal transition hover:text-foundry-ink">View all</a>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {directions.map((direction) => {
-                const Icon = direction.icon;
-                return (
-                  <button
-                    key={direction.label}
-                    type="button"
-                    onClick={() => onOpenFlow(templateById(direction.templateId))}
-                    className="rounded-xl border border-white/10 bg-white/[0.03] p-4 text-left transition hover:border-foundry-teal/35 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
-                  >
-                    <span className={`grid h-9 w-9 place-items-center rounded-md border bg-black/20 ${accentBorder(direction.accent)}`}>
-                      <Icon size={17} />
-                    </span>
-                    <span className="mt-3 block text-sm font-extrabold text-foundry-ink">{direction.label}</span>
-                    <span className="mt-1 block text-xs leading-5 text-foundry-muted">{direction.hint}</span>
-                  </button>
-                );
-              })}
-            </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            {beginOptions.map((option) => {
+              const Icon = option.icon;
+              return (
+                <button
+                  key={option.label}
+                  type="button"
+                  onClick={option.onSelect}
+                  className={`group flex flex-col rounded-2xl border p-5 text-left transition hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 ${beginTone(option.accent)}`}
+                >
+                  <span className={`grid h-10 w-10 place-items-center rounded-xl border bg-foundry-surface shadow-sm ${accentBorder(option.accent)}`}>
+                    <Icon size={18} />
+                  </span>
+                  <span className="mt-4 block text-[15px] font-extrabold text-foundry-ink">{option.label}</span>
+                  <span className="mt-1.5 block text-xs leading-5 text-foundry-muted">{option.hint}</span>
+                  <span className="mt-4 inline-flex items-center gap-1 self-end text-xs font-extrabold text-foundry-muted transition group-hover:gap-1.5 group-hover:text-foundry-ink">
+                    {option.cta}
+                    <ArrowRight size={13} />
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            {directions.map((direction) => {
+              const Icon = direction.icon;
+              return (
+                <button
+                  key={direction.label}
+                  type="button"
+                  onClick={() => onOpenFlow(templateById(direction.templateId))}
+                  className="flex items-start gap-3.5 rounded-2xl border border-overlay/10 bg-foundry-surface p-4 text-left shadow-[0_1px_2px_rgb(var(--foundry-overlay)/0.04)] transition hover:border-foundry-amber/40 hover:shadow-[0_8px_24px_rgb(var(--foundry-overlay)/0.07)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-amber/40"
+                >
+                  <span className={`mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg border bg-foundry-bg ${accentBorder(direction.accent)}`}>
+                    <Icon size={15} />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-sm font-extrabold text-foundry-ink">{direction.label}</span>
+                    <span className="mt-0.5 block text-xs leading-5 text-foundry-muted">{direction.hint}</span>
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </section>
 
         {continueCard ? (
-          <section>
+          <section className="rounded-2xl border border-overlay/10 bg-foundry-surface p-4 shadow-[0_1px_2px_rgb(var(--foundry-overlay)/0.04)]">
+            <h2 className="text-sm font-extrabold text-foundry-ink">Continue where you left off</h2>
             <button
               type="button"
-              onClick={() => onOpenExistingFlow("connect-existing")}
-              className="flex w-full items-center gap-3 rounded-xl border border-foundry-blue/25 bg-foundry-blue/[0.05] p-4 text-left transition hover:border-foundry-blue/45 hover:bg-foundry-blue/[0.09] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-blue/40"
+              onClick={() => onSelectMission(continueCard.missionId)}
+              className="mt-3 flex w-full items-center gap-3 rounded-xl border border-overlay/[0.07] bg-foundry-bg px-3.5 py-3 text-left transition hover:border-foundry-amber/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-amber/40"
             >
-              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md border border-foundry-blue/30 bg-black/20 text-foundry-blue">
-                <FolderOpen size={18} />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-extrabold text-foundry-ink">{continueCard.title}</span>
+                <span className="mt-0.5 block truncate text-xs text-foundry-muted">{continueCard.subtitle}</span>
+                {continueProgress?.percent != null ? (
+                  <span className="mt-2 block h-1 w-full overflow-hidden rounded-full bg-overlay/[0.08]">
+                    <span className="block h-full rounded-full bg-gradient-to-r from-foundry-amber to-foundry-teal" style={{ width: `${continueProgress.percent}%` }} />
+                  </span>
+                ) : null}
               </span>
-              <span className="min-w-0">
-                <span className="block text-sm font-extrabold text-foundry-ink">Open an existing project instead</span>
-                <span className="mt-0.5 block text-xs leading-5 text-foundry-muted">Connect a local folder, open a workspace project, or upload files to work on here.</span>
-              </span>
-              <ArrowRight size={16} className="ml-auto shrink-0 text-foundry-subtle" />
+              <span className="shrink-0 text-xs font-extrabold text-foundry-muted">Open →</span>
             </button>
           </section>
         ) : null}
 
-        {recentCards.length ? (
+        {recentCards.length || historyRecommendations.length ? (
           <section>
             <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 className="text-sm font-extrabold text-foundry-ink">Recent projects</h2>
+              <h2 className="text-sm font-extrabold text-foundry-ink">{recentCards.length ? "Recent projects" : "Suggested for you"}</h2>
+              {historyRecommendations.length ? <ModelSelectionChip selection={historyModelSelection} showModelNames={showModelNames} /> : null}
             </div>
-            <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
+            <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
               {recentCards.map((card) => (
                 <button
                   key={card.id}
                   type="button"
-                  className="rounded-lg border border-white/10 bg-white/[0.03] p-4 text-left transition hover:border-foundry-teal/35 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
+                  className="rounded-lg border border-overlay/10 bg-overlay/[0.03] p-3.5 text-left transition hover:border-foundry-teal/35 hover:bg-overlay/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/40"
                   onClick={() => onSelectMission(card.missionId)}
                 >
-                  <span className="block text-[13px] font-extrabold text-foundry-ink">{card.title}</span>
-                  <span className="mt-1.5 block truncate text-xs leading-5 text-foundry-muted">{card.subtitle}</span>
+                  <span className="block truncate text-[13px] font-extrabold text-foundry-ink">{card.title}</span>
+                  <span className="mt-1 block truncate text-xs leading-5 text-foundry-muted">{card.subtitle}</span>
                 </button>
               ))}
-            </div>
-          </section>
-        ) : null}
-
-        {historyRecommendations.length ? (
-          <section>
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 className="text-sm font-extrabold text-foundry-ink">Recommended Based on Your History</h2>
-              <ModelSelectionChip selection={historyModelSelection} showModelNames={showModelNames} />
-            </div>
-            <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
               {historyRecommendations.map((recommendation) => (
                 <button
                   key={recommendation.id}
                   type="button"
-                  className="rounded-lg border border-foundry-amber/25 bg-foundry-amber/[0.06] p-4 text-left transition hover:border-foundry-amber/45 hover:bg-foundry-amber/[0.11] focus-visible:border-foundry-amber/50 focus-visible:outline-none"
+                  className="rounded-lg border border-foundry-amber/25 bg-foundry-amber/[0.05] p-3.5 text-left transition hover:border-foundry-amber/45 hover:bg-foundry-amber/[0.1] focus-visible:border-foundry-amber/50 focus-visible:outline-none"
                   onClick={() => onOpenFlow(customTemplate, recommendation.suggestedMessage)}
                 >
-                  <span className="block text-[13px] font-extrabold text-foundry-ink">{recommendation.title}</span>
-                  <span className="mt-1.5 block text-xs leading-5 text-foundry-muted">{recommendation.reason}</span>
+                  <span className="block truncate text-[13px] font-extrabold text-foundry-ink">{recommendation.title}</span>
+                  <span className="mt-1 block truncate text-xs leading-5 text-foundry-muted">{recommendation.reason}</span>
                 </button>
               ))}
             </div>
           </section>
         ) : null}
 
-        <section id="all-project-types" className="scroll-mt-4">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <h2 className="text-sm font-extrabold text-foundry-ink">All project types</h2>
-            <span className="text-xs font-bold text-foundry-subtle">Every one goes through the same discovery flow</span>
-          </div>
-          <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
-            {starterTemplates.map((template) => (
-              <BuildCard key={template.id} template={template} onStart={() => onOpenFlow(template)} />
-            ))}
-            <BuildCard template={customTemplate} onStart={() => onOpenFlow(customTemplate)} />
-          </div>
+        {/* Secondary: every template stays reachable, but collapsed so the default view is the hero
+            plus the primary choices rather than a wall of ~15 cards. */}
+        <section id="all-project-types" className="scroll-mt-4 overflow-hidden rounded-2xl border border-overlay/10 bg-foundry-surface">
+          <button
+            type="button"
+            aria-expanded={templatesOpen}
+            aria-controls="all-project-types-grid"
+            onClick={() => setTemplatesOpen((open) => !open)}
+            className="flex w-full items-center justify-between gap-3 px-4 py-3.5 text-left text-sm font-extrabold text-foundry-ink transition hover:bg-overlay/[0.02] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-amber/40"
+          >
+            <span>Browse all project types</span>
+            <span className="inline-flex items-center gap-2 text-xs font-bold text-foundry-subtle">
+              {starterTemplates.length + 1} templates
+              <ChevronDown size={14} className={`transition ${templatesOpen ? "rotate-180" : ""}`} />
+            </span>
+          </button>
+          {templatesOpen ? (
+            <div id="all-project-types-grid" className="grid gap-2.5 border-t border-overlay/10 p-4 sm:grid-cols-2 xl:grid-cols-3">
+              {starterTemplates.map((template) => (
+                <BuildCard key={template.id} template={template} onStart={() => onOpenFlow(template)} />
+              ))}
+              <BuildCard template={customTemplate} onStart={() => onOpenFlow(customTemplate)} />
+            </div>
+          ) : null}
         </section>
 
-        {realEvents.length > 0 ? (
-          <section className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
-            <p className="section-kicker">Recent Project Activity</p>
-            <div className="mt-3 grid gap-2">
-              {realEvents.slice(-5).map((event, index) => (
-                <div key={`${event}-${index}`} className="flex items-center gap-2 rounded-md bg-black/20 px-3 py-2 text-sm text-foundry-muted">
-                  <CheckCircle2 size={15} className="text-foundry-teal" />
-                  <span>{event}</span>
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
-
-        <section>
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <h2 className="text-sm font-extrabold text-foundry-ink">Bring In Existing Work</h2>
-          </div>
-          <div className="grid gap-3 md:grid-cols-2">
-            <button
-              className="rounded-lg border border-white/10 bg-white/[0.035] p-4 text-left transition hover:border-foundry-blue/35 hover:bg-foundry-blue/[0.06] focus-visible:border-foundry-blue/50 focus-visible:outline-none"
-              type="button"
-              onClick={() => onOpenExistingFlow("convert-existing")}
-            >
-              <span className="block text-[13px] font-extrabold text-foundry-ink">Convert Existing Project</span>
-              <span className="mt-1.5 block text-xs leading-5 text-foundry-muted">Migrate an existing project to a different stack in place — Foundry builds the new version alongside the old one until it&apos;s verified.</span>
-            </button>
-            <button
-              className="rounded-lg border border-white/10 bg-white/[0.035] p-4 text-left transition hover:border-foundry-blue/35 hover:bg-foundry-blue/[0.06] focus-visible:border-foundry-blue/50 focus-visible:outline-none"
-              type="button"
-              onClick={() => onOpenExistingFlow("clone-existing")}
-            >
-              <span className="block text-[13px] font-extrabold text-foundry-ink">Clone Into Another Stack</span>
-              <span className="mt-1.5 block text-xs leading-5 text-foundry-muted">Build a new copy of an existing project in a different stack, and leave the original untouched.</span>
-            </button>
-          </div>
+        <section aria-label="Bring in existing work" className="flex flex-wrap items-center gap-x-1.5 gap-y-2 pb-2 text-xs text-foundry-subtle">
+          <span className="font-bold">Moving a project between stacks?</span>
+          <button
+            type="button"
+            className="rounded font-extrabold text-foundry-blue underline-offset-2 transition hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-blue/40"
+            onClick={() => onOpenExistingFlow("convert-existing")}
+            title="Migrate an existing project to a different stack in place — Foundry builds the new version alongside the old one until it's verified."
+          >
+            Convert to another stack
+          </button>
+          <span aria-hidden="true">·</span>
+          <button
+            type="button"
+            className="rounded font-extrabold text-foundry-blue underline-offset-2 transition hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-blue/40"
+            onClick={() => onOpenExistingFlow("clone-existing")}
+            title="Build a new copy of an existing project in a different stack, and leave the original untouched."
+          >
+            Clone into another stack
+          </button>
         </section>
       </div>
     </section>
@@ -1372,7 +1429,7 @@ function ProjectFileTree({
 }) {
   const tree = buildFileTree(files);
   return (
-    <div className="mt-3 min-h-0 overflow-auto border-t border-white/10 pt-2">
+    <div className="mt-3 min-h-0 overflow-auto border-t border-overlay/10 pt-2">
       {tree.children.length ? (
         tree.children.map((node) => <FileTreeNodeView key={node.path || node.name} node={node} depth={0} onReadFile={onReadFile} recentlyChangedPaths={recentlyChangedPaths} />)
       ) : (
@@ -1399,7 +1456,7 @@ function FileTreeNodeView({
     return (
       <div>
         <button
-          className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs font-bold text-foundry-muted hover:bg-white/[0.055] hover:text-foundry-ink"
+          className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs font-bold text-foundry-muted hover:bg-overlay/[0.055] hover:text-foundry-ink"
           style={{ paddingLeft: 8 + depth * 14 }}
           type="button"
           onClick={() => setOpen((current) => !current)}
@@ -1431,6 +1488,7 @@ function FileTreePanel({
   connectedPath,
   selectedFile,
   error,
+  loading,
   onClose,
   onReadFile,
 }: {
@@ -1439,29 +1497,30 @@ function FileTreePanel({
   connectedPath: string;
   selectedFile: FactoryFileReadResult | null;
   error: string;
+  loading?: boolean;
   onClose: () => void;
   onReadFile: (path: string) => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4">
-      <section className="grid h-[86vh] w-full max-w-6xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-xl border border-white/15 bg-[#101416] shadow-workspace">
-        <header className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
+    <div className="fixed inset-0 z-50 grid place-items-center bg-shade/70 p-4">
+      <section className="grid h-[86vh] w-full max-w-6xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-xl border border-overlay/15 bg-foundry-raised shadow-workspace">
+        <header className="flex items-center justify-between gap-3 border-b border-overlay/10 px-4 py-3">
           <div className="min-w-0">
             <p className="section-kicker">Project Files</p>
-            <h2 className="truncate text-lg font-extrabold text-foundry-ink">{execution?.projectPath ?? connectedPath ?? selectedFile?.projectId ?? "Connected project"}</h2>
+            <h2 className="truncate text-lg font-extrabold text-foundry-ink">{execution?.projectPath || connectedPath || selectedFile?.projectId || "Connected project"}</h2>
           </div>
-          <button className="rounded-md px-3 py-2 text-sm font-bold text-foundry-muted transition hover:bg-white/10 hover:text-foundry-ink" type="button" onClick={onClose}>
+          <button className="rounded-md px-3 py-2 text-sm font-bold text-foundry-muted transition hover:bg-overlay/10 hover:text-foundry-ink" type="button" onClick={onClose}>
             Close
           </button>
         </header>
         <div className="grid min-h-0 gap-0 md:grid-cols-[300px_minmax(0,1fr)]">
-          <aside className="min-h-0 overflow-auto border-b border-white/10 p-3 md:border-b-0 md:border-r">
-            <ProjectFileTree files={execution?.files.length ? execution.files : workspaceFiles} onReadFile={onReadFile} />
+          <aside className="min-h-0 overflow-auto border-b border-overlay/10 p-3 md:border-b-0 md:border-r">
+            <ProjectFileTree files={workspaceFiles} onReadFile={onReadFile} />
             <div className="hidden">
               {(execution?.files ?? (selectedFile ? [{ path: selectedFile.path, status: "created" as const, size: selectedFile.content.length }] : [])).map((file) => (
                 <button
                   key={file.path}
-                  className={`rounded-md px-3 py-2 text-left text-xs transition ${selectedFile?.path === file.path ? "bg-foundry-teal/15 text-foundry-ink" : "text-foundry-muted hover:bg-white/[0.06] hover:text-foundry-ink"}`}
+                  className={`rounded-md px-3 py-2 text-left text-xs transition ${selectedFile?.path === file.path ? "bg-foundry-teal/15 text-foundry-ink" : "text-foundry-muted hover:bg-overlay/[0.06] hover:text-foundry-ink"}`}
                   type="button"
                   onClick={() => onReadFile(file.path)}
                 >
@@ -1472,10 +1531,10 @@ function FileTreePanel({
             </div>
           </aside>
           <section className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]">
-            <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
+            <div className="flex items-center justify-between gap-3 border-b border-overlay/10 px-4 py-3">
               <p className="truncate text-sm font-extrabold text-foundry-ink">{selectedFile?.path ?? "Select a file"}</p>
               <button
-                className="rounded-md border border-white/10 px-3 py-2 text-xs font-extrabold text-foundry-muted transition enabled:hover:border-foundry-teal/35 enabled:hover:text-foundry-ink disabled:opacity-50"
+                className="rounded-md border border-overlay/10 px-3 py-2 text-xs font-extrabold text-foundry-muted transition enabled:hover:border-foundry-teal/35 enabled:hover:text-foundry-ink disabled:opacity-50"
                 type="button"
                 disabled={!selectedFile}
                 onClick={() => selectedFile && void navigator.clipboard.writeText(selectedFile.content)}
@@ -1483,8 +1542,8 @@ function FileTreePanel({
                 Copy
               </button>
             </div>
-            {error ? <p className="p-4 text-sm text-red-300">{error}</p> : null}
-            <pre className="min-h-0 overflow-auto whitespace-pre-wrap p-4 text-xs leading-5 text-foundry-muted">{selectedFile?.content ?? "Choose a file from the tree."}</pre>
+            {loading ? <p className="p-4 text-sm text-foundry-muted">Loading and indexing project files…</p> : error ? <p className="p-4 text-sm text-red-300">{error}</p> : null}
+            <pre className="min-h-0 overflow-auto whitespace-pre-wrap p-4 text-xs leading-5 text-foundry-muted">{selectedFile?.content ?? (loading ? "Project files will appear here automatically." : "Choose a file from the tree.")}</pre>
           </section>
         </div>
       </section>
@@ -1503,13 +1562,12 @@ function CustomBuildStep({ start, onUpdate }: { start: ProjectStart; onUpdate: (
   // deleted). A Stage-A seed only enriches naming/subtype chips instantly; the real analysis always
   // comes from the same Discovery Engine LLM pass every other entry path uses, not a duplicate one.
   function applyDescription(value: string) {
-    const seed = seedDiscovery(value);
     onUpdate({
       projectDescription: value,
       appKind: value,
-      subtype: firstSubtypeForDetectedType(seed.domainGuess),
+      subtype: firstSubtypeFor("custom"),
       customSubtype: "",
-      projectName: start.projectNameTouched ? start.projectName : cleanProjectName(seed.domainGuess),
+      projectName: start.projectNameTouched ? start.projectName : cleanProjectName(value),
       discoveryAnswers: {},
     });
   }
@@ -1517,7 +1575,7 @@ function CustomBuildStep({ start, onUpdate }: { start: ProjectStart; onUpdate: (
   return (
     <FlowSection eyebrow="Foundry is asking" title="What do you want to build?" body="Describe it in your own words. Foundry will infer the shape, stack, architecture, features, style, and data model before it asks anything else.">
       <textarea
-        className="min-h-32 w-full resize-y border-0 border-b border-white/10 bg-transparent p-0 pb-2 font-serif text-[17px] italic leading-8 text-foundry-ink outline-none placeholder:not-italic placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+        className="min-h-32 w-full resize-y border-0 border-b border-overlay/10 bg-transparent p-0 pb-2 font-serif text-[17px] italic leading-8 text-foundry-ink outline-none placeholder:not-italic placeholder:text-foundry-subtle focus:border-foundry-teal/50"
         value={start.projectDescription}
         onChange={(event) => applyDescription(event.target.value)}
         placeholder="a small warehouse system tracking pallets across three sites…"
@@ -1543,7 +1601,8 @@ type DiscoveryEngineOutcome = Awaited<ReturnType<typeof runDiscoveryEngine>>;
  * "Next.js" memo and the four hardcoded fallback stack cards. Keying by the request signature means a
  * remount awaits the same in-flight promise instead of firing (and aborting) a fresh one.
  */
-const discoveryRequestCache = new Map<string, Promise<DiscoveryEngineOutcome>>();
+type CachedDiscoveryRequest = { promise: Promise<DiscoveryEngineOutcome>; abort: () => void };
+const discoveryRequestCache = new Map<string, CachedDiscoveryRequest>();
 
 function discoverySeedText(start: ProjectStart) {
   if (start.template.id !== "custom") {
@@ -1552,33 +1611,45 @@ function discoverySeedText(start: ProjectStart) {
   return start.projectDescription.trim() || start.appKind;
 }
 
-function cachedRunDiscoveryEngine(key: string, run: () => Promise<DiscoveryEngineOutcome>): Promise<DiscoveryEngineOutcome> {
+function cachedRunDiscoveryEngine(key: string, run: (signal: AbortSignal) => Promise<DiscoveryEngineOutcome>): CachedDiscoveryRequest {
   const existing = discoveryRequestCache.get(key);
   if (existing) return existing;
-  const promise = run().catch((error) => {
-    // Drop failures from the cache so a later attempt for the same project can retry cleanly.
-    discoveryRequestCache.delete(key);
-    throw error;
-  });
-  discoveryRequestCache.set(key, promise);
-  return promise;
+  const controller = new AbortController();
+  const request: CachedDiscoveryRequest = {
+    promise: run(controller.signal)
+      .then((result) => {
+        if (!result.ok) discoveryRequestCache.delete(key);
+        return result;
+      })
+      .catch((error) => {
+        discoveryRequestCache.delete(key);
+        throw error;
+      }),
+    abort: () => controller.abort("Discovery exceeded the user-facing time budget."),
+  };
+  discoveryRequestCache.set(key, request);
+  return request;
 }
 
 function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart; onUpdate: (update: Partial<ProjectStart>) => void; onAdvance: () => void }) {
   const [showEscape, setShowEscape] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [discoveryError, setDiscoveryError] = useState("");
+  const [attempt, setAttempt] = useState(0);
   // "cancelled" means only "this mounted instance should stop touching state" — it must NOT abort the
   // underlying discovery request. React remounts this component (Strict Mode in dev + parent
   // re-renders); tying the network request's lifetime to the effect is exactly what made the fetch get
   // aborted before it reached the server every time. The request now lives in discoveryRequestCache,
   // independent of any single mount.
   const cancelledRef = useRef(false);
+  const activeRequestRef = useRef<CachedDiscoveryRequest | null>(null);
 
   useEffect(() => {
+    if (discoveryError) return;
     const started = Date.now();
     const timer = window.setInterval(() => setElapsedSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [attempt, discoveryError]);
 
   useEffect(() => {
     cancelledRef.current = false;
@@ -1591,7 +1662,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
     // A real gpt-5 analysis has been observed taking 60-80+ seconds; 110s is the hard ceiling. This is a
     // Promise.race that resolves to a heuristic fallback rather than aborting the shared request, so a
     // remount's own timer can never tear down an in-flight discovery the cache is serving.
-    const hardTimeoutMs = 25000;
+    const hardTimeoutMs = 20_000;
     const startedAt = Date.now();
 
     async function refine() {
@@ -1607,11 +1678,11 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
       // as the fallback memo content if the LLM call fails, so the user never lands on a blank summary
       // step just because OPENAI_API_KEY is unset or the network hiccups.
       const heuristic = discoverProject(seedText);
-      const cacheKey = JSON.stringify(["fast-discovery-v3-stack-only", seedText, start.template.id, start.subtype, start.customSubtype, start.projectLocation, start.uploadNames]);
+      const cacheKey = JSON.stringify(["fast-discovery-v4-platform-contract", seedText, start.template.id, start.subtype, start.customSubtype, start.projectLocation, start.uploadNames]);
+      let completed = false;
       try {
         const inspection = start.uploadNames.length ? inspectExistingSourceNames(start.uploadNames) : null;
-        const result = await Promise.race([
-          cachedRunDiscoveryEngine(cacheKey, () =>
+        const cachedRequest = cachedRunDiscoveryEngine(cacheKey, (signal) =>
             runDiscoveryEngine(
               heuristic,
               {
@@ -1630,20 +1701,33 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
               // Discovery is a bounded comparison task. The Fast reasoning tier preserves real AI
               // stack analysis without making the user wait on a build-scale model; the selected
               // execution tier still governs the actual architecture/build mission afterward.
-              { mode: "fast" }
-            )
-          ),
-          wait(hardTimeoutMs).then((): DiscoveryEngineOutcome => ({ ok: false, error: "Discovery analysis exceeded the time budget." })),
+              { mode: "fast", signal }
+            ),
+        );
+        activeRequestRef.current = cachedRequest;
+        const result = await Promise.race([
+          cachedRequest.promise,
+          wait(hardTimeoutMs).then((): DiscoveryEngineOutcome => {
+            cachedRequest.abort();
+            return { ok: false, error: "Discovery analysis exceeded the 20-second time budget and was cancelled." };
+          }),
         ]);
         if (!cancelledRef.current) {
-          const rawDiscovery = result.ok && result.discovery ? result.discovery : heuristic;
+          if (!result.ok || !result.discovery) {
+            setDiscoveryError(result.error || "Discovery could not produce a complete project decision.");
+            return;
+          }
+          const rawDiscovery = result.discovery;
           const resolvedDiscovery = reconcileKnownStarterDiscovery(rawDiscovery, start);
-          const resolvedStackOptions = Array.isArray(result.stackOptions) && result.stackOptions.length ? result.stackOptions : fallbackStackOptionsFor(resolvedDiscovery);
+          const proposedStackOptions = Array.isArray(result.stackOptions) && result.stackOptions.length ? result.stackOptions : fallbackStackOptionsFor(resolvedDiscovery, start);
+          const platformContract = reconcilePlatformStackOptions(start.template.id, resolvedDiscovery, proposedStackOptions);
+          const resolvedStackOptions = platformContract.stackOptions;
           const recommendedOption = resolvedStackOptions.find((option) => option.recommended);
           const resolvedStack = recommendedOption?.name || resolvedDiscovery.recommendedStack;
           const authoritativeDiscovery = alignDiscoveryWithSelectionAndConstraints(resolvedDiscovery, start, resolvedStack);
           onUpdate({
             discovery: authoritativeDiscovery,
+            discoveryProvenance: "model",
             // The recommendation and the selected value are one decision. Keeping the old
             // seed stack here made the sidebar/build brief claim Next.js while the cards
             // correctly recommended WPF (or another domain-specific stack).
@@ -1656,16 +1740,17 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
             stackOptions: resolvedStackOptions,
             modelSelection: result.modelSelection ?? null,
           });
+          completed = true;
         }
-      } catch {
+      } catch (error) {
         // Network error or malformed response — fall back to the heuristic-only memo rather than
         // leaving start.discovery null and the summary step blank.
-        if (!cancelledRef.current) onUpdate({ discovery: heuristic, projectName: start.projectNameTouched ? start.projectName : cleanProjectName(heuristic.projectType) });
+        if (!cancelledRef.current) setDiscoveryError(error instanceof Error ? error.message : "Discovery failed before returning a project decision.");
       } finally {
         window.clearTimeout(escapeTimer);
         const remaining = minVisibleMs - (Date.now() - startedAt);
         if (remaining > 0 && !cancelledRef.current) await wait(remaining);
-        if (!cancelledRef.current) onAdvance();
+        if (!cancelledRef.current && completed) onAdvance();
       }
     }
 
@@ -1675,10 +1760,11 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
       window.clearTimeout(escapeTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [attempt]);
 
   function skipRefinement() {
     cancelledRef.current = true;
+    activeRequestRef.current?.abort();
     // Same fallback as a failed LLM call (see refine() above) — skipping must never leave the summary
     // step with a blank memo just because the user got impatient before Stage B resolved. The in-flight
     // request keeps running in the cache; it just no longer has a listener.
@@ -1686,7 +1772,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
       const seedText = discoverySeedText(start);
       if (seedText.trim()) {
         const heuristic = discoverProject(seedText);
-        onUpdate({ discovery: heuristic, projectName: start.projectNameTouched ? start.projectName : cleanProjectName(heuristic.projectType) });
+        onUpdate({ discovery: heuristic, discoveryProvenance: "rough", projectName: start.projectNameTouched ? start.projectName : cleanProjectName(heuristic.projectType) });
       }
     }
     onAdvance();
@@ -1707,7 +1793,20 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           <p className="text-xs leading-5 text-foundry-subtle">{elapsedSeconds < 2 ? "Sending the project context…" : `Waiting for the selected model · ${elapsedSeconds}s`}</p>
         </div>
       </div>
-      {showEscape ? (
+      {discoveryError ? (
+        <div className="mt-8 rounded-lg border border-red-300/20 bg-red-300/[0.05] p-4">
+          <p className="text-sm font-bold text-red-100">Discovery did not complete</p>
+          <p className="mt-1 text-xs leading-5 text-foundry-muted">{discoveryError} No AI recommendation has been accepted as authoritative.</p>
+          <div className="mt-3 flex flex-wrap gap-3">
+            <button className="text-xs font-bold text-foundry-teal transition hover:text-foundry-ink" type="button" onClick={() => { setDiscoveryError(""); setShowEscape(false); setElapsedSeconds(0); setAttempt((value) => value + 1); }}>
+              Retry discovery
+            </button>
+            <button className="text-xs font-bold text-foundry-subtle transition hover:text-foundry-muted" type="button" onClick={skipRefinement}>
+              Continue with a clearly labeled rough pass
+            </button>
+          </div>
+        </div>
+      ) : showEscape ? (
         <div className="mt-8">
           <p className="text-xs leading-5 text-foundry-subtle">Still reasoning — a thorough analysis genuinely takes a while. You can wait for it, or continue now with a rough first pass instead.</p>
           <button className="mt-2 text-xs font-bold text-foundry-subtle transition hover:text-foundry-muted" type="button" onClick={skipRefinement}>
@@ -1723,15 +1822,17 @@ function DiscoveryRail({ start, stepIndex, steps }: { start: ProjectStart; stepI
   const idx = (target: FlowStep) => steps.indexOf(target);
   const starterLabel = start.template.id === "custom" ? "Custom project" : start.template.title.replace(/^Build\s+/i, "");
   const styleValue = start.customStyle.trim() || start.styleChoice;
+  const exactProjectChoice = start.customSubtype.trim() || (start.subtype === "Other / Custom" ? "" : start.subtype.trim());
 
   const rows: Array<{ key: string; label: string; value: string; show: boolean; pending?: boolean }> = [
     { key: "starter", label: "Starter", value: starterLabel, show: true },
+    { key: "choice", label: "Your choice", value: exactProjectChoice, show: Boolean(exactProjectChoice) },
     {
       key: "domain",
-      label: "Domain",
-      // Stage A seed shows instantly (before any network call resolves); Stage B's real analysis
-      // (start.discovery) takes over the moment UnderstandingStep's LLM call returns.
-      value: start.discovery?.projectType ?? seedDiscovery(start.appKind || start.projectDescription).domainGuess,
+      label: start.discovery ? "Domain" : "Project brief",
+      // Before the model finishes, repeat only what the user actually said. A keyword seed is useful
+      // internally but must never appear under "Established so far" as if it were authoritative.
+      value: start.discovery?.projectType ?? cleanProjectName(start.projectDescription || start.appKind),
       show: true,
     },
     { key: "stack", label: "Stack", value: selectedStackFor(start), show: stepIndex >= idx("stack") },
@@ -1743,9 +1844,9 @@ function DiscoveryRail({ start, stepIndex, steps }: { start: ProjectStart; stepI
   ];
 
   return (
-    <aside className="hidden border-r border-white/[0.06] bg-gradient-to-b from-white/[0.025] to-transparent px-5 py-6 md:flex md:flex-col">
+    <aside className="hidden border-r border-overlay/[0.06] bg-gradient-to-b from-overlay/[0.025] to-transparent px-5 py-6 md:flex md:flex-col">
       <div className="mb-8 flex items-center gap-2">
-        <span className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[5px] bg-gradient-to-br from-foundry-teal to-[#1f7a5c] font-serif text-[13px] font-bold italic text-[#06110d]">F</span>
+        <span className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[5px] bg-gradient-to-br from-foundry-teal to-[#1f7a5c] font-serif text-[13px] font-bold italic text-foundry-bg">F</span>
         <span className="font-serif text-[16px] text-foundry-ink">Foundry</span>
         <span className="font-mono text-[9.5px] uppercase tracking-[0.08em] text-foundry-subtle">discovery</span>
       </div>
@@ -1765,7 +1866,7 @@ function DiscoveryRail({ start, stepIndex, steps }: { start: ProjectStart; stepI
           ))}
       </div>
 
-      <div className="mt-4 border-t border-white/[0.06] pt-4">
+      <div className="mt-4 border-t border-overlay/[0.06] pt-4">
         <span className="inline-flex items-center gap-2 font-mono text-[10px] text-foundry-muted">
           <span className="h-1.5 w-1.5 animate-breathe rounded-full bg-foundry-teal" />
           Foundry is here with you
@@ -1773,6 +1874,57 @@ function DiscoveryRail({ start, stepIndex, steps }: { start: ProjectStart; stepI
       </div>
     </aside>
   );
+}
+
+function projectNeedsVisualStyle(start: ProjectStart) {
+  const projectShape = `${start.discovery?.projectType ?? ""} ${start.appKind} ${start.subtype} ${start.customSubtype}`;
+  return !/\b(?:backend|api|microservice|webhook service|command[- ]line|cli|library|sdk)\b/i.test(projectShape);
+}
+
+function DiscoveryAttachmentPreview({ file, onRemove }: { file: File; onRemove: () => void }) {
+  const [source, setSource] = useState("");
+  const isImage = file.type.startsWith("image/") || /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name);
+
+  useEffect(() => {
+    if (!isImage) {
+      setSource("");
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    setSource(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file, isImage]);
+
+  return (
+    <figure className="group relative overflow-hidden rounded-lg border border-overlay/10 bg-shade/35">
+      {isImage && source ? (
+        // This local URL exists only while the unsent discovery attachment is being previewed.
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={source} alt={file.name || "Pasted screenshot"} className="h-28 w-full object-contain" />
+      ) : (
+        <div className="flex h-28 flex-col items-center justify-center gap-2 px-3 text-center text-foundry-muted">
+          <File size={24} />
+          <span className="max-w-full truncate text-[11px] font-semibold">{file.name || "Attached file"}</span>
+          <span className="text-[10px] text-foundry-subtle">{formatDiscoveryFileSize(file.size)}</span>
+        </div>
+      )}
+      <figcaption className="truncate border-t border-overlay/8 px-2.5 py-1.5 text-[10px] text-foundry-subtle">{file.name || "Pasted screenshot"}</figcaption>
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label={`Remove ${file.name || "attachment"}`}
+        className="absolute right-1.5 top-1.5 grid h-7 w-7 place-items-center rounded-full border border-overlay/15 bg-shade/80 text-overlay/75 shadow-lg transition hover:border-overlay/30 hover:bg-black hover:text-white"
+      >
+        <X size={13} />
+      </button>
+    </figure>
+  );
+}
+
+function formatDiscoveryFileSize(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function ProjectStartFlow({
@@ -1795,10 +1947,14 @@ function ProjectStartFlow({
   onCreate: () => void;
 }) {
   const projectUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const instructionAttachmentInputRef = useRef<HTMLInputElement | null>(null);
   const stackOptions = start.stackOptions.length ? start.stackOptions : FALLBACK_STACK_OPTIONS;
   const selectedRecommendation = recommendationForStart(start);
   const canUseFolderPicker = supportsBrowserFolderAccess();
-  const steps: FlowStep[] = ["kind", "project", "understanding", "stack", "style", "summary", "instructions"];
+  const hasVisualExperience = projectNeedsVisualStyle(start);
+  const steps: FlowStep[] = hasVisualExperience
+    ? ["kind", "project", "understanding", "stack", "style", "summary", "instructions"]
+    : ["kind", "project", "understanding", "stack", "summary", "instructions"];
   const stepIndex = steps.indexOf(step);
   const nextStep = steps[Math.min(stepIndex + 1, steps.length - 1)];
   // Going back from "stack" skips the transitional "understanding" screen rather than re-triggering it.
@@ -1812,6 +1968,17 @@ function ProjectStartFlow({
   const [connectedFolderEntries, setConnectedFolderEntries] = useState<string[]>([]);
   const everConnectedRef = useRef(false);
 
+  function addInstructionFiles(files: File[]) {
+    if (!files.length) return;
+    const next = new Map(start.instructionFiles.map((file) => [`${file.name}:${file.size}:${file.lastModified}`, file]));
+    for (const file of files) next.set(`${file.name}:${file.size}:${file.lastModified}`, file);
+    onUpdate({ instructionFiles: Array.from(next.values()) });
+  }
+
+  useEffect(() => {
+    if (step === "style" && !hasVisualExperience) onStepChange("summary");
+  }, [hasVisualExperience, onStepChange, step]);
+
   // Keeps discovery.recommendedStack in sync with the user's actual pick — projectBriefFor() and the
   // memo's "Recommended stack" field both read discovery.recommendedStack, so without this the build
   // silently used whatever the heuristic/LLM guessed first regardless of what was clicked here.
@@ -1824,7 +1991,7 @@ function ProjectStartFlow({
     // Switching away from the originally-recommended stack invalidates any framework-specific
     // architecture language (e.g. "Next.js App Router with Server Actions") — replace it with a
     // stack-neutral description instead of leaving a wrong, stack-mismatched claim in the memo.
-    const stackChanged = resolved !== start.discovery.recommendedStack;
+    const stackChanged = !sameStackChoice(resolved, start.discovery.recommendedStack);
     const nextArchitecture = stackChanged ? genericArchitectureFor(resolved, start.discovery.dataModel, start.discovery.projectType, start.discovery.mainFeatures) : start.discovery.architecture;
     onUpdate({
       stack: name,
@@ -1926,7 +2093,7 @@ function ProjectStartFlow({
     } else {
       input.removeAttribute("webkitdirectory");
       input.removeAttribute("directory");
-      input.setAttribute("accept", ".zip,.tar,.gz,.7z,.rar,.txt,.md,.json,.js,.jsx,.ts,.tsx,.css,.html,.py,.cs,.java,.kt,.php,.go,.rs");
+      input.setAttribute("accept", ".zip,.txt,.md,.json,.js,.jsx,.ts,.tsx,.css,.scss,.sass,.less,.html,.py,.cs,.java,.kt,.php,.go,.rs,.rb,.swift,.dart,.sql,.xml,.yml,.yaml,.toml,.sh,.ps1");
     }
     input.click();
   }
@@ -1953,16 +2120,16 @@ function ProjectStartFlow({
   const blockedByExistingSource = existingSourceRisky && !start.existingSourceChoice;
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
-      <section className="grid max-h-[90vh] w-full max-w-4xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-lg border border-white/15 bg-[#111617] shadow-workspace">
-        <header className="flex items-center justify-between gap-4 border-b border-white/[0.08] px-5 py-3.5">
+    <div className="fixed inset-0 z-50 grid place-items-center bg-shade/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
+      <section className="grid max-h-[90vh] w-full max-w-4xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-lg border border-overlay/15 bg-foundry-raised shadow-workspace">
+        <header className="flex items-center justify-between gap-4 border-b border-overlay/[0.08] px-5 py-3.5">
           <div className="flex items-center gap-2.5">
             <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-foundry-teal/25 bg-foundry-teal/[0.08] text-foundry-teal">
               <Icon size={16} />
             </span>
             <span className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-foundry-subtle">Intelligent Project Discovery</span>
           </div>
-          <button className="rounded-md px-3 py-1.5 text-sm font-bold text-foundry-muted hover:bg-white/10 hover:text-foundry-ink" type="button" onClick={onClose}>
+          <button className="rounded-md px-3 py-1.5 text-sm font-bold text-foundry-muted hover:bg-overlay/10 hover:text-foundry-ink" type="button" onClick={onClose}>
             Close
           </button>
         </header>
@@ -1981,7 +2148,7 @@ function ProjectStartFlow({
                   const files = event.currentTarget.files;
                   void selectedUploadedFiles(files).then((uploadedFiles) =>
                     onUpdate({
-                      uploadNames: selectedUploadNames(files),
+                      uploadNames: uploadedFiles.map((file) => file.path),
                       uploadedFiles,
                       browserFolderHandleId: "",
                       browserFolderName: "",
@@ -2020,7 +2187,7 @@ function ProjectStartFlow({
                 <label className="mt-7 flex items-baseline gap-2.5 text-[15px]">
                   <span className="whitespace-nowrap font-serif italic text-foundry-subtle">or, in your words —</span>
                   <input
-                    className="flex-1 border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+                    className="flex-1 border-0 border-b border-overlay/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
                     value={start.customSubtype}
                     onChange={(event) => {
                       const appKind = appKindFor(start.template, start.subtype, event.target.value);
@@ -2057,13 +2224,13 @@ function ProjectStartFlow({
                 </div>
 
                 {hasConnectedProject ? (
-                  <div className="rounded-md border border-white/10 bg-white/[0.035] p-3 text-sm text-foundry-muted">
+                  <div className="rounded-md border border-overlay/10 bg-overlay/[0.035] p-3 text-sm text-foundry-muted">
                     Current workspace project detected: <span className="font-bold text-foundry-ink">{connectedProjectTitle}</span>
                   </div>
                 ) : null}
 
                 {start.projectLocation !== "create-folder" ? (
-                  <div className="rounded-md border border-white/10 bg-black/20 p-3 text-xs leading-5 text-foundry-muted">
+                  <div className="rounded-md border border-overlay/10 bg-shade/20 p-3 text-xs leading-5 text-foundry-muted">
                     Planned folder path: <span className="font-mono text-foundry-ink">{plannedProjectPath(start)}</span>
                   </div>
                 ) : null}
@@ -2086,10 +2253,10 @@ function ProjectStartFlow({
                           <a className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]" href="/api/factory/agent/download?platform=windows" download>
                             Download for Windows
                           </a>
-                          <a className="rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink" href="/api/factory/agent/download?platform=mac" download>
+                          <a className="rounded-md border border-overlay/15 bg-overlay/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink" href="/api/factory/agent/download?platform=mac" download>
                             macOS
                           </a>
-                          <a className="rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink" href="/api/factory/agent/download?platform=linux" download>
+                          <a className="rounded-md border border-overlay/15 bg-overlay/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink" href="/api/factory/agent/download?platform=linux" download>
                             Linux
                           </a>
                         </div>
@@ -2097,7 +2264,7 @@ function ProjectStartFlow({
                           Requires Node.js already installed (get it from nodejs.org if needed). Run the downloaded file once — it installs itself, starts running, and relaunches automatically every time you log in. Then check again below.
                         </p>
                         <button
-                          className="mt-3 rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink"
+                          className="mt-3 rounded-md border border-overlay/15 bg-overlay/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink"
                           type="button"
                           onClick={() => {
                             setAgentStatus("checking");
@@ -2168,7 +2335,7 @@ function ProjectStartFlow({
                         {canUseFolderPicker ? "Open live folder" : "Upload folder copy"}
                       </button>
                       <button
-                        className="rounded-md border border-white/15 bg-white/[0.055] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-blue/35 hover:bg-foundry-blue/10 hover:text-foundry-ink"
+                        className="rounded-md border border-overlay/15 bg-overlay/[0.055] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-blue/35 hover:bg-foundry-blue/10 hover:text-foundry-ink"
                         type="button"
                         onClick={() => openProjectUploadPicker("files")}
                       >
@@ -2206,6 +2373,11 @@ function ProjectStartFlow({
 
           {step === "stack" ? (
             <FlowSection eyebrow="Foundry recommends, doesn't force" title="Pick a stack — or trust the recommendation." body="Foundry proposed these as different-language ways to build the exact same plan, honest capability level attached. Pick one, or type anything else below.">
+              {start.discoveryProvenance === "rough" ? (
+                <div role="status" className="mb-4 rounded-lg border border-foundry-amber/25 bg-foundry-amber/[0.06] px-3 py-2 text-xs leading-5 text-foundry-muted">
+                  Rough local pass — the AI discovery call did not complete. These choices are provisional and are not presented as a verified model recommendation.
+                </div>
+              ) : null}
               <div className="grid gap-2.5 sm:grid-cols-2">
                 {stackOptions.map((option) => (
                   <StackCard
@@ -2220,7 +2392,7 @@ function ProjectStartFlow({
               <label className="mt-6 flex items-baseline gap-2.5 text-[15px]">
                 <span className="whitespace-nowrap font-serif italic text-foundry-subtle">or, another stack —</span>
                 <input
-                  className="flex-1 border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+                  className="flex-1 border-0 border-b border-overlay/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
                   value={start.customStack}
                   onChange={(event) => selectStack(start.stack, event.target.value)}
                   placeholder="type any language or framework…"
@@ -2240,8 +2412,8 @@ function ProjectStartFlow({
                     type="button"
                     className={`rounded-full border px-4 py-2.5 text-[13.5px] transition ${
                       !start.customStyle.trim() && start.styleChoice === option
-                        ? "border-foundry-teal bg-foundry-teal font-semibold text-[#06120d]"
-                        : "border-white/10 bg-white/[0.04] text-foundry-muted hover:border-white/25 hover:text-foundry-ink"
+                        ? "border-foundry-teal bg-foundry-teal font-semibold text-foundry-bg"
+                        : "border-overlay/10 bg-overlay/[0.04] text-foundry-muted hover:border-overlay/25 hover:text-foundry-ink"
                     }`}
                     onClick={() =>
                       onUpdate({
@@ -2259,7 +2431,7 @@ function ProjectStartFlow({
               <label className="mt-7 flex items-baseline gap-2.5 text-[15px]">
                 <span className="whitespace-nowrap font-serif italic text-foundry-subtle">or, in your words —</span>
                 <input
-                  className="flex-1 border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+                  className="flex-1 border-0 border-b border-overlay/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
                   value={start.customStyle}
                   onChange={(event) =>
                     onUpdate({
@@ -2291,18 +2463,58 @@ function ProjectStartFlow({
           ) : null}
 
           {step === "instructions" ? (
-            <FlowSection eyebrow="Optional" title="Anything else Foundry should know?" body="Constraints, features, data fields, brand direction, integrations — leave it empty and Foundry builds from the memo alone.">
-              <textarea
-                className="min-h-32 w-full resize-y border-0 border-b border-white/10 bg-transparent p-0 pb-2 font-serif text-[17px] italic leading-8 text-foundry-ink outline-none placeholder:not-italic placeholder:text-foundry-subtle focus:border-foundry-teal/50"
-                value={start.instructions}
-                onChange={(event) => onUpdate({ instructions: event.target.value })}
-                placeholder="roles, pages, workflows, data, integrations, visual style, constraints…"
-              />
+            <FlowSection eyebrow="Optional" title="Anything else Foundry should know?" body={hasVisualExperience ? "Constraints, features, data fields, brand direction, integrations — leave it empty and Foundry builds from the memo alone." : "Constraints, endpoints, data contracts, integrations, deployment requirements — leave it empty and Foundry builds from the memo alone."}>
+              <div className="grid gap-4">
+                <textarea
+                  className="min-h-32 w-full resize-y border-0 border-b border-overlay/10 bg-transparent p-0 pb-2 font-serif text-[17px] italic leading-8 text-foundry-ink outline-none placeholder:not-italic placeholder:text-foundry-subtle focus:border-foundry-teal/50"
+                  value={start.instructions}
+                  onChange={(event) => onUpdate({ instructions: event.target.value })}
+                  onPaste={(event) => {
+                    const pastedFiles = Array.from(event.clipboardData.items)
+                      .filter((item) => item.kind === "file")
+                      .map((item) => item.getAsFile())
+                      .filter((file): file is File => Boolean(file));
+                    addInstructionFiles(pastedFiles);
+                  }}
+                  placeholder={hasVisualExperience ? "roles, pages, workflows, data, integrations, visual style, constraints…" : "endpoints, validation, data contracts, integrations, deployment constraints…"}
+                />
+                <input
+                  ref={instructionAttachmentInputRef}
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={(event) => {
+                    addInstructionFiles(Array.from(event.target.files ?? []));
+                    event.currentTarget.value = "";
+                  }}
+                />
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => instructionAttachmentInputRef.current?.click()}
+                    className="inline-flex items-center gap-2 rounded-md border border-foundry-teal/25 bg-foundry-teal/[0.07] px-3.5 py-2 text-xs font-bold text-foundry-teal transition hover:border-foundry-teal/45 hover:bg-foundry-teal/[0.12]"
+                  >
+                    <Paperclip size={14} /> Attach files
+                  </button>
+                  <p className="text-xs leading-5 text-foundry-subtle">Choose any file, or paste a screenshot directly into the field. Attachments are read with the brief when the build starts.</p>
+                </div>
+                {start.instructionFiles.length ? (
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3" aria-label="Project brief attachments">
+                    {start.instructionFiles.map((file, index) => (
+                      <DiscoveryAttachmentPreview
+                        key={`${file.name}:${file.size}:${file.lastModified}`}
+                        file={file}
+                        onRemove={() => onUpdate({ instructionFiles: start.instructionFiles.filter((_, fileIndex) => fileIndex !== index) })}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+              </div>
             </FlowSection>
           ) : null}
         </div>
 
-            <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.07] px-7 py-5 sm:px-9">
+            <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-overlay/[0.07] px-7 py-5 sm:px-9">
               <button
                 className="text-[13px] font-medium text-foundry-subtle transition hover:text-foundry-muted disabled:opacity-30"
                 type="button"
@@ -2321,7 +2533,7 @@ function ProjectStartFlow({
                       <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Choose what Foundry should do about the existing files before continuing.</p>
                     ) : null}
                     <button
-                      className="inline-flex items-center gap-2 rounded-md bg-foundry-teal px-5 py-2.5 text-[13.5px] font-bold text-[#06120d] shadow-[0_6px_20px_-8px_rgba(79,209,189,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
+                      className="inline-flex items-center gap-2 rounded-md bg-foundry-teal px-5 py-2.5 text-[13.5px] font-bold text-foundry-bg shadow-[0_6px_20px_-8px_rgba(79,209,189,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
                       type="button"
                       disabled={(step === "kind" && lacksKindStepSignal(start)) || (step === "project" && blockedByExistingSource)}
                       onClick={() => onStepChange(nextStep)}
@@ -2331,7 +2543,7 @@ function ProjectStartFlow({
                   </div>
                 ) : (
                   <button
-                    className="inline-flex items-center gap-2 rounded-md bg-foundry-amber px-5 py-2.5 text-[13.5px] font-bold text-[#1a1206] shadow-[0_6px_20px_-8px_rgba(232,183,92,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
+                    className="inline-flex items-center gap-2 rounded-md bg-foundry-amber px-5 py-2.5 text-[13.5px] font-bold text-foundry-bg shadow-[0_6px_20px_-8px_rgba(232,183,92,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
                     type="button"
                     disabled={blockedByExistingSource}
                     onClick={onCreate}
@@ -2369,7 +2581,14 @@ function ExistingProjectFlow({
   const [connecting, setConnecting] = useState(false);
   const [folderBrowserOpen, setFolderBrowserOpen] = useState(false);
   const [connectedFolderEntries, setConnectedFolderEntries] = useState<string[]>([]);
+  const [connectedFolderTreeState, setConnectedFolderTreeState] = useState<"idle" | "loading" | "ready" | "error">(start.localConnectorRoot ? "loading" : "idle");
+  const [importingUpload, setImportingUpload] = useState(false);
   const everConnectedRef = useRef(false);
+  const onUpdateRef = useRef(onUpdate);
+
+  useEffect(() => {
+    onUpdateRef.current = onUpdate;
+  }, [onUpdate]);
 
   function selectExistingSource(sourceId: ExistingSource) {
     onUpdate({
@@ -2390,11 +2609,11 @@ function ExistingProjectFlow({
     start.source === "browser-local"
       ? Boolean(start.browserFolderHandleId)
       : start.source === "connector"
-        ? Boolean(start.localConnectorUrl && start.localConnectorRoot)
+        ? Boolean(start.localConnectorUrl && start.localConnectorRoot && connectedFolderTreeState === "ready")
         : start.source === "local"
           ? Boolean(start.localPath.trim())
           : start.source === "upload"
-            ? start.uploadedFiles.length > 0
+            ? !importingUpload && start.uploadedFiles.length > 0
             : false;
 
   const activeSourceNames = start.source === "connector" ? connectedFolderEntries : start.source === "browser-local" || start.source === "upload" ? start.uploadNames : [];
@@ -2404,9 +2623,13 @@ function ExistingProjectFlow({
   const targetStackMissing = needsTargetStack && !start.targetStack.trim();
 
   async function handleExistingUpload(files: FileList | null) {
-    const uploadNames = selectedUploadNames(files);
-    const uploadedFiles = await selectedUploadedFiles(files);
-    onUpdate({ uploadNames, uploadedFiles, source: "upload", existingSourceConfirmed: false, existingSourceChoice: null });
+    setImportingUpload(true);
+    try {
+      const uploadedFiles = await selectedUploadedFiles(files);
+      onUpdate({ uploadNames: uploadedFiles.map((file) => file.path), uploadedFiles, source: "upload", existingSourceConfirmed: false, existingSourceChoice: null });
+    } finally {
+      setImportingUpload(false);
+    }
   }
 
   async function openBrowserLocalFolder() {
@@ -2462,11 +2685,24 @@ function ExistingProjectFlow({
   useEffect(() => {
     if (start.source !== "connector" || agentStatus !== "connected" || !start.localConnectorRoot) {
       setConnectedFolderEntries([]);
+      setConnectedFolderTreeState(start.source === "connector" && start.localConnectorRoot ? "loading" : "idle");
       return;
     }
     let cancelled = false;
-    void listAgentTree(agentUrl, agentToken, start.localConnectorRoot).then((result) => {
-      if (!cancelled && result.ok) setConnectedFolderEntries(result.entries.map((entry) => entry.path));
+    setConnectedFolderTreeState("loading");
+    setConnectError("");
+    void listAgentTreeWithRetry(agentUrl, agentToken, start.localConnectorRoot).then((result) => {
+      if (cancelled) return;
+      if (!result.ok) {
+        setConnectedFolderEntries([]);
+        setConnectedFolderTreeState("error");
+        setConnectError(result.error || "Could not index project files from the connected folder.");
+        return;
+      }
+      const paths = result.entries.map((entry) => entry.path);
+      setConnectedFolderEntries(paths);
+      setConnectedFolderTreeState("ready");
+      onUpdateRef.current({ uploadNames: paths, uploadedFiles: [] });
     });
     return () => {
       cancelled = true;
@@ -2474,7 +2710,9 @@ function ExistingProjectFlow({
   }, [start.source, agentStatus, start.localConnectorRoot, agentUrl, agentToken]);
 
   function applyConnectedFolder(root: string) {
-    onUpdate({ source: "connector", localConnectorUrl: agentUrl, localConnectorToken: agentToken, localConnectorRoot: root, existingSourceConfirmed: false, existingSourceChoice: null });
+    setConnectedFolderEntries([]);
+    setConnectedFolderTreeState("loading");
+    onUpdate({ source: "connector", localConnectorUrl: agentUrl, localConnectorToken: agentToken, localConnectorRoot: root, uploadNames: [], uploadedFiles: [], existingSourceConfirmed: false, existingSourceChoice: null });
     setAgentStatus("connected");
     setConnectError("");
   }
@@ -2519,20 +2757,20 @@ function ExistingProjectFlow({
     } else {
       input.removeAttribute("webkitdirectory");
       input.removeAttribute("directory");
-      input.setAttribute("accept", ".zip,.tar,.gz,.7z,.rar,.txt,.md,.json,.js,.jsx,.ts,.tsx,.css,.html,.py,.cs,.java,.kt,.php,.go,.rs,.log");
+      input.setAttribute("accept", ".zip,.txt,.md,.json,.js,.jsx,.ts,.tsx,.css,.scss,.sass,.less,.html,.py,.cs,.java,.kt,.php,.go,.rs,.rb,.swift,.dart,.sql,.xml,.yml,.yaml,.toml,.sh,.ps1,.log");
     }
     input.click();
   }
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
-      <section className="grid max-h-[90vh] w-full max-w-3xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-lg border border-white/15 bg-[#111617] shadow-workspace">
-        <header className="flex items-start justify-between gap-4 border-b border-white/10 p-4">
+    <div className="fixed inset-0 z-50 grid place-items-center bg-shade/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
+      <section className="grid max-h-[90vh] w-full max-w-3xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-lg border border-overlay/15 bg-foundry-raised shadow-workspace">
+        <header className="flex items-start justify-between gap-4 border-b border-overlay/10 p-4">
           <div>
             <p className="section-kicker">Open Existing Project</p>
             <h2 className="mt-1 text-lg font-extrabold text-foundry-ink">Bring a project into Foundry</h2>
           </div>
-          <button className="rounded-md px-3 py-1.5 text-sm font-bold text-foundry-muted hover:bg-white/10 hover:text-foundry-ink" type="button" onClick={onClose}>
+          <button className="rounded-md px-3 py-1.5 text-sm font-bold text-foundry-muted hover:bg-overlay/10 hover:text-foundry-ink" type="button" onClick={onClose}>
             Close
           </button>
         </header>
@@ -2627,16 +2865,16 @@ function ExistingProjectFlow({
                 ) : agentStatus === "not-installed" ? (
                   <>
                     <p className="mt-2 text-sm leading-6 text-foundry-muted">
-                      The Local Agent lets Foundry read, write, and run real commands against a real folder on this computer — real <code className="rounded bg-black/30 px-1 py-0.5 font-mono text-[11px]">node_modules</code>, real dev server, not a throwaway copy. Install it once, then connect any project folder.
+                      The Local Agent lets Foundry read, write, and run real commands against a real folder on this computer — real <code className="rounded bg-shade/30 px-1 py-0.5 font-mono text-[11px]">node_modules</code>, real dev server, not a throwaway copy. Install it once, then connect any project folder.
                     </p>
                     <div className="mt-3 flex flex-wrap gap-2">
                       <a className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 py-2 text-sm font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]" href="/api/factory/agent/download?platform=windows" download>
                         Download for Windows
                       </a>
-                      <a className="rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink" href="/api/factory/agent/download?platform=mac" download>
+                      <a className="rounded-md border border-overlay/15 bg-overlay/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink" href="/api/factory/agent/download?platform=mac" download>
                         macOS
                       </a>
-                      <a className="rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink" href="/api/factory/agent/download?platform=linux" download>
+                      <a className="rounded-md border border-overlay/15 bg-overlay/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink" href="/api/factory/agent/download?platform=linux" download>
                         Linux
                       </a>
                     </div>
@@ -2645,7 +2883,7 @@ function ExistingProjectFlow({
                       On macOS you may need to right-click the downloaded file and choose Open the first time.
                     </p>
                     <button
-                      className="mt-3 rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink"
+                      className="mt-3 rounded-md border border-overlay/15 bg-overlay/[0.05] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink"
                       type="button"
                       onClick={() => {
                         setAgentStatus("checking");
@@ -2672,6 +2910,13 @@ function ExistingProjectFlow({
                     {agentStatus === "connected" && start.localConnectorRoot ? (
                       <>
                         <p className="mt-3 text-sm font-bold text-foundry-teal">Connected: {start.localConnectorRoot}</p>
+                        {connectedFolderTreeState === "loading" ? (
+                          <p className="mt-2 text-xs font-bold text-foundry-muted">Indexing project files… The project will open as soon as its file tree is ready.</p>
+                        ) : connectedFolderTreeState === "ready" ? (
+                          <p className="mt-2 text-xs font-bold text-foundry-teal">{connectedFolderEntries.length} readable project file{connectedFolderEntries.length === 1 ? "" : "s"} detected.</p>
+                        ) : connectedFolderTreeState === "error" ? (
+                          <p className="mt-2 text-xs font-bold text-red-300">{connectError || "Project files could not be indexed."}</p>
+                        ) : null}
                         <ExistingSourceGuard
                           names={connectedFolderEntries}
                           mode="open-existing"
@@ -2692,14 +2937,14 @@ function ExistingProjectFlow({
                     <label className="grid gap-1.5 text-xs font-bold text-foundry-muted">
                       Project folder path
                       <input
-                        className="min-h-10 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                        className="min-h-10 rounded-md border border-overlay/10 bg-shade/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
                         value={folderPathInput}
                         onChange={(event) => setFolderPathInput(event.target.value)}
                         placeholder="C:\Users\you\Documents\your-project"
                       />
                     </label>
                     <button
-                      className="justify-self-start rounded-md border border-white/15 bg-white/[0.05] px-3 py-2 text-xs font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink disabled:cursor-not-allowed disabled:opacity-50"
+                      className="justify-self-start rounded-md border border-overlay/15 bg-overlay/[0.05] px-3 py-2 text-xs font-extrabold text-foundry-muted transition hover:border-foundry-teal/35 hover:text-foundry-ink disabled:cursor-not-allowed disabled:opacity-50"
                       type="button"
                       disabled={connecting || !folderPathInput.trim()}
                       onClick={() => {
@@ -2712,7 +2957,7 @@ function ExistingProjectFlow({
                       <label className="grid gap-1.5 text-xs font-bold text-foundry-muted">
                         Agent URL
                         <input
-                          className="min-h-10 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                          className="min-h-10 rounded-md border border-overlay/10 bg-shade/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
                           value={agentUrl}
                           onChange={(event) => setAgentUrl(event.target.value)}
                           placeholder="http://127.0.0.1:3917"
@@ -2721,7 +2966,7 @@ function ExistingProjectFlow({
                       <label className="grid gap-1.5 text-xs font-bold text-foundry-muted">
                         Token (optional)
                         <input
-                          className="min-h-10 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                          className="min-h-10 rounded-md border border-overlay/10 bg-shade/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
                           value={agentToken}
                           onChange={(event) => setAgentToken(event.target.value)}
                           placeholder="Only if the agent was started with a token"
@@ -2754,14 +2999,14 @@ function ExistingProjectFlow({
                 </p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
-                    className="rounded-md border border-white/15 bg-white/[0.055] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-blue/35 hover:bg-foundry-blue/10 hover:text-foundry-ink"
+                    className="rounded-md border border-overlay/15 bg-overlay/[0.055] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-blue/35 hover:bg-foundry-blue/10 hover:text-foundry-ink"
                     type="button"
                     onClick={() => openExistingUploadPicker("files")}
                   >
                     Choose ZIP/project files
                   </button>
                   <button
-                    className="rounded-md border border-white/15 bg-white/[0.055] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-blue/35 hover:bg-foundry-blue/10 hover:text-foundry-ink"
+                    className="rounded-md border border-overlay/15 bg-overlay/[0.055] px-3 py-2 text-sm font-extrabold text-foundry-muted transition hover:border-foundry-blue/35 hover:bg-foundry-blue/10 hover:text-foundry-ink"
                     type="button"
                     onClick={() => openExistingUploadPicker("folder")}
                   >
@@ -2769,6 +3014,7 @@ function ExistingProjectFlow({
                   </button>
                 </div>
                 <UploadSummary names={start.uploadNames} />
+                {importingUpload ? <p className="mt-2 text-xs font-bold text-foundry-muted">Reading and indexing uploaded project files…</p> : start.uploadedFiles.length ? <p className="mt-2 text-xs font-bold text-foundry-teal">{start.uploadedFiles.length} readable project file{start.uploadedFiles.length === 1 ? "" : "s"} ready.</p> : null}
                 <ExistingSourceGuard
                   names={start.uploadNames}
                   mode="open-existing"
@@ -2788,7 +3034,7 @@ function ExistingProjectFlow({
                 <label className="mt-3 grid gap-1.5 text-xs font-bold text-foundry-muted">
                   Folder path
                   <input
-                    className="min-h-10 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                    className="min-h-10 rounded-md border border-overlay/10 bg-shade/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
                     value={start.localPath}
                     onChange={(event) => onUpdate({ localPath: event.target.value })}
                     placeholder="C:\\Users\\you\\Documents\\your-project"
@@ -2810,7 +3056,7 @@ function ExistingProjectFlow({
                 <label className="mt-3 grid gap-1.5 text-xs font-bold text-foundry-muted">
                   Target stack
                   <input
-                    className="min-h-10 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-amber/45"
+                    className="min-h-10 rounded-md border border-overlay/10 bg-shade/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-amber/45"
                     value={start.targetStack}
                     onChange={(event) => onUpdate({ targetStack: event.target.value })}
                     placeholder="e.g. Next.js (TypeScript), Python/FastAPI, .NET WPF…"
@@ -2822,7 +3068,7 @@ function ExistingProjectFlow({
             <label className="mt-4 grid gap-1.5 text-xs font-bold text-foundry-muted">
               {needsTargetStack ? "What should Foundry know before migrating?" : "Optional project context"}
               <textarea
-                className="min-h-36 w-full resize-y rounded-md border border-white/10 bg-black/25 p-3 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                className="min-h-36 w-full resize-y rounded-md border border-overlay/10 bg-shade/25 p-3 text-sm leading-6 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
                 value={start.description}
                 onChange={(event) => onUpdate({ description: event.target.value })}
                 placeholder={needsTargetStack ? "Anything Foundry should preserve, avoid, or prioritize during the migration…" : "Example: This is a Next.js storefront. The current priority is fixing checkout bugs and preparing for Vercel later..."}
@@ -2835,9 +3081,9 @@ function ExistingProjectFlow({
           </FlowSection>
         </div>
 
-        <footer className="flex flex-wrap items-center justify-end gap-2 border-t border-white/10 p-4">
+        <footer className="flex flex-wrap items-center justify-end gap-2 border-t border-overlay/10 p-4">
           {blockedByExistingSource ? <p className="mr-auto max-w-xs text-xs leading-5 text-foundry-amber">Choose what Foundry should do about the existing files before opening this project.</p> : null}
-          <button className="rounded-md px-3 py-2 text-sm font-bold text-foundry-muted transition hover:bg-white/10 hover:text-foundry-ink" type="button" onClick={onClose}>
+          <button className="rounded-md px-3 py-2 text-sm font-bold text-foundry-muted transition hover:bg-overlay/10 hover:text-foundry-ink" type="button" onClick={onClose}>
             Cancel
           </button>
           <button
@@ -2893,8 +3139,8 @@ function useLocalAgentInstallStatus(): AgentStatus {
 
 function AgentStatusBadge({ status }: { status: AgentStatus }) {
   const config: Record<AgentStatus, { label: string; className: string }> = {
-    checking: { label: "Checking...", className: "border-white/15 bg-white/[0.05] text-foundry-subtle" },
-    "not-installed": { label: "Agent Not Installed", className: "border-white/15 bg-white/[0.05] text-foundry-subtle" },
+    checking: { label: "Checking...", className: "border-overlay/15 bg-overlay/[0.05] text-foundry-subtle" },
+    "not-installed": { label: "Agent Not Installed", className: "border-overlay/15 bg-overlay/[0.05] text-foundry-subtle" },
     installed: { label: "Agent Connected", className: "border-foundry-teal/30 bg-foundry-teal/[0.1] text-foundry-teal" },
     connected: { label: "Agent Connected", className: "border-foundry-teal/30 bg-foundry-teal/[0.1] text-foundry-teal" },
     offline: { label: "Agent Offline", className: "border-red-400/30 bg-red-400/[0.1] text-red-300" },
@@ -3079,14 +3325,14 @@ function FolderBrowserModal({
   const breadcrumbSegments = currentPath ? currentPath.replace(/\\/g, "/").split("/").filter(Boolean) : [];
 
   return (
-    <div className="fixed inset-0 z-[60] grid place-items-center bg-black/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
-      <section className="grid max-h-[85vh] w-full max-w-xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-lg border border-white/15 bg-[#111617] shadow-workspace">
-        <header className="flex items-start justify-between gap-4 border-b border-white/10 p-4">
+    <div className="fixed inset-0 z-[60] grid place-items-center bg-shade/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
+      <section className="grid max-h-[85vh] w-full max-w-xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-lg border border-overlay/15 bg-foundry-raised shadow-workspace">
+        <header className="flex items-start justify-between gap-4 border-b border-overlay/10 p-4">
           <div>
             <p className="section-kicker">Local Agent</p>
             <h2 className="mt-1 text-lg font-extrabold text-foundry-ink">Choose a Project Folder</h2>
           </div>
-          <button className="rounded-md px-3 py-1.5 text-sm font-bold text-foundry-muted hover:bg-white/10 hover:text-foundry-ink" type="button" onClick={onClose}>
+          <button className="rounded-md px-3 py-1.5 text-sm font-bold text-foundry-muted hover:bg-overlay/10 hover:text-foundry-ink" type="button" onClick={onClose}>
             Close
           </button>
         </header>
@@ -3104,7 +3350,7 @@ function FolderBrowserModal({
             <div className="mt-3 grid gap-1">
               {parentPath !== null ? (
                 <button
-                  className="flex items-center gap-2 rounded-md border border-white/10 bg-white/[0.03] px-3 py-2 text-left text-sm font-bold text-foundry-muted transition hover:border-foundry-teal/30 hover:bg-white/[0.06] hover:text-foundry-ink"
+                  className="flex items-center gap-2 rounded-md border border-overlay/10 bg-overlay/[0.03] px-3 py-2 text-left text-sm font-bold text-foundry-muted transition hover:border-foundry-teal/30 hover:bg-overlay/[0.06] hover:text-foundry-ink"
                   type="button"
                   onClick={() => void load(parentPath)}
                 >
@@ -3117,7 +3363,7 @@ function FolderBrowserModal({
                 entries.map((entry) => (
                   <button
                     key={entry.path}
-                    className="flex items-center gap-2 rounded-md border border-white/10 bg-white/[0.03] px-3 py-2 text-left text-sm font-bold text-foundry-ink transition hover:border-foundry-teal/30 hover:bg-white/[0.06]"
+                    className="flex items-center gap-2 rounded-md border border-overlay/10 bg-overlay/[0.03] px-3 py-2 text-left text-sm font-bold text-foundry-ink transition hover:border-foundry-teal/30 hover:bg-overlay/[0.06]"
                     type="button"
                     onClick={() => void load(entry.path)}
                   >
@@ -3129,11 +3375,11 @@ function FolderBrowserModal({
           )}
 
           {currentPath && !loading ? (
-            <div className="mt-4 border-t border-white/10 pt-3">
+            <div className="mt-4 border-t border-overlay/10 pt-3">
               {newFolderOpen ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <input
-                    className="min-h-9 flex-1 rounded-md border border-white/10 bg-black/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
+                    className="min-h-9 flex-1 rounded-md border border-overlay/10 bg-shade/25 px-3 text-sm text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/45"
                     value={newFolderName}
                     onChange={(event) => setNewFolderName(event.target.value)}
                     placeholder="New folder name"
@@ -3171,8 +3417,8 @@ function FolderBrowserModal({
           ) : null}
         </div>
 
-        <footer className="flex justify-end gap-2 border-t border-white/10 p-4">
-          <button className="rounded-md px-3 py-2 text-sm font-bold text-foundry-muted transition hover:bg-white/10 hover:text-foundry-ink" type="button" onClick={onClose}>
+        <footer className="flex justify-end gap-2 border-t border-overlay/10 p-4">
+          <button className="rounded-md px-3 py-2 text-sm font-bold text-foundry-muted transition hover:bg-overlay/10 hover:text-foundry-ink" type="button" onClick={onClose}>
             Cancel
           </button>
           <button
@@ -3215,10 +3461,10 @@ function ChoiceButton({ active, label, description, disabled = false, onClick }:
     <button
       className={`min-h-11 rounded-lg border px-3.5 py-2.5 text-left text-[13.5px] font-semibold transition ${
         disabled
-          ? "cursor-not-allowed border-white/[0.06] bg-white/[0.015] text-foundry-subtle opacity-60"
+          ? "cursor-not-allowed border-overlay/[0.06] bg-overlay/[0.015] text-foundry-subtle opacity-60"
           : active
             ? "border-foundry-teal/45 bg-foundry-teal/[0.08] text-foundry-ink"
-            : "border-white/10 bg-white/[0.03] text-foundry-muted hover:border-white/20 hover:text-foundry-ink"
+            : "border-overlay/10 bg-overlay/[0.03] text-foundry-muted hover:border-overlay/20 hover:text-foundry-ink"
       }`}
       type="button"
       disabled={disabled}
@@ -3236,7 +3482,7 @@ function ChipButton({ active, label, onClick }: { active: boolean; label: string
       type="button"
       onClick={onClick}
       className={`rounded-full border px-4 py-2.5 text-[13.5px] transition ${
-        active ? "border-foundry-teal bg-foundry-teal font-semibold text-[#06120d]" : "border-white/10 bg-white/[0.04] text-foundry-muted hover:border-white/25 hover:text-foundry-ink"
+        active ? "border-foundry-teal bg-foundry-teal font-semibold text-foundry-bg" : "border-overlay/10 bg-overlay/[0.04] text-foundry-muted hover:border-overlay/25 hover:text-foundry-ink"
       }`}
     >
       {label}
@@ -3248,7 +3494,7 @@ function CapabilityBadge({ level }: { level: number }) {
   const styles: Record<number, string> = {
     4: "border-foundry-teal/40 text-foundry-teal",
     3: "border-foundry-amber/45 text-foundry-amber",
-    2: "border-white/15 text-foundry-muted",
+    2: "border-overlay/15 text-foundry-muted",
     1: "border-red-300/40 text-red-300",
   };
   return <span className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[9.5px] tracking-wide ${styles[level] ?? styles[2]}`}>{level}/4</span>;
@@ -3260,7 +3506,7 @@ function StackCard({ recommendation, active, onClick }: { recommendation: StackR
       type="button"
       onClick={onClick}
       className={`rounded-lg border px-4 py-4 text-left transition ${
-        active ? "border-foundry-teal/50 bg-foundry-teal/[0.07] shadow-[inset_0_0_0_1px_rgba(79,209,189,0.3)]" : "border-white/10 bg-white/[0.03] hover:border-white/20"
+        active ? "border-foundry-teal/50 bg-foundry-teal/[0.07] shadow-[inset_0_0_0_1px_rgba(79,209,189,0.3)]" : "border-overlay/10 bg-overlay/[0.03] hover:border-overlay/20"
       }`}
     >
       <div className="mb-2 flex items-center justify-between gap-2">
@@ -3284,7 +3530,7 @@ function UploadSummary({ names }: { names: string[] }) {
   const hiddenCount = Math.max(names.length - visible.length, 0);
 
   return (
-    <div className="mt-3 rounded-md border border-white/10 bg-black/20 p-3">
+    <div className="mt-3 rounded-md border border-overlay/10 bg-shade/20 p-3">
       <p className="text-xs font-extrabold uppercase tracking-[0.08em] text-foundry-muted">Selected</p>
       <ul className="mt-2 grid gap-1 text-xs leading-5 text-foundry-muted">
         {visible.map((name) => (
@@ -3321,7 +3567,7 @@ function ExistingSourceGuard({
 }) {
   if (!names.length) {
     return (
-      <div className="mt-3 rounded-md border border-white/10 bg-black/20 p-3 text-xs leading-5 text-foundry-subtle">
+      <div className="mt-3 rounded-md border border-overlay/10 bg-shade/20 p-3 text-xs leading-5 text-foundry-subtle">
         {mode === "open-existing"
           ? "Select a folder or project files before Foundry opens this project."
           : "Select a folder or project files before Foundry uses an existing source as a starting reference for this new project."}
@@ -3485,9 +3731,9 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
       {alternativeStacks.length ? (
         <div>
           <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Alternative Stacks</p>
-          <div className="border-t border-white/[0.07]">
+          <div className="border-t border-overlay/[0.07]">
             {alternativeStacks.map((name) => (
-              <div key={name} className="flex items-center justify-between gap-3 border-b border-white/[0.07] py-2.5 text-[13.5px] text-foundry-ink">
+              <div key={name} className="flex items-center justify-between gap-3 border-b border-overlay/[0.07] py-2.5 text-[13.5px] text-foundry-ink">
                 <span>{name}</span>
                 <button className="font-mono text-[10.5px] text-foundry-subtle transition hover:text-foundry-teal" type="button" onClick={() => applyAlternativeStack(name)}>
                   use instead →
@@ -3542,7 +3788,7 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
                   {decision.question}
                 </span>
                 <input
-                  className="border-0 border-b border-white/10 bg-transparent p-0 pb-1.5 pl-[19px] text-[13.5px] text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-amber/50"
+                  className="border-0 border-b border-overlay/10 bg-transparent p-0 pb-1.5 pl-[19px] text-[13.5px] text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-amber/50"
                   value={start.discoveryAnswers[decision.dimension] ?? ""}
                   onChange={(event) => onUpdate({ discoveryAnswers: { ...start.discoveryAnswers, [decision.dimension]: event.target.value } })}
                   placeholder="Answer if it matters for the first build…"
@@ -3553,11 +3799,11 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
         </div>
       ) : null}
 
-      <details className="border-t border-white/[0.07] pt-4">
+      <details className="border-t border-overlay/[0.07] pt-4">
         <summary className="cursor-pointer font-mono text-[10.5px] uppercase tracking-[0.08em] text-foundry-subtle">Full reasoning &amp; confidence map — {disclosedDecisions.length} decisions</summary>
-        <div className="mt-3 grid overflow-hidden rounded-md border border-white/[0.07]">
+        <div className="mt-3 grid overflow-hidden rounded-md border border-overlay/[0.07]">
           {disclosedDecisions.map((decision) => (
-            <div key={decision.dimension} className="grid gap-1 border-b border-white/[0.06] bg-white/[0.015] px-3 py-2.5 font-mono text-[11px] leading-5 text-foundry-muted last:border-b-0">
+            <div key={decision.dimension} className="grid gap-1 border-b border-overlay/[0.06] bg-overlay/[0.015] px-3 py-2.5 font-mono text-[11px] leading-5 text-foundry-muted last:border-b-0">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="font-bold text-foundry-ink">{humanizeKey(decision.dimension)}</span>
                 <span className="text-foundry-subtle">{decision.confidence}% · {decision.stakes} stakes · {decision.source} · {decision.action}</span>
@@ -3580,7 +3826,7 @@ function ReadableField({ label, value, onChange }: { label: string; value: strin
         <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{label}</span>
         <input
           autoFocus
-          className="border-0 border-b border-white/10 bg-transparent p-0 pb-1 text-[14px] text-foundry-ink outline-none focus:border-foundry-teal/50"
+          className="border-0 border-b border-overlay/10 bg-transparent p-0 pb-1 text-[14px] text-foundry-ink outline-none focus:border-foundry-teal/50"
           value={value}
           onChange={(event) => onChange(event.target.value)}
           onBlur={() => setEditing(false)}
@@ -3712,12 +3958,6 @@ function subtypesForEffectiveProject(start: ProjectStart) {
   return [...customSubtypesForDetectedType(start.appKind), "Other / Custom"];
 }
 
-function firstSubtypeForDetectedType(detectedType: string) {
-  const inferredTemplateId = templateIdForDetectedType(detectedType);
-  if (inferredTemplateId) return firstSubtypeFor(inferredTemplateId);
-  return customSubtypesForDetectedType(detectedType)[0] ?? detectedType ?? "Custom";
-}
-
 function templateIdForDetectedType(detectedType: string): TemplateId | null {
   if (detectedType === "Inventory System") return "inventory";
   if (detectedType === "E-commerce Store") return "commerce";
@@ -3747,27 +3987,41 @@ function slugifyProjectName(value: string) {
   );
 }
 
-function selectedUploadNames(files: FileList | null) {
-  if (!files) return [];
-
-  return Array.from(files)
-    .map((file) => {
-      const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
-      return relativePath || file.name;
-    })
-    .filter(isEditableUploadPath);
-}
-
 async function selectedUploadedFiles(files: FileList | null): Promise<FactoryUploadedFile[]> {
   if (!files) return [];
   const maxFileSize = 240_000;
   const maxTotalSize = 1_500_000;
+  const maxArchiveSize = 20_000_000;
   let totalSize = 0;
   const readableFiles: FactoryUploadedFile[] = [];
 
   for (const file of Array.from(files)) {
-    const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
-    if (!isEditableUploadPath(relativePath) || file.size > maxFileSize || totalSize + file.size > maxTotalSize) continue;
+    const relativePath = normalizeUploadedPath((file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name);
+    if (/\.zip$/i.test(relativePath)) {
+      if (file.size > maxArchiveSize) continue;
+      try {
+        let acceptedSize = 0;
+        const entries = unzipSync(new Uint8Array(await file.arrayBuffer()), {
+          filter: (entry) => {
+            const path = normalizeUploadedPath(entry.name);
+            const size = entry.originalSize;
+            if (!path || !isEditableUploadPath(path) || size > maxFileSize || totalSize + acceptedSize + size > maxTotalSize) return false;
+            acceptedSize += size;
+            return true;
+          },
+        });
+        for (const [entryName, bytes] of Object.entries(entries)) {
+          const path = normalizeUploadedPath(entryName);
+          if (!path || !isEditableUploadPath(path) || totalSize + bytes.byteLength > maxTotalSize) continue;
+          readableFiles.push({ path, content: strFromU8(bytes), size: bytes.byteLength });
+          totalSize += bytes.byteLength;
+        }
+      } catch {
+        // Invalid, encrypted, or unsupported ZIP archives are ignored instead of creating fake file records.
+      }
+      continue;
+    }
+    if (!relativePath || !isEditableUploadPath(relativePath) || file.size > maxFileSize || totalSize + file.size > maxTotalSize) continue;
     try {
       const content = await file.text();
       readableFiles.push({ path: relativePath, content, size: file.size });
@@ -3780,10 +4034,17 @@ async function selectedUploadedFiles(files: FileList | null): Promise<FactoryUpl
   return readableFiles;
 }
 
+function normalizeUploadedPath(filePath: string) {
+  const parts = filePath.replace(/\\/g, "/").split("/").filter((part) => part && part !== ".");
+  if (parts.some((part) => part === "..")) return "";
+  return parts.join("/");
+}
+
 function isEditableUploadPath(filePath: string) {
   const normalized = filePath.replace(/\\/g, "/").toLowerCase();
   if (/(^|\/)(node_modules|\.git|\.next|dist|build|coverage|target|bin|obj)(\/|$)/.test(normalized)) return false;
-  return /\.(html|css|js|mjs|cjs|json|md|txt|ts|tsx|jsx|vue|svelte|py|php|cs|java|kt|xml|yml|yaml)$/i.test(normalized);
+  return /\.(html|css|scss|sass|less|js|mjs|cjs|json|md|mdx|txt|ts|tsx|jsx|vue|svelte|py|php|cs|java|kt|go|rs|rb|swift|dart|sql|sh|bash|zsh|ps1|xml|yml|yaml|toml|ini|env|graphql|gql|proto|log)$/i.test(normalized)
+    || /(^|\/)(dockerfile|makefile|procfile|gemfile|rakefile)$/i.test(normalized);
 }
 
 function uploadSummaryText(names: string[]) {
@@ -3872,7 +4133,14 @@ function selectedStackFor(start: ProjectStart) {
 }
 
 function genericArchitectureFor(stack: string, entities: string[], projectType = "", features: string[] = []) {
-  if (/\b(website|portfolio|marketing|landing|brochure|docs?|content|studio|agency)\b/i.test(`${projectType} ${features.join(" ")}`)) {
+  const projectShape = projectType.trim();
+  const featureShape = features.join(" ");
+  if (/\b(?:backend|api|microservice|webhook service)\b/i.test(projectShape)) {
+    const primaryEntities = entities.slice(0, 2).join(" and ") || "the named API resources";
+    return `${stack} backend service with versioned routes for ${primaryEntities}, schema-based request validation, centralized JSON errors and logging, explicit local persistence, automated endpoint tests, and runnable API documentation. No visual UI is introduced unless the brief requests one.`;
+  }
+  if (/\b(website|portfolio|marketing|landing|brochure|content|studio|agency)\b/i.test(projectShape)
+    || (!projectShape && /\b(website|portfolio|marketing|landing|brochure|content|studio|agency)\b/i.test(featureShape))) {
     return `${stack} presentation site with reusable content sections, static-first pages, responsive media, accessible navigation, per-page SEO metadata, and a real inquiry path. Content editing stays outside the visitor experience unless an admin CMS is explicitly requested.`;
   }
   const primaryEntities = entities.slice(0, 2).join(" and ") || "the core data";
@@ -3938,7 +4206,7 @@ function reconcileKnownStarterDiscovery(discovery: ProjectDiscoveryResult, start
 
 function alignDiscoveryWithSelectionAndConstraints(discovery: ProjectDiscoveryResult, start: ProjectStart, selectedStack: string): ProjectDiscoveryResult {
   const brief = `${start.projectDescription} ${discovery.prompt}`;
-  const stackChanged = selectedStack.trim() !== "" && selectedStack.trim() !== discovery.recommendedStack.trim();
+  const stackChanged = selectedStack.trim() !== "" && !sameStackChoice(selectedStack, discovery.recommendedStack);
   const architecture = stackChanged
     ? genericArchitectureFor(selectedStack, discovery.dataModel, discovery.projectType, discovery.mainFeatures)
     : discovery.architecture;
@@ -3990,7 +4258,22 @@ function alignDiscoveryWithSelectionAndConstraints(discovery: ProjectDiscoveryRe
   };
 }
 
-function fallbackStackOptionsFor(discovery: ProjectDiscoveryResult): StackOption[] {
+function sameStackChoice(left: string, right: string) {
+  const normalize = (value: string) => value
+    .toLowerCase()
+    .replace(/\bwith\b/g, " ")
+    .replace(/[^a-z0-9+#.]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .sort()
+    .join(" ");
+  return normalize(left) === normalize(right);
+}
+
+function fallbackStackOptionsFor(discovery: ProjectDiscoveryResult, start: ProjectStart): StackOption[] {
+  const platformOptions = platformStackOptionsForProject(start.template.id, discovery);
+  if (platformOptions.length) return platformOptions;
   const evidence = `${discovery.projectType} ${discovery.prompt} ${discovery.architecture}`.toLowerCase();
   const contentOnlyWeb = /\b(content|public|marketing|portfolio|club|venue|studio|website)\b/.test(evidence)
     && /\b(no|without) (?:login|auth|database|backend)\b/.test(evidence);
@@ -4208,6 +4491,9 @@ function projectFilesForMission(mission: MissionState, execution: FactoryProject
 }
 
 function connectedPathForMission(mission: MissionState, execution: FactoryProjectResult | null) {
+  if (execution?.projectPath) return execution.projectPath;
+  const generatedWorkspace = generatedWorkspaceForMission(mission);
+  if (generatedWorkspace) return generatedWorkspace.projectPath;
   const brief = projectBriefFromMission(mission);
   const browserFolderName = brief.match(/^Browser folder name:\s*(.+)$/im)?.[1]?.trim() ?? "";
   if (browserFolderName) return browserFolderName;
@@ -4215,7 +4501,6 @@ function connectedPathForMission(mission: MissionState, execution: FactoryProjec
   if (localPath) return localPath;
   const connectorRoot = brief.match(/^Local connector root:\s*(.+)$/im)?.[1]?.trim() ?? "";
   if (connectorRoot) return connectorRoot;
-  if (execution?.projectPath) return execution.projectPath;
   const files = projectFilesForMission(mission, execution);
   if (!files.length) return "";
   const roots = Array.from(new Set(files.map((file) => file.path.split("/")[0]).filter(Boolean)));
@@ -4231,17 +4516,29 @@ function connectorInfoFromMission(mission: MissionState): { url: string; token: 
   return { url, token, root };
 }
 
-async function listAgentTree(agentUrl: string, token: string, root: string, maxEntries = 2000): Promise<{ ok: boolean; entries: Array<{ path: string; size: number }>; truncated?: boolean }> {
+async function listAgentTree(agentUrl: string, token: string, root: string, maxEntries = 2000): Promise<{ ok: boolean; entries: Array<{ path: string; size: number }>; truncated?: boolean; error?: string }> {
   try {
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (token.trim()) headers.authorization = `Bearer ${token.trim()}`;
-    const response = await fetch(`${agentUrl.replace(/\/+$/, "")}/tree`, { method: "POST", headers, body: JSON.stringify({ root, maxEntries }) });
+    const response = await fetch("/api/factory/agent/files", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: agentUrl, token, root, action: "tree", maxEntries }),
+    });
     const result = (await response.json().catch(() => ({}))) as { entries?: Array<{ path: string; size: number }>; truncated?: boolean; error?: string };
-    if (!response.ok) return { ok: false, entries: [] };
+    if (!response.ok) return { ok: false, entries: [], error: result.error || `Could not load Local Agent files (HTTP ${response.status}).` };
     return { ok: true, entries: result.entries ?? [], truncated: result.truncated };
-  } catch {
-    return { ok: false, entries: [] };
+  } catch (error) {
+    return { ok: false, entries: [], error: error instanceof Error ? error.message : "Could not reach the Local Agent file bridge." };
   }
+}
+
+async function listAgentTreeWithRetry(agentUrl: string, token: string, root: string, maxEntries = 2000) {
+  let latest: Awaited<ReturnType<typeof listAgentTree>> = { ok: false, entries: [], error: "Could not load Local Agent files." };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    latest = await listAgentTree(agentUrl, token, root, maxEntries);
+    if (latest.ok) return latest;
+    if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+  }
+  return latest;
 }
 
 function mergeConnectorFiles(treeFiles: FactoryProjectResult["files"], overlayFiles: FactoryProjectResult["files"]): FactoryProjectResult["files"] {
@@ -4253,16 +4550,18 @@ function mergeConnectorFiles(treeFiles: FactoryProjectResult["files"], overlayFi
   return merged;
 }
 
-async function readAgentFile(agentUrl: string, token: string, root: string, filePath: string): Promise<string | null> {
+async function readAgentFile(agentUrl: string, token: string, root: string, filePath: string): Promise<{ content: string | null; error?: string }> {
   try {
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (token.trim()) headers.authorization = `Bearer ${token.trim()}`;
-    const response = await fetch(`${agentUrl.replace(/\/+$/, "")}/read`, { method: "POST", headers, body: JSON.stringify({ root, path: filePath }) });
-    const result = (await response.json().catch(() => ({}))) as { exists?: boolean; content?: string };
-    if (!response.ok || !result.exists) return null;
-    return result.content ?? null;
-  } catch {
-    return null;
+    const response = await fetch("/api/factory/agent/files", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: agentUrl, token, root, action: "read", path: filePath }),
+    });
+    const result = (await response.json().catch(() => ({}))) as { exists?: boolean; content?: string; error?: string };
+    if (!response.ok || !result.exists) return { content: null, error: result.error || `Could not read ${filePath} from the Local Agent.` };
+    return { content: result.content ?? "" };
+  } catch (error) {
+    return { content: null, error: error instanceof Error ? error.message : "Could not reach the Local Agent file bridge." };
   }
 }
 
@@ -4326,6 +4625,8 @@ function projectBriefFor(start: ProjectStart) {
   const answeredQuestions = Object.entries(start.discoveryAnswers)
     .filter(([, answer]) => answer.trim())
     .map(([dimension, answer]) => `${humanizeKey(dimension)}: ${answer.trim()}`);
+  const customInstructions = start.instructions.trim() || (answeredQuestions.length ? answeredQuestions.join("; ") : "");
+  const customInstructionsSummary = customInstructions.replace(/\s+/g, " ").trim();
   const liveFolderMode = start.projectLocation === "connect-existing" && Boolean(start.browserFolderHandleId);
   const uploadedCopyMode = start.projectLocation === "connect-existing" && !start.browserFolderHandleId && start.uploadedFiles.length > 0;
   const connectorMode = start.projectLocation === "create-folder" && Boolean(start.localConnectorRoot);
@@ -4338,6 +4639,8 @@ function projectBriefFor(start: ProjectStart) {
         : locationLabel(start.projectLocation);
 
   return [
+    "# Foundry Project Brief",
+    "",
     `Create Project: ${projectName}`,
     "",
     `Template: Intelligent Project Discovery`,
@@ -4373,7 +4676,8 @@ function projectBriefFor(start: ProjectStart) {
     answeredQuestions.length ? `User-confirmed answers: ${answeredQuestions.join("; ")}` : "",
     discovery?.decisions.length ? `Confidence map: ${discovery.decisions.map((decision) => `${decision.dimension}=${decision.hypothesis} (${decision.confidence}%, ${decision.stakes}, ${decision.source}, ${decision.action})`).join("; ")}` : "",
     defaults.length && !discovery ? `Smart defaults: ${defaults.join("; ")}` : "",
-    start.instructions ? `Custom instructions: ${start.instructions}` : answeredQuestions.length ? `Custom instructions: ${answeredQuestions.join("; ")}` : "Custom instructions: None",
+    customInstructionsSummary ? `Custom instructions: ${customInstructionsSummary}` : "Custom instructions: None",
+    start.instructionFiles.length ? `Attached project evidence: ${start.instructionFiles.map((file) => `${file.name} (${file.type || "unknown type"}, ${file.size} bytes)`).join("; ")}` : "Attached project evidence: None",
     "",
     liveFolderMode
       ? "Factory status: live local folder opened. Foundry should inspect and edit this browser-granted folder directly."
@@ -4384,6 +4688,14 @@ function projectBriefFor(start: ProjectStart) {
           : "Factory status: create a real workspace, save the brief, generate supported files, run real commands, and show actual execution results.",
     liveFolderMode || uploadedCopyMode || connectorMode ? "Next action: work inside the project workspace to add features, fix bugs, improve UI, analyze architecture, or prepare deployment." : "Next action: enter the project workspace and continue project work there.",
     "Architecture constraint: do not assume Foundry will depend only on uploaded files. Preserve a path for future local workspace connectors, local project folders, terminal/build logs, dev server ports, previews, and explicit user-approved file edits or commands.",
+    "",
+    "## User-provided custom instructions",
+    customInstructions || "_None provided._",
+    "",
+    "## User-provided attachments",
+    start.instructionFiles.length
+      ? start.instructionFiles.map((file) => `- ${file.name} — ${file.type || "unknown type"}, ${file.size} bytes`).join("\n")
+      : "_None provided._",
   ]
     .filter(Boolean)
     .join("\n");

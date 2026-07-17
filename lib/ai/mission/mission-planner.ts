@@ -71,18 +71,20 @@ function extractStatedRequirementCount(task: string): number | undefined {
 export async function planMission(input: {
   objective: string;
   task: string;
+  intent?: "question" | "status" | "analyze" | "build" | "edit" | "debug" | "undo" | "deploy";
   projectSnapshot: string;
   apiKey: string;
   workspaceId?: string;
   userId?: string;
   canRunCommands?: boolean;
+  canBrowserValidate?: boolean;
   provider?: ProviderId;
   /** Defaults to "builder" — this function's fixed tier before quality-aware routing existed. A quality-aware caller passes tierForStage("plan", quality, complexity) (lib/ai/mission/orchestration.ts) instead. */
   tier?: ModelTier;
   routingAssessment?: DynamicTaskAssessment;
 }): Promise<MissionPlan> {
   const canRunCommands = input.canRunCommands ?? true;
-  if (isConcreteDebugRequest(input.task)) {
+  if (input.intent === "debug" || (input.intent === undefined && isConcreteDebugRequest(input.task))) {
     return { checklist: debugInvestigationChecklist(input.task, canRunCommands), conflicts: [] };
   }
   const atomicRequirements = extractAtomicUserRequirements(input.task);
@@ -103,9 +105,15 @@ export async function planMission(input: {
       ? "This request is a large-scope rewrite, migration, conversion, or architecture change. Break it into real milestone phases: first inventory the existing project's actual features and behavior (not its file layout), then build the target implementation feature-by-feature, then a final phase. This is feature parity, not a line-by-line translation — a feature should be re-expressed the way it's idiomatically done in the target stack, not transliterated statement-by-statement from the old one. That final phase must contain items that each verify one specific piece of the existing project's real behavior still works after the change — derive those items from what this specific project actually does (its real screens, routes, or features), never a generic 'test everything' item."
       : "",
     "Each item must still be independently verifiable — something that can be confirmed true or false by reading real files or command output later — avoid vague items like 'improve the code'.",
+    input.canBrowserValidate
+      ? "The executor can validate the owned local preview in a real browser. For user-facing UI work, include a rendered desktop/mobile interaction check when it is needed to prove the requested outcome."
+      : "",
     canRunCommands
       ? "The executor can only read/write files and run shell commands — it cannot open a browser, click through a UI, or inspect DevTools. Never write an item that can only be confirmed by doing those things (e.g. 'check the Console/Network tab', 'visually confirm in the browser'). If a requirement can only be verified that way, verify what the file contents and command output actually support instead, and phrase the item around that."
       : "The executor can only read and write files in this environment — it cannot run any shell commands (no build, no test, no runtime check, no git). Never write an item that can only be verified by running something (e.g. 'run the tests', 'confirm it builds', 'commit the change', 'check the console'). Every item must be verifiable purely by reading file contents.",
+    input.canBrowserValidate
+      ? "The browser capability above is authoritative: the executor can open and exercise the owned local preview. Include that real rendered check for UI outcomes instead of limiting verification to source inspection."
+      : "",
     "Do not invent requirements the user did not ask for. Do not add generic housekeeping items.",
     "For concrete bug reports, errors, stack traces, failed uploads, parse errors, failed builds, or broken behavior, do not add product-design questions, README updates, logging tasks, reproduction scripts, or tests unless the user explicitly asked. Start with inspecting the existing code path, then the smallest repair, then direct verification.",
     "Give each item a short kebab-case id and a concise label written the way an engineer would describe the work, not a sub-task.",
@@ -167,6 +175,14 @@ export async function planMission(input: {
         status: "pending",
         phase: foundationPhase,
       },
+      ...(input.canBrowserValidate ? [{
+        id: "verify-rendered-ux",
+        label: requiresPolishedUiAcceptance(input.task)
+          ? "Exercise the finished experience in real desktop and mobile browser viewports"
+          : "Exercise the affected user flow in the real browser preview",
+        status: "pending" as const,
+        phase: "Polish & verification",
+      }] : []),
     ]);
   }
 

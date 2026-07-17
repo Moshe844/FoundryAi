@@ -96,6 +96,7 @@ export const DISCOVERY_REFINEMENT_SYSTEM_PROMPT = [
   "A portfolio, landing page, marketing site, brochure site, and other public showcase are presentation experiences by default—not CRUD applications. Do not invent visible add/edit/delete forms, admin controls, localStorage content management, or optimistic mutation flows unless the user explicitly asks to manage content inside the site. Put the visitor experience first: hierarchy, work samples, storytelling, navigation, contact, accessibility, responsive composition, and visual polish.",
   "BE DECISIVE. A principal architect assumes correctly about 95% of the time and only asks about the few things that would actually change the architecture if the answer were different (e.g. single-tenant vs multi-tenant, whether auth is required, whether a specific compliance/payment requirement applies). Do not ask about things you can reasonably infer — likely users, complexity, visual style, and navigation should almost always be confident assumptions, never questions. Target at most 1-3 'ask' decisions total across all 10 dimensions, and only when the answer is genuinely architecture-changing. Every decision you don't ask about should read as a stated fact, not a hedge.",
   "RIGHT-SIZE THE STACK AND ARCHITECTURE TO THE ACTUAL PROJECT. Match the complexity of your recommendation to the real complexity of the request — a small single-user tool must not get an enterprise stack. A static page, a personal to-do/task list, a landing page, a calculator, a timer, a quiz, a portfolio, or any small client-only tool with no real multi-user backend need is best built with plain HTML/CSS/JS (or a tiny static setup) — recommending Next.js/React, an ORM, or a database for something this small is over-engineering and is the WRONG answer. Only reach for a full framework, server, ORM, or database when the project genuinely needs one: real persistence shared across users/devices, authentication, server-side workflows, or many related data entities. When in doubt for something small, prefer the simplest thing that fully does the job. Do NOT frame a genuinely simple project as 'production-ready' or lean on 'scalable enough to grow into…' to justify a heavier stack than it needs.",
+  "THE FIRST BUILD MUST BE LOCALLY RUNNABLE AND VERIFIABLE. Unless the user explicitly requested an external/shared production datastore or supplied an existing service connection, prefer zero-setup persistence (SQLite, an embedded store, or local files) for the first working build and describe the seam for PostgreSQL/MySQL/hosted storage later. Never silently recommend a stack that requires DATABASE_URL, REDIS_URL, hosted-service credentials, or another secret to start. If an external service is genuinely required now, make auth-database-api an ask decision and ask whether the connection is already configured before implementation begins.",
   "Name real technologies, patterns, and providers, not categories. 'Secure authentication' is not a decision — 'JWT sessions in httpOnly cookies, bcrypt password hashing, middleware-enforced route protection, Google + GitHub OAuth, magic-link support' is. 'Responsive layout' is not a decision — 'glassmorphism card over an animated gradient, dark-mode-first palette, inline validation, skeleton loading states' is.",
   "Apply this same level of specificity across domains: for auth/accounts name providers and session/security mechanisms; for e-commerce/inventory name the data operations and table/workflow patterns; for dashboards name the chart/filter/drill-down mechanics; for games name the scene/input/scoring mechanics; for APIs name the validation/error/versioning approach; for anything else (bookings, registrations, memberships, niche tools) reason from first principles the same way — never fall back to a generic label just because it doesn't match one of these examples.",
   "For decisions: rewrite each hypothesis to be specific — 8-16 words naming real things, not a 2-3 word label. rationale must be ONE short sentence explaining WHY this is the right call for this specific project (not a generic process note like 'this can be adjusted later') — e.g. 'Chosen because inventory staff spend hours inside dense tables where speed matters more than decoration,' not 'Style follows the domain.'",
@@ -121,6 +122,22 @@ export type DiscoveryRefinementResult = {
   lede: string;
   stackOptions: StackOption[];
 };
+
+export function hasCompleteDiscoveryRefinement(rawArguments: string | undefined): boolean {
+  if (!rawArguments) return false;
+  try {
+    const value = JSON.parse(rawArguments) as Record<string, unknown>;
+    const requiredText = ["lede", "project_type", "recommended_stack", "architecture", "style_direction", "deployment_note"];
+    const requiredArrays = ["main_features", "data_model", "alternative_stacks", "key_facts", "future_capabilities", "stack_options", "decisions"];
+    return Boolean(value)
+      && requiredText.every((key) => typeof value[key] === "string" && Boolean((value[key] as string).trim()))
+      && requiredArrays.every((key) => Array.isArray(value[key]))
+      && (value.stack_options as unknown[]).length >= MIN_VALID_STACK_OPTIONS
+      && (value.decisions as unknown[]).length >= MIN_VALID_DECISIONS;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Defensively parses the model's tool-call arguments into a refined discovery result.

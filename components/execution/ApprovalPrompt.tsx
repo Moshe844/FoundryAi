@@ -25,6 +25,7 @@ export function ApprovalGate({ event, onApprove }: { event: FactoryExecutionEven
 
 export function BlockedCommandLine({ event, onApprove }: { event: FactoryExecutionEvent; onApprove?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void }) {
   if (event.details?.actionKind === "delete-project") return <ProjectDeletionApproval event={event} onApprove={onApprove} />;
+  if (event.details?.actionKind === "delete-project-lock") return <ProjectLockDeletionApproval event={event} onApprove={onApprove} />;
   const reason = (event.details?.reason as string | undefined) || event.output || "Foundry needs approval before continuing.";
   const category = event.details?.category as string | undefined;
   const command = event.command || event.title;
@@ -53,7 +54,7 @@ export function BlockedCommandLine({ event, onApprove }: { event: FactoryExecuti
           </div>
         </div>
 
-        <div className="rounded-lg border border-white/10 bg-black/25 p-3.5">
+        <div className="rounded-lg border border-overlay/10 bg-shade/25 p-3.5">
           <p className="text-[10.5px] font-bold uppercase tracking-[0.1em] text-foundry-subtle">Requested action</p>
           <code className="mt-2 block whitespace-pre-wrap break-all font-mono text-[12.5px] leading-6 text-foundry-ink">{command}</code>
           <p className="mt-2 text-xs leading-5 text-foundry-subtle">{scopeExplanation}</p>
@@ -71,7 +72,7 @@ export function BlockedCommandLine({ event, onApprove }: { event: FactoryExecuti
             {category ? (
               <button
                 type="button"
-                className="min-h-10 rounded-lg border border-white/15 bg-white/[0.045] px-3.5 text-sm font-bold text-foundry-muted transition hover:bg-white/[0.08] hover:text-foundry-ink"
+                className="min-h-10 rounded-lg border border-overlay/15 bg-overlay/[0.045] px-3.5 text-sm font-bold text-foundry-muted transition hover:bg-overlay/[0.08] hover:text-foundry-ink"
                 onClick={() => onApprove(event, "approve-category")}
               >
                 {projectScopeLabel}
@@ -79,18 +80,52 @@ export function BlockedCommandLine({ event, onApprove }: { event: FactoryExecuti
             ) : null}
             <button
               type="button"
-              className="min-h-10 rounded-lg border border-white/15 bg-white/[0.045] px-3.5 text-sm font-bold text-foundry-muted transition hover:bg-white/[0.08] hover:text-foundry-ink"
+              className="min-h-10 rounded-lg border border-overlay/15 bg-overlay/[0.045] px-3.5 text-sm font-bold text-foundry-muted transition hover:bg-overlay/[0.08] hover:text-foundry-ink"
               onClick={() => onApprove(event, "approve-command")}
             >
               Always allow this exact {isFileAction ? "action" : "command"}
             </button>
             <button
               type="button"
-              className="min-h-10 rounded-lg px-3.5 text-sm font-bold text-foundry-subtle transition hover:bg-white/[0.06] hover:text-foundry-ink"
+              className="min-h-10 rounded-lg px-3.5 text-sm font-bold text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"
               onClick={() => onApprove(event, "skip")}
             >
               Deny
             </button>
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function ProjectLockDeletionApproval({ event, onApprove }: { event: FactoryExecutionEvent; onApprove?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void }) {
+  const projectPath = String(event.details?.projectPath || event.filePath || "Unknown project path");
+  const lockOwners = Array.isArray(event.details?.lockOwners) ? event.details.lockOwners.map(String) : [];
+  return (
+    <section className="my-3 overflow-hidden rounded-xl border border-red-300/30 bg-[linear-gradient(145deg,rgba(127,29,29,0.22),rgba(17,22,23,0.96)_55%)] shadow-[0_18px_55px_rgba(0,0,0,0.35)]">
+      <div className="grid gap-5 p-5 sm:p-6">
+        <div className="flex items-start gap-3.5">
+          <span className="grid h-11 w-11 shrink-0 place-items-center rounded-lg border border-red-300/25 bg-red-400/10 text-red-200"><AlertTriangle size={21} /></span>
+          <div className="min-w-0">
+            <p className="text-[10.5px] font-extrabold uppercase tracking-[0.14em] text-red-200/80">Application lock · approval required</p>
+            <h3 className="mt-1.5 text-lg font-extrabold text-foundry-ink">Close the locking application and delete?</h3>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-foundry-muted">Windows will not delete this project while another application uses it as a working directory. Foundry can close the identified application, then continue deletion automatically.</p>
+          </div>
+        </div>
+        <div className="rounded-lg border border-overlay/10 bg-shade/25 p-4">
+          <p className="text-[10.5px] font-bold uppercase tracking-[0.1em] text-foundry-subtle">Lock owner</p>
+          <p className="mt-2 text-sm font-bold text-foundry-ink">{lockOwners.join(", ") || "An external application"}</p>
+          <code className="mt-2 block break-all font-mono text-[12px] leading-5 text-foundry-subtle">{projectPath}</code>
+        </div>
+        <div className="flex items-start gap-2.5 rounded-lg border border-red-300/20 bg-red-400/[0.07] px-3.5 py-3 text-sm leading-5 text-red-100/90">
+          <AlertTriangle className="mt-0.5 shrink-0" size={16} />
+          <p>Save work first. Force-closing the application can discard unsaved changes. Foundry will stop only the exact process shown above.</p>
+        </div>
+        {onApprove ? (
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button type="button" className="min-h-11 rounded-lg border border-red-300/35 bg-red-400/15 px-4 text-sm font-extrabold text-red-100 transition hover:border-red-200/55 hover:bg-red-400/25" onClick={() => onApprove(event, "approve-once")}>Close app and delete project</button>
+            <button type="button" className="min-h-11 rounded-lg border border-overlay/15 bg-overlay/[0.045] px-4 text-sm font-bold text-foundry-muted transition hover:bg-overlay/[0.08] hover:text-foundry-ink" onClick={() => onApprove(event, "skip")}>Keep app open</button>
           </div>
         ) : null}
       </div>
@@ -119,7 +154,7 @@ function ProjectDeletionApproval({ event, onApprove }: { event: FactoryExecution
           </div>
         </div>
 
-        <div className="rounded-lg border border-white/10 bg-black/25 p-4">
+        <div className="rounded-lg border border-overlay/10 bg-shade/25 p-4">
           <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-[0.1em] text-foundry-subtle">
             <ShieldCheck size={14} /> Exact deletion target
           </div>
@@ -147,7 +182,7 @@ function ProjectDeletionApproval({ event, onApprove }: { event: FactoryExecution
             </button>
             <button
               type="button"
-              className="min-h-11 rounded-lg border border-white/15 bg-white/[0.045] px-4 text-sm font-bold text-foundry-muted transition hover:bg-white/[0.08] hover:text-foundry-ink"
+              className="min-h-11 rounded-lg border border-overlay/15 bg-overlay/[0.045] px-4 text-sm font-bold text-foundry-muted transition hover:bg-overlay/[0.08] hover:text-foundry-ink"
               onClick={() => onApprove(event, "skip")}
             >
               Keep project

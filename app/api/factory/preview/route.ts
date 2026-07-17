@@ -3,7 +3,13 @@ import { getPreviewStatus, launchDesktopPreview, refreshPreviewForProject, stopP
 
 type PreviewRequest = {
   projectId?: string;
+  projectPath?: string;
   action?: "status" | "stop" | "launch-desktop" | "refresh";
+  localConnector?: {
+    url?: string;
+    token?: string;
+    rootLabel?: string;
+  };
 };
 
 export async function POST(request: Request) {
@@ -18,13 +24,20 @@ export async function POST(request: Request) {
   }
 
   if (body.action === "launch-desktop") {
-    const result = launchDesktopPreview(body.projectId);
+    const result = await launchDesktopPreview(body.projectId, body.projectPath);
     return NextResponse.json(result, { status: result.ok ? 200 : 409 });
   }
 
   if (body.action === "refresh") {
     try {
-      return NextResponse.json(await refreshPreviewForProject(body.projectId));
+      const localConnector = body.localConnector?.url && body.localConnector.rootLabel
+        ? {
+            url: body.localConnector.url,
+            token: body.localConnector.token,
+            rootLabel: body.localConnector.rootLabel,
+          }
+        : undefined;
+      return NextResponse.json(await refreshPreviewForProject(body.projectId, localConnector));
     } catch (error) {
       return NextResponse.json({
         previewState: "unavailable",

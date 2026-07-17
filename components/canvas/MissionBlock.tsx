@@ -9,6 +9,7 @@ import type { BlockedCommandAction } from "@/components/execution/ApprovalPrompt
 import { BlockingCard } from "@/components/canvas/BlockingCard";
 import { LiveActivityRow } from "@/components/canvas/LiveActivityRow";
 import { SummaryBlock } from "@/components/canvas/SummaryBlock";
+import { CanvasMarkdown } from "@/components/canvas/CanvasMarkdown";
 
 /**
  * §2/§3 — one mission on the canvas: the user's message (the only accent-bordered
@@ -32,7 +33,7 @@ export function MissionBlock({
   recorded?: boolean;
   /** Event ids to force-expand and scroll to (evidence links from the summary). */
   revealEventIds?: string[];
-  liveActivity?: { text: string; elapsedMs: number } | null;
+  liveActivity?: { id: string; text: string; elapsedMs: number } | null;
   suggestions?: MissionRecommendation[];
   onAnswer?: (answers: Array<{ question: string; answer: string }>) => void;
   onApprove?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
@@ -41,24 +42,35 @@ export function MissionBlock({
 }) {
   const showPhases = (vm.tier === "large" || vm.tier === "huge") && vm.phases.length > 0;
   const blocked = Boolean(vm.blocking);
-  const elapsedMs = Math.max(0, new Date(vm.updatedAt).getTime() - new Date(vm.requestedAt).getTime());
+  const currentLiveActivity = !recorded && vm.isBusy ? liveActivity : null;
+  const elapsedMs = vm.summary?.elapsedMs
+    ?? Math.max(0, new Date(vm.updatedAt).getTime() - new Date(vm.requestedAt).getTime());
 
   return (
     <article className="grid gap-5" aria-label={vm.request}>
       <div className="border-l-[3px] border-foundry-teal pl-3">
         <p className="whitespace-pre-wrap text-[16px] font-semibold leading-[1.5] text-foundry-ink">{vm.request}</p>
+        {vm.requestAttachments.length ? <MessageImages attachments={vm.requestAttachments} /> : null}
+        {vm.requestBrief ? <RequestBrief brief={vm.requestBrief} /> : null}
       </div>
 
       {showPhases ? <PhaseList phases={vm.phases} recorded={recorded} /> : null}
 
-      <VoiceTrail groups={vm.groups} recorded={recorded} busy={vm.isBusy && !recorded} revealEventIds={revealEventIds} />
+      <VoiceTrail
+        groups={currentLiveActivity ? groupsWithoutLiveEvent(vm.groups, currentLiveActivity.id) : vm.groups}
+        recorded={recorded}
+        busy={vm.isBusy && !recorded}
+        revealEventIds={revealEventIds}
+      />
+
+      {vm.deliveredFiles.length ? <DeliveredFiles files={vm.deliveredFiles} /> : null}
 
       {!recorded && vm.blocking && onAnswer && onApprove ? (
         <BlockingCard blocking={vm.blocking} onAnswer={onAnswer} onApprove={onApprove} />
       ) : null}
 
-      {!recorded && !blocked && vm.isBusy && liveActivity ? (
-        <LiveActivityRow text={liveActivity.text} elapsedMs={liveActivity.elapsedMs} />
+      {!blocked && currentLiveActivity ? (
+        <LiveActivityRow text={currentLiveActivity.text} elapsedMs={currentLiveActivity.elapsedMs} />
       ) : null}
 
       {vm.summary ? (
@@ -73,6 +85,96 @@ export function MissionBlock({
         </div>
       ) : null}
     </article>
+  );
+}
+
+function RequestBrief({ brief }: { brief: NonNullable<CanvasMissionVM["requestBrief"]> }) {
+  return (
+    <details className="mt-3 max-w-[760px] overflow-hidden rounded-lg border border-overlay/10 bg-overlay/[0.025]">
+      <summary className="cursor-pointer select-none px-3.5 py-2.5 text-[12px] font-bold text-foundry-muted transition hover:bg-overlay/[0.04] hover:text-foundry-ink">
+        Project brief{brief.customInstructions ? " · custom instructions included" : ""}
+      </summary>
+      <div className="grid gap-3 border-t border-overlay/8 px-3.5 py-3">
+        {brief.customInstructions ? (
+          <div className="rounded-md border border-foundry-teal/20 bg-foundry-teal/[0.055] p-3">
+            <p className="font-mono text-[10px] font-bold uppercase tracking-[0.08em] text-foundry-teal">Your custom instructions</p>
+            <p className="mt-1.5 whitespace-pre-wrap text-[13px] leading-6 text-foundry-ink">{brief.customInstructions}</p>
+          </div>
+        ) : null}
+        <div>
+          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Saved as foundry-brief.md</p>
+          <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 font-mono text-[11px] leading-5 text-foundry-muted">{brief.content}</pre>
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function MessageImages({ attachments }: { attachments: CanvasMissionVM["requestAttachments"] }) {
+  return (
+    <div className="mt-3 flex max-w-[760px] flex-wrap gap-2" aria-label="Attached screenshots">
+      {attachments.map((attachment) => (
+        <a
+          key={attachment.fileId}
+          href={attachment.dataUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="group relative w-full max-w-[280px] overflow-hidden rounded-lg border border-overlay/12 bg-shade/30 transition hover:border-foundry-teal/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/50"
+          title={`Open ${attachment.fileName}`}
+        >
+          {/* Attachment data URLs are already-local persisted evidence, so Next image optimization cannot improve this render. */}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={attachment.dataUrl}
+            alt={attachment.fileName || "Attached screenshot"}
+            className="block h-36 w-full bg-shade/20 object-contain"
+          />
+          <span className="flex items-center justify-between gap-2 border-t border-overlay/8 px-2.5 py-1.5 text-[10px] text-foundry-subtle group-hover:text-foundry-muted">
+            <span className="truncate">{attachment.fileName}</span>
+            <span className="shrink-0">Expand</span>
+          </span>
+        </a>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The newest event has a dedicated live-status row while work is running. Remove that exact event
+ * identity from the permanent trail until the mission settles; comparing text would incorrectly
+ * collapse legitimate repeated commands or reads.
+ */
+function groupsWithoutLiveEvent(groups: CanvasVoiceGroup[], liveEventId: string): CanvasVoiceGroup[] {
+  return groups.flatMap((group) => {
+    if (group.id === liveEventId) {
+      return group.events.length ? [{ ...group, id: `${group.id}-prior-work`, voice: undefined }] : [];
+    }
+    const events = group.events.filter((event) => event.id !== liveEventId);
+    return group.voice || events.length ? [{ ...group, events }] : [];
+  });
+}
+
+function DeliveredFiles({ files }: { files: CanvasMissionVM["deliveredFiles"] }) {
+  return (
+    <section className="grid gap-2" aria-label="Delivered project files">
+      <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-foundry-subtle">Files</p>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {files.map((file) => (
+          <a
+            key={file.path}
+            href={`data:${file.mediaType};charset=utf-8,${encodeURIComponent(file.content)}`}
+            download={file.path.split("/").at(-1) || "project-file"}
+            className="group flex min-w-0 items-center gap-3 rounded-lg border border-overlay/10 bg-overlay/[0.035] px-3 py-2.5 transition hover:border-foundry-teal/45 hover:bg-foundry-teal/[0.06]"
+          >
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-foundry-teal/25 bg-foundry-teal/[0.09] font-mono text-[11px] font-bold text-foundry-teal">↓</span>
+            <span className="min-w-0">
+              <span className="block truncate text-[13px] font-semibold text-foundry-ink">{file.path}</span>
+              <span className="block text-[11px] text-foundry-subtle">{Math.max(1, Math.ceil(file.size / 1024))} KB · Download</span>
+            </span>
+          </a>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -91,7 +193,7 @@ function PhaseList({ phases, recorded }: { phases: CanvasPhase[]; recorded: bool
               type="button"
               aria-expanded={expanded}
               onClick={() => setOpenPhases((current) => ({ ...current, [phase.index]: !expanded }))}
-              className="flex w-full items-baseline gap-2 rounded px-1 py-0.5 text-left transition hover:bg-white/[0.03]"
+              className="flex w-full items-baseline gap-2 rounded px-1 py-0.5 text-left transition hover:bg-overlay/[0.03]"
             >
               <span className={`font-mono text-[12px] ${phase.failed ? "text-red-300" : complete ? "text-foundry-teal" : "text-foundry-subtle"}`} aria-hidden="true">
                 {phase.failed ? "!" : complete ? "✓" : "○"}
@@ -140,9 +242,7 @@ function VoiceTrail({ groups, recorded, busy, revealEventIds }: { groups: Canvas
         return (
           <section key={group.id} className={busy && index === groups.length - 1 ? "canvas-enter" : undefined}>
             {group.voice ? (
-              <p className="max-w-[70ch] whitespace-pre-wrap text-[15px] leading-[1.6] text-foundry-ink" aria-live={busy && index === groups.length - 1 ? "polite" : undefined}>
-                {group.voice}
-              </p>
+              <CanvasMarkdown value={group.voice} live={busy && index === groups.length - 1} />
             ) : null}
             {group.events.length ? (
               expanded ? (
@@ -205,7 +305,7 @@ function EventRow({ event }: { event: CanvasWorkEvent }) {
         </span>
       </div>
       {open && event.output ? (
-        <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded border border-white/8 bg-black/30 p-2.5 font-mono text-[12px] leading-5 text-foundry-muted">{event.output}</pre>
+        <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded border border-overlay/8 bg-shade/30 p-2.5 font-mono text-[12px] leading-5 text-foundry-muted">{event.output}</pre>
       ) : null}
     </li>
   );

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { THEME_BOOT_SCRIPT } from "@/lib/ui/theme";
 
 export const metadata: Metadata = {
   title: "Foundry Workspace",
@@ -17,6 +18,10 @@ export default function RootLayout({
     // React intentionally does not reconcile them. Limit suppression to the two document boundary
     // elements so genuine mismatches inside the application continue to surface.
     <html lang="en" suppressHydrationWarning>
+      <head>
+        {/* Applies the stored theme before first paint so a saved choice never flashes the default. */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
+      </head>
       <body suppressHydrationWarning className="min-h-screen bg-foundry-bg font-sans text-foundry-ink subpixel-antialiased">
         {children}
       </body>

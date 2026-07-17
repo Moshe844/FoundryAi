@@ -5,11 +5,12 @@ import type { ManagedCallOptions, ManagedModelRequest, ManagedModelResult, Provi
 import { getModelConfig, resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
 import { refreshModelRegistry, reportModelHealth } from "@/lib/ai/routing/dynamic-router";
 import { sameTierFallbacks } from "@/lib/ai/routing/selector";
-import type { TaskProfile } from "@/lib/ai/routing/types";
+import type { RegisteredModel, TaskProfile } from "@/lib/ai/routing/types";
 import { profileTask } from "@/lib/ai/routing/task-profiler";
 import { selectModel } from "@/lib/ai/routing/selector";
 import { CostGuardError, releaseModelCall, reserveModelCall, settleModelCall } from "@/lib/ai/routing/cost-guard";
 import { recordProviderCall } from "@/lib/ai/routing/telemetry";
+import { redactSensitiveData } from "@/lib/security/secret-redaction";
 
 /** The env var each provider's key lives in — same "read directly, 503 if missing" pattern every route already used for OPENAI_API_KEY. */
 export function apiKeyForProvider(provider: ProviderId): string | undefined {
@@ -26,7 +27,18 @@ export function envVarNameForProvider(provider: ProviderId): string {
 
 const PROVIDERS: ProviderId[] = ["openai", "anthropic", "google"];
 const managedResultCache = new Map<string, { result: ManagedModelResult; expiresAt: number }>();
-type CandidateFailure = { provider: ProviderId; model: string; message: string; kind: NonNullable<ManagedModelResult["failureKind"]> };
+type TransportFailureReason = "timeout" | "connection" | "other";
+type CandidateFailure = {
+  provider: ProviderId;
+  model: string;
+  message: string;
+  kind: NonNullable<ManagedModelResult["failureKind"]>;
+  transportReason?: TransportFailureReason;
+};
+
+const MIN_PROVIDER_ATTEMPT_TIMEOUT_MS = 45_000;
+const MAX_PROVIDER_ATTEMPT_TIMEOUT_MS = 160_000;
+const MAX_LOGICAL_FALLBACK_WINDOW_MS = 300_000;
 
 /** Picks the best configured provider for a tier and falls back cleanly when a key is absent. */
 export function providerForTier(tier: ModelTier, preferred?: ProviderId): { provider: ProviderId; apiKey: string } | undefined {
@@ -47,8 +59,21 @@ export function providerForTier(tier: ModelTier, preferred?: ProviderId): { prov
  * request.provider.
  */
 export async function callManagedModel(request: ManagedModelRequest, options: ManagedCallOptions): Promise<ManagedModelResult> {
-  const tier = request.routing?.tier ?? inferTier(request);
+  // Final common boundary before every provider. Upstream routes may sanitize earlier, but doing it
+  // here prevents a future call site from sending pasted credentials, .env output, or remembered
+  // secrets to any configured model.
+  request = redactSensitiveData(request);
+  const requiredToolName = typeof request.toolChoice === "object" ? request.toolChoice.name : undefined;
+  if (requiredToolName && !request.tools?.some((tool) => tool.name === requiredToolName)) {
+    return blockedResult(
+      request,
+      options,
+      `Internal tool contract mismatch: required tool ${requiredToolName} was not advertised. The provider call was prevented before billing.`,
+      "tool",
+    );
+  }
   const registry = await refreshModelRegistry();
+  const tier = request.routing?.tier ?? inferTier(request, registry.get(request.provider, request.model));
   const profile = request.routing ? profileTask({ message: request.routing.task, dynamicAssessment: request.routing.dynamicAssessment }) : fallbackProfile(tier);
   profile.recommendedIntelligenceTier = tier;
   const freshDecision = selectModel(profile, registry, { preferredProvider: request.provider, budget: request.routing?.budget });
@@ -81,7 +106,12 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
   const candidates = (primary
     ? [primary, ...(crossProviderCandidates.length ? crossProviderCandidates : sameProviderAlternate ? [sameProviderAlternate] : [])]
     : []).slice(0, maximumProviders);
-  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 90_000);
+  // `timeoutMs` is the useful-work allowance for one provider attempt, not a pot to divide between
+  // every fallback. Splitting a 60-second implementation call into two 30-second attempts made both
+  // healthy coding providers fail before either could return its edit. Give each configured provider
+  // a real attempt while retaining a hard, bounded window for the whole logical call.
+  const candidateTimeoutMs = providerAttemptTimeoutMs(options.timeoutMs);
+  const timeoutSignal = AbortSignal.timeout(providerFallbackWindowMs(candidateTimeoutMs, candidates.length));
   const overallSignal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
   let lastResult: ManagedModelResult | undefined;
   const candidateFailures: CandidateFailure[] = [];
@@ -119,16 +149,13 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
     // One slow provider must not consume the entire logical-call window and prevent same-tier
     // fallback. Keep the caller's overall deadline, but bound each candidate independently so a
     // healthy alternate provider can still complete the requested tool action.
-    const logicalTimeoutMs = options.timeoutMs ?? 90_000;
-    const candidateTimeoutMs = Math.min(75_000, Math.max(15_000, Math.floor(logicalTimeoutMs / Math.max(1, candidates.length))));
-    // Always compose the per-candidate deadline with the logical call's deadline. Previously,
-    // supplying the mission signal accidentally dropped the overall 90-second limit, allowing a
-    // long fallback list to consume 45 seconds per model while the canvas appeared stalled.
+    // Always compose the per-candidate deadline with the logical call's bounded fallback window and
+    // the user's cancellation signal. A slow primary can no longer starve the alternate provider.
     const candidateSignal = AbortSignal.any([overallSignal, AbortSignal.timeout(candidateTimeoutMs)]);
     const candidateOptions = { ...options, apiKey, signal: candidateSignal, timeoutMs: candidateTimeoutMs, maxAttempts: 1 };
     let result: ManagedModelResult;
     try {
-      result = await callProvider(candidateRequest, candidateOptions);
+      result = redactSensitiveData(await callProvider(candidateRequest, candidateOptions));
       settleModelCall(reservation, result.usage);
     } catch (error) {
       releaseModelCall(reservation);
@@ -162,12 +189,25 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
           failureKind: providerError ? classifyProviderFailure(providerError) : "tool" as const,
         };
     const failureKind = failedResult.failureKind ?? classifyProviderFailure(failedResult.errorMessage);
-    candidateFailures.push({ provider, model: candidate.modelId, message: failedResult.errorMessage || "Provider returned an unusable response.", kind: failureKind });
+    const failureMessage = failedResult.errorMessage || "Provider returned an unusable response.";
+    candidateFailures.push({
+      provider,
+      model: candidate.modelId,
+      message: failureMessage,
+      kind: failureKind,
+      transportReason: failureKind === "transport" ? transportFailureReason(failureMessage) : undefined,
+    });
     lastResult = { ...failedResult, failureKind };
     // A charged but unusable response must not silently trigger another provider bill. Automatic
     // fallback remains available for zero-token transport failures; paid fallback is explicit opt-in.
+    // Exception: a tool-forced call that came back WITHOUT the required tool is categorically
+    // unusable — the executor cannot advance on it at all — so it is not the "useful paid work" this
+    // guard exists to protect. Retrying the same tool-incapable model is what dooms the whole call
+    // (a flaky/incompatible fast model then fails every turn with no fallback); fall back to a model
+    // that can obey instead. Cost stays bounded by `maximumProviders` (default: one alternate).
     const consumedPaidTokens = result.usage.requestCount > 0 && result.usage.totalTokens > 0;
-    if (consumedPaidTokens && process.env.FOUNDRY_ALLOW_PAID_PROVIDER_FALLBACK !== "true") break;
+    const unusableToolDisobey = Boolean(requiredTool) && !obeyedToolChoice;
+    if (consumedPaidTokens && !unusableToolDisobey && process.env.FOUNDRY_ALLOW_PAID_PROVIDER_FALLBACK !== "true") break;
   }
 
   if (lastResult && candidateFailures.length) {
@@ -206,10 +246,42 @@ function classifyProviderFailure(message = ""): NonNullable<ManagedModelResult["
     : "provider";
 }
 
+export function providerAttemptTimeoutMs(requestedTimeoutMs?: number): number {
+  const requested = Number.isFinite(requestedTimeoutMs) ? Number(requestedTimeoutMs) : 90_000;
+  return Math.min(MAX_PROVIDER_ATTEMPT_TIMEOUT_MS, Math.max(MIN_PROVIDER_ATTEMPT_TIMEOUT_MS, requested));
+}
+
+export function providerFallbackWindowMs(candidateTimeoutMs: number, candidateCount: number): number {
+  return Math.min(MAX_LOGICAL_FALLBACK_WINDOW_MS, candidateTimeoutMs * Math.max(1, candidateCount));
+}
+
+function transportFailureReason(message: string): TransportFailureReason {
+  if (/timed?\s*out|timeout|aborted due to timeout|operation was aborted/i.test(message)) return "timeout";
+  if (/network request|fetch failed|socket|connection|econn|enotfound|dns/i.test(message)) return "connection";
+  return "other";
+}
+
 function summarizeCandidateFailures(failures: CandidateFailure[], failureKind: NonNullable<ManagedModelResult["failureKind"]>) {
   const attempts = failures.slice(0, 3).map((failure) => `${failure.provider}/${failure.model}`).join(", ");
   if (failureKind === "transport") {
-    return `Configured provider fallbacks timed out or could not be reached (${attempts}).`;
+    const reasons = failures.map((failure) => failure.transportReason ?? transportFailureReason(failure.message));
+    if (reasons.every((reason) => reason === "timeout")) {
+      return `All configured provider attempts timed out before returning a usable action (${attempts}).`;
+    }
+    if (reasons.every((reason) => reason === "connection")) {
+      return `Configured providers could not be reached (${attempts}).`;
+    }
+    const details = failures.slice(0, 3).map((failure) => {
+      const reason = failure.transportReason ?? transportFailureReason(failure.message);
+      const outcome = reason === "timeout" ? "timed out" : reason === "connection" ? "could not be reached" : "failed during transport";
+      return `${failure.provider}/${failure.model} ${outcome}`;
+    }).join("; ");
+    return `Configured provider attempts ended in transport failures: ${details}.`;
+  }
+  const actionFailure = failures.find((failure) => failure.kind === "tool" || failure.kind === "provider");
+  const guardrailFailure = failures.find((failure) => failure.kind === "guardrail");
+  if (actionFailure && guardrailFailure) {
+    return `Configured provider ${actionFailure.provider}/${actionFailure.model} did not produce the required executable action. ${actionFailure.message} No fallback call was sent: ${guardrailFailure.message}`;
   }
   const last = failures.at(-1)?.message ?? "No provider produced a usable response.";
   return `Configured provider fallbacks did not produce a usable action (${attempts}). ${last}`;
@@ -225,10 +297,17 @@ function callProvider(request: ManagedModelRequest, options: ManagedCallOptions)
   return callGoogleManaged(request, options);
 }
 
-function inferTier(request: ManagedModelRequest): ModelTier {
+function inferTier(request: ManagedModelRequest, registeredModel?: RegisteredModel): ModelTier {
   if (request.provider === "openai") {
-    if (request.model === getModelConfig().fast) return "fast";
-    return request.effort === "high" ? "architect" : "builder";
+    const configuredFastModel = getModelConfig().fast;
+    if (configuredFastModel && request.model === configuredFastModel) return "fast";
+  }
+  // Registry-based routing deliberately leaves the legacy env model table empty. Infer the
+  // selected model's intended capability tier from the same live tier-fit evidence that chose it,
+  // otherwise Fast mini/flash/haiku requests are mistakenly reclassified as Builder at dispatch.
+  if (registeredModel?.tierFit) {
+    const fit = registeredModel.tierFit;
+    return (Object.entries(fit) as Array<[ModelTier, number]>).sort((left, right) => right[1] - left[1])[0]?.[0] ?? "builder";
   }
   return request.effort === "high" ? "architect" : "builder";
 }

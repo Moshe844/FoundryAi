@@ -13,16 +13,29 @@ const config: Config = {
         serif: ["Iowan Old Style", "Palatino Linotype", "Palatino", "Book Antiqua", "Georgia", "serif"],
       },
       colors: {
+        // Every token resolves through a CSS variable holding a space-separated RGB triplet, so the
+        // whole palette swaps per theme (see app/globals.css) while Tailwind's `/alpha` modifiers
+        // keep working — e.g. `border-foundry-teal/35`.
         foundry: {
-          bg: "#090b0d",
-          ink: "#f3f1ea",
-          muted: "#9ca6a5",
-          subtle: "#6f7978",
-          panel: "rgba(18, 22, 24, 0.78)",
-          amber: "#e8b75c",
-          teal: "#4fd1bd",
-          blue: "#8fb7ff",
+          bg: "rgb(var(--foundry-bg) / <alpha-value>)",
+          ink: "rgb(var(--foundry-ink) / <alpha-value>)",
+          muted: "rgb(var(--foundry-muted) / <alpha-value>)",
+          subtle: "rgb(var(--foundry-subtle) / <alpha-value>)",
+          panel: "rgb(var(--foundry-panel) / <alpha-value>)",
+          surface: "rgb(var(--foundry-surface) / <alpha-value>)",
+          raised: "rgb(var(--foundry-raised) / <alpha-value>)",
+          amber: "rgb(var(--foundry-amber) / <alpha-value>)",
+          teal: "rgb(var(--foundry-teal) / <alpha-value>)",
+          blue: "rgb(var(--foundry-blue) / <alpha-value>)",
         },
+        /**
+         * Theme-aware replacements for literal `white/x` and `black/x` overlays. The app expresses
+         * depth with hundreds of translucent overlays; on a dark base those lift a surface (white),
+         * on a light base they must deepen it (slate). Routing them through variables is what makes
+         * a real light theme possible without hand-editing every call site.
+         */
+        overlay: "rgb(var(--foundry-overlay) / <alpha-value>)",
+        shade: "rgb(var(--foundry-shade) / <alpha-value>)",
       },
       boxShadow: {
         workspace: "0 24px 70px rgba(0, 0, 0, 0.42)",

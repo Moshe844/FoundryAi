@@ -21,6 +21,13 @@ type OpenAIResponse = {
   output?: Array<{
     type?: string;
     content?: OpenAIContent[];
+    action?: {
+      sources?: Array<{
+        type?: string;
+        url?: string;
+        title?: string;
+      }>;
+    };
   }>;
   error?: {
     message?: string;
@@ -188,6 +195,8 @@ async function answerWithWebSearch(request: SourceProviderRequest): Promise<Sour
     body: JSON.stringify({
       model: modelForProfile(implementationRequest ? "standard" : "fast").model,
       tools: [{ type: "web_search" }],
+      tool_choice: "required",
+      include: ["web_search_call.action.sources"],
       input: [
         {
           role: "system",
@@ -200,7 +209,7 @@ async function answerWithWebSearch(request: SourceProviderRequest): Promise<Sour
               ? "The user is asking you to build or write an artifact using source/docs context. Do not return a link list as the answer. Produce the requested code/script/files directly. Before writing any request body or payload, extract required API fields from the sources and include required constants/config values even if they are not user-upload columns."
               : "",
             directLinkRequest
-              ? "The user is asking for links/docs/templates/downloads. Return the requested official links first in a compact list. Do not write a tutorial before the links. Add only a short next-step note after the links."
+              ? "The user is asking for links/docs/templates/downloads. Cite only official vendor or project documentation pages. Return URLs and no tutorial, summary, acknowledgement, or next-step prose."
               : "Use a mentor style, not a report style. If the user is troubleshooting, orient them with current situation, do this now, expected result, and after that.",
             "If multiple fixes or interpretations exist, give the recommended one first and then the practical alternatives. Do not collapse a multi-path problem into one source-backed paragraph.",
           ].join(" "),
@@ -210,7 +219,6 @@ async function answerWithWebSearch(request: SourceProviderRequest): Promise<Sour
           content: formatSourceRequest(request),
         },
       ],
-      temperature: 0.25,
       max_output_tokens: implementationRequest ? 3600 : directLinkRequest ? 700 : instructional ? 1800 : 900,
     }),
   });
@@ -244,9 +252,10 @@ async function answerWithWebSearch(request: SourceProviderRequest): Promise<Sour
   }
 
   if (directLinkRequest) {
+    const directSources = selectDirectSourceLinks(request, sources);
     return {
-      answer: formatDirectSourceLinksAnswer(request, rawAnswer, sources),
-      sources,
+      answer: formatDirectSourceLinksAnswer(directSources),
+      sources: directSources,
     };
   }
 
@@ -346,7 +355,6 @@ async function answerFromProvidedSourceText(
           ].join("\n\n"),
         },
       ],
-      temperature: 0.25,
       max_output_tokens: implementationRequest ? 3600 : directLinkRequest ? 700 : instructional ? 1800 : 900,
     }),
   });
@@ -358,7 +366,7 @@ async function answerFromProvidedSourceText(
   }
 
   const answer = sanitizeAnswerUrls(extractText(data) || "I read the source, but could not produce a useful answer.");
-  return directLinkRequest ? formatDirectSourceLinksAnswer(request, answer, sources.map(toSourceReferenceLike)) : answer;
+  return directLinkRequest ? formatDirectSourceLinksAnswer(selectDirectSourceLinks(request, sources.map(toSourceReferenceLike))) : answer;
 }
 
 async function fetchUrlSource(url: string): Promise<FetchedSource | null> {
@@ -559,25 +567,14 @@ function extractLikelyApiFieldMentions(message: string) {
   });
 }
 
-function formatDirectSourceLinksAnswer(request: SourceProviderRequest, _rawAnswer: string, sources: SourceReference[]) {
+function selectDirectSourceLinks(request: SourceProviderRequest, sources: SourceReference[]) {
   const officialSources = sources.slice(0, 6);
   const intent = directSourceIntent(request.userMessage);
-  const primarySources = rankSourcesForDirectIntent(officialSources, intent);
+  return rankSourcesForDirectIntent(officialSources, intent);
+}
 
-  const linkList = primarySources
-    .map((source) => `- [${source.title}](${source.url})`)
-    .join("\n");
-  const note = noteForDirectSourceIntent(intent, primarySources);
-
-  return [
-    sourceRequestAcknowledgement(request.userMessage),
-    "**Official Links**",
-    linkList,
-    note ? `\n**Note**\n${note}` : "",
-    `\n**Next**\n${nextStepForSourceIntent(intent)}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+function formatDirectSourceLinksAnswer(sources: SourceReference[]) {
+  return sources.map((source) => `- [${source.url}](${source.url})`).join("\n");
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -585,14 +582,6 @@ function acknowledgementForSourceRequest(message: string) {
   if (/\b(please|pls)\b/i.test(message)) return "Sure — here are the official links I found.";
   if (/\b(can you|could you|would you|send me|give me|share)\b/i.test(message)) {
     return "Sure — here are the official links I found.";
-  }
-  return "Here are the official links I found.";
-}
-
-function sourceRequestAcknowledgement(message: string) {
-  if (/\b(please|pls)\b/i.test(message)) return "Sure - here are the official links I found.";
-  if (/\b(can you|could you|would you|send me|give me|share)\b/i.test(message)) {
-    return "Sure - here are the official links I found.";
   }
   return "Here are the official links I found.";
 }
@@ -628,30 +617,6 @@ function rankSourcesForDirectIntent(sources: SourceReference[], intent: DirectSo
     const rightText = `${right.title} ${right.url}`;
     return Number(matcher.test(rightText)) - Number(matcher.test(leftText));
   });
-}
-
-function noteForDirectSourceIntent(intent: DirectSourceIntent, sources: SourceReference[]) {
-  const topSourceText = sources.map((source) => `${source.title} ${source.url}`).join(" ");
-  if ((intent === "template" || intent === "download") && !/\b(template|sample|download|installer|package|file)\b/i.test(topSourceText)) {
-    return "I found official documentation, but not a separate citable download/template URL. Check the linked official page for the download area.";
-  }
-  return "";
-}
-
-function nextStepForSourceIntent(intent: DirectSourceIntent) {
-  const nextSteps: Record<DirectSourceIntent, string> = {
-    download: "Open the official page first and use the vendor-provided download link from there. Send me the file or page text if you want me to verify it.",
-    template: "Open the official page first and use the vendor-provided template/sample link from there. Send me the template if you want me to check the fields.",
-    requirements: "Open the official docs first. If you want, ask me to extract the exact requirements into a short checklist.",
-    "release-notes": "Open the official release notes first. If you want, ask me to summarize the changes that matter for your version.",
-    changelog: "Open the official changelog first. If you want, ask me to pull out the relevant changes or breaking changes.",
-    "api-docs": "Open the official API docs first. If you want, ask me to turn the relevant section into an implementation checklist.",
-    pricing: "Open the official pricing page first. If you want, ask me to compare the plan details that matter for your use case.",
-    status: "Open the official status page first. If you want, send me the incident text and I can help interpret impact.",
-    docs: "Open the official page first. If you want, I can pull out the exact requirements or steps from the docs next.",
-  };
-
-  return nextSteps[intent];
 }
 
 function formatSourceRequest(request: SourceProviderRequest) {
@@ -751,6 +716,24 @@ function extractSources(response: OpenAIResponse, provider: SourceReference["pro
       sources.push({
         id: createSourceId(url),
         title: annotation.title || url,
+        url,
+        provider,
+        createdAt: new Date().toISOString(),
+      });
+    });
+
+  // Current Responses web search can also return the complete consulted URL set on the
+  // web_search_call item when explicitly requested. Citations stay first; consulted sources are a
+  // truthful fallback for direct link lookups where the assistant emits no narrative/citation text.
+  response.output
+    ?.flatMap((item) => item.action?.sources ?? [])
+    .forEach((source) => {
+      const url = source.url ? cleanUrl(source.url) : "";
+      if (!url || seen.has(url) || !isLikelyVerifiedSourceUrl(url)) return;
+      seen.add(url);
+      sources.push({
+        id: createSourceId(url),
+        title: source.title || url,
         url,
         provider,
         createdAt: new Date().toISOString(),

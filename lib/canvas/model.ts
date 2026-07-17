@@ -1,5 +1,7 @@
 import type { FactoryExecutionEvent, FactoryExecutionEventKind, FactoryObjectiveChecklistItem, MissionClarification } from "@/lib/factory/types";
-import type { ExecutionMission, ExecutionMissionState, ExecutionMissionVerificationStatus } from "@/lib/mission/model";
+import type { DeliveredProjectFile, ExecutionMission, ExecutionMissionState, ExecutionMissionVerificationStatus } from "@/lib/mission/model";
+import type { WorkspaceAttachment } from "@/lib/files";
+import { stripTerminalFormatting } from "@/lib/text/terminal";
 
 /**
  * Mission Canvas view-model — the single contract between the rendering layer
@@ -77,8 +79,10 @@ export type CanvasSummaryLine = {
 
 /** Terminal block. Rendered only after the real final event. */
 export type CanvasSummary = {
-  heading: "Done" | "Failed" | "Stopped" | "Blocked";
+  heading: "Done" | "Failed" | "Stopped" | "Blocked" | "Needs repair";
   verificationStatus: ExecutionMissionVerificationStatus;
+  /** Product-specific final handoff, preserved from the executor rather than replaced by a status word. */
+  outcome?: string;
   /** Real claims: files touched, with evidence links. ≤ 5 lines. */
   whatChanged: CanvasSummaryLine[];
   /** Only things actually exercised. Empty ⇒ the explicit unverified label renders. */
@@ -95,11 +99,16 @@ export type CanvasMissionVM = {
   id: string;
   /** The user's real request text. */
   request: string;
+  /** Full durable new-project brief shown on demand at execution start. */
+  requestBrief?: { content: string; customInstructions?: string };
+  /** Images attached to this exact request, rendered as first-class message content. */
+  requestAttachments: WorkspaceAttachment[];
   requestedAt: string;
   state: ExecutionMissionState;
   stateLabel: string;
   tier: CanvasTier;
   groups: CanvasVoiceGroup[];
+  deliveredFiles: DeliveredProjectFile[];
   phases: CanvasPhase[];
   blocking?: CanvasBlocking;
   summary?: CanvasSummary;
@@ -111,17 +120,39 @@ export type CanvasMissionVM = {
 
 export type CanvasDotState = "idle" | "working" | "waiting" | "failed";
 
+/** A verified product/build defect is actionable work, not an unexplained execution crash. */
+export function needsRepairAction(mission: ExecutionMission): boolean {
+  if (mission.state !== "failed") return false;
+  const actionableChecks = new Set(["preview", "build", "test", "lint", "typecheck", "command"]);
+  return mission.verification.some((item) => item.result === "fail" && actionableChecks.has(item.check_type));
+}
+
 const voiceKinds: FactoryExecutionEventKind[] = ["reasoning", "planning", "summary"];
+
+/** Hide internal orchestration records, including records persisted before those emitters were
+ * correctly marked internal. This preserves the engineering history while removing model-routing
+ * and capability-level implementation details from every user-facing timeline. */
+export function isInternalExecutionEvent(event: FactoryExecutionEvent): boolean {
+  const text = `${event.title ?? ""} ${event.rationale ?? ""}`.trim();
+  return Boolean(event.internal)
+    // Legacy runtimes persisted one stdout/stderr event per process chunk. Command terminal
+    // events retain the actual output, so these bookkeeping rows are never user-facing evidence.
+    || event.kind === "stdout"
+    || event.kind === "stderr"
+    || /^Routing:\s*(?:fast|builder|architect|enterprise-architect|super-reasoning)\b/i.test(text)
+    || /\bI'm at Level\s+[1-4]\s+here\b/i.test(text)
+    || /\bFull mission support here\b/i.test(text);
+}
 
 /** A voice event is one whose text is a sentence Foundry says; everything else is a work row. */
 export function isVoiceEvent(event: FactoryExecutionEvent): boolean {
-  if (event.internal) return false;
+  if (isInternalExecutionEvent(event)) return false;
   if (event.tier === "finding" || event.tier === "decision" || event.tier === "flag") return true;
   return voiceKinds.includes(event.kind);
 }
 
 export function voiceTextOf(event: FactoryExecutionEvent): string {
-  return (event.rationale || event.output || event.title || "").replace(/\s+/g, " ").trim();
+  return stripTerminalFormatting(event.rationale || event.output || event.title || "").replace(/\s+/g, " ").trim();
 }
 
 /** Row text for a work event: verb + object + real outcome. Nothing predictive. */
@@ -166,7 +197,7 @@ function sizeFromPlan(mission: ExecutionMission, engineSize: CanvasTier | undefi
   const phaseCount = new Set(plan.map((item) => item.phase ?? "")).size;
   if (phaseCount > 1 || plan.length > 6) return "large";
   if (plan.length >= 3) return engineSize === "tiny" ? "medium" : engineSize ?? "medium";
-  if (plan.length === 0 && !engineSize) return mission.timeline.filter((event) => !event.internal).length > 8 ? "medium" : "tiny";
+  if (plan.length === 0 && !engineSize) return mission.timeline.filter((event) => !isInternalExecutionEvent(event)).length > 8 ? "medium" : "tiny";
   return engineSize ?? "medium";
 }
 
@@ -203,7 +234,7 @@ export function groupTimeline(timeline: FactoryExecutionEvent[]): CanvasVoiceGro
   let current: CanvasVoiceGroup | null = null;
 
   timeline
-    .filter((event) => !event.internal && event.kind !== "blocked")
+    .filter((event) => !isInternalExecutionEvent(event) && event.kind !== "blocked")
     .forEach((event) => {
       if (isVoiceEvent(event)) {
         const voice = voiceTextOf(event);
@@ -248,7 +279,7 @@ export function groupTimeline(timeline: FactoryExecutionEvent[]): CanvasVoiceGro
 function rawPayloadOf(event: FactoryExecutionEvent): string | undefined {
   const parts = [event.output, event.stdout, event.stderr].filter((part): part is string => Boolean(part && part.trim()));
   if (!parts.length) return undefined;
-  return parts.join("\n").trim();
+  return stripTerminalFormatting(parts.join("\n")).trim();
 }
 
 /** §7 status dot: exactly four states, driven only by the real mission state. */
@@ -260,11 +291,11 @@ export function dotStateOf(state: ExecutionMissionState | "idle", isBusy: boolea
 }
 
 /** The most recent real event, rendered verbatim in the live activity row (§7.1). */
-export function latestLiveEvent(timeline: FactoryExecutionEvent[]): { text: string; timestamp: string } | null {
-  const last = timeline.filter((event) => !event.internal).at(-1);
+export function latestLiveEvent(timeline: FactoryExecutionEvent[]): { id: string; text: string; timestamp: string } | null {
+  const last = timeline.filter((event) => !isInternalExecutionEvent(event)).at(-1);
   if (!last) return null;
   const text = isVoiceEvent(last) ? voiceTextOf(last) : workEventText(last);
-  return text ? { text, timestamp: last.timestamp } : null;
+  return text ? { id: last.id, text, timestamp: last.timestamp } : null;
 }
 
 /** Past-tense outcome phrase for a collapsed mission row: the real summary's first sentence. */

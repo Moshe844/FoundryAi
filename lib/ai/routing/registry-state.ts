@@ -1,6 +1,8 @@
 import { CapabilityRegistry } from "@/lib/ai/routing/capability-registry";
 
-let registry = new CapabilityRegistry([]);
+// Configured models are immediately routable while live catalogue discovery runs. Starting with an
+// empty registry made every first request depend on three external model-list endpoints completing.
+let registry = new CapabilityRegistry();
 let refreshedAt = 0;
 
 export function getLiveRegistry() { return registry; }

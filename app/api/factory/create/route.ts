@@ -36,6 +36,7 @@ export async function POST(request: Request) {
             body.modelMode,
             body.quality,
             runtimeController.signal,
+            body.evidenceAttachments ?? [],
           )
             .then((result) => {
               completeExecution(body.controlId, result);
@@ -67,7 +68,7 @@ export async function POST(request: Request) {
       });
     }
 
-    const result = await createFactoryProject(body.brief, undefined, body.discovery, body.modelMode, body.quality);
+    const result = await createFactoryProject(body.brief, undefined, body.discovery, body.modelMode, body.quality, undefined, body.evidenceAttachments ?? []);
     return NextResponse.json(result);
   } catch (error) {
     return NextResponse.json(

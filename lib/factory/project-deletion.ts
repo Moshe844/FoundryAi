@@ -14,3 +14,19 @@ export function isWholeProjectDeletionRequest(message: string) {
 export function projectDeletionApprovalCommand(projectPath: string) {
   return `foundry:delete-project-root:${projectPath}`;
 }
+
+export function projectDeletionLockApprovalCommand(projectPath: string, processIds: number[]) {
+  const ids = [...new Set(processIds.filter((pid) => Number.isInteger(pid) && pid > 0))].sort((left, right) => left - right);
+  return `foundry:stop-project-locks-and-delete:${ids.join(",")}:${projectPath}`;
+}
+
+export function parseProjectDeletionLockApprovalCommand(command: string, projectPath: string) {
+  const prefix = "foundry:stop-project-locks-and-delete:";
+  if (!command.startsWith(prefix)) return undefined;
+  const remainder = command.slice(prefix.length);
+  const separator = remainder.indexOf(":");
+  if (separator < 1 || remainder.slice(separator + 1) !== projectPath) return undefined;
+  const processIds = remainder.slice(0, separator).split(",").map(Number);
+  if (!processIds.length || processIds.some((pid) => !Number.isInteger(pid) || pid <= 0)) return undefined;
+  return [...new Set(processIds)].sort((left, right) => left - right);
+}

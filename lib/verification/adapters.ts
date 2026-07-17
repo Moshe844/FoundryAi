@@ -14,6 +14,50 @@ function packageJson(evidence: ProjectEvidence) {
   }
 }
 
+function isPlaceholderNodeScript(name: string, value: string) {
+  if (name !== "test") return false;
+  const normalized = value.toLowerCase().replace(/["']/g, "").replace(/\s+/g, " ").trim();
+  return /(?:^|&&|;)\s*exit\s+1\b/.test(normalized)
+    && /(?:no test specified|no tests? (?:configured|defined|found)|tests? not implemented)/.test(normalized);
+}
+
+function rootJavaScriptSyntaxCommands(evidence: ProjectEvidence) {
+  return evidence.rootEntries
+    // Connector command tokenization deliberately avoids shell evaluation. Quoted arguments would
+    // therefore be passed to Node with the quote characters still attached. Restrict this fallback
+    // to shell-safe relative paths and pass them unquoted; projects with complex paths should define
+    // a real package script instead.
+    .filter((entry) => /^(?![./]*$)[a-z0-9_./-]+\.(?:cjs|mjs|js)$/i.test(entry))
+    .slice(0, 8)
+    .map((entry, index) => command(
+      `node-syntax-${index + 1}`,
+      "compile",
+      `node --check ${entry}`,
+      `root JavaScript source: ${entry}`,
+    ));
+}
+
+function shellQuotedPath(filePath: string) {
+  return `"${filePath.replace(/"/g, '\\"')}"`;
+}
+
+function dotnetVerificationTarget(evidence: ProjectEvidence) {
+  const solutions = evidence.rootEntries.filter((entry) => entry.toLowerCase().endsWith(".sln"));
+  const projects = evidence.rootEntries.filter((entry) => entry.toLowerCase().endsWith(".csproj"));
+  const candidates = solutions.length ? solutions : projects;
+  if (!candidates.length) return undefined;
+  const rootNames = new Set(evidence.rootEntries.map((entry) => entry.toLowerCase()));
+  return [...candidates].sort((left, right) => {
+    const score = (entry: string) => {
+      const base = entry.replace(/\.[^.]+$/, "").toLowerCase();
+      const content = evidence.files[entry] ?? evidence.files[entry.toLowerCase()] ?? "";
+      const referencedProjects = Array.from(content.matchAll(/Project\([^\r\n]+?=\s*"[^"]+"\s*,\s*"([^"]+\.csproj)"/gi)).length;
+      return (rootNames.has(base) ? 100 : 0) + referencedProjects * 10 + (content.trim() ? 1 : 0);
+    };
+    return score(right) - score(left) || left.localeCompare(right);
+  })[0];
+}
+
 function nodeAdapter(): EcosystemAdapter {
   return {
     id: "node",
@@ -23,17 +67,27 @@ function nodeAdapter(): EcosystemAdapter {
       const pkg = packageJson(evidence);
       const scripts = pkg?.scripts || {};
       const manager = has(evidence, "pnpm-lock.yaml") ? "pnpm" : has(evidence, "yarn.lock") ? "yarn" : has(evidence, "bun.lockb") || has(evidence, "bun.lock") ? "bun" : "npm";
-      const run = (script: string) => manager === "npm" ? `npm run ${script}` : `${manager} ${script}`;
+      const run = (script: string) => manager === "npm" ? `${evidence.platform === "win32" ? "npm.cmd" : "npm"} run ${script}` : `${manager} ${script}`;
       const commands: VerificationCommand[] = [];
+      let ignoredPlaceholderTest = false;
       for (const [script, stage] of [["format:check", "format"], ["lint", "lint"], ["typecheck", "typecheck"], ["check", "typecheck"], ["build", "build"], ["test", "unit-test"], ["test:unit", "unit-test"], ["test:integration", "integration-test"], ["test:e2e", "integration-test"]] as const) {
-        if (scripts[script]) commands.push(command(`node-${script.replace(/:/g, "-")}`, stage, run(script), `package.json script: ${script}`));
+        if (!scripts[script]) continue;
+        if (isPlaceholderNodeScript(script, scripts[script])) {
+          ignoredPlaceholderTest = true;
+          continue;
+        }
+        commands.push(command(`node-${script.replace(/:/g, "-")}`, stage, run(script), `package.json script: ${script}`));
       }
+      if (!commands.length) commands.push(...rootJavaScriptSyntaxCommands(evidence));
       const startScript = scripts.dev ? "dev" : scripts.start ? "start" : undefined;
       return {
         packageManager: manager,
         commands,
         preview: startScript ? { command: run(startScript), expectedUrl: scripts.dev?.includes("3001") ? "http://localhost:3001" : undefined } : undefined,
-        limitations: commands.length ? [] : ["package.json defines no recognized verification scripts."],
+        limitations: [
+          ...(ignoredPlaceholderTest ? ["Ignored the default failing npm test placeholder because it is not real project verification."] : []),
+          ...(!commands.length ? ["package.json defines no recognized verification scripts and no root JavaScript source was available for syntax verification."] : []),
+        ],
       };
     },
   };
@@ -66,12 +120,24 @@ const adapters: EcosystemAdapter[] = [
   {
     id: "dotnet", label: ".NET",
     detect: (evidence) => endsWith(evidence, ".sln") || endsWith(evidence, ".csproj") ? 90 : 0,
-    buildProfile: () => ({ commands: [command("dotnet-restore", "dependencies", "dotnet restore", "solution/project file"), command("dotnet-build", "build", "dotnet build --no-restore", "solution/project file"), command("dotnet-test", "unit-test", "dotnet test --no-build", "solution/project file", false)], limitations: [] }),
+    buildProfile: (evidence) => {
+      const target = dotnetVerificationTarget(evidence);
+      const targetArg = target ? ` ${shellQuotedPath(target)}` : "";
+      const source = target ? `selected solution/project: ${target}` : "solution/project file";
+      return {
+        commands: [
+          command("dotnet-restore", "dependencies", `dotnet restore${targetArg}`, source),
+          command("dotnet-build", "build", `dotnet build${targetArg} --no-restore`, source),
+          command("dotnet-test", "unit-test", `dotnet test${targetArg} --no-build`, source, false),
+        ],
+        limitations: [],
+      };
+    },
   },
   {
     id: "python", label: "Python",
     detect: (evidence) => has(evidence, "pyproject.toml") || has(evidence, "requirements.txt") || has(evidence, "manage.py") ? 85 : 0,
-    buildProfile: (evidence) => { const pyproject = evidence.files["pyproject.toml"] || ""; const commands = [command("python-compile", "compile", "python -m compileall .", "Python project")]; if (/pytest/i.test(pyproject) || has(evidence, "pytest.ini")) commands.push(command("python-test", "unit-test", "python -m pytest", "pytest configuration")); if (/ruff/i.test(pyproject)) commands.push(command("python-lint", "lint", "python -m ruff check .", "pyproject.toml")); if (/mypy/i.test(pyproject)) commands.push(command("python-types", "typecheck", "python -m mypy .", "pyproject.toml")); if (has(evidence, "manage.py")) commands.push(command("django-check", "configuration", "python manage.py check", "manage.py")); return { commands, limitations: [] }; },
+    buildProfile: (evidence) => { const pyproject = evidence.files["pyproject.toml"] || ""; const commands = [command("python-compile", "compile", "python -m compileall .", "Python project")]; if (/pytest/i.test(pyproject) || has(evidence, "pytest.ini")) commands.push(command("python-test", "unit-test", "python -m pytest -p no:cacheprovider", "pytest configuration")); if (/ruff/i.test(pyproject)) commands.push(command("python-lint", "lint", "python -m ruff check .", "pyproject.toml")); if (/mypy/i.test(pyproject)) commands.push(command("python-types", "typecheck", "python -m mypy .", "pyproject.toml")); if (has(evidence, "manage.py")) commands.push(command("django-check", "configuration", "python manage.py check", "manage.py")); return { commands, limitations: [] }; },
   },
   {
     id: "php-composer", label: "PHP/Composer",

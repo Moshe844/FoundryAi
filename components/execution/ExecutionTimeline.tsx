@@ -4,6 +4,8 @@ import { CircleDot } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { RefObject } from "react";
 import type { FactoryExecutionEvent } from "@/lib/factory/types";
+import { isInternalExecutionEvent } from "@/lib/canvas/model";
+import { stripTerminalFormatting } from "@/lib/text/terminal";
 import { BlockedCommandLine } from "@/components/execution/ApprovalPrompt";
 import {
   compactChangeText,
@@ -29,7 +31,7 @@ export function ExecutionLevelToggle({ level, onChange }: { level: ExecutionLeve
     { id: "command", label: "Checks" },
   ];
   return (
-    <div className="inline-flex items-center gap-0.5 rounded-md border border-white/10 bg-white/[0.03] p-0.5" role="tablist" aria-label="Execution level">
+    <div className="inline-flex items-center gap-0.5 rounded-md border border-overlay/10 bg-overlay/[0.03] p-0.5" role="tablist" aria-label="Execution level">
       {levels.map((item) => (
         <button
           key={item.id}
@@ -68,7 +70,7 @@ export function ExecutionTimeline({
   suppressBlocked?: boolean;
 }) {
   const visibleTimeline = timeline.filter((event) => {
-    if (event.internal) return false;
+    if (isInternalExecutionEvent(event)) return false;
     if (!suppressBlocked) return true;
     if (event.kind === "blocked") return false;
     // Compatibility for missions persisted before approval events were canonicalized: those runs
@@ -155,7 +157,7 @@ function TraceEvidenceSummary({
         <span className="w-4 shrink-0 text-center font-mono normal-case">⋯</span>
         <span>Trace evidence: {parts.join(", ") || `${events.length} step${events.length === 1 ? "" : "s"}`}</span>
       </summary>
-      <div className="ml-1 mt-0.5 border-l border-white/10 pl-3">
+      <div className="ml-1 mt-0.5 border-l border-overlay/10 pl-3">
         {events.map((event) => renderTraceEvent(event, { level, onReadFile, onFetchFileContent, onApproveCommand }))}
       </div>
     </details>
@@ -189,12 +191,12 @@ function NarrativeLine({ event }: { event: FactoryExecutionEvent }) {
   if (tier !== "flag") {
     return (
       <details className="group my-0.5 rounded-md text-[13px] leading-5">
-        <summary className="flex cursor-pointer list-none items-start gap-2 px-1.5 py-1.5 text-foundry-ink transition hover:bg-white/[0.035]">
+        <summary className="flex cursor-pointer list-none items-start gap-2 px-1.5 py-1.5 text-foundry-ink transition hover:bg-overlay/[0.035]">
           <span className={`mt-0.5 w-4 shrink-0 font-mono ${tier === "finding" ? "text-foundry-blue" : "text-foundry-teal"}`}>{icon}</span>
           <span className="min-w-0 flex-1">{text}</span>
           <span className="shrink-0 font-mono text-[10px] text-foundry-subtle">{formatClockTime(event.timestamp)}</span>
         </summary>
-        <div className="ml-7 grid gap-1.5 border-l border-white/10 px-3 py-2 text-xs leading-5 text-foundry-muted">
+        <div className="ml-7 grid gap-1.5 border-l border-overlay/10 px-3 py-2 text-xs leading-5 text-foundry-muted">
           {source ? <DetailRow label="Source" value={source} /> : null}
           {narrative?.filePath ? <DetailRow label="Path" value={narrative.filePath} /> : event.filePath ? <DetailRow label="Path" value={event.filePath} /> : null}
           {typeof narrative?.confidence === "number" ? <DetailRow label="Confidence" value={`${narrative.confidence}%`} /> : null}
@@ -265,22 +267,22 @@ function CommandLine({ event, forceOpen = false }: { event: FactoryExecutionEven
   const hasSplitOutput = Boolean(event.stdout || event.stderr);
 
   return (
-    <div className={`my-1 overflow-hidden rounded-md border ${failed ? "border-red-400/25 bg-red-400/[0.05]" : "border-foundry-teal/20 bg-black/35"}`}>
+    <div className={`my-1 overflow-hidden rounded-md border ${failed ? "border-red-400/25 bg-red-400/[0.05]" : "border-foundry-teal/20 bg-shade/35"}`}>
       <button type="button" className="flex w-full items-start gap-2 px-3 py-2 text-left font-mono text-[12.5px] leading-5" onClick={() => setOpen((current) => !current)}>
         <span className="font-mono text-[10px] text-foundry-subtle">{formatClockTime(event.timestamp)}</span>
         <span className={`shrink-0 ${promptTone}`}>{promptSymbol}</span>
-        <span className="min-w-0 flex-1 whitespace-pre-wrap break-all text-[#d8f3ec]">{command}</span>
+        <span className="min-w-0 flex-1 whitespace-pre-wrap break-all text-foundry-ink">{command}</span>
       </button>
-      {event.cwd ? <p className="border-t border-white/10 px-3 py-1 text-[10.5px] text-foundry-subtle">cwd: {event.cwd}</p> : null}
+      {event.cwd ? <p className="border-t border-overlay/10 px-3 py-1 text-[10.5px] text-foundry-subtle">cwd: {event.cwd}</p> : null}
       {event.details?.shellFallbackFrom ? (
-        <p className="border-t border-white/10 px-3 py-1 text-[10.5px] text-foundry-amber">
+        <p className="border-t border-overlay/10 px-3 py-1 text-[10.5px] text-foundry-amber">
           Ran via {String(event.details.shellUsed)} — {String(event.details.shellFallbackFrom)} didn&apos;t recognize this.
         </p>
       ) : null}
       {open && (hasSplitOutput || event.output) ? (
         <div>
           {hasSplitOutput ? (
-            <div className="flex items-center gap-1 border-t border-white/10 px-2 pt-1.5">
+            <div className="flex items-center gap-1 border-t border-overlay/10 px-2 pt-1.5">
               <button type="button" className={`rounded px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-[0.06em] ${tab === "stdout" ? "bg-foundry-teal/20 text-foundry-teal" : "text-foundry-subtle"}`} onClick={() => setTab("stdout")}>
                 stdout
               </button>
@@ -291,8 +293,8 @@ function CommandLine({ event, forceOpen = false }: { event: FactoryExecutionEven
               {event.durationMs ? <span className="pr-1 text-[10px] font-bold text-foundry-subtle">{(event.durationMs / 1000).toFixed(1)}s</span> : null}
             </div>
           ) : null}
-          <pre className="max-h-40 overflow-auto whitespace-pre-wrap border-t border-white/10 bg-black/40 px-3 py-2 text-[11.5px] leading-5 text-foundry-muted">
-            {hasSplitOutput ? (tab === "stdout" ? event.stdout || "(empty)" : event.stderr || "(empty)") : event.output}
+          <pre className="max-h-40 overflow-auto whitespace-pre-wrap border-t border-overlay/10 bg-shade/40 px-3 py-2 text-[11.5px] leading-5 text-foundry-muted">
+            {stripTerminalFormatting(hasSplitOutput ? (tab === "stdout" ? event.stdout || "(empty)" : event.stderr || "(empty)") : event.output || "")}
           </pre>
         </div>
       ) : null}
@@ -332,7 +334,7 @@ function BuildLine({ event, onReadFile, forceOpen = false }: { event: FactoryExe
   const locations = parseBuildLocations(output);
 
   return (
-    <div className={`my-1 overflow-hidden rounded-md border ${failed ? "border-red-400/25 bg-red-400/[0.05]" : "border-foundry-teal/20 bg-black/30"}`}>
+    <div className={`my-1 overflow-hidden rounded-md border ${failed ? "border-red-400/25 bg-red-400/[0.05]" : "border-foundry-teal/20 bg-shade/30"}`}>
       <button type="button" className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-[12.5px] font-bold" onClick={() => setOpen((current) => !current)}>
         <span className="flex items-center gap-2">
           <span className="font-mono text-[10px] font-normal text-foundry-subtle">{formatClockTime(event.timestamp)}</span>
@@ -341,14 +343,14 @@ function BuildLine({ event, onReadFile, forceOpen = false }: { event: FactoryExe
         {locations.length ? <span className="text-[10px] font-extrabold uppercase tracking-[0.06em] text-foundry-subtle">{locations.length} location{locations.length === 1 ? "" : "s"}</span> : null}
       </button>
       {open ? (
-        <div className="border-t border-white/10 px-3 py-2">
+        <div className="border-t border-overlay/10 px-3 py-2">
           {locations.length ? (
             <div className="grid gap-1">
               {locations.map((location, index) => (
                 <button
                   key={`${location.file}-${location.line}-${index}`}
                   type="button"
-                  className="flex items-center gap-2 rounded px-1.5 py-1 text-left text-[11.5px] text-foundry-muted hover:bg-white/[0.05] hover:text-foundry-ink"
+                  className="flex items-center gap-2 rounded px-1.5 py-1 text-left text-[11.5px] text-foundry-muted hover:bg-overlay/[0.05] hover:text-foundry-ink"
                   onClick={() => onReadFile?.(location.file)}
                 >
                   <span className={`font-mono ${location.severity === "error" ? "text-red-300" : "text-foundry-amber"}`}>{location.severity === "error" ? "✕" : "!"}</span>
@@ -361,7 +363,7 @@ function BuildLine({ event, onReadFile, forceOpen = false }: { event: FactoryExe
               ))}
             </div>
           ) : null}
-          {output ? <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-black/30 p-3 text-[11px] leading-5 text-foundry-muted">{output}</pre> : null}
+          {output ? <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 text-[11px] leading-5 text-foundry-muted">{output}</pre> : null}
         </div>
       ) : null}
     </div>
@@ -415,18 +417,18 @@ export function CodeViewTabs({
         ) : null}
       </div>
       {tab === "diff" ? (
-        <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-black/30 p-3 text-[11px] leading-5 text-foundry-muted">{event.output || "No diff captured for this change."}</pre>
+        <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 text-[11px] leading-5 text-foundry-muted">{event.output || "No diff captured for this change."}</pre>
       ) : tab === "entire" ? (
-        <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-black/30 p-3 text-[11px] leading-5 text-foundry-muted">{loading ? "Loading..." : afterContent || "No content available."}</pre>
+        <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 text-[11px] leading-5 text-foundry-muted">{loading ? "Loading..." : afterContent || "No content available."}</pre>
       ) : (
         <div className="grid gap-2 sm:grid-cols-2">
           <div>
             <p className="mb-1 font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Before</p>
-            <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-black/30 p-3 text-[11px] leading-5 text-foundry-muted">{event.beforeContent || "(new file — no previous version)"}</pre>
+            <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 text-[11px] leading-5 text-foundry-muted">{event.beforeContent || "(new file — no previous version)"}</pre>
           </div>
           <div>
             <p className="mb-1 font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">After</p>
-            <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-black/30 p-3 text-[11px] leading-5 text-foundry-muted">{loading ? "Loading..." : afterContent || "No content available."}</pre>
+            <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 text-[11px] leading-5 text-foundry-muted">{loading ? "Loading..." : afterContent || "No content available."}</pre>
           </div>
         </div>
       )}
@@ -457,7 +459,7 @@ function TimelineItem({
           {line.delta ? <span className="font-mono text-xs font-bold text-foundry-teal">{line.delta}</span> : null}
         </span>
       </summary>
-      <div className="ml-5 grid gap-2 border-l border-white/10 py-2 pl-3 text-xs leading-5 text-foundry-muted">
+      <div className="ml-5 grid gap-2 border-l border-overlay/10 py-2 pl-3 text-xs leading-5 text-foundry-muted">
         <DetailRow label="Status" value={event.status} />
         <DetailRow label="Time" value={new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })} />
         {event.filePath ? <DetailRow label={event.status === "completed" ? "Path" : "File"} value={event.filePath} /> : null}
@@ -475,7 +477,7 @@ function TimelineItem({
         ) : event.output ? (
           <div>
             <p className="font-extrabold uppercase tracking-[0.08em] text-foundry-subtle">Output</p>
-            <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-black/30 p-3 text-[11px] leading-5 text-foundry-muted">{event.output}</pre>
+            <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 text-[11px] leading-5 text-foundry-muted">{event.output}</pre>
           </div>
         ) : null}
       </div>
@@ -509,7 +511,11 @@ function eventLineFor(event: FactoryExecutionEvent) {
             : event.kind === "preview"
               ? running
                 ? "Preview updating"
-                : "Preview ready"
+                : failed
+                  ? "Preview failed"
+                  : event.status === "skipped"
+                    ? "Preview unavailable"
+                    : "Preview ready"
             : event.kind === "summary"
                 ? event.title
                 : running

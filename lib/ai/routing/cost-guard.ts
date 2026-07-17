@@ -7,11 +7,14 @@ import { DailySpendLimitError, releaseGlobalModelSpend, reserveGlobalModelSpend,
 type RequiredRoutingBudget = Required<Pick<RoutingBudget, "maximumModelCalls" | "premiumCallLimit" | "maximumParallelCalls" | "estimatedCostUsd">>;
 
 const TIER_ROUTING_BUDGETS: Record<ModelTier, RequiredRoutingBudget> = {
-  fast: { maximumModelCalls: 4, estimatedCostUsd: 0.08, premiumCallLimit: 1, maximumParallelCalls: 1 },
-  builder: { maximumModelCalls: 8, estimatedCostUsd: 0.35, premiumCallLimit: 1, maximumParallelCalls: 1 },
-  architect: { maximumModelCalls: 10, estimatedCostUsd: 0.75, premiumCallLimit: 1, maximumParallelCalls: 1 },
-  "enterprise-architect": { maximumModelCalls: 12, estimatedCostUsd: 1.25, premiumCallLimit: 2, maximumParallelCalls: 1 },
-  "super-reasoning": { maximumModelCalls: 12, estimatedCostUsd: 1.5, premiumCallLimit: 2, maximumParallelCalls: 1 },
+  // Last-resort runaway ceilings. Normal waste is stopped by the executor's durable-progress guard,
+  // while estimated spend remains the primary cost boundary. Healthy multi-step work should not
+  // fail merely because it needed a fourth action.
+  fast: { maximumModelCalls: 12, estimatedCostUsd: 0.5, premiumCallLimit: 2, maximumParallelCalls: 1 },
+  builder: { maximumModelCalls: 24, estimatedCostUsd: 2, premiumCallLimit: 4, maximumParallelCalls: 1 },
+  architect: { maximumModelCalls: 32, estimatedCostUsd: 4, premiumCallLimit: 6, maximumParallelCalls: 1 },
+  "enterprise-architect": { maximumModelCalls: 40, estimatedCostUsd: 7, premiumCallLimit: 8, maximumParallelCalls: 1 },
+  "super-reasoning": { maximumModelCalls: 40, estimatedCostUsd: 8, premiumCallLimit: 8, maximumParallelCalls: 1 },
 };
 
 /** Fast is the safe default. A mission receives more guarded capacity only after evidence raises its tier. */
@@ -27,7 +30,17 @@ export function routingBudgetForTier(tier: ModelTier): RequiredRoutingBudget {
   };
 }
 
-type Ledger = { calls: number; premiumCalls: number; estimatedCostUsd: number; actualCostUsd: number; activeCalls: number; expiresAt: number };
+type Ledger = {
+  calls: number;
+  premiumCalls: number;
+  estimatedCostUsd: number;
+  actualCostUsd: number;
+  activeCalls: number;
+  expiresAt: number;
+  maximumModelCalls: number;
+  premiumCallLimit: number;
+  estimatedCostLimitUsd: number;
+};
 const ledgers = new Map<string, Ledger>();
 
 export type CostGuardContext = {
@@ -44,16 +57,32 @@ export function reserveModelCall(request: ManagedModelRequest, context: CostGuar
   cleanup();
   const budget = { ...routingBudgetForTier(context.tier), ...context.budget };
   const key = context.missionId || context.requestId;
-  const ledger = ledgers.get(key) ?? { calls: 0, premiumCalls: 0, estimatedCostUsd: 0, actualCostUsd: 0, activeCalls: 0, expiresAt: Date.now() + 30 * 60_000 };
+  const ledger = ledgers.get(key) ?? {
+    calls: 0,
+    premiumCalls: 0,
+    estimatedCostUsd: 0,
+    actualCostUsd: 0,
+    activeCalls: 0,
+    expiresAt: Date.now() + 30 * 60_000,
+    maximumModelCalls: budget.maximumModelCalls,
+    premiumCallLimit: budget.premiumCallLimit,
+    estimatedCostLimitUsd: budget.estimatedCostUsd,
+  };
+  // One mission can move from Builder implementation to a cheaper Fast repair. The shared ledger
+  // preserves the greatest capacity already granted during that mission; changing stage/model tier
+  // must never retroactively lower the ceiling beneath calls or spend that were already authorized.
+  ledger.maximumModelCalls = Math.max(ledger.maximumModelCalls, budget.maximumModelCalls);
+  ledger.premiumCallLimit = Math.max(ledger.premiumCallLimit, budget.premiumCallLimit);
+  ledger.estimatedCostLimitUsd = Math.max(ledger.estimatedCostLimitUsd, budget.estimatedCostUsd);
   // "High" is the normal Builder/Architect workhorse class. Counting every high-capability turn as
   // premium made ordinary debugging exhaust the premium allowance during inspection, before an edit.
   // The estimated-dollar and total-call ceilings still bound those turns; this counter is reserved
   // for genuinely premium models.
   const premium = context.costClass === "premium";
   const estimate = estimateCallCost(request);
-  if (ledger.calls >= budget.maximumModelCalls) throw new CostGuardError(`Model-call limit reached (${budget.maximumModelCalls}) for this request.`);
-  if (premium && ledger.premiumCalls >= budget.premiumCallLimit) throw new CostGuardError(`Premium-model call limit reached (${budget.premiumCallLimit}) for this mission.`);
-  if (ledger.estimatedCostUsd + estimate > budget.estimatedCostUsd) throw new CostGuardError(`Estimated request cost would exceed the $${budget.estimatedCostUsd.toFixed(2)} limit.`);
+  if (ledger.calls >= ledger.maximumModelCalls) throw new CostGuardError(`Model-call limit reached (${ledger.maximumModelCalls}) for this request.`);
+  if (premium && ledger.premiumCalls >= ledger.premiumCallLimit) throw new CostGuardError(`Premium-model call limit reached (${ledger.premiumCallLimit}) for this mission.`);
+  if (ledger.estimatedCostUsd + estimate > ledger.estimatedCostLimitUsd) throw new CostGuardError(`Estimated request cost would exceed the $${ledger.estimatedCostLimitUsd.toFixed(2)} limit.`);
   if (ledger.activeCalls >= budget.maximumParallelCalls) throw new CostGuardError("A duplicate or parallel model call is already active for this request.");
   let globalReservation: GlobalSpendReservation;
   try {
@@ -76,6 +105,12 @@ export function settleModelCall(reservation: CostReservation, usage: RuntimeUsag
   settleGlobalModelSpend(reservation.globalReservation, usage.estimatedCostUsd);
   if (!ledger) return;
   ledger.activeCalls = Math.max(0, ledger.activeCalls - 1);
+  if (usage.requestCount <= 0) {
+    // Provider rejections and other zero-usage responses are not paid work. They must not consume
+    // the operation's action allowance or make a schema error exhaust the mission.
+    ledger.calls = Math.max(0, ledger.calls - 1);
+    if (reservation.premium) ledger.premiumCalls = Math.max(0, ledger.premiumCalls - 1);
+  }
   // Reservations use the request's worst-case max-output estimate so concurrent calls cannot
   // overcommit the mission budget. Once the call finishes, replace that reservation with the
   // provider's actual metered usage. Keeping every worst-case reservation forever made a normal

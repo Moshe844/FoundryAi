@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
 import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dispatch";
-import { TIER_DISPLAY, tierForRuntimePayload } from "@/lib/ai/model-router";
+import { TIER_DISPLAY } from "@/lib/ai/model-router";
 import { routePayloadDynamically } from "@/lib/ai/routing/dynamic-router";
 import type { ModelMode, ModelTier } from "@/lib/ai/model-router";
 import { HISTORY_RECOMMENDATION_SYSTEM_PROMPT, SUGGEST_NEXT_PROJECT_TOOL, historyRecommendationUserText, parseHistoryRecommendations } from "@/lib/discovery/history-recommendations";
@@ -29,7 +29,9 @@ export async function POST(request: Request) {
     // mode defaults to "fast" — the fixed tier this route always used before the mode selector existed.
     const mode: ModelMode = body.mode ?? DEFAULT_MODE;
     const autoSelected = mode === "auto";
-    const tier: ModelTier = autoSelected ? tierForRuntimePayload(history) : mode;
+    // A suggestion card is always a low-stakes Fast task. Never let project-history wording route
+    // passive personalization to Builder/Architect capacity that belongs to actual implementation.
+    const tier: ModelTier = "fast";
     const routed = await routePayloadDynamically(history, tier, body.provider);
     provider = routed.decision.provider;
     apiKey = apiKeyForProvider(provider);
@@ -45,9 +47,9 @@ export async function POST(request: Request) {
         messages: [{ role: "user", content: [{ type: "text", text: historyRecommendationUserText(history) }] }],
         tools: [SUGGEST_NEXT_PROJECT_TOOL],
         toolChoice: { name: "suggest_next_project" },
-        maxOutputTokens: 1200,
+        maxOutputTokens: 600,
       },
-      { apiKey, workspaceId: "factory-history-recommendation", userId: "local-user", maxAttempts: 2 },
+      { apiKey, workspaceId: "factory-history-recommendation", userId: "local-user", maxAttempts: 1 },
     );
 
     const call = result.toolCalls.find((item) => item.name === "suggest_next_project");

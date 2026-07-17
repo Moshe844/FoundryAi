@@ -1,4 +1,4 @@
-export type FileUploadStatus = "readable" | "image" | "unsupported" | "error";
+export type FileUploadStatus = "readable" | "image" | "binary" | "unsupported" | "error";
 
 export type EvidenceKind =
   | "log"
@@ -81,15 +81,20 @@ export async function ingestFile(file: File, missionId: string): Promise<Workspa
     }
 
     if (!isReadableTextFile(file)) {
-      return base;
+      return {
+        ...base,
+        dataUrl: await readAsDataUrl(file),
+        uploadStatus: "binary",
+      };
     }
 
-    const rawText = await file.text();
+    const [rawText, dataUrl] = await Promise.all([file.text(), readAsDataUrl(file)]);
     const parsedStructure = parseReadableContent(rawText, fileType);
 
     return {
       ...base,
       rawText,
+      dataUrl,
       parsedStructure,
       evidenceIndex: buildEvidenceIndex(parsedStructure, rawText, fileType),
       uploadStatus: "readable",
@@ -156,6 +161,7 @@ export function buildEvidenceIndex(parsedStructure: unknown, rawText: string, fi
 export function describeAttachmentStatus(attachment: WorkspaceAttachment) {
   if (attachment.uploadStatus === "readable") return "Readable";
   if (attachment.uploadStatus === "image") return "Visual evidence";
+  if (attachment.uploadStatus === "binary") return "Binary asset";
   if (attachment.uploadStatus === "error") return "Could not read";
   return "Unsupported";
 }

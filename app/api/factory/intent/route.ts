@@ -4,8 +4,8 @@ import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dis
 import { routePayloadDynamically } from "@/lib/ai/routing/dynamic-router";
 import type { ModelMode } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
-import { normalizeFollowUpResolution } from "@/lib/mission/classifyFollowUp";
-import type { FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
+import { explicitReadOnlyProjectIntent, interpretationConfirmation, isAcceptedInterpretationReply, normalizeFollowUpResolution } from "@/lib/mission/classifyFollowUp";
+import type { FollowUpResolutionRecord, InterpretationKind } from "@/lib/mission/classifyFollowUp";
 
 const projectIntentValues = ["question", "inspection", "diagnose", "status", "debug", "edit", "undo", "continue", "retrospective", "clarify"] as const;
 
@@ -16,6 +16,7 @@ type ProjectIntentContext = {
   objective?: string;
   lastResult?: string;
   source?: string;
+  recentConversation?: Array<{ author: "user" | "foundry"; body: string }>;
   execution?: {
     id?: string;
     status?: string;
@@ -75,6 +76,34 @@ const RESOLVE_PROJECT_TURN_INTENT_TOOL: NeutralTool = {
         items: { type: "string" },
         description: "Only when intent is clarify: 2-4 short, concrete, mutually-exclusive choices the user can click to resolve the question (e.g. the specific paths the fork splits into). Omit or leave empty when the answer is genuinely open-ended and only free text makes sense.",
       },
+      interpreted_request: {
+        type: "string",
+        description: "A concise, grammatically clear restatement that preserves every requested action, target, constraint, quantity, and negation. Do not add requirements.",
+      },
+      interpretation_kind: {
+        type: "string",
+        enum: ["verbatim", "surface-only", "meaning-bearing", "ambiguous"],
+        description: "verbatim when meaning needed no correction; surface-only for harmless spelling/grammar cleanup; meaning-bearing when an executable action/target/constraint/quantity/negation/UI label had to be inferred; ambiguous when multiple executable meanings remain plausible.",
+      },
+      interpretation_confidence: {
+        type: "number",
+        minimum: 0,
+        maximum: 1,
+      },
+      interpretation_source: {
+        type: "string",
+        enum: ["message", "recent_conversation", "mission_state", "inferred", "ambiguous"],
+        description: "Where executable scope came from. Use recent_conversation when resolving a reference to an actual prior user or Foundry turn; this is grounded context, not an invented correction.",
+      },
+      mutation_authorized: {
+        type: "boolean",
+        description: "True only when the user is asking Foundry itself to change the connected project. Judge authorization independently from whether you think planning or clarification would be helpful.",
+      },
+      mutation_kind: {
+        type: "string",
+        enum: ["none", "apply_change", "undo_recorded_change"],
+        description: "The semantic side effect requested. Use undo_recorded_change whenever the desired outcome is to restore, roll back, revert, or otherwise return recorded project work to an earlier state, regardless of the user's exact wording.",
+      },
       referenced_execution_id: { type: "string", description: "Exact execution id from mission_state that this turn refers to; empty for new work." },
       referenced_action_description: { type: "string", description: "Factual short description of the referenced recorded action; empty for new work." },
       relevant_files: { type: "array", items: { type: "string" }, description: "Only file paths from mission_state directly connected to this follow-up. Never invent a path." },
@@ -83,7 +112,7 @@ const RESOLVE_PROJECT_TURN_INTENT_TOOL: NeutralTool = {
       reference_confidence: { type: "number", minimum: 0, maximum: 1 },
       planned_action: { type: "string", description: "The exact next action consistent with the resolved target and scope." },
     },
-    required: ["intent", "execution_mode", "confidence", "rationale", "continuity", "clarifying_question", "referenced_execution_id", "referenced_action_description", "relevant_files", "expected_scope", "destructive", "reference_confidence", "planned_action"],
+    required: ["intent", "execution_mode", "confidence", "interpreted_request", "interpretation_kind", "interpretation_confidence", "interpretation_source", "mutation_authorized", "mutation_kind", "rationale", "continuity", "clarifying_question", "referenced_execution_id", "referenced_action_description", "relevant_files", "expected_scope", "destructive", "reference_confidence", "planned_action"],
   },
 };
 
@@ -91,6 +120,12 @@ type ResolveToolResult = {
   intent?: ProjectTurnIntent;
   execution_mode?: "read-only" | "mutate" | "control" | "status";
   confidence?: number;
+  interpreted_request?: string;
+  interpretation_kind?: InterpretationKind;
+  interpretation_confidence?: number;
+  interpretation_source?: "message" | "recent_conversation" | "mission_state" | "inferred" | "ambiguous";
+  mutation_authorized?: boolean;
+  mutation_kind?: "none" | "apply_change" | "undo_recorded_change";
   rationale?: string;
   continuity?: "carry_forward_plan" | "fresh_plan" | "not_applicable";
   clarifying_question?: string;
@@ -105,14 +140,29 @@ type ResolveToolResult = {
 };
 
 const SYSTEM_PROMPT = [
-  "You resolve user intent for Foundry, an AI software agent working inside a connected project.",
+  "You resolve user intent for Foundry, an autonomous software engineering system working continuously inside a connected project.",
   "Use the whole message and the current mission state. Do not rely on keyword triggers or fixed phrases.",
+  "Natural language is open-ended. Examples in this prompt and release tests illustrate intent; they are never passwords or exhaustive phrase lists.",
+  "Understand colloquial wording, indirect requests, shorthand, reasonable misspellings, idioms, pronouns, and multi-clause requests from their meaning and conversation context.",
+  "mission_state.recentConversation is ordered oldest-to-newest and contains the actual recent user and Foundry turns. Treat the latest Foundry response as usable discourse context, including every proposal, recommendation, checklist, or feature list it contains.",
+  "When the user asks Foundry to implement, apply, build, or carry out what Foundry just proposed or described, and there is one clear preceding Foundry proposal, resolve that proposal directly: choose edit, reference its recorded execution, and put the complete proposed scope into planned_action. Never ask the user to repeat Foundry's own immediately preceding list or identify files before the project has been inspected.",
+  "Project inspection, file selection, implementation order, prioritization, phasing, and converting outcome-level recommendations into concrete code are Foundry's planning responsibilities. They are not missing user requirements. If the user authorizes the complete preceding proposal, do not ask whether to implement all of it or which part to start with.",
+  "Resolve three things semantically: what outcome the user wants, whether they authorize side effects, and which project or recorded mission evidence can answer them.",
+  "Restate the complete request in interpreted_request without dropping clauses or adding features.",
+  "Set interpretation_source to recent_conversation when the executable scope is grounded in an actual prior conversation turn. Expanding 'that', 'it', 'the list', 'your recommendations', or any equivalent reference from a stored turn is normal discourse resolution, not a meaning correction that needs confirmation.",
+  "Set mutation_authorized independently from intent and execution_mode. It is true whenever the user asks Foundry to make the connected project embody, reflect, contain, apply, or otherwise realize an outcome, including indirect or colloquial wording. Wanting more planning does not make authorization false.",
+  "Classify the requested side effect in mutation_kind from meaning, not vocabulary. If the requested end state is an earlier recorded project state, choose undo_recorded_change and intent undo—even for indirect wording such as asking to put something back how it was, remove what the last run did, or recover the prior version.",
+  "Classify language normalization separately from task intent: verbatim means no correction; surface-only means spelling/grammar cleanup that cannot change executable scope; meaning-bearing means you inferred or corrected an action, target, constraint, quantity, negation, or referenced UI label; ambiguous means multiple executable interpretations remain plausible.",
+  "Use meaning-bearing even when the intended correction seems likely. For example, correcting an unclear command verb or control label changes what Foundry will execute and must be confirmed. Harmless corrections such as 'teh header' to 'the header' are surface-only.",
+  "If the message explicitly confirms an interpretation from Foundry's immediately preceding question, do not ask for the same confirmation again; treat the confirmed interpretation as authoritative.",
   "Return exactly one intent:",
   "- question: answer a general question; no project inspection or file writes are needed.",
   "- inspection: read or summarize the project; no file writes.",
+  "A recommendation, critique, UX suggestion, architecture opinion, or 'what would you do' question is inspection whenever a responsible answer depends on the connected project's actual files or behavior. Use question only when project evidence is genuinely unnecessary.",
   "- diagnose: investigate/explain root cause or tell the user how to fix something; no file writes.",
   "- status: report prior execution state, result, blocker, or changed files.",
   "- retrospective: explain why Foundry previously did something or how a previous fix worked.",
+  "Recognize retrospective intent semantically across paraphrases: questions about the reason, rationale, justification, decision, choice, motivation, thinking, or tradeoffs behind prior Foundry work do not need to contain the word 'why'.",
   "- debug: investigate a bug/error and apply the repair to project files.",
   "- edit: modify existing project behavior, UI, code, config, docs, or files.",
   "- undo: revert a previous Foundry change.",
@@ -121,12 +171,16 @@ const SYSTEM_PROMPT = [
   "If the user asks Foundry to perform the change, choose debug/edit/undo/continue.",
   "A bare bug report in a connected project is a request to investigate and fix. If the user gives an error/failure/screenshot/log and says it happens during a workflow, choose debug unless they explicitly ask only for explanation, root cause, review, or instructions they will apply themselves.",
   "If the user asks why, how, what happened, what should I change, or asks for an explanation without asking Foundry to apply the repair, choose a read-only intent.",
+  "A manual how-to request asks for instructions the user will perform themselves. Classify it as question or inspection, never edit/debug/clarify merely because the hypothetical steps contain verbs such as add, create, or change.",
+  "An explicit constraint such as 'do not make changes', 'do not change anything', or 'without changing files' is authoritative. Keep explanation/review/architecture requests read-only even if another clause names project files or components.",
   "If the message is ambiguous between explanation and file mutation, choose the read-only interpretation and say why in rationale — this is a normal, common resolution and does not need clarify.",
   "Reserve clarify for real forks in the road: e.g. the mission is blocked needing approval for one specific command and the user's message could equally mean 'retry that same command' or 'abandon it and use something else instead', and the wording doesn't say which.",
   "Resolve short replies such as yes, do it, continue, stop, or no using the mission state and previous execution.",
   "For edit/debug/continue intents, set continuity: carry_forward_plan when this message revises, corrects, or continues the work described in mission_state.execution (e.g. 'actually don't use that package', 'now add validation', 'switch it to .NET' while a mission is still open) — it should not restart from a blank plan. Set fresh_plan when it's an unrelated new request. Set not_applicable for every other intent.",
   "Always call resolve_project_turn_intent. Do not answer in prose.",
   "Resolve the concrete prior execution and file target before acting. Use only execution ids and paths present in mission_state. If more than one target is plausible, choose clarify rather than guessing.",
+  "For status and retrospective requests, set referenced_execution_id to the exact recorded run the user means whenever mission_state makes that reference resolvable. Do not silently substitute the latest run for an older named or contextually referenced run.",
+  "References are not always to the latest run. When the user names an earlier review, proposal, decision, or other mission—or explicitly excludes intervening status, failure, or no-op turns—search the full supplied recentConversation and recentMissionMemory and select that exact execution. Never replace it with the newest superficially related run.",
   "A destructive or pronoun-based mutation needs reference_confidence >= 0.72 and an actual referenced_execution_id. Otherwise choose clarify with one focused question.",
 ].join("\n");
 
@@ -165,14 +219,14 @@ export async function POST(request: Request) {
             content: [
               {
                 type: "text",
-                text: JSON.stringify({ message, mission_state: compactProjectIntentContext(body.context) }, null, 2),
+                text: JSON.stringify({ resolver_contract: "project-intent-v4", message, mission_state: compactProjectIntentContext(body.context) }, null, 2),
               },
             ],
           },
         ],
         tools: [RESOLVE_PROJECT_TURN_INTENT_TOOL],
         toolChoice: { name: "resolve_project_turn_intent" },
-        maxOutputTokens: 700,
+        maxOutputTokens: 1_000,
       },
       { apiKey, workspaceId: "factory-intent", userId: "local-user", maxAttempts: 3 },
     );
@@ -197,20 +251,56 @@ export async function POST(request: Request) {
       });
     }
 
-    const finalIntent = applyProjectIntentPolicy(intent, message, body.context);
+    const acceptedInterpretation = isAcceptedInterpretationReply(message);
+    const policyMessage = acceptedInterpretation
+      ? String(parsed?.interpreted_request ?? parsed?.planned_action ?? message).trim()
+      : message;
+    const enforcedReadOnlyIntent = explicitReadOnlyProjectIntent(policyMessage);
+    // Interpretation confirmation protects executable scope. A read-only question cannot mutate
+    // the project, so pausing it because the classifier polished or restated its wording only adds
+    // cost and produces a nonsensical approval-looking card.
+    const conversationGroundedMutation = parsed?.mutation_authorized === true && parsed?.interpretation_source === "recent_conversation";
+    const semanticUndo = parsed?.mutation_authorized === true && parsed?.mutation_kind === "undo_recorded_change";
+    const semanticApplyChange = parsed?.mutation_authorized === true && parsed?.mutation_kind === "apply_change";
+    const effectiveIntent = semanticUndo
+      ? "undo"
+      : semanticApplyChange && intent !== "debug" && intent !== "continue"
+        ? "edit"
+        : conversationGroundedMutation && intent === "clarify"
+          ? "edit"
+          : intent;
+    const mutatingIntent = effectiveIntent === "edit" || effectiveIntent === "debug" || effectiveIntent === "undo" || effectiveIntent === "continue";
+    const meaningCorrectionNeedsApproval = !enforcedReadOnlyIntent && mutatingIntent && !conversationGroundedMutation;
+    const interpretation = acceptedInterpretation || !meaningCorrectionNeedsApproval
+      ? null
+      : interpretationConfirmation({
+          originalRequest: message,
+          interpretedRequest: String(parsed?.interpreted_request ?? message),
+          kind: normalizeInterpretationKind(parsed?.interpretation_kind),
+          confidence: clampConfidence(parsed?.interpretation_confidence),
+        });
+    const finalIntent = interpretation ? "clarify" : enforcedReadOnlyIntent ?? applyProjectIntentPolicy(effectiveIntent, policyMessage, body.context);
     const rationale =
-      finalIntent === intent
+      interpretation
+        ? `Foundry must confirm a meaning-bearing interpretation before turning it into executable scope. ${String(parsed?.rationale ?? "")}`.trim()
+        : enforcedReadOnlyIntent
+        ? `Product policy enforced ${enforcedReadOnlyIntent}: manual guidance and explicit no-mutation constraints are read-only authority boundaries. ${String(parsed?.rationale ?? "")}`.trim()
+        : finalIntent === intent
         ? String(parsed?.rationale ?? "")
         : `Product policy corrected ${intent} to ${finalIntent}: a concrete imperative change request (or a real project error report) starts an edit/debug mission — any conflicting requirements are resolved inside the mission's decision prompt — unless the user explicitly asked for read-only explanation. ${String(parsed?.rationale ?? "")}`.trim();
 
-    const referencedMemory = body.context?.recentMissionMemory?.find((item) => item.id === parsed?.referenced_execution_id);
+    const conversationGroundedMemory = conversationGroundedMutation
+      ? memoryForLatestFoundryTurn(body.context)
+      : undefined;
+    const referencedExecutionId = String(parsed?.referenced_execution_id || conversationGroundedMemory?.id || "").trim();
+    const referencedMemory = body.context?.recentMissionMemory?.find((item) => item.id === referencedExecutionId);
     const resolution = normalizeFollowUpResolution(
       {
         currentIntent: finalIntent,
-        referencedPriorAction: parsed?.referenced_execution_id
+        referencedPriorAction: referencedExecutionId
           ? {
-              executionId: parsed.referenced_execution_id,
-              description: String(parsed.referenced_action_description || referencedMemory?.summary || referencedMemory?.task || "").trim(),
+              executionId: referencedExecutionId,
+              description: String(parsed?.referenced_action_description || referencedMemory?.summary || referencedMemory?.task || "").trim(),
               createdAt: referencedMemory?.createdAt,
               updatedAt: referencedMemory?.updatedAt,
             }
@@ -218,14 +308,18 @@ export async function POST(request: Request) {
         relevantFiles: Array.isArray(parsed?.relevant_files) ? parsed.relevant_files.map(String) : [],
         expectedScope: String(parsed?.expected_scope ?? ""),
         destructive: Boolean(parsed?.destructive),
-        referenceConfidence: clampConfidence(parsed?.reference_confidence),
-        plannedAction: String(parsed?.planned_action ?? message),
-        continuity: finalIntent === intent ? parsed?.continuity ?? "not_applicable" : "not_applicable",
+        referenceConfidence: conversationGroundedMemory ? Math.max(0.96, clampConfidence(parsed?.reference_confidence)) : clampConfidence(parsed?.reference_confidence),
+        plannedAction: String(parsed?.planned_action ?? parsed?.interpreted_request ?? message),
+        continuity: conversationGroundedMemory?.status === "complete" && (finalIntent === "edit" || finalIntent === "debug" || finalIntent === "continue")
+          ? "fresh_plan"
+          : finalIntent === effectiveIntent
+            ? parsed?.continuity ?? "not_applicable"
+            : "not_applicable",
         rationale,
-        clarifyingQuestion: finalIntent === "clarify" ? String(parsed?.clarifying_question ?? "").trim() : "",
-        clarifyingOptions: finalIntent === "clarify" && Array.isArray(parsed?.clarify_options) ? parsed.clarify_options.map(String) : [],
+        clarifyingQuestion: interpretation?.question ?? (finalIntent === "clarify" ? String(parsed?.clarifying_question ?? "").trim() : ""),
+        clarifyingOptions: interpretation?.options ?? (finalIntent === "clarify" && Array.isArray(parsed?.clarify_options) ? parsed.clarify_options.map(String) : []),
       } satisfies Partial<FollowUpResolutionRecord>,
-      message,
+      policyMessage,
       body.context ?? {},
     );
 
@@ -241,6 +335,14 @@ export async function POST(request: Request) {
       resolution,
       usage: result.usage,
       modelSelection,
+      interpretation: {
+        accepted: acceptedInterpretation,
+        kind: normalizeInterpretationKind(parsed?.interpretation_kind),
+        request: String(parsed?.interpreted_request ?? message),
+        source: parsed?.interpretation_source ?? "message",
+        mutationAuthorized: parsed?.mutation_authorized === true,
+        requestedExecutionMode: parsed?.execution_mode ?? executionModeForIntent(intent),
+      },
     });
   } catch (error) {
     return NextResponse.json(
@@ -260,6 +362,10 @@ function compactProjectIntentContext(context: ProjectIntentContext | undefined):
     objective: truncate(context?.objective, 1200),
     lastResult: truncate(context?.lastResult, 800),
     source: truncate(context?.source, 120),
+    recentConversation: context?.recentConversation?.slice(-20).map((turn) => ({
+      author: turn.author,
+      body: truncate(turn.body, 1_400) ?? "",
+    })),
     execution: execution
       ? {
           id: truncate(execution.id, 120),
@@ -276,11 +382,11 @@ function compactProjectIntentContext(context: ProjectIntentContext | undefined):
           updatedAt: truncate(execution.updatedAt, 80),
         }
       : null,
-    recentMissionMemory: context?.recentMissionMemory?.slice(-5).map((run) => ({
+    recentMissionMemory: context?.recentMissionMemory?.slice(-20).map((run) => ({
       id: truncate(run.id, 120),
-      task: truncate(run.task, 300),
+      task: truncate(run.task, 500),
       status: truncate(run.status, 80),
-      summary: truncate(run.summary, 600),
+      summary: truncate(run.summary, 1_600),
       filesChanged: run.filesChanged?.slice(0, 20).map((file) => ({
         path: truncate(file.path, 220),
         status: truncate(file.status, 60),
@@ -315,7 +421,7 @@ function applyProjectIntentPolicy(intent: ProjectTurnIntent, message: string, co
   // clarify and no mission ever started. Scoped to clarify (and bare read-only reads) so genuine forks the
   // model flags on an already-blocked mission still ask; explicitly read-only diagnostics still explain.
   if (
-    (intent === "clarify" || intent === "question" || intent === "inspection") &&
+    (intent === "clarify" || intent === "question" || intent === "inspection" || intent === "status" || intent === "retrospective") &&
     isConnectedProjectContext(context) &&
     looksLikeImperativeMutation(message) &&
     !explicitlyReadOnlyDiagnostic(message)
@@ -345,6 +451,32 @@ function looksLikeImperativeMutation(message: string) {
 
 function looksLikeServerActionRequest(message: string) {
   return /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,40}\b(?:server|app|project|service|api|backend|frontend|dev server|application|build|tests?|lint|linter|typecheck|checks?)\b/i.test(message);
+}
+
+function normalizeInterpretationKind(value: unknown): InterpretationKind {
+  return value === "surface-only" || value === "meaning-bearing" || value === "ambiguous" ? value : "verbatim";
+}
+
+/**
+ * Bind a discourse-grounded proposal to persisted mission evidence without guessing from the
+ * user's wording. Exact/containment matching uses the stored Foundry turn and stored summary; if
+ * the workspace exposes only one recorded run, that run is the only possible conversation source.
+ */
+function memoryForLatestFoundryTurn(context: ProjectIntentContext | undefined) {
+  const foundryTurn = [...(context?.recentConversation ?? [])].reverse().find((turn) => turn.author === "foundry" && turn.body.trim());
+  const memories = [...(context?.recentMissionMemory ?? [])].reverse().filter((item) => item.id);
+  if (!foundryTurn || memories.length === 0) return undefined;
+
+  const turnText = normalizeDiscourseText(foundryTurn.body);
+  const matched = memories.find((memory) => {
+    const summary = normalizeDiscourseText(memory.summary ?? "");
+    return summary.length >= 32 && (turnText.includes(summary) || summary.includes(turnText));
+  });
+  return matched ?? (memories.length === 1 ? memories[0] : undefined);
+}
+
+function normalizeDiscourseText(value: string) {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
 function isConnectedProjectContext(context: ProjectIntentContext | undefined) {

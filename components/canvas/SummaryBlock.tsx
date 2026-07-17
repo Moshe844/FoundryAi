@@ -31,6 +31,10 @@ export function SummaryBlock({
         {summary.elapsedMs ? <span className="ml-2 text-[12px] font-normal text-foundry-subtle">{formatDuration(summary.elapsedMs)}</span> : null}
       </p>
 
+      {summary.outcome ? (
+        <p className="max-w-3xl whitespace-pre-wrap text-[14px] leading-6 text-foundry-ink">{summary.outcome}</p>
+      ) : null}
+
       {summary.whatChanged.length ? (
         <ul className="grid gap-1">
           {summary.whatChanged.map((line) => (
@@ -87,7 +91,7 @@ export function SummaryBlock({
               type="button"
               role="listitem"
               onClick={() => onSuggestion(recommendation)}
-              className="w-full rounded px-1 py-1 text-left text-[14px] leading-6 text-foundry-muted transition hover:bg-white/[0.03] hover:text-foundry-ink"
+              className="w-full rounded px-1 py-1 text-left text-[14px] leading-6 text-foundry-muted transition hover:bg-overlay/[0.03] hover:text-foundry-ink"
               title={recommendation.why || undefined}
             >
               <span className="mr-2 text-foundry-subtle" aria-hidden="true">↳</span>

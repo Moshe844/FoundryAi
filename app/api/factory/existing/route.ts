@@ -8,11 +8,15 @@ export async function POST(request: Request) {
   if (!body?.brief || !body?.task) {
     return NextResponse.json({ error: "Missing brief or task." }, { status: 400 });
   }
+  const evidenceAttachments = body.evidenceAttachments ?? (body.evidenceImages ?? []).map((image) => ({
+    ...image,
+    uploadStatus: "image" as const,
+  }));
 
   const url = new URL(request.url);
   if (url.searchParams.get("stream") !== "1") {
     try {
-      const result = await executeExistingProjectTask(body.brief, body.task, body.files ?? [], body.localPath, undefined, body.localConnector, request.signal, body.approvedCategories ?? [], body.approvedCommands ?? [], body.parentMission, body.followUpResolution, body.continuity, body.approvalResponse, body.quality, body.modelMode, body.evidenceImages ?? []);
+      const result = await executeExistingProjectTask(body.brief, body.task, body.files ?? [], body.localPath, undefined, body.localConnector, request.signal, body.approvedCategories ?? [], body.approvedCommands ?? [], body.parentMission, body.followUpResolution, body.continuity, body.approvalResponse, body.quality, body.modelMode, evidenceAttachments, body.idempotencyCandidate, body.retryExecutionId);
       return NextResponse.json(result);
     } catch (error) {
       return NextResponse.json({ error: error instanceof Error ? error.message : "Existing project execution failed." }, { status: 500 });
@@ -38,7 +42,7 @@ export async function POST(request: Request) {
           sentEvents.add(key);
           recordExecutionEvent(body.controlId, event);
           send({ type: "event", event });
-        }, body.localConnector, runtimeController.signal, body.approvedCategories ?? [], body.approvedCommands ?? [], body.parentMission, body.followUpResolution, body.continuity, body.approvalResponse, body.quality, body.modelMode, body.evidenceImages ?? []);
+        }, body.localConnector, runtimeController.signal, body.approvedCategories ?? [], body.approvedCommands ?? [], body.parentMission, body.followUpResolution, body.continuity, body.approvalResponse, body.quality, body.modelMode, evidenceAttachments, body.idempotencyCandidate, body.retryExecutionId);
         completeExecution(body.controlId, result);
         send({ type: "result", result });
       } catch (error) {

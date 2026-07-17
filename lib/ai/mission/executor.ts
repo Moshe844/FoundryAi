@@ -1,17 +1,21 @@
 import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
 import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
-import { commandPermissionIdentity, isSensitiveFilePath, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
+import { commandPermissionIdentity, isSensitiveFilePath, normalizeCommandForExecution, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
 import { approvalScopeLabel, type CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 import { isEmptySourceWrite } from "@/lib/ai/mission/write-verification";
 import type { ManagedToolCall, NeutralContentPart, NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { ExecutionMissionVerification, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactorySessionSummary, MissionParentContext } from "@/lib/factory/types";
+import { matchingRunningEventId, upsertExecutionEvent } from "@/lib/factory/event-contract";
 import { formatVerificationProfile } from "@/lib/verification/project-detector";
 import type { VerificationProfile } from "@/lib/verification/types";
 import type { ExecutionStrategy } from "@/lib/ai/mission/execution-strategy";
+import { assessAutonomousBlocker } from "@/lib/ai/mission/autonomy-contract";
 import { routingContext } from "@/lib/ai/routing/request-context";
-import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
+import type { DynamicTaskAssessment, RoutingBudget } from "@/lib/ai/routing/types";
 import type { FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
+import { isUserFacingUiOutcome, requiresPresentationLayerChange } from "@/lib/ai/mission/requirement-contract";
+import { redactSensitiveData, redactSensitiveText } from "@/lib/security/secret-redaction";
 import { Script } from "node:vm";
 
 export type MissionExecutorInput = {
@@ -26,6 +30,12 @@ export type MissionExecutorInput = {
   /** Shared billing identity for every executor batch, fallback, and repair in one user mission. */
   costScopeId?: string;
   maxTurns?: number;
+  /** Optional stage-specific output ceiling. Used by evidence-driven repair callers that need a
+   * targeted tool edit rather than the executor's larger general Builder generation allowance. */
+  maxOutputTokens?: number;
+  /** A caller may reserve a small, explicit phase allowance after deterministic evidence exists.
+   * This expands only the shared mission ledger; maxTurns still bounds the phase itself. */
+  routingBudget?: RoutingBudget;
   /** The caller owns a larger phased mission and will immediately continue a bounded batch. */
   continuableBatch?: boolean;
   maxNudges?: number;
@@ -66,6 +76,11 @@ export type MissionExecutorInput = {
   staticProject?: boolean;
   /** Browser-evidenced static repair: replace the complete self-contained page in one forced write. */
   staticRewrite?: boolean;
+  /** A deterministic browser gate already proved the failure. Permit one relevant read and then force
+   * a source mutation; Foundry owns the rebuild and repeat browser validation outside the model loop. */
+  evidenceFirstRepair?: boolean;
+  /** Existing source paths selected deterministically for evidence-first reads, in required order. */
+  evidenceRepairReadPaths?: string[];
   /** Mission-first workflow chosen before model/provider assignment. */
   executionStrategy?: ExecutionStrategy;
   /** Stack-specific checks detected from real project files by the registered ecosystem adapter. */
@@ -73,6 +88,12 @@ export type MissionExecutorInput = {
   routingAssessment?: DynamicTaskAssessment;
   /** Operation-only mission: commands and reads are allowed, but source mutation tools are omitted. */
   commandOnly?: boolean;
+  /** Current source gathered deterministically for a bounded coordinated edit. */
+  initialProjectEvidence?: string;
+  /** The supplied source evidence is sufficient for an immediate first mutation. */
+  requireFirstMutation?: boolean;
+  /** Files already changed by an immediately preceding bounded batch. */
+  avoidFirstMutationPaths?: string[];
 };
 
 export type MissionExecutorResult = {
@@ -88,17 +109,20 @@ export type MissionExecutorResult = {
   verification: ExecutionMissionVerification[];
   turnsUsed: number;
   usage: RuntimeUsageRecord[];
+  /** A verified proposed edit matched the current file byte-for-byte. */
+  alreadySatisfied?: boolean;
 };
 
-const IMPLEMENTATION_SCAN_EXCLUDED_DIRS = new Set(["node_modules", ".git", ".next", "dist", "build", "coverage", "target", "bin", "obj"]);
+const IMPLEMENTATION_SCAN_EXCLUDED_DIRS = new Set(["node_modules", ".git", ".next", ".next-build", ".svelte-kit", ".turbo", ".cache", "dist", "build", "out", "coverage", "target", "bin", "obj"]);
 const EXECUTABLE_SOURCE_PATH = /\.(?:[cm]?[jt]sx?|vue|svelte|astro|html?|css|scss|sass|less|py|rb|php|java|kt|kts|swift|go|rs|cs|fs|fsx|vb|dart|scala|lua|r|sql|graphql|proto|xaml)$/i;
 
-async function hasRunnableProjectEntry(access: ProjectAccess): Promise<boolean> {
+export async function hasRunnableProjectEntry(access: ProjectAccess): Promise<boolean> {
   const entryPatterns = [
     /^(?:src\/)?app\/page\.[cm]?[jt]sx?$/i,
     /^(?:src\/)?pages\/index\.[cm]?[jt]sx?$/i,
     /^(?:src\/)?(?:main|index|app)\.(?:[cm]?[jt]sx?|vue|svelte|astro|py|rb|php|go|rs|cs|java|kt|swift|dart)$/i,
     /^index\.html?$/i,
+    /(?:^|\/)(?:program\.cs|app\.xaml|mainwindow\.xaml|mainactivity\.(?:java|kt)|__main__\.py|main\.(?:rs|go|dart|swift|c|cc|cpp|cxx)|application\.java)$/i,
   ];
   async function visit(relativePath: string, depth: number): Promise<boolean> {
     if (depth > 3) return false;
@@ -113,12 +137,43 @@ async function hasRunnableProjectEntry(access: ProjectAccess): Promise<boolean> 
         const obviousStub = /continuing implementation|coming soon|todo|placeholder|hello world/i.test(content);
         // A filename alone is not a runnable experience. Generated recovery previously accepted a
         // seven-line "Continuing implementation" page as complete and moved straight to build.
-        if (content.length >= 400 && !obviousStub) return true;
+        const conventionalCompiledEntry = /(?:^|\/)(?:program\.cs|app\.xaml|mainwindow\.xaml|mainactivity\.(?:java|kt)|__main__\.py|main\.(?:rs|go|dart|swift|c|cc|cpp|cxx)|application\.java)$/i.test(childPath);
+        if (content.length >= (conventionalCompiledEntry ? 120 : 400) && !obviousStub) return true;
       }
     }
     return false;
   }
   return visit("", 0);
+}
+
+function projectManifestFamily(filePath: string) {
+  const normalized = filePath.replace(/\\/g, "/").toLowerCase();
+  if (/\.sln$/.test(normalized)) return "dotnet-solution";
+  if (/\.(?:cs|fs|vb)proj$/.test(normalized)) return "dotnet-project";
+  if (/(?:^|\/)package\.json$/.test(normalized)) return "node-package";
+  if (/(?:^|\/)cargo\.toml$/.test(normalized)) return "rust-package";
+  if (/(?:^|\/)go\.mod$/.test(normalized)) return "go-module";
+  if (/(?:^|\/)pom\.xml$/.test(normalized)) return "maven-project";
+  if (/(?:^|\/)build\.gradle(?:\.kts)?$/.test(normalized)) return "gradle-project";
+  if (/(?:^|\/)pyproject\.toml$/.test(normalized)) return "python-project";
+  if (/(?:^|\/)pubspec\.yaml$/.test(normalized)) return "dart-package";
+  return undefined;
+}
+
+async function existingProjectManifestPaths(access: ProjectAccess) {
+  const found: string[] = [];
+  const queue: Array<{ path: string; depth: number }> = [{ path: "", depth: 0 }];
+  const ignored = /^(?:node_modules|\.git|\.next|dist|build|out|bin|obj|target)$/i;
+  while (queue.length && found.length < 80) {
+    const current = queue.shift()!;
+    const entries = await access.listDir(current.path).catch(() => []);
+    for (const entry of entries) {
+      const child = current.path ? `${current.path}/${entry.name}` : entry.name;
+      if (entry.kind === "file" && projectManifestFamily(child)) found.push(child.replace(/\\/g, "/"));
+      if (entry.kind === "directory" && current.depth < 3 && !ignored.test(entry.name)) queue.push({ path: child, depth: current.depth + 1 });
+    }
+  }
+  return found;
 }
 
 function explicitRequiredProjectPaths(task: string): string[] {
@@ -292,7 +347,7 @@ function toolSchemas(canRunCommands: boolean, canBrowserValidate = false): Neutr
     },
     {
       name: "report_blocked",
-      description: "Call this if you cannot complete the objective (missing info, ambiguous request, tool failure). Ends the mission.",
+      description: "Call this only for a concrete external dependency, missing user authority/credential, incompatible required host, or explicit user stop. Compiler, build, test, preview, command, and no-progress failures are engineering work: inspect their evidence, repair them, and continue instead of reporting blocked.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -381,30 +436,93 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   let hasSelfContainedStaticEntry = false;
   const commands: MissionExecutorResult["commands"] = [];
   const narrativeObjects: FactoryNarrativeObject[] = [];
-  // Static greenfield projects have no build command to run and Foundry starts their preview
-  // deterministically after generation. Hiding command execution here prevents an LLM from launching
-  // a redundant long-running `npx serve`/`http.server` process and waiting for the command timeout.
-  const allowCommandTools = input.access.capabilities.canRunCommands && !(input.newProject && input.hasBuildTooling === false);
-  const availableTools = toolSchemas(allowCommandTools, input.access.capabilities.canBrowserValidate);
-  const browserValidationRequested = input.commandOnly
-    && input.access.capabilities.canBrowserValidate
+  // Static projects without build tooling already have an owned preview and deterministic browser gate.
+  // Hiding command execution prevents the model from launching a redundant `npx serve`/`http.server`
+  // process, whether the project was just generated or connected earlier.
+  const allowCommandTools = input.access.capabilities.canRunCommands && input.hasBuildTooling !== false;
+  const candidateTools = toolSchemas(allowCommandTools, input.access.capabilities.canBrowserValidate);
+  const referencedProposal = ((input.followUpResolution?.currentIntent === "edit" || input.followUpResolution?.currentIntent === "debug" || input.followUpResolution?.currentIntent === "continue")
+      ? input.followUpResolution.plannedAction.trim()
+      : "")
+    || input.followUpResolution?.referencedPriorAction?.description?.trim()
+    || (input.priorContext
+      && input.followUpResolution?.referencedPriorAction?.executionId === input.priorContext.id
+      ? input.priorContext.summary
+      : "");
+  const carriesPriorRequirements = !referencedProposal && Boolean(input.priorContext?.source_requirements.length) && (
+    input.followUpResolution?.continuity === "carry_forward_plan"
+    || input.followUpResolution?.referencedPriorAction?.executionId === input.priorContext?.id
+  );
+  const acceptedRequirements = [
+    ...(carriesPriorRequirements ? input.priorContext?.source_requirements ?? [] : []),
+    referencedProposal,
+    input.task,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const semanticVisualNeed = input.routingAssessment?.visualOutcome
+    || input.executionStrategy?.stages.some((stage) => stage.capability === "visual") ? 1 : undefined;
+  const uiOutcomeRequested = isUserFacingUiOutcome(acceptedRequirements, semanticVisualNeed);
+  const presentationChangeRequired = requiresPresentationLayerChange(acceptedRequirements, semanticVisualNeed);
+  const explicitBrowserValidationRequested = Boolean(input.commandOnly)
     && (/\bvalidate_browser\b/i.test(input.task)
       || (/\b(?:validate|verify|test|exercise|check)\b/i.test(input.task)
         && /\b(?:browser|preview|live\s+(?:site|app)|navigation|user\s+flow|click(?:ing)?)\b/i.test(input.task)));
-  const immediateBrowserValidationRequested = browserValidationRequested
+  // UI outcomes are verified as UI outcomes whenever the connection can do so. Static generation
+  // and evidence-first static repair are validated by the runtime's deterministic preview gate.
+  const browserValidationOwnedByRuntime = Boolean(input.staticProject && (input.newProject || input.staticRewrite));
+  // Never let an implementation model invent a localhost port. Foundry owns normal preview startup
+  // and browser acceptance after the source batch. The model-level browser tool is exposed only for
+  // an explicit operation-only request that already contains the exact loopback URL to exercise.
+  const immediateBrowserValidationRequested = Boolean(input.access.capabilities.canBrowserValidate)
+    && !browserValidationOwnedByRuntime
+    && explicitBrowserValidationRequested
     && /\bvalidate_browser\b/i.test(input.task)
     && /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/i.test(input.task);
-  const requiredBrowserValidationPasses = browserValidationRequested && /\b(?:then\s+repeat|repeat\s+at|both\s+(?:viewports?|sizes?))\b/i.test(input.task) ? 2 : 1;
+  const browserValidationRequested = immediateBrowserValidationRequested;
+  const availableTools = immediateBrowserValidationRequested
+    ? candidateTools
+    : candidateTools.filter((tool) => tool.name !== "validate_browser");
+  const requiredBrowserValidationPasses = browserValidationRequested
+    && (presentationChangeRequired || /\b(?:then\s+repeat|repeat\s+at|both\s+(?:viewports?|sizes?))\b/i.test(input.task)) ? 2 : 1;
   let successfulBrowserValidationPasses = 0;
+  const requiredEvidenceRepairReadPaths = Array.from(new Set(
+    (input.evidenceRepairReadPaths ?? [])
+      .map((candidate) => candidate.replace(/\\/g, "/").trim())
+      .filter(Boolean),
+  ));
+  const readOnlyFollowUp = Boolean(
+    input.followUpResolution
+    && ["question", "inspection", "diagnose", "status", "retrospective"].includes(input.followUpResolution.currentIntent),
+  );
   // A new static project has one meaningful model action: write its complete first artifact. Keeping
   // the full inspection/deletion/reporting catalogue in this forced-tool request adds schema noise
   // and gives small coding models more ways to return prose instead of the required write. Foundry
   // owns browser verification and completion immediately after the coherent source lands.
-  const tools = immediateBrowserValidationRequested
+  const tools = readOnlyFollowUp
+    ? availableTools.filter((tool) => ["list_dir", "read_file", "search_files", "mark_checklist_item", "record_finding", "record_decision", "record_flag", "report_complete", "report_blocked"].includes(tool.name))
+    : immediateBrowserValidationRequested
     ? availableTools.filter((tool) => ["validate_browser", "mark_checklist_item", "record_finding", "record_decision", "record_flag", "report_complete", "report_blocked"].includes(tool.name))
+    : input.evidenceFirstRepair
+    ? availableTools
+        .filter((tool) => ["read_file", "replace_in_file", "write_file", "write_files", "mark_checklist_item", "record_finding", "record_decision", "record_flag", "report_complete", "report_blocked"].includes(tool.name))
+        .map((tool) => tool.name === "replace_in_file" ? {
+          ...tool,
+          description: "Make one small exact compiler- or browser-evidenced edit. Copy only the shortest uniquely matching source fragment around the reported failure; never send the complete file in old_text or new_text.",
+          parameters: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              path: requiredEvidenceRepairReadPaths.length ? { type: "string", enum: requiredEvidenceRepairReadPaths } : { type: "string" },
+              old_text: { type: "string", minLength: 1, maxLength: 3_000 },
+              new_text: { type: "string", maxLength: 3_000 },
+            },
+            required: ["path", "old_text", "new_text"],
+          },
+        } : tool)
     : input.staticProject && input.fastLane && !input.newProject
     ? availableTools
-        .filter((tool) => ["read_file", "replace_in_file", "mark_checklist_item", "record_finding", "record_decision", "record_flag", "report_complete", "report_blocked"].includes(tool.name))
+        .filter((tool) => ["read_file", "replace_in_file", "write_file", "mark_checklist_item", "record_finding", "record_decision", "record_flag", "report_complete", "report_blocked"].includes(tool.name))
         .map((tool) => tool.name === "read_file" ? {
           ...tool,
           description: "Read the complete existing index.html exactly once before applying this bounded static follow-up.",
@@ -440,6 +558,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const needsGeneratedEntryRecovery = input.newProject
     ? !(await hasRunnableProjectEntry(input.access))
     : false;
+  const establishedProjectManifests = input.newProject ? await existingProjectManifestPaths(input.access) : [];
+  const explicitProjectExpansion = /\b(?:add|create)\s+(?:another|additional|second|new)\s+(?:project|module|service|library)\b|\bmulti[- ]project\b/i.test(acceptedRequirements);
   const generatedWriteFloor = input.newProject
     ? Math.min(8, Math.max(3, Math.ceil(input.routingAssessment?.estimatedFiles ?? 3)))
     : 0;
@@ -453,16 +573,20 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const { model, effort } = resolveModelForTier(effectiveTier, { provider });
 
   async function emit(kind: FactoryExecutionEventKind, status: FactoryExecutionEventStatus, title: string, extra: Partial<FactoryExecutionEvent> = {}) {
+    const id = extra.id
+      ?? (status !== "running" ? matchingRunningEventId(timeline, { kind, command: extra.command, filePath: extra.filePath }) : undefined)
+      ?? `mission-event-${timeline.length}-${Math.random().toString(16).slice(2)}`;
     const event: FactoryExecutionEvent = {
-      id: `mission-event-${timeline.length}-${Math.random().toString(16).slice(2)}`,
+      id,
       timestamp: new Date().toISOString(),
       tier: extra.tier ?? "trace",
       kind,
       status,
       title,
+      transient: extra.transient ?? status === "running",
       ...extra,
     };
-    timeline.push(event);
+    upsertExecutionEvent(timeline, event);
     await input.onEvent(event);
   }
 
@@ -479,14 +603,6 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     turnsUsed: number,
     blockedStep?: MissionExecutorResult["blockedStep"]
   ): MissionExecutorResult {
-    if (status === "passed") {
-      for (const item of checklist) {
-        if (item.status === "pending" || item.status === "running") {
-          item.status = "completed";
-          item.evidence ||= "Completed and verified before the mission finished.";
-        }
-      }
-    }
     return {
       status,
       blocker,
@@ -496,9 +612,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       changedFiles: Array.from(changedFiles),
       commands,
       sessionSummary: buildSessionSummary(timeline, changedFiles, status, blocker),
-      verification: buildVerificationEntries(checklist, changedFiles, narrativeObjects, commands),
+      verification: buildVerificationEntries(checklist, changedFiles, commands, timeline),
       turnsUsed,
       usage,
+      alreadySatisfied,
     };
   }
 
@@ -511,6 +628,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     input.followUpResolution
       ? `Accepted follow-up resolution (authoritative): intent=${input.followUpResolution.currentIntent}; referenced execution=${input.followUpResolution.referencedPriorAction?.executionId ?? "none"}; relevant files=${input.followUpResolution.relevantFiles.join(", ") || "not pre-bounded"}; destructive=${input.followUpResolution.destructive}; confidence=${input.followUpResolution.referenceConfidence}; expected scope=${input.followUpResolution.expectedScope}; planned action=${input.followUpResolution.plannedAction}. Do not reinterpret the user as asking for a different action. For a bounded file list, do not write or delete any other file; if a dependency makes that necessary, report the dependency and stop for a new resolution instead of widening scope yourself.`
       : "",
+    readOnlyFollowUp
+      ? "This follow-up is authoritatively read-only. Mutation and command tools are unavailable. Inspect only relevant evidence, answer the request, and do not create notes, scratchpads, summaries, markers, or any other project file."
+      : "",
     input.deniedActions?.length
       ? `The user explicitly denied these actions: ${input.deniedActions.join(", ")}. Do not request or attempt them again. Mark dependent work skipped and continue independent work.`
       : "",
@@ -520,6 +640,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             input.priorContext
               ? "You already have verified context from earlier in this same mission, given below — trust it and don't re-read files it already covers unless something looks inconsistent with the current request."
               : "You have no built-in knowledge of this project's current contents — read files before assuming anything about them.",
+            input.initialProjectEvidence
+              ? "Foundry already read the bounded working set immediately before this call and included its exact current contents below. Do not list the project, read package.json, or reread those files before editing. Apply the first real source mutation immediately from that verified evidence, then continue through every acceptance item."
+              : "",
             "write_file always takes one complete new file, while write_files writes a coordinated verified set in one operation. For a new project or multi-file feature, prefer one write_files call over one model turn per file. For a localized change in an existing file, prefer replace_in_file with an exact old_text match so a small repair never requires a risky whole-file rewrite.",
             input.newProject && !input.staticProject
               ? "For a multi-file greenfield build, keep each write_files response to 3–4 complete coordinated files and at most roughly 36,000 characters of file content. Finish the executable foundation over multiple verified batches. Do not attempt the entire repository in one oversized tool call: a truncated JSON action writes nothing and wastes the model call."
@@ -539,6 +662,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               : "",
             input.staticRewrite
               ? "This is one browser-evidenced repair of an already-generated static page. The task contains the original requirements and exact browser failure. Do not list or read files and do not explain. Call write_file once with a complete corrected self-contained index.html that preserves every requested feature and fixes the verified failure."
+              : "",
+            input.evidenceFirstRepair
+              ? `Foundry already reproduced the exact compiler or browser failure and included it in the task. Do not start a server, run a build, or invoke browser validation inside this model loop. Read ${requiredEvidenceRepairReadPaths.length ? `these deterministically verified source paths in order before editing: ${requiredEvidenceRepairReadPaths.join(", ")}` : "the most directly relevant existing source file"}, then call replace_in_file with only the shortest unique fragment around the reported failure (at most 3,000 characters for old_text and new_text). Never copy or rewrite the complete file. Foundry will rebuild and repeat the same gate deterministically after the write.`
               : "",
             "Writing to an environment/secrets-shaped file (.env and variants, credentials/secrets files, key material) needs the user's approval, same as a shell command — expect it to pause the same way, and don't avoid the edit just because it needs approval if it's the right fix.",
             "delete_file removes a file and always needs the user's approval — never avoid deleting something that genuinely should go, and never delete anything as a substitute for asking when you are unsure whether it's still needed.",
@@ -570,7 +696,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             "Treat every user-requirement item as an acceptance contract copied from the user's message. Complete and verify each clause independently; one token implementation must never stand in for a different clause. If the user asks for signup, sign-in to a dashboard, and a polished dashboard, all three must exist and work before completion.",
             "Quality words are requirements, not filler. A requested nice/polished/professional dashboard needs intentional navigation and hierarchy, useful summary content or data sections, multiple meaningful interactions, responsive layout, and real visual structure. A welcome heading, one sentence, and a sign-out button is a placeholder and must not be marked complete.",
             input.access.capabilities.canBrowserValidate
-              ? "A real browser runner is available. For UI changes, start the preview, use validate_browser to exercise the affected flow at relevant desktop/mobile viewports, and treat console errors, page errors, or failed network requests as verification failures. Use a baseline screenshot when before/after comparison matters."
+              ? `Foundry owns preview startup and real-browser acceptance after your source batch. Do not start a dev server, guess a localhost port, or claim visual verification inside this model loop. Implement the complete UI requirement and run the canonical build; Foundry will then exercise the owned preview${presentationChangeRequired ? " at desktop and mobile sizes" : " at the relevant viewport"} and route concrete browser evidence back into repair if needed.`
               : "Real browser interaction is unavailable in this connection mode. Never claim visual or workflow verification from source inspection or a preview URL alone; report that limitation explicitly.",
             "A styling or layout change is not verified by how it looks in your head — it's verified by the app still working. Before report_complete on any mission that touched .tsx/.jsx/.vue/.svelte/.html files: (1) actually run the app (build, dev server, or existing test suite — whichever this project has) and confirm it starts/builds without new errors, and (2) explicitly check that the interactive elements your change touched or sits near — buttons, forms, nav links, click handlers — still reference real, existing functions/state after your edit (read the handler wiring, don't assume a move/restyle left it intact). Record a finding or decision that states this plainly, e.g. \"Verified nav links still route correctly after moving the nav\" — not just \"updated styles.\" If you find something broken, fix it before completing; never report complete with a known-broken interaction.",
             "For requests that move hardcoded backend fields, payload fields, spreadsheet columns, or transaction fields into the frontend or configuration, build the whole product loop unless the existing project makes it impossible: create or update a durable config file, load existing fields from it, add/edit/remove fields in the UI, persist required/optional metadata, generate frontend forms from that config, and make backend upload/API mapping read the saved config dynamically.",
@@ -634,6 +760,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             `Project root: ${input.access.rootLabel}`,
             ...(input.priorContext ? ["", "Mission this continues:", formatParentContext(input.priorContext)] : []),
             ...(input.followUpResolution ? ["", "Accepted follow-up resolution:", JSON.stringify(input.followUpResolution)] : []),
+            ...(input.initialProjectEvidence ? ["", "Verified current working-set source (authoritative):", input.initialProjectEvidence] : []),
             "",
             "Checklist:",
             ...checklist.map((item) => `- [${item.id}]${item.phase ? ` [${item.phase}]` : ""} ${item.label}`),
@@ -655,9 +782,21 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   let hadUnresolvedToolFailure = false;
   let lastReasoningNormalized = "";
   let silentExplorationTurns = 0;
-  let inspectedExistingProject = false;
-  let forcedMutationRecovery: "replace_in_file" | "write_file" | undefined;
+  // Runtime-supplied working-set evidence is a completed inspection. Do not pay the model to list or
+  // reread files whose exact current contents are already present in its authoritative context.
+  let inspectedExistingProject = Boolean(input.initialProjectEvidence);
+  let consecutiveExplorationTurns = 0;
+  const completedEvidenceRepairReads = new Set<string>();
+  let modelCallsSinceDurableProgress = 0;
+  const successfulCommandSignatures = new Set<string>();
+  const coordinatedEvidencePaths = Array.from(input.initialProjectEvidence?.matchAll(/^--- (.+?) ---$/gm) ?? [], (match) => match[1].replace(/\\/g, "/"));
+  const coordinatedMutationCounts = new Map<string, number>();
+  let lastCoordinatedMutationPath = "";
+  const coordinatedDiversityNudges = new Set<string>();
+  const maxModelCallsWithoutDurableProgress = Math.max(1, Number(process.env.FOUNDRY_MAX_NO_PROGRESS_MODEL_CALLS) || 4);
+  let forcedMutationRecovery: "replace_in_file" | "write_file" | undefined = input.requireFirstMutation ? mutationToolForExistingProject() : undefined;
   let mutationRecoveryUsed = false;
+  let alreadySatisfied = false;
   const explicitlyRequiredPaths = input.newProject ? explicitRequiredProjectPaths(input.task) : [];
   let lastRequiredPathNudge = "";
   let forcedRequiredWriteFailures = 0;
@@ -686,8 +825,52 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     await emit("summary", "error", "Mission blocked", { details: { reason } });
   }
 
+  function mutationToolForExistingProject(): "replace_in_file" | "write_file" {
+    // A small visual request (background, color, spacing, copy, sizing) is still a localized edit.
+    // Whole-file static rewrites are reserved for explicit page-wide redesigns; forcing every CSS
+    // tweak through write_file inflated latency/cost and made a one-line change depend on a huge JSON
+    // response surviving intact.
+    if (input.staticProject && input.initialProjectEvidence && presentationChangeRequired
+      && /\b(?:redesign|overhaul|rewrite|rebuild|replace)\b[^.\n]{0,60}\b(?:entire|whole|complete|page|screen|site|interface|ui)\b|\bfrom scratch\b/i.test(input.task)) return "write_file";
+    return /\b(?:create|add|new)\b[^.\n]{0,50}\b(?:file|page|route|component|screen)\b/i.test(input.task)
+      ? "write_file"
+      : "replace_in_file";
+  }
+
   for (let turn = 1; turn <= maxTurns; turn += 1) {
     if (input.signal?.aborted) return stoppedByUser(turn);
+    // Existing-project missions may need a small amount of inspection, but inspection is not the
+    // requested outcome. Once two model turns have only read/listed/searched, require the next
+    // call to mutate the project. This applies to every detected stack and keeps a weak Fast model
+    // from consuming the whole no-progress allowance before the runtime can escalate it.
+    if (
+      !input.newProject
+      && !input.commandOnly
+      && changedFiles.size === 0
+      && inspectedExistingProject
+      && consecutiveExplorationTurns >= 2
+      && !mutationRecoveryUsed
+    ) {
+      forcedMutationRecovery = mutationToolForExistingProject();
+      conversation.push({
+        role: "user",
+        content: [{
+          type: "text",
+          text: `Inspection is complete. Apply the requested change now with ${forcedMutationRecovery}. Do not read, list, or search again. Use the verified file evidence already in this conversation, make one real source change, and then verify it.`,
+        }],
+      });
+    }
+    if (modelCallsSinceDurableProgress >= maxModelCallsWithoutDurableProgress) {
+      const durableWorkExists = changedFiles.size > 0 || successfulCommandSignatures.size > 0;
+      const reason = durableWorkExists
+        ? `NO_PROGRESS_AFTER_MUTATION: ${changedFiles.size} verified file change${changedFiles.size === 1 ? " is" : "s are"} already on disk, but the current implementation batch then used ${modelCallsSinceDurableProgress} model calls without another durable change or unique successful command. Preserve the written work and continue with deterministic verification or one refreshed continuation batch.`
+        : `NO_PROGRESS_BEFORE_MUTATION: The initial implementation route used ${modelCallsSinceDurableProgress} consecutive model calls without a new file change or unique successful command. No additional provider call was sent; the runtime should preserve the inspected evidence and try one stronger action-enforced route.`;
+      await emit("planning", "warning", "Implementation route needs escalation", {
+        internal: true,
+        details: { reason, paidCallPrevented: true, recoverable: true, durableWorkExists },
+      });
+      return finalize("failed", reason, Math.max(0, turn - 1));
+    }
 
     // Announce the work once. Later turns are an implementation detail of the model/tool loop, not
     // user-visible milestones. Emitting a generic recovery sentence on every turn made healthy
@@ -718,6 +901,71 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       lastRequiredPathNudge = requiredPathSignature;
     }
 
+    const pendingEvidenceRepairReadPath = input.evidenceFirstRepair
+      ? requiredEvidenceRepairReadPaths.find((candidate) => !completedEvidenceRepairReads.has(candidate))
+      : undefined;
+    const avoidOnThisTurn = changedFiles.size === 0 && input.avoidFirstMutationPaths?.length
+      ? new Set(input.avoidFirstMutationPaths.map((file) => file.replace(/\\/g, "/").toLowerCase()))
+      : lastCoordinatedMutationPath && (coordinatedMutationCounts.get(lastCoordinatedMutationPath) ?? 0) >= 2
+        ? new Set([lastCoordinatedMutationPath.toLowerCase()])
+        : undefined;
+    const coordinatedAlternatePaths = avoidOnThisTurn
+      ? coordinatedEvidencePaths.filter((file) => !avoidOnThisTurn.has(file.toLowerCase()))
+      : [];
+    if (coordinatedAlternatePaths.length && lastCoordinatedMutationPath && !coordinatedDiversityNudges.has(lastCoordinatedMutationPath)) {
+      coordinatedDiversityNudges.add(lastCoordinatedMutationPath);
+      conversation.push({
+        role: "user",
+        content: [{
+          type: "text",
+          text: `${lastCoordinatedMutationPath} has already received two verified mutations in this bounded multi-file mission. Do not rewrite it again yet. Apply the next incomplete acceptance layer in one of these other current source files: ${coordinatedAlternatePaths.join(", ")}.`,
+        }],
+      });
+    }
+    const baseTurnTools = pendingEvidenceRepairReadPath
+      ? tools.map((tool) => tool.name === "read_file" ? {
+          ...tool,
+          description: `Read the deterministically verified repair source at ${pendingEvidenceRepairReadPath}.`,
+          parameters: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              path: { type: "string", const: pendingEvidenceRepairReadPath },
+              offset_bytes: { type: "integer", const: 0 },
+              limit_bytes: { type: "integer", const: 200_000 },
+            },
+            required: ["path", "offset_bytes", "limit_bytes"],
+          },
+        } : tool)
+      : tools;
+    const turnTools = coordinatedAlternatePaths.length
+      ? baseTurnTools.map((tool) => tool.name === "replace_in_file" ? {
+          ...tool,
+          description: `${tool.description} For this turn, continue the coordinated change in a different source file.`,
+          parameters: {
+            ...tool.parameters,
+            properties: {
+              ...((tool.parameters.properties as Record<string, unknown> | undefined) ?? {}),
+              path: { type: "string", enum: coordinatedAlternatePaths },
+            },
+          },
+      } : tool)
+      : baseTurnTools;
+    const activeProviderStage = pendingEvidenceRepairReadPath
+      ? `Preparing an exact repair from ${pendingEvidenceRepairReadPath}`
+      : changedFiles.size > 0
+        ? `Continuing from ${changedFiles.size} verified file change${changedFiles.size === 1 ? "" : "s"}`
+        : input.newProject
+          ? "Generating the first runnable source batch"
+          : forcedMutationRecovery
+            ? "Applying the required source change"
+            : "Preparing the next verified project action";
+    await emit("reasoning", "running", activeProviderStage, {
+      // One provider-wait lifecycle replaces itself across turns and continuation batches. Without
+      // a stable identity the canvas rendered the same "Continuing from …" state once per model call.
+      id: "implementation-provider-wait",
+      details: { provider, model, turn, waitingOnProvider: true, changedFiles: changedFiles.size },
+    });
     const result = await callManagedModel(
       {
         provider,
@@ -726,13 +974,15 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         cacheKey: `${input.workspaceId ?? "workspace"}:${effectiveTier}:executor`,
         system,
         messages: conversation,
-        tools: forceRequiredFile
-          ? tools.filter((tool) => tool.name === "write_file")
+        tools: forcedMutationRecovery && changedFiles.size === 0
+          ? turnTools.filter((tool) => tool.name === forcedMutationRecovery)
+          : forceRequiredFile
+          ? turnTools.filter((tool) => tool.name === "write_file")
           : needsGeneratedEntryRecovery && generatedWriteCalls < generatedWriteFloor
-          ? tools.filter((tool) => tool.name === (input.staticProject ? "write_file" : "write_files"))
+          ? turnTools.filter((tool) => tool.name === (input.staticProject ? "write_file" : "write_files"))
           : input.staticProject && input.fastLane && !input.newProject && inspectedExistingProject
-          ? tools.filter((tool) => !explorationToolNames.has(tool.name))
-          : tools,
+          ? turnTools.filter((tool) => !explorationToolNames.has(tool.name))
+          : turnTools,
         // A greenfield or incomplete generated project already has its authoritative brief in the
         // task. Require the first concrete action to put source on disk; otherwise models can spend
         // an entire guarded batch repeatedly proving that the missing application is still missing.
@@ -741,6 +991,12 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           ? { name: "validate_browser" }
           : input.staticRewrite
           ? { name: "write_file" }
+          : input.evidenceFirstRepair && pendingEvidenceRepairReadPath
+          ? { name: "read_file" }
+          : input.evidenceFirstRepair && changedFiles.size === 0
+          ? { name: "replace_in_file" }
+          : forcedMutationRecovery
+          ? { name: forcedMutationRecovery }
           : input.staticProject && input.fastLane && !input.newProject && !inspectedExistingProject
           ? { name: "read_file" }
           : input.staticProject && input.fastLane && !input.newProject && inspectedExistingProject
@@ -749,22 +1005,26 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           ? { name: "write_file" }
           : needsGeneratedEntryRecovery && generatedWriteCalls < generatedWriteFloor
           ? { name: input.staticProject ? "write_file" : "write_files" }
-          : forcedMutationRecovery
-          ? { name: forcedMutationRecovery }
+          : coordinatedAlternatePaths.length
+          ? { name: "replace_in_file" }
           : "auto",
         maxOutputTokens: input.staticProject && input.fastLane && !input.newProject
-          ? !inspectedExistingProject ? 1200 : input.tier && input.tier !== "fast" ? 10_000 : 6000
-          : input.fastLane
+          ? !inspectedExistingProject ? 1200 : input.maxOutputTokens ?? (input.tier && input.tier !== "fast" ? 10_000 : 6000)
+          : input.maxOutputTokens ?? (input.fastLane
           ? 2500
           : input.staticProject && (input.newProject || input.staticRewrite)
           ? 10_000
           : input.newProject
           ? 16_000
-          : 8000,
-        routing: routingContext(input.task, "implement", effectiveTier, input.workspaceId, input.routingAssessment, routingOperationId),
+          : 8000),
+        routing: {
+          ...routingContext(input.task, "implement", effectiveTier, input.workspaceId, input.routingAssessment, routingOperationId),
+          budget: input.routingBudget,
+        },
       },
-      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 1, signal: input.signal, timeoutMs: input.staticProject && (input.newProject || input.staticRewrite || (input.fastLane && input.tier && input.tier !== "fast")) ? 75_000 : input.staticProject ? 60_000 : input.fastLane ? 45_000 : 160_000 },
+      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 1, signal: input.signal, timeoutMs: input.staticProject && (input.newProject || input.staticRewrite || (input.fastLane && input.tier && input.tier !== "fast")) ? 120_000 : input.staticProject ? 90_000 : input.fastLane ? 60_000 : 160_000 },
     );
+    if (result.usage.requestCount > 0) modelCallsSinceDurableProgress += 1;
     usage.push(result.usage);
     if (turn === 1) {
       await emit("planning", "completed", `Model · ${result.usage.provider}/${result.usage.model}`, {
@@ -793,29 +1053,48 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         commands,
         input.hasBuildTooling ?? true,
         input.verificationProfile,
+        { uiOutcomeRequested, presentationChangeRequired, browserValidationRequested, successfulBrowserValidationPasses, requiredBrowserValidationPasses },
       );
       if (verifiedBeforeProviderRecovery.ok) {
-        await emit("summary", "completed", "Behavior verified", {
-          details: { summary: "The requested work and its verification completed successfully." },
-        });
+        const completionSummary = buildCompletionHandoff("", changedFiles, commands, timeline, narrativeObjects, checklist);
+        await emit("summary", "completed", "Implementation complete", { output: completionSummary, details: { summary: completionSummary } });
         return finalize("passed", undefined, turn);
       }
       if (result.failureKind === "guardrail") {
         const preservedWork = changedFiles.size
           ? `${changedFiles.size} changed file${changedFiles.size === 1 ? " was" : "s were"} preserved.`
           : "No project files were changed.";
-        const reason = `Foundry stopped before another paid model call because this request reached its configured execution limit. ${preservedWork} ${result.errorMessage || "No additional provider call was sent."}`;
-        await emit("summary", "error", "Execution limit reached", {
-          details: { reason, retryable: true, changedFiles: changedFiles.size, noAdditionalCall: true },
-        });
+        const billedCalls = usage.reduce((sum, item) => sum + item.requestCount, 0);
+        const billedCost = usage.reduce((sum, item) => sum + item.estimatedCostUsd, 0);
+        const paidWork = billedCalls > 0
+          ? `${billedCalls} provider call${billedCalls === 1 ? " was" : "s were"} already billed (estimated $${billedCost.toFixed(4)})${changedFiles.size ? "." : " without producing a verified file change."}`
+          : "No provider call was billed for the blocked attempt.";
+        const reason = `Foundry reached its configured execution limit and did not send an additional provider call. ${paidWork} ${preservedWork} ${result.errorMessage || "No additional provider call was sent."}`;
+        if (changedFiles.size > 0 || alreadySatisfied || Boolean(input.initialProjectEvidence)) {
+          // A budget boundary after a verified write is an orchestration hand-off, not yet a product
+          // failure. The same is true for a coordinated retry whose edits landed in an earlier
+          // bounded batch. The runtime owns stack-specific command/browser verification and can
+          // complete it without buying a narration response. Keep this internal so the canvas does
+          // not show a false red terminal event immediately before deterministic verification wins.
+          await emit("planning", "warning", changedFiles.size > 0 ? "Model budget reached after verified edit" : "Model batch complete; deterministic verification pending", {
+            internal: true,
+            details: { reason, deterministicVerificationPending: true, changedFiles: changedFiles.size, alreadySatisfied, coordinatedEvidence: Boolean(input.initialProjectEvidence), noAdditionalCall: true },
+          });
+        } else {
+          await emit("summary", "error", "Execution limit reached", {
+            details: { reason, retryable: true, changedFiles: 0, noAdditionalCall: true },
+          });
+        }
         return finalize("failed", reason, turn);
       }
       if (result.failureKind === "transport") {
         const preservedWork = changedFiles.size
           ? `${changedFiles.size} changed file${changedFiles.size === 1 ? " was" : "s were"} preserved, but Foundry could not finish and verify the request.`
           : "No project files were changed.";
-        const reason = `AI providers were temporarily unreachable. ${preservedWork} ${result.errorMessage || "The configured provider fallbacks timed out."}`;
-        await emit("summary", "error", "AI providers unavailable", { details: { reason, retryable: true, changedFiles: changedFiles.size } });
+        const providerFailure = result.errorMessage || "The configured provider attempts failed during transport.";
+        const timedOut = /timed?\s*out|timeout/i.test(providerFailure);
+        const reason = `${timedOut ? "AI provider attempts timed out." : "AI providers could not be reached."} ${preservedWork} ${providerFailure}`;
+        await emit("summary", "error", timedOut ? "AI provider attempts timed out" : "AI providers unavailable", { details: { reason, retryable: true, changedFiles: changedFiles.size } });
         return finalize("failed", reason, turn);
       }
       const recoveredStaticHtml = input.staticProject && input.newProject && /did not call required tool write_file/i.test(result.errorMessage ?? "")
@@ -899,6 +1178,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     // purely exploring (reading/listing/searching) with no visible update at all.
     const hasConsequentialCall = functionCalls.some((call) => consequentialToolNames.has(call.name ?? ""));
     const explorationOnly = functionCalls.length > 0 && functionCalls.every((call) => explorationToolNames.has(call.name ?? ""));
+    consecutiveExplorationTurns = explorationOnly ? consecutiveExplorationTurns + 1 : 0;
     const forceCheckIn = explorationOnly && silentExplorationTurns >= 2;
     let emittedThisTurn = false;
     if (turn === 1 || hasConsequentialCall || forceCheckIn) {
@@ -916,9 +1196,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       }
       const outstanding = checklist.filter((item) => item.status !== "completed" && item.status !== "skipped");
       if (!input.newProject && !input.commandOnly && inspectedExistingProject && !mutationRecoveryUsed) {
-        forcedMutationRecovery = /\b(?:create|add|new)\b[^.\n]{0,50}\b(?:file|page|route|component|screen)\b/i.test(input.task)
-          ? "write_file"
-          : "replace_in_file";
+        forcedMutationRecovery = mutationToolForExistingProject();
       }
       conversation.push({ role: "assistant", content: [{ type: "text", text: messageText || "(no text)" }] });
       conversation.push({
@@ -976,10 +1254,17 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       }
 
       if (call.name === "report_complete") {
-        const browserMissing = browserValidationRequested && successfulBrowserValidationPasses < requiredBrowserValidationPasses;
-        const verification = browserMissing
-          ? { ok: false as const, reason: `Real browser verification is still required (${successfulBrowserValidationPasses}/${requiredBrowserValidationPasses} requested flow${requiredBrowserValidationPasses === 1 ? "" : "s"} passed). Start the owned preview and call validate_browser before reporting completion.` }
-          : verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure, commands, input.hasBuildTooling ?? true, input.verificationProfile);
+        const verification = verifyCompletion(
+          checklist,
+          changedFiles,
+          narrativeObjects,
+          Boolean(input.fastLane),
+          hadUnresolvedToolFailure,
+          commands,
+          input.hasBuildTooling ?? true,
+          input.verificationProfile,
+          { uiOutcomeRequested, presentationChangeRequired, browserValidationRequested, successfulBrowserValidationPasses, requiredBrowserValidationPasses },
+        );
         if (!verification.ok) {
           completionRejections += 1;
           if (completionRejections > maxCompletionRejections) {
@@ -998,12 +1283,30 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           });
           continue;
         }
-        await emit("summary", "completed", "Behavior verified", { details: { summary: String(args.summary ?? "") } });
+        const completionSummary = buildCompletionHandoff(String(args.summary ?? ""), changedFiles, commands, timeline, narrativeObjects, checklist);
+        await emit("summary", "completed", "Implementation complete", { output: completionSummary, details: { summary: completionSummary } });
         return finalize("passed", undefined, turn);
       }
 
       if (call.name === "report_blocked") {
         const reason = String(args.reason ?? "The model reported it could not complete the objective.");
+        const assessment = assessAutonomousBlocker(reason);
+        if (!assessment.terminal) {
+          await emit("planning", "warning", "Recoverable engineering failure returned to execution", {
+            internal: true,
+            details: { reason, disposition: assessment.disposition, terminal: false },
+          });
+          toolResultParts.push({
+            type: "tool_result",
+            toolUseId: callId,
+            content: JSON.stringify({
+              accepted: false,
+              reason: "This is a recoverable project/verification failure, not an external blocker.",
+              instruction: "Continue autonomously: use the exact failure evidence, make a durable source/configuration change or run a new diagnostic command, then repeat the failed verification. Do not call report_blocked for this fingerprint again.",
+            }),
+          });
+          continue;
+        }
         await emitBlockedOrContinuation(reason);
         return finalize("failed", reason, turn);
       }
@@ -1032,16 +1335,33 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           : [];
         const hasRootApp = rootEntries.some((entry) => entry.kind === "directory" && entry.name.toLowerCase() === "app");
         const hasSrcApp = srcEntries.some((entry) => entry.kind === "directory" && entry.name.toLowerCase() === "app");
-        if (hasSrcApp && generatedMutationPaths.some((path) => /^app\//i.test(path))) {
+        const rootAppEntries = hasRootApp ? await input.access.listDir("app").catch(() => []) : [];
+        const srcAppEntries = hasSrcApp ? await input.access.listDir("src/app").catch(() => []) : [];
+        const appTreeScore = (entries: typeof rootAppEntries) => entries.reduce((score, entry) => score
+          + (/^page\.[cm]?[jt]sx?$/i.test(entry.name) ? 100 : 0)
+          + (/^layout\.[cm]?[jt]sx?$/i.test(entry.name) ? 10 : 0)
+          + (entry.kind === "file" ? 1 : 0), 0);
+        const preferredRoot = hasRootApp && hasSrcApp
+          ? (appTreeScore(rootAppEntries) >= appTreeScore(srcAppEntries) ? "app" : "src/app")
+          : hasRootApp ? "app" : hasSrcApp ? "src/app" : undefined;
+        if (preferredRoot === "src/app" && generatedMutationPaths.some((path) => /^app\//i.test(path))) {
           generatedApplicationRootIssue = "This project already uses src/app. Writing a parallel app tree would create conflicting routes; keep every Next.js route, layout, and style under src/app.";
-        } else if (hasRootApp && generatedMutationPaths.some((path) => /^src\/app\//i.test(path))) {
+        } else if (preferredRoot === "app" && generatedMutationPaths.some((path) => /^src\/app\//i.test(path))) {
           generatedApplicationRootIssue = "This project already uses app. Writing a parallel src/app tree would create conflicting routes; keep every Next.js route, layout, and style under app.";
         }
       }
       const runnableEntryExistsNow = input.newProject ? await hasRunnableProjectEntry(input.access) : true;
       const protectedBatchPath = input.newProject ? generatedMutationPaths.find((path) => /(?:^|\/)foundry-brief\.md$/i.test(path)) : undefined;
       const generatedBatchDocumentationPath = input.newProject && !runnableEntryExistsNow ? generatedMutationPaths.find((path) => /(?:^|\/)(?:readme(?:\.[^/]+)?|changelog(?:\.[^/]+)?|notes?(?:\.[^/]+)?|scratch(?:\.[^/]+)?|temp(?:\.[^/]+)?|todo(?:\.[^/]+)?|\.init-stamp)$/i.test(path)) : undefined;
-      const generatedBatchMarkerPath = input.newProject ? generatedMutationPaths.find((path) => /(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch)(?:\.[^/]*)?|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe)[^/]*)$|\.(?:tmp|log)$/i.test(path)) : undefined;
+      const generatedBatchMarkerPath = input.newProject ? generatedMutationPaths.find((path) => /(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch)(?:\.[^/]*)?|fix\.txt|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe|noop|fix[-_ ]?note|repair[-_ ]?note|debug[-_ ]?note|verification[-_ ]?note)[^/]*)(?:\.[^/]*)?$|\.(?:tmp|log)$/i.test(path)) : undefined;
+      const competingProjectManifestPath = input.newProject && !explicitProjectExpansion
+        ? generatedMutationPaths.find((candidate) => {
+            const family = projectManifestFamily(candidate);
+            if (!family) return false;
+            const normalized = candidate.replace(/\\/g, "/").toLowerCase();
+            return establishedProjectManifests.some((existing) => projectManifestFamily(existing) === family && existing.toLowerCase() !== normalized);
+          })
+        : undefined;
       let generatedManifestIssue: string | undefined;
       if (input.newProject) {
         const manifestWrite = call.name === "write_files" && Array.isArray(args.files)
@@ -1075,7 +1395,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         ? "Documentation cannot substitute for the unfinished application. Write the missing coordinated application source, configuration, data, or tests first; update README only after the real project builds."
         : undefined;
       const generatedMarkerIssue = input.newProject && (call.name === "write_file" || call.name === "replace_in_file")
-        && (/(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch)(?:\.[^/]*)?|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe)[^/]*)$/i.test(writePath)
+        && (/(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch)(?:\.[^/]*)?|fix\.txt|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe|noop|fix[-_ ]?note|repair[-_ ]?note|debug[-_ ]?note|verification[-_ ]?note)[^/]*)(?:\.[^/]*)?$/i.test(writePath)
           || /\.(?:tmp|log)$/i.test(writePath))
         ? "Internal marker, status, progress, bootstrap, handoff, temp, and log files are not customer application source. Write a real executable source, style, configuration, domain-data, route, component, or test file instead."
         : undefined;
@@ -1088,6 +1408,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         : undefined;
       const coordinatedGeneratedWriteIssue = protectedBatchPath
         ? "foundry-brief.md is the authoritative saved requirement and cannot be overwritten as generated application output."
+        : competingProjectManifestPath
+          ? `${competingProjectManifestPath} would create a competing project root beside the established ${establishedProjectManifests.join(", ")}. Repair the existing project in place; do not scaffold a replacement unless the user explicitly requests another project or module.`
         : generatedBatchDocumentationPath
           ? `${generatedBatchDocumentationPath} is documentation, not the unfinished customer application. Write the coordinated application source first.`
           : generatedBatchMarkerPath
@@ -1096,21 +1418,65 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       const staticWriteIssue = wrongForcedRequiredPath ?? repeatedGeneratedWriteIssue ?? generatedApplicationRootIssue ?? generatedManifestIssue ?? coordinatedGeneratedWriteIssue ?? protectedGeneratedBriefIssue ?? generatedDocumentationIssue ?? generatedMarkerIssue ?? generatedRecoveryWriteIssue ?? firstStaticArtifactIssue ?? (input.staticProject && call.name === "write_file"
         ? invalidStaticEntryWrite(writePath, String(args.content ?? ""))
         : undefined);
+      const evidenceRepairReplacement = typeof args.new_text === "string" ? args.new_text : "";
+      const evidenceRepairWriteIssue = input.evidenceFirstRepair
+        && call.name === "replace_in_file"
+        && /direct child links \(no list wrapper\)/i.test(input.task)
+        && /nav\s+(?:>\s*)?(?:ul|ol)\s*\{/i.test(evidenceRepairReplacement)
+        && !/(?:\.primary-nav|#primary-nav|nav(?:[#.][\w-]+)*)\s*\{/i.test(evidenceRepairReplacement)
+          ? "The browser proved these navigation links are direct children of the nav and there is no list wrapper. A nav ul/nav ol rule cannot affect this DOM. Target the verified nav container or its direct anchors instead."
+          : undefined;
       let toolResult: unknown;
-      if (staticWriteIssue) {
+      if (staticWriteIssue ?? evidenceRepairWriteIssue) {
+        const rejectedWriteReason = staticWriteIssue ?? evidenceRepairWriteIssue!;
         await emit("edit", "warning", "Incomplete page write rejected before touching disk", {
           filePath: String(args.path ?? ""),
-          details: { reason: staticWriteIssue },
+          details: { reason: rejectedWriteReason },
         });
-        toolResult = { verified: false, reason: staticWriteIssue };
+        toolResult = { verified: false, reason: rejectedWriteReason };
       } else {
         toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions).catch((error) => ({
           error: error instanceof Error ? error.message : "Tool call failed unexpectedly.",
         }));
       }
+      if (call.name === "read_file" && input.evidenceFirstRepair) {
+        const normalizedReadPath = typeof args.path === "string" ? args.path.replace(/\\/g, "/").trim() : "";
+        const readResult = toolResult as { exists?: boolean; error?: unknown };
+        if (normalizedReadPath && readResult.exists === true && !readResult.error) {
+          completedEvidenceRepairReads.add(normalizedReadPath);
+        }
+      }
+      if (["write_file", "write_files", "replace_in_file"].includes(call.name ?? "")) {
+        const writeResult = toolResult as { verified?: boolean; contentChanged?: boolean; written?: number };
+        if (writeResult.verified && (writeResult.contentChanged || Number(writeResult.written ?? 0) > 0)) {
+          modelCallsSinceDurableProgress = 0;
+          consecutiveExplorationTurns = 0;
+          const mutationPaths = coordinatedWritePaths.length ? coordinatedWritePaths : [writePath];
+          for (const mutationPath of mutationPaths.filter(Boolean)) {
+            const normalizedMutationPath = mutationPath.toLowerCase();
+            coordinatedMutationCounts.set(normalizedMutationPath, (coordinatedMutationCounts.get(normalizedMutationPath) ?? 0) + 1);
+            lastCoordinatedMutationPath = normalizedMutationPath;
+          }
+          if (input.staticProject && input.fastLane && !input.newProject) {
+            // The runtime owns the real static preview and browser acceptance gate. Once the targeted
+            // edit is verified on disk, another paid model turn can only narrate/checklist the work or
+            // incorrectly ask to start a server. Hand off immediately and let deterministic evidence
+            // decide success or failure.
+            await emit("planning", "completed", "Verified static edit ready for browser validation", {
+              internal: true,
+              details: { changedFiles: Array.from(changedFiles), deterministicBrowserVerificationPending: true },
+            });
+            return finalize("passed", undefined, turn);
+          }
+        }
+      }
       if (call.name === "run_command") {
         const commandResult = toolResult as { exitCode?: number | null; skipped?: string };
         const command = typeof args.command === "string" ? args.command : "";
+        if (commandResult.exitCode === 0 && !commandResult.skipped && command && !successfulCommandSignatures.has(command)) {
+          successfulCommandSignatures.add(command);
+          modelCallsSinceDurableProgress = 0;
+        }
         if (commandResult.exitCode === 0 && !commandResult.skipped && explicitlyRequestsCommand(input.task, command)) {
           checklist.forEach((item) => {
             if (item.status === "pending" || item.status === "running") {
@@ -1127,7 +1493,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       }
       if (call.name === "validate_browser" && (toolResult as { verified?: boolean }).verified) {
         successfulBrowserValidationPasses += 1;
-        if (successfulBrowserValidationPasses >= requiredBrowserValidationPasses) {
+        if (input.commandOnly && successfulBrowserValidationPasses >= requiredBrowserValidationPasses) {
           checklist.forEach((item) => {
             if (item.status === "pending" || item.status === "running") {
               item.status = "completed";
@@ -1238,18 +1604,48 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           await emit("edit", "completed", "Recovered — the targeted edit completed successfully");
         }
       }
+      if (input.evidenceFirstRepair && call.name === "replace_in_file" && (toolResult as { verified?: boolean; contentChanged?: boolean }).verified && (toolResult as { contentChanged?: boolean }).contentChanged) {
+        await emit("reasoning", "completed", "The evidence-backed source repair is on disk. Foundry is rebuilding and repeating the same browser gate now; no paid wrap-up call is needed.");
+        return finalize("passed", undefined, turn);
+      }
       if (
         !input.newProject
         && changedFiles.size === 0
         && (call.name === "write_file" || call.name === "replace_in_file")
         && (toolResult as { noOp?: boolean }).noOp
       ) {
-        const reason = "The first edit pass returned the existing file content unchanged, so Foundry stopped the fast lane before spending more calls on the same no-progress action.";
-        await emit("planning", "warning", "No source change was applied", {
-          internal: true,
-          details: { reason, noProgress: true, escalate: true },
-        });
-        return finalize("failed", reason, turn);
+        if (input.fastLane && checklist.length <= 1) {
+          alreadySatisfied = true;
+          const evidence = `${String(args.path ?? "The target file")} already contains the exact requested content; the verified write was a no-op.`;
+          for (const item of checklist) {
+            item.status = "completed";
+            item.evidence = evidence;
+          }
+          await emit("summary", "completed", "Request already satisfied", {
+            details: { reason: evidence, alreadySatisfied: true, paidWrapUpCalls: 0 },
+          });
+          return finalize("passed", undefined, turn);
+        }
+        if (input.initialProjectEvidence) {
+          // A coordinated existing-project edit can span several files. On a retry, the first
+          // proposed mutation may correctly be a no-op because that part already landed in the
+          // prior bounded run. That is evidence to continue verifying the complete requirement
+          // set, not evidence that the executor is stuck. Do not auto-complete the checklist here:
+          // every item still needs explicit evidence plus the project's deterministic checks.
+          (toolResult as Record<string, unknown>).continuation =
+            "This proposed edit is already present. Verify every checklist requirement against the supplied project evidence, run the required checks, and report completion only when the entire request is satisfied.";
+          await emit("inspection", "completed", "This part of the requested change is already present; verifying the complete request", {
+            internal: true,
+            details: { path: String(args.path ?? ""), noOp: true, verificationRequired: true },
+          });
+        } else {
+          const reason = "The first edit pass returned the existing file content unchanged, so Foundry stopped before spending more calls on the same no-progress action.";
+          await emit("planning", "warning", "No source change was applied", {
+            internal: true,
+            details: { reason, noProgress: true, escalate: true },
+          });
+          return finalize("failed", reason, turn);
+        }
       }
       if (call.name === "delete_file") {
         const deleteResult = toolResult as { skipped?: string; reason?: string; category?: string };
@@ -1295,28 +1691,36 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     }
     if (toolResultParts.length) conversation.push({ role: "user", content: toolResultParts });
 
-    if (browserValidationRequested && successfulBrowserValidationPasses >= requiredBrowserValidationPasses) {
-      await emit("summary", "completed", "Browser validation completed", {
-        details: { summary: `${successfulBrowserValidationPasses} requested browser validation${successfulBrowserValidationPasses === 1 ? "" : "s"} passed without source changes.` },
-      });
-      return finalize("passed", undefined, turn);
-    }
-
     // The model's job for a dependency-free static project ends when the coordinated source set is
     // durably written. Foundry owns the next step: start its dedicated server and exercise the result
     // in Chromium. Requiring more model turns merely to narrate/read back those same files inflated a
     // four-file utility into the costly multi-minute loop this path is specifically meant to avoid.
-    if (input.staticProject && (input.newProject || input.staticRewrite) && hasCompleteStaticProject(changedFiles, hasSelfContainedStaticEntry) && !hadUnresolvedToolFailure) {
+    if (input.staticProject && (input.newProject || input.staticRewrite || (input.initialProjectEvidence && input.requireFirstMutation)) && hasCompleteStaticProject(changedFiles, hasSelfContainedStaticEntry) && !hadUnresolvedToolFailure) {
+      checklist.forEach((item) => {
+        if (item.status === "pending" || item.status === "running") {
+          item.status = "completed";
+          item.evidence = `The complete static source set was written and read back from disk (${Array.from(changedFiles).join(", ")}); deterministic browser verification follows in the runtime gate.`;
+        }
+      });
       await emit("reasoning", "completed", "The complete source set is ready. I’m opening it in a real browser now and checking the rendered experience.");
       return finalize("passed", undefined, turn);
     }
   }
 
-  const ranOutOfTurnsButActuallyDone = verifyCompletion(checklist, changedFiles, narrativeObjects, Boolean(input.fastLane), hadUnresolvedToolFailure, commands, input.hasBuildTooling ?? true, input.verificationProfile);
+  const ranOutOfTurnsButActuallyDone = verifyCompletion(
+    checklist,
+    changedFiles,
+    narrativeObjects,
+    Boolean(input.fastLane),
+    hadUnresolvedToolFailure,
+    commands,
+    input.hasBuildTooling ?? true,
+    input.verificationProfile,
+    { uiOutcomeRequested, presentationChangeRequired, browserValidationRequested, successfulBrowserValidationPasses, requiredBrowserValidationPasses },
+  );
   if (ranOutOfTurnsButActuallyDone.ok) {
-    await emit("summary", "completed", "Behavior verified", {
-      details: { summary: "The work was verified complete before the turn budget ran out; skipping the final wrap-up call." },
-    });
+    const completionSummary = buildCompletionHandoff("", changedFiles, commands, timeline, narrativeObjects, checklist);
+    await emit("summary", "completed", "Implementation complete", { output: completionSummary, details: { summary: completionSummary } });
     return finalize("passed", undefined, maxTurns);
   }
 
@@ -1334,7 +1738,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
 }
 
 function compactToolResultForContext(toolName: string, result: unknown) {
-  const value: Record<string, unknown> = result && typeof result === "object" ? { ...(result as Record<string, unknown>) } : { result };
+  const redactedResult = redactSensitiveData(result);
+  const value: Record<string, unknown> = redactedResult && typeof redactedResult === "object" ? { ...(redactedResult as Record<string, unknown>) } : { result: redactedResult };
   if (toolName === "run_command") {
     value.stdout = summarizeExecutionOutput(String(value.stdout ?? ""));
     value.stderr = summarizeExecutionOutput(String(value.stderr ?? ""));
@@ -1461,10 +1866,22 @@ function dependencyAdditions(beforeText: string, afterText: string) {
 }
 
 const interactiveUiExtensions = /\.(tsx|jsx|vue|svelte|html)$/i;
+const presentationLayerExtensions = /\.(tsx|jsx|vue|svelte|html|css|scss|sass|less)$/i;
+const browserUiAssetExtensions = /\.(?:[cm]?[jt]sx?|vue|svelte|html|css|scss|sass|less)$/i;
 
-function changedInteractiveUiFiles(changedFiles: Set<string>): string[] {
-  return Array.from(changedFiles).filter((path) => interactiveUiExtensions.test(path));
+function changedInteractiveUiFiles(changedFiles: Set<string>, uiOutcomeRequested = false): string[] {
+  return Array.from(changedFiles).filter((path) =>
+    interactiveUiExtensions.test(path) || (uiOutcomeRequested && browserUiAssetExtensions.test(path)),
+  );
 }
+
+type CompletionEvidencePolicy = {
+  uiOutcomeRequested: boolean;
+  presentationChangeRequired: boolean;
+  browserValidationRequested: boolean;
+  successfulBrowserValidationPasses: number;
+  requiredBrowserValidationPasses: number;
+};
 
 /** Whether the mission ran something that could actually exercise runtime behavior (build/dev server/
  * test), as opposed to only reading a file back — a read-back proves the edit landed, not that it runs. */
@@ -1484,18 +1901,31 @@ function verifyCompletion(
   checklist: FactoryObjectiveChecklistItem[],
   changedFiles: Set<string>,
   narrativeObjects: FactoryNarrativeObject[],
-  fastLane = false,
+  _fastLane = false,
   hasUnresolvedFailure = false,
   commands: MissionExecutorResult["commands"] = [],
   hasBuildTooling = true,
   verificationProfile?: VerificationProfile,
+  policy: CompletionEvidencePolicy = {
+    uiOutcomeRequested: false,
+    presentationChangeRequired: false,
+    browserValidationRequested: false,
+    successfulBrowserValidationPasses: 0,
+    requiredBrowserValidationPasses: 0,
+  },
 ): { ok: true } | { ok: false; reason: string } {
+  void _fastLane; // Fast execution changes cost/turn limits, never the evidence required to say "done".
   // Section 19: never let a mission complete while its most recent command or write failure was never
   // followed by a fix or a successful retry — completion must never silently paper over a real failure.
   if (hasUnresolvedFailure) {
     return { ok: false, reason: "A command or file write failed and was never followed by a fix or a successful retry." };
   }
-  if (fastLane && checklist.length === 1 && changedFiles.size > 0) return { ok: true };
+  if (policy.browserValidationRequested && policy.successfulBrowserValidationPasses < policy.requiredBrowserValidationPasses) {
+    return {
+      ok: false,
+      reason: `The requested UI outcome is not complete until real browser verification passes (${policy.successfulBrowserValidationPasses}/${policy.requiredBrowserValidationPasses} required viewport checks passed).`,
+    };
+  }
   const incomplete = checklist.filter((item) => item.status !== "completed" && item.status !== "skipped");
   if (incomplete.length) {
     return { ok: false, reason: `Checklist item(s) not completed: ${incomplete.map((item) => item.label).join("; ")}` };
@@ -1503,6 +1933,13 @@ function verifyCompletion(
   const withoutEvidence = checklist.filter((item) => !item.evidence?.trim());
   if (withoutEvidence.length) {
     return { ok: false, reason: `Checklist item(s) marked completed without evidence: ${withoutEvidence.map((item) => item.label).join("; ")}` };
+  }
+  const genericEvidence = checklist.filter((item) =>
+    item.status === "completed"
+    && /^(?:done|complete(?:d)?|implemented|verified|completed and verified before the mission finished)[.!]?$/i.test(item.evidence?.trim() ?? ""),
+  );
+  if (genericEvidence.length) {
+    return { ok: false, reason: `Checklist evidence is too generic to prove completion: ${genericEvidence.map((item) => item.label).join("; ")}` };
   }
   const runtimeRelevantChanges = changedFiles.size === 0 || Array.from(changedFiles).some((path) => !/\.(?:md|mdx|txt|rst)$/i.test(path));
   const missingRequiredChecks = runtimeRelevantChanges ? verificationProfile?.commands
@@ -1528,6 +1965,12 @@ function verifyCompletion(
     return { ok: false, reason: "The mission reported completion, but produced no verifiable evidence — no file write on disk and no command that ran successfully." };
   }
   const hasFinding = narrativeObjects.some((item) => item.tier === "finding");
+  if (policy.presentationChangeRequired && !Array.from(changedFiles).some((path) => presentationLayerExtensions.test(path))) {
+    return {
+      ok: false,
+      reason: "The request calls for a broad visual/UX improvement, but no rendered presentation-layer file (component, markup, or stylesheet) changed. A logic-only edit cannot satisfy that outcome.",
+    };
+  }
   const hasDecision = narrativeObjects.some((item) => item.tier === "decision");
   if (!hasFinding || !hasDecision) {
     return { ok: false, reason: "The mission cannot complete until it records structured finding and decision objects for the narrative layer." };
@@ -1536,7 +1979,7 @@ function verifyCompletion(
   // actually run (build/dev/test), and a narrative object that speaks to interactive behavior — not just
   // "the file reads back correctly." Skip this for fastLane (already handled above) and for missions that
   // only skipped items (already flagged honestly by the checks above).
-  const touchedUi = changedInteractiveUiFiles(changedFiles);
+  const touchedUi = changedInteractiveUiFiles(changedFiles, policy.uiOutcomeRequested);
   if (touchedUi.length && !hasSkippedItem) {
     // The build/dev/test-run requirement only applies to projects that actually HAVE such a step. A
     // pure static HTML/CSS/JS site has no build/test, and a static preview server never exits 0 — so
@@ -1652,8 +2095,8 @@ function sameVerificationCommand(executed: string, expected: string) {
 function buildVerificationEntries(
   checklist: FactoryObjectiveChecklistItem[],
   changedFiles: Set<string>,
-  narrativeObjects: FactoryNarrativeObject[],
   commands: MissionExecutorResult["commands"],
+  timeline: FactoryExecutionEvent[],
 ): ExecutionMissionVerification[] {
   const entries: ExecutionMissionVerification[] = [];
 
@@ -1672,19 +2115,24 @@ function buildVerificationEntries(
   }
 
   for (const command of commands) {
-    const isBuildLike = /\b(build|tsc|compile)\b/i.test(command.command);
+    const isTypecheckLike = /\b(typecheck|tsc)\b/i.test(command.command);
+    const isLintLike = /\b(?:eslint|lint)\b/i.test(command.command);
+    const isBuildLike = /\b(build|compile)\b/i.test(command.command);
     const isTestLike = /\btest\b/i.test(command.command);
     entries.push({
-      check_type: isBuildLike ? "build" : isTestLike ? "test" : "command",
+      check_type: isTypecheckLike ? "typecheck" : isLintLike ? "lint" : isBuildLike ? "build" : isTestLike ? "test" : "command",
       result: command.exitCode === 0 ? "pass" : "fail",
       evidence: `${command.command} exited with code ${command.exitCode ?? "unknown"}.`,
     });
   }
 
-  for (const item of narrativeObjects) {
-    if (item.tier === "finding" || item.tier === "decision") {
-      entries.push({ check_type: "manual-evidence", result: "pass", evidence: item.rationale });
-    }
+  for (const event of timeline.filter((item) => item.kind === "preview" && item.status !== "running")) {
+    const url = typeof event.details?.url === "string" ? ` at ${event.details.url}` : "";
+    entries.push({
+      check_type: "preview",
+      result: event.status === "completed" ? "pass" : "fail",
+      evidence: `${event.title}${url}.`,
+    });
   }
 
   return entries;
@@ -1753,7 +2201,11 @@ async function executeTool(
           },
         });
       }
-      return result;
+      // Keep environment-variable names available for diagnosis without ever returning their values
+      // to the model. Deterministic runtime preflights can still check local configuration directly.
+      return isSensitiveFilePath(pathArg) && result.exists
+        ? { ...result, content: redactSensitiveText(result.content), sensitiveValuesRedacted: true }
+        : result;
     }
     case "search_files": {
       const query = typeof args.query === "string" ? args.query : "";
@@ -1941,7 +2393,8 @@ async function executeTool(
       return { verified: result.verified, reason: result.reason };
     }
     case "run_command": {
-      const command = typeof args.command === "string" ? args.command : "";
+      const command = normalizeCommandForExecution(typeof args.command === "string" ? args.command : "");
+      args.command = command;
       if (deniedActions.some((entry) => commandPermissionIdentity(entry) === commandPermissionIdentity(command))) {
         return { exitCode: null, stdout: "", stderr: "The user denied this command.", skipped: "denied" };
       }
@@ -2001,7 +2454,13 @@ async function executeTool(
     }
     case "validate_browser": {
       if (!access.validateBrowser) return { available: false, verified: false, reason: "Real browser validation is not available in this connection mode." };
-      const url = typeof args.url === "string" ? args.url : "";
+      const authorizedUrl = task.match(/https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/[^\s]*)?/i)?.[0];
+      if (!authorizedUrl) {
+        return { available: false, verified: false, reason: "Foundry has not supplied an owned browser URL to this model call. Preview startup and browser verification remain runtime-owned." };
+      }
+      // The request's explicit URL is authoritative. Ignore a model-supplied substitute so a guessed
+      // default port can never validate a different application that happens to be running locally.
+      const url = authorizedUrl;
       await emit("preview", "running", `Validating ${url} in a real browser`, { tier: "trace", details: { url } });
       const result = await access.validateBrowser({
         url,
@@ -2117,15 +2576,36 @@ function makeNarrativeObject(
   };
 }
 
+function concreteEditEvidence(timeline: FactoryExecutionEvent[]) {
+  return timeline
+    .filter((event) => event.kind === "edit" && event.status === "completed" && event.filePath && event.output)
+    .slice(-6)
+    .map((event) => {
+      const lines = (event.output ?? "").split(/\r?\n/);
+      const removed = lines.filter((line) => line.startsWith("- ")).map((line) => line.slice(2).trim());
+      const added = lines.filter((line) => line.startsWith("+ ")).map((line) => line.slice(2).trim());
+      if (removed.length === 1 && added.length === 1 && removed[0].length <= 280 && added[0].length <= 280) {
+        return `${event.filePath}: ${removed[0]} → ${added[0]}`;
+      }
+      return `${event.title}${event.filePath ? ` (${event.filePath})` : ""}`;
+    });
+}
+
 function buildSessionSummary(timeline: FactoryExecutionEvent[], changedFiles: Set<string>, status: MissionExecutorResult["status"], blocker?: string): FactorySessionSummary {
   const narrative = timeline.map((event) => event.narrative).filter((item): item is FactoryNarrativeObject => Boolean(item));
   const findings = narrative.filter((item) => item.tier === "finding");
   const decisions = narrative.filter((item) => item.tier === "decision");
   const flags = narrative.filter((item) => item.tier === "flag");
   const changed = Array.from(changedFiles);
+  const editEvidence = concreteEditEvidence(timeline);
+  const reportedOutcome = [...timeline]
+    .reverse()
+    .find((event) => event.kind === "summary" && event.status === "completed")
+    ?.output?.trim();
   const outcome = status === "failed"
     ? blocker || "The mission did not complete."
-    : decisions.at(-1)?.rationale ||
+    : reportedOutcome ||
+      decisions.at(-1)?.rationale ||
       findings.at(-1)?.rationale ||
       (changed.length ? `Updated ${changed.length} file${changed.length === 1 ? "" : "s"} and verified the writes on disk.` : "No user-facing outcome was verified.");
 
@@ -2134,9 +2614,40 @@ function buildSessionSummary(timeline: FactoryExecutionEvent[], changedFiles: Se
     preserved: flags
       .filter((flag) => /preserv|kept|left|unchanged/i.test(flag.rationale) || /preserv/i.test(String(flag.details?.flagType ?? "")))
       .map((flag) => flag.rationale),
-    changes: decisions.length ? decisions.map((decision) => decision.rationale) : changed.map((filePath) => `Changed ${filePath}.`),
+    changes: editEvidence.length ? editEvidence : decisions.length ? decisions.map((decision) => decision.rationale) : changed.map((filePath) => `Changed ${filePath}.`),
     flags: flags.map((flag) => flag.rationale),
   };
+}
+
+function buildCompletionHandoff(
+  reportedSummary: string,
+  changedFiles: Set<string>,
+  commands: MissionExecutorResult["commands"],
+  timeline: FactoryExecutionEvent[],
+  narrativeObjects: FactoryNarrativeObject[],
+  checklist: FactoryObjectiveChecklistItem[],
+): string {
+  const cleanReported = reportedSummary.replace(/\s+/g, " ").trim();
+  const narrativeOutcome = [...narrativeObjects]
+    .reverse()
+    .find((item) => item.tier === "decision" || item.tier === "finding")
+    ?.rationale?.trim();
+  const outcome = cleanReported || narrativeOutcome || "The requested implementation is complete.";
+  const fileLine = changedFiles.size
+    ? `Changed files: ${Array.from(changedFiles).join(", ")}.`
+    : "Changed files: none; this mission completed through a verified operation.";
+  const passedCommands = commands.filter((command) => command.exitCode === 0).map((command) => command.command);
+  const passedPreviews = timeline.filter((event) => event.kind === "preview" && event.status === "completed").map((event) => event.title);
+  const checks = [...passedCommands, ...passedPreviews];
+  const verificationLine = checks.length
+    ? `Verified: ${checks.join("; ")}.`
+    : "Verified: no runtime check was available; only recorded file evidence supports this result.";
+  const limitations = checklist
+    .filter((item) => item.status === "skipped")
+    .map((item) => item.evidence?.trim() || item.label)
+    .filter(Boolean);
+  const limitationLine = limitations.length ? `Limitations: ${limitations.join("; ")}.` : "Limitations: none recorded.";
+  return [outcome, fileLine, verificationLine, limitationLine].join("\n");
 }
 
 function dependencyCommandCategory(command: string) {

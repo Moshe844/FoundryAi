@@ -11,6 +11,9 @@ export type FactoryFileEntry = {
   status: "created" | "edited" | "uploaded";
   size: number;
   content?: string;
+  /** SHA-256 of the complete on-disk content. Persisted only as an integrity fingerprint; never
+   * used as a substitute for reading or verifying the current project. */
+  contentHash?: string;
 };
 
 export type FactorySourceMode = "local-folder" | "uploaded-copy" | "new-project";
@@ -94,6 +97,8 @@ export type FactoryExecutionEvent = {
   details?: Record<string, string | number | boolean | string[] | undefined>;
   /** Engine-internal bookkeeping (exploratory reads, checklist sync, retry mechanics). Never render this to the user. */
   internal?: boolean;
+  /** Live lifecycle placeholder. Stream it, but do not persist it as durable mission evidence. */
+  transient?: boolean;
 };
 
 export type FactoryJournalEntry = {
@@ -208,6 +213,18 @@ export type FactoryCreateRequest = {
   discovery?: StructuredDiscovery;
   modelMode?: ModelMode;
   quality?: MissionQualityLevel;
+  /** Files selected or pasted during Discovery. Text is supplied as authoritative context, visual
+   * files are supplied to vision-capable execution, and project assets are copied into the workspace. */
+  evidenceAttachments?: FactoryEvidenceAttachment[];
+};
+
+export type FactoryEvidenceAttachment = {
+  fileName: string;
+  mediaType: string;
+  evidenceKind?: string;
+  uploadStatus: "readable" | "image" | "binary";
+  dataUrl?: string;
+  rawText?: string;
 };
 
 export type FactoryUploadedFile = {
@@ -219,13 +236,16 @@ export type FactoryUploadedFile = {
 /** Structured record of the mission this follow-up continues, sent verbatim instead of a flattened prose digest so the executor can act on real plan/decision state rather than re-deriving it from a paragraph. */
 export type MissionParentContext = {
   id: string;
+  /** Canonical connected root captured with the execution. Continuations and retries must match the
+   * current project root before any read, model call, command, or write is allowed. */
+  projectIdentity?: string;
   /** The original user request(s) this mission is still carrying out. Approval replies must resume
    * these requirements instead of replacing them with synthetic "Approved" text. */
   source_requirements: string[];
   /** Free-text mirror of ExecutionMissionState (kept as a plain string here to avoid a circular import between lib/factory/types.ts and lib/mission-engine.ts). */
   state: string;
   plan: FactoryObjectiveChecklistItem[];
-  files_touched: Array<{ path: string; status?: string; diffSummary?: string; verified: boolean }>;
+  files_touched: Array<{ path: string; status?: string; diffSummary?: string; verified: boolean; contentHash?: string }>;
   commands_run: Array<{ command: string; exitCode: number | null; approval_scope_label?: string }>;
   /** Rationale strings pulled from the narrative "decision" tier, most recent last, capped to a small number. */
   decisions: string[];
@@ -255,6 +275,13 @@ export type FactoryExistingProjectRequest = {
   approvedCommands?: string[];
   /** Structured record of the mission this follow-up continues. Replaces the old flattened missionDigest string. */
   parentMission?: MissionParentContext;
+  /** A prior successful mission whose normalized request exactly matches this turn. The server
+   * independently verifies every recorded file fingerprint and required project check before reuse. */
+  idempotencyCandidate?: MissionParentContext;
+  /** Present only when the user clicked the dedicated Retry control for this exact failed execution.
+   * Natural-language follow-ups must never enter retry recovery merely because a classifier inferred
+   * continuation. */
+  retryExecutionId?: string;
   /** Canonical resolution record for this follow-up. The runtime must not re-resolve its target. */
   followUpResolution?: FollowUpResolutionRecord;
   /** Whether this follow-up should revise the parent mission's still-open plan (carry_forward_plan) or replan from scratch (fresh_plan). Only meaningful when parentMission is present. */
@@ -269,8 +296,12 @@ export type FactoryExistingProjectRequest = {
   quality?: MissionQualityLevel;
   /** Auto chooses from the real task; an explicit mode pins the intelligence tier. */
   modelMode?: ModelMode;
-  /** Current-turn screenshot/image evidence sent to the execution model, never written into the project. */
-  evidenceImages?: Array<{ fileName: string; mediaType: string; dataUrl: string }>;
+  /** Current or continued user attachments available to an implementation mission. Readable files
+   * are supplied as authoritative model evidence; files requested as project assets are written and
+   * read-back verified before implementation. */
+  evidenceAttachments?: FactoryEvidenceAttachment[];
+  /** Backward-compatible image-only wire field used by older browser bundles. */
+  evidenceImages?: Array<{ fileName: string; mediaType: string; dataUrl: string; evidenceKind?: string }>;
 };
 
 export type FactoryFileReadResult = {

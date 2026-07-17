@@ -1,6 +1,6 @@
 "use client";
 
-import { Code2, FolderTree, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { ChevronDown, Code2, FolderTree, History, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { MissionRecommendation } from "@/lib/ai/mission/recommendations";
@@ -11,7 +11,7 @@ import type { MissionState } from "@/lib/mission-engine";
 import { deriveMissionDisplayStatus, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
 import { answerTaskFor, buildMissionVM } from "@/lib/canvas/adapter";
 import type { CanvasDotState, CanvasMissionVM } from "@/lib/canvas/model";
-import { dotStateOf, latestLiveEvent } from "@/lib/canvas/model";
+import { dotStateOf, latestLiveEvent, needsRepairAction } from "@/lib/canvas/model";
 import type { BlockedCommandAction } from "@/components/execution/ApprovalPrompt";
 import { CanvasComposer } from "@/components/canvas/CanvasComposer";
 import { CollapsedMissionRow } from "@/components/canvas/CollapsedMissionRow";
@@ -33,11 +33,15 @@ export function MissionCanvas({
   brief,
   execution,
   connectedPath,
+  localConnector,
   workspaceFiles,
   queuedTask,
   onStartProject,
   onViewFiles,
   onExecute,
+  onRetry,
+  onUndo,
+  onPreviewStateChange,
   onApproveCategory,
   onApproveCommand,
 }: {
@@ -45,11 +49,15 @@ export function MissionCanvas({
   brief: string;
   execution: FactoryProjectResult | null;
   connectedPath: string;
+  localConnector?: { url: string; token?: string; rootLabel: string };
   workspaceFiles: FactoryProjectResult["files"];
   queuedTask?: string;
   onStartProject: () => void;
   onViewFiles: () => void;
   onExecute: (task: string, approvalResponse?: ApprovalResponse, evidenceFiles?: File[]) => void;
+  onRetry?: (task: string, executionId: string) => void;
+  onUndo?: (executionId: string) => void;
+  onPreviewStateChange?: (preview: Pick<FactoryProjectResult, "previewState" | "previewUrl" | "previewPlatform" | "previewReason">) => void;
   onApproveCategory?: (category: string) => void;
   onApproveCommand?: (command: string) => void;
 }) {
@@ -72,6 +80,7 @@ export function MissionCanvas({
     } catch { /* storage unavailable — drafts just don't persist */ }
   }, [task, draftKey]);
   const [expandedPriorId, setExpandedPriorId] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [revealEventIds, setRevealEventIds] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const liveEdgeRef = useRef<HTMLDivElement | null>(null);
@@ -116,6 +125,7 @@ export function MissionCanvas({
     && !projectDeleted
     ? (activeExecution.source_requirements[0] || activeExecution.title || "").trim() || null
     : null;
+  const retryWillRepair = Boolean(activeExecution && needsRepairAction(activeExecution));
 
   const silenceMs = useElapsedSince(liveEvent?.timestamp, missionStatus.isBusy);
   const stalled = missionStatus.isBusy && isStalled(silenceMs);
@@ -123,7 +133,14 @@ export function MissionCanvas({
 
   // Preview dock: only a really-started surface can open it (§8).
   const [recoveredPreview, setRecoveredPreview] = useState<Partial<FactoryProjectResult> | null>(null);
-  const connectedProjectId = execution?.projectId || connectedPath.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) || "";
+  const connectedFolderName = connectedPath.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) || "";
+  // Generated projects are sometimes reopened through the local-folder execution path, whose
+  // execution id is prefixed with `local-`. Preview recovery, however, is intentionally rooted in
+  // Foundry's managed projects directory and therefore needs the real folder id. Keeping those two
+  // identities separate made the visible Preview button silently request a nonexistent folder.
+  const connectedProjectId = /[\\/]projects[\\/][^\\/]+[\\/]*$/i.test(connectedPath)
+    ? connectedFolderName
+    : execution?.projectId || connectedFolderName;
   const recoveredExecutionBase: FactoryProjectResult | null = connectedProjectId ? {
     projectId: connectedProjectId,
     projectName: projectTitleFor(mission),
@@ -137,16 +154,34 @@ export function MissionCanvas({
     files: execution?.files ?? workspaceFiles,
     commands: execution?.commands ?? [],
   } : null;
-  const effectiveExecution = recoveredPreview && recoveredExecutionBase
-    ? { ...recoveredExecutionBase, ...execution, ...recoveredPreview }
+  const applicableRecoveredPreview = recoveredPreview?.projectId === connectedProjectId ? recoveredPreview : null;
+  const effectiveExecution = applicableRecoveredPreview && recoveredExecutionBase
+    ? { ...recoveredExecutionBase, ...execution, ...applicableRecoveredPreview }
     : execution;
   const previewAvailable = effectiveExecution?.previewState === "ready"
     && Boolean(effectiveExecution.previewUrl || effectiveExecution.artifact || effectiveExecution.previewPlatform === "desktop");
+  const previewFailureReason = effectiveExecution?.previewState === "error"
+    ? effectiveExecution.previewReason || "The real preview failed its readiness check."
+    : undefined;
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [previewFullScreen, setPreviewFullScreen] = useState(false);
   const [previewWidthPct, setPreviewWidthPct] = useState(45);
   const autoOpenedForRef = useRef<string | null>(null);
   const middleRowRef = useRef<HTMLDivElement | null>(null);
+  const connectorUrl = localConnector?.url;
+  const connectorToken = localConnector?.token;
+  const connectorRootLabel = localConnector?.rootLabel;
+  const previewConnector = useMemo(() => connectorUrl && connectorRootLabel ? {
+    url: connectorUrl,
+    token: connectorToken,
+    rootLabel: connectorRootLabel,
+  } : undefined, [connectorUrl, connectorToken, connectorRootLabel]);
+  const hasExecution = Boolean(execution);
+  const onPreviewStateChangeRef = useRef(onPreviewStateChange);
+  useEffect(() => {
+    onPreviewStateChangeRef.current = onPreviewStateChange;
+  }, [onPreviewStateChange]);
 
   async function togglePreview() {
     if (previewOpen) {
@@ -159,48 +194,65 @@ export function MissionCanvas({
       setPreviewOpen(true);
       return;
     }
+    setPreviewLoading(true);
     try {
       const response = await fetch("/api/factory/preview", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ projectId: connectedProjectId, action: "refresh" }),
+        body: JSON.stringify({ projectId: connectedProjectId, action: "refresh", localConnector: previewConnector }),
       });
       const status = (await response.json().catch(() => null)) as Partial<FactoryProjectResult> | null;
       const ready = Boolean(response.ok && status?.previewState === "ready"
         && (status.previewUrl || status.artifact || status.previewPlatform === "desktop"));
-      if (ready) setRecoveredPreview(status);
+      if (status) {
+        const reconciled = ready ? status : { ...status, previewUrl: undefined, artifact: undefined };
+        setRecoveredPreview({ ...reconciled, projectId: connectedProjectId });
+        if (status.previewState && status.previewState !== execution?.previewState) onPreviewStateChangeRef.current?.(status);
+      }
       setPreviewOpen(ready);
     } catch {
       setPreviewOpen(false);
+    } finally {
+      setPreviewLoading(false);
     }
   }
 
   useEffect(() => {
-    setRecoveredPreview(null);
-    if (projectDeleted || !connectedProjectId || missionStatus.isBusy) return;
+    // A persisted runtime failure is already truthful evidence. Do not automatically relaunch the
+    // broken server on every parent-state reconciliation; that both churns processes and can replace
+    // the concrete first failure (for example a missing DATABASE_URL) with a generic second-attempt
+    // timeout. The explicit Retry preview action is the only recovery trigger from an error state.
+    if (projectDeleted || !connectedProjectId || execution?.previewState === "error" || execution?.status === "failed" || activeExecution?.state === "failed") return;
+    // Keep the last proven preview mounted while an edit is running. Clearing it here made the app
+    // disappear exactly when users need to watch their changes land, then reappear only at completion.
+    if (missionStatus.isBusy && hasExecution) return;
     let cancelled = false;
+    setPreviewLoading(true);
     void fetch("/api/factory/preview", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ projectId: connectedProjectId, action: "refresh" }),
+      body: JSON.stringify({ projectId: connectedProjectId, action: "refresh", localConnector: previewConnector }),
     }).then((response) => response.ok ? response.json() : null).then((preview) => {
       if (cancelled) return;
-      if (preview?.previewState === "ready") setRecoveredPreview(preview);
-      else setRecoveredPreview({ ...preview, previewState: preview?.previewState ?? "unavailable", previewUrl: undefined, artifact: undefined });
-    }).catch(() => undefined);
+      if (preview?.previewState === "ready") setRecoveredPreview({ ...preview, projectId: connectedProjectId });
+      else setRecoveredPreview({ ...preview, projectId: connectedProjectId, previewState: preview?.previewState ?? "unavailable", previewUrl: undefined, artifact: undefined });
+      if (preview?.previewState && preview.previewState !== execution?.previewState) onPreviewStateChangeRef.current?.(preview);
+    }).catch(() => undefined).finally(() => {
+      if (!cancelled) setPreviewLoading(false);
+    });
     return () => { cancelled = true; };
-  }, [connectedProjectId, execution?.previewState, missionStatus.isBusy, projectDeleted]);
+  }, [activeExecution?.state, connectedProjectId, execution?.previewState, execution?.status, hasExecution, previewConnector, missionStatus.isBusy, projectDeleted]);
 
   useEffect(() => {
-    const previewIdentity = effectiveExecution?.projectId
-      ? `${effectiveExecution.projectId}:${effectiveExecution.previewUrl ?? effectiveExecution.artifact?.downloadUrl ?? effectiveExecution.previewPlatform ?? "preview"}:${activeExecution?.id ?? "result"}`
+    const previewIdentity = connectedProjectId
+      ? `${connectedProjectId}:${effectiveExecution?.previewUrl ?? effectiveExecution?.artifact?.downloadUrl ?? effectiveExecution?.previewPlatform ?? "preview"}:${activeExecution?.id ?? "result"}`
       : null;
     if (effectiveExecution?.previewState === "ready" && previewIdentity && autoOpenedForRef.current !== previewIdentity) {
       autoOpenedForRef.current = previewIdentity;
       setPreviewOpen(true);
     }
-    if (!previewAvailable) setPreviewOpen(false);
-  }, [effectiveExecution?.previewState, effectiveExecution?.projectId, effectiveExecution?.previewUrl, effectiveExecution?.artifact?.downloadUrl, effectiveExecution?.previewPlatform, activeExecution?.id, previewAvailable]);
+    if (!previewAvailable && !missionStatus.isBusy) setPreviewOpen(false);
+  }, [connectedProjectId, effectiveExecution?.previewState, effectiveExecution?.previewUrl, effectiveExecution?.artifact?.downloadUrl, effectiveExecution?.previewPlatform, activeExecution?.id, previewAvailable, missionStatus.isBusy]);
 
   // §6.1 auto-follow: stay pinned while the user is at the live edge; any real upward
   // scroll breaks the follow, and nothing moves the viewport until they return.
@@ -303,6 +355,7 @@ export function MissionCanvas({
     const files = evidenceFiles;
     setEvidenceFiles([]);
     setExpandedPriorId(null);
+    setHistoryOpen(false);
     setRevealEventIds([]);
     scrollToLiveEdge("auto");
     onExecute(nextTask, undefined, files);
@@ -344,6 +397,7 @@ export function MissionCanvas({
   function handleSuggestion(recommendation: MissionRecommendation) {
     setTurnAccepted(true);
     setExpandedPriorId(null);
+    setHistoryOpen(false);
     setRevealEventIds([]);
     scrollToLiveEdge("auto");
     onExecute(recommendation.task);
@@ -375,11 +429,12 @@ export function MissionCanvas({
   ));
   const showStatusStrip = Boolean(activeExecution) && !liveEdgeVisible && (missionStatus.isBusy || missionStatus.isPausedForApproval || missionStatus.isPausedForUser);
   const dockOpen = previewAvailable && previewOpen;
+  const visibleFileCount = workspaceFiles.length || execution?.files.length || 0;
 
   return (
-    <section className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden border border-white/10 bg-[#0c1011]/95 shadow-workspace">
+    <section className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden border border-overlay/10 bg-foundry-surface/95 shadow-workspace">
       {/* Project Bar (§1.1) — the only place status lives when the live edge is off-screen. */}
-      <header className="flex h-12 items-center gap-3 border-b border-white/8 px-4 sm:px-5">
+      <header className="flex h-12 items-center gap-3 border-b border-overlay/8 px-4 sm:px-5">
         <StatusDot state={dotState} />
         <h1 className="min-w-0 truncate text-sm font-bold text-foundry-ink">{projectTitleFor(mission)}</h1>
         {editingTarget ? <span className="hidden min-w-0 truncate font-mono text-[11px] text-foundry-subtle md:inline">{editingTarget}</span> : null}
@@ -388,28 +443,29 @@ export function MissionCanvas({
             type="button"
             onClick={onViewFiles}
             disabled={projectDeleted}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-bold text-foundry-subtle transition hover:bg-white/[0.05] hover:text-foundry-ink disabled:cursor-not-allowed disabled:opacity-65 disabled:hover:bg-transparent disabled:hover:text-foundry-subtle"
+            className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-bold text-foundry-subtle transition hover:bg-overlay/[0.05] hover:text-foundry-ink disabled:cursor-not-allowed disabled:opacity-65 disabled:hover:bg-transparent disabled:hover:text-foundry-subtle"
             title={projectDeleted ? "This project folder was deleted" : "Browse project files"}
           >
             <FolderTree size={14} />
-            {projectDeleted ? "Project deleted" : workspaceFiles.length || execution?.files.length ? `${workspaceFiles.length || execution?.files.length} files` : "Files"}
+            {projectDeleted ? "Project deleted" : visibleFileCount ? `${visibleFileCount} ${visibleFileCount === 1 ? "file" : "files"}` : "Files"}
           </button>
-          {connectedProjectId && !projectDeleted && !missionStatus.isBusy ? (
+          {connectedProjectId && !projectDeleted ? (
             <button
               type="button"
               onClick={() => void togglePreview()}
+              disabled={previewLoading}
               aria-pressed={dockOpen}
-              className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-bold text-foundry-subtle transition hover:bg-white/[0.05] hover:text-foundry-ink"
-              title={dockOpen ? "Close the preview" : "Open the preview"}
+              className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-bold text-foundry-subtle transition hover:bg-overlay/[0.05] hover:text-foundry-ink disabled:cursor-wait disabled:opacity-70"
+              title={previewLoading ? "Starting the project preview" : previewFailureReason ? `Preview failed: ${previewFailureReason}` : dockOpen ? "Close the preview" : "Open the preview"}
             >
               {dockOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
-              Preview
+              {previewLoading ? "Starting preview..." : previewFailureReason ? "Preview failed" : "Preview"}
             </button>
           ) : null}
           <button
             type="button"
             onClick={onStartProject}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-bold text-foundry-subtle transition hover:bg-white/[0.05] hover:text-foundry-ink"
+            className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-bold text-foundry-subtle transition hover:bg-overlay/[0.05] hover:text-foundry-ink"
           >
             <Code2 size={14} />
             New Project
@@ -425,28 +481,57 @@ export function MissionCanvas({
           style={dockOpen ? { flexBasis: `${100 - previewWidthPct}%` } : undefined}
         >
           <div className={`w-full px-6 py-6 ${dockOpen ? "" : "mx-auto max-w-[856px]"}`}>
+            {previewFailureReason ? (
+              <div role="alert" className="mx-auto mb-4 flex max-w-[760px] items-start justify-between gap-4 rounded-lg border border-red-400/30 bg-red-400/[0.08] px-4 py-3 text-sm text-foundry-ink">
+                <div>
+                  <p className="font-extrabold">Preview failed</p>
+                  <p className="mt-1 text-[12px] leading-5 text-foundry-muted">{previewFailureReason}</p>
+                </div>
+                <button type="button" onClick={() => void togglePreview()} className="shrink-0 rounded-md border border-overlay/15 px-2.5 py-1 text-[11px] font-bold text-foundry-ink hover:bg-overlay/[0.06]">
+                  Retry preview
+                </button>
+              </div>
+            ) : null}
             <div className="mx-auto max-w-[760px]">
               {mission.compaction ? (
                 <p className="mb-3 text-[11px] leading-5 text-foundry-subtle">Earlier project activity compacted into project memory.</p>
               ) : null}
               {priorVMs.length ? (
-                <div className="mb-8 grid gap-0.5">
-                  {priorVMs.map((vm) => (
-                    <CollapsedMissionRow
-                      key={vm.id}
-                      vm={vm}
-                      expanded={expandedPriorId === vm.id}
-                      onToggle={() => setExpandedPriorId((current) => (current === vm.id ? null : vm.id))}
-                    />
-                  ))}
-                </div>
+                <section className="mb-8 overflow-hidden rounded-lg border border-overlay/8 bg-overlay/[0.018]" aria-label="Previous messages">
+                  <button
+                    type="button"
+                    aria-expanded={historyOpen}
+                    onClick={() => {
+                      setHistoryOpen((current) => !current);
+                      if (historyOpen) setExpandedPriorId(null);
+                    }}
+                    className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-foundry-muted transition hover:bg-overlay/[0.035] hover:text-foundry-ink"
+                  >
+                    <History size={14} className="text-foundry-subtle" aria-hidden="true" />
+                    <span>Previous messages</span>
+                    <span className="rounded-full bg-overlay/[0.055] px-2 py-0.5 font-mono text-[10px] text-foundry-subtle">{priorVMs.length}</span>
+                    <ChevronDown size={14} className={`ml-auto text-foundry-subtle transition-transform ${historyOpen ? "rotate-180" : ""}`} aria-hidden="true" />
+                  </button>
+                  {historyOpen ? (
+                    <div className="canvas-enter border-t border-overlay/8 px-1.5 py-1.5">
+                      {priorVMs.map((vm) => (
+                        <CollapsedMissionRow
+                          key={vm.id}
+                          vm={vm}
+                          expanded={expandedPriorId === vm.id}
+                          onToggle={() => setExpandedPriorId((current) => (current === vm.id ? null : vm.id))}
+                        />
+                      ))}
+                    </div>
+                  ) : null}
+                </section>
               ) : null}
 
               {activeVM ? (
                 <MissionBlock
                   vm={activeVM}
                   revealEventIds={revealEventIds}
-                  liveActivity={liveEvent ? { text: liveEvent.text, elapsedMs: silenceMs } : null}
+                  liveActivity={liveEvent ? { id: liveEvent.id, text: liveEvent.text, elapsedMs: silenceMs } : null}
                   suggestions={recommendations}
                   onAnswer={handleAnswer}
                   onApprove={handleApprove}
@@ -473,7 +558,7 @@ export function MissionCanvas({
             <button
               type="button"
               onClick={() => scrollToLiveEdge()}
-              className="canvas-enter sticky bottom-4 left-full mr-4 flex items-center gap-2 rounded-full border border-white/15 bg-[#101617] px-3.5 py-1.5 text-[12px] font-bold text-foundry-ink shadow-lg transition hover:border-foundry-teal/40"
+              className="canvas-enter sticky bottom-4 left-full mr-4 flex items-center gap-2 rounded-full border border-overlay/15 bg-foundry-raised px-3.5 py-1.5 text-[12px] font-bold text-foundry-ink shadow-lg transition hover:border-foundry-teal/40"
             >
               <span className="h-1.5 w-1.5 rounded-full bg-foundry-teal" aria-hidden="true" />
               {missedEvents} new event{missedEvents === 1 ? "" : "s"} ↓
@@ -492,13 +577,13 @@ export function MissionCanvas({
                 if (event.key === "ArrowLeft") setPreviewWidthPct((value) => Math.min(60, value + 4));
                 if (event.key === "ArrowRight") setPreviewWidthPct((value) => Math.max(30, value - 4));
               }}
-              className="w-1.5 shrink-0 cursor-col-resize bg-white/5 transition hover:bg-foundry-teal/40 focus:bg-foundry-teal/40 focus:outline-none"
+              className="w-1.5 shrink-0 cursor-col-resize bg-overlay/5 transition hover:bg-foundry-teal/40 focus:bg-foundry-teal/40 focus:outline-none"
               aria-label="Resize the preview"
             /> : null}
             <div
               className={previewFullScreen
-                ? "fixed inset-3 z-50 flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-white/15 bg-[#080b0c] shadow-2xl"
-                : "flex min-h-0 min-w-0 flex-col border-l border-white/10 bg-black/10"}
+                ? "fixed inset-3 z-50 flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-overlay/15 bg-foundry-bg shadow-2xl"
+                : "flex min-h-0 min-w-0 flex-col border-l border-overlay/10 bg-shade/10"}
               style={previewFullScreen ? undefined : { flexBasis: `${previewWidthPct}%` }}
             >
               <EngineeringWorkspacePanel
@@ -514,16 +599,20 @@ export function MissionCanvas({
 
       <div>
         {retryableTask ? (
-          <div className="flex flex-wrap items-center gap-2.5 border-t border-white/8 bg-black/20 px-4 py-2 sm:px-6">
+          <div className="flex flex-wrap items-center gap-2.5 border-t border-overlay/8 bg-shade/20 px-4 py-2 sm:px-6">
             <span className="text-[12px] text-foundry-muted">
-              {activeExecution?.state === "cancelled" ? "The last run was interrupted before it finished." : "The last run didn't finish."}
+              {activeExecution?.state === "cancelled"
+                ? "The last run was interrupted before it finished."
+                : retryWillRepair
+                  ? "The implementation is on disk, but verification found issues that still need repair."
+                  : "The last run didn't finish."}
             </span>
             <button
               type="button"
               className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-2.5 py-1 text-[12px] font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
-              onClick={() => onExecute(retryableTask)}
+              onClick={() => activeExecution && (onRetry ? onRetry(retryableTask, activeExecution.id) : onExecute(retryableTask))}
             >
-              Retry this task
+              {retryWillRepair ? "Fix verified issues" : "Retry this task"}
             </button>
           </div>
         ) : null}
@@ -531,7 +620,7 @@ export function MissionCanvas({
           <button
             type="button"
             onClick={() => scrollToLiveEdge()}
-            className="flex h-8 w-full items-center gap-2.5 border-t border-white/8 bg-black/30 px-4 text-left sm:px-6"
+            className="flex h-8 w-full items-center gap-2.5 border-t border-overlay/8 bg-shade/30 px-4 text-left sm:px-6"
             aria-label="Jump to the live edge"
           >
             <StatusDot state={dotState} />
@@ -556,11 +645,12 @@ export function MissionCanvas({
           onChange={setTask}
           onSend={send}
           onStop={() => onExecute("stop")}
-          onUndo={() => onExecute("Undo the last file change")}
+          onUndo={() => activeExecution && (onUndo ? onUndo(activeExecution.id) : onExecute("Undo the last file change"))}
           onAddEvidence={(files) => {
             if (!files) return;
             setEvidenceFiles((current) => [...current, ...Array.from(files)]);
           }}
+          onRemoveEvidence={(index) => setEvidenceFiles((current) => current.filter((_, currentIndex) => currentIndex !== index))}
           onClearEvidence={() => setEvidenceFiles([])}
         />
       </div>
@@ -655,7 +745,7 @@ function IdleConnectLine({ brief, editingTarget, fileCount }: { brief: string; e
   return (
     <p className="max-w-[70ch] text-[15px] leading-[1.6] text-foundry-muted">
       {isExisting
-        ? `Connected to ${editingTarget || "the project"}${fileCount ? ` — ${fileCount} files readable` : ""}. Ask a question to inspect without edits, or describe a change.`
+        ? `Connected to ${editingTarget || "the project"}${fileCount ? ` — ${fileCount} ${fileCount === 1 ? "file" : "files"} readable` : ""}. Ask a question to inspect without edits, or describe a change.`
         : "This project is empty. Describe the first thing to build."}
     </p>
   );

@@ -35,7 +35,7 @@ const INSPECTOR_TOOLS: NeutralTool[] = [
   },
   {
     name: "answer",
-    description: "Give the final answer to the user's question. Call this once you have read enough real files to answer accurately, never before.",
+    description: "Give the final answer to the user's question. For questions about this project, call it only after reading enough real files to answer accurately; for general programming/technology questions, call it directly without reading files.",
     parameters: { type: "object", additionalProperties: false, properties: { text: { type: "string" } }, required: ["text"] },
   },
 ];
@@ -100,6 +100,7 @@ export async function runReadOnlyInspection(input: {
     "You answer a question about a real, already-connected software project by reading its actual files — you investigate like an engineer skimming a codebase, not a script that reads everything indiscriminately.",
     "Before you call a tool, if the reason isn't already obvious from what you just said, say one short plain sentence connecting it to the user's actual question — e.g. \"Checking server.js because the question mentions an upload token.\" Don't restate the same reasoning again in different words turn after turn; speak again only when your understanding changes.",
     "Most questions can be answered from a small number of well-chosen files — an entry point, a config/README, and whatever plausibly matches the question's own keywords. Do not read the whole project and do not open a file you have no real reason to open.",
+    "If the question is general programming/technology knowledge and not about this project's own code or behavior, answer it directly from knowledge — do not read any files first.",
     "Answer as soon as you have a real, useful answer — never keep reading just to be thorough. A grounded partial answer beats an exhaustive one that never arrives.",
     "Never invent file names or behavior. Only describe what you actually read.",
     "Do not write or modify any files — you have no ability to do so in this mode.",

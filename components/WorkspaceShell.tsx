@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createInitialMission } from "@/lib/mission-engine";
-import type { CreatedArtifact, ExecutionMission, ExecutionMissionState, MissionState } from "@/lib/mission-engine";
+import type { CreatedArtifact, ExecutionMission, ExecutionMissionState, MissionState, PendingClarification } from "@/lib/mission-engine";
 import { computeMissionState, verificationStatusFrom } from "@/lib/mission/state";
 import { deriveMissionDisplayStatus, getActiveExecutionMission } from "@/lib/mission/status";
 import { BuildDashboard } from "@/components/BuildDashboard";
@@ -12,7 +12,9 @@ import { approvalScopeLabel } from "@/lib/ai/mission/command-permissions";
 import { artifactKindForOutcome } from "@/lib/artifacts";
 import { classifyEvidenceKind, ingestFile } from "@/lib/files";
 import { executeBrowserFolderTask, getBrowserFolderHandle, readBrowserFolderFiles } from "@/lib/factory/browser-folder";
+import { customInstructionsFromProjectBrief } from "@/lib/factory/project-brief";
 import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryProjectResult, FactoryUploadedFile, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
+import { mergeExecutionTimelines } from "@/lib/factory/event-contract";
 import type { WorkspaceAttachment } from "@/lib/files";
 import type { SourceReference } from "@/lib/sources/types";
 import type { VisualArtifact } from "@/lib/visual-artifacts";
@@ -21,12 +23,15 @@ import { readStoredMissionQuality } from "@/lib/ai/mission/quality-mode";
 import {
   classifyFollowUpControl,
   fallbackFollowUpResolution,
+  isAcceptedInterpretationReply,
   isApprovalReplyMessage,
-  isBareContinuationMessage,
   normalizeFollowUpResolution,
+  standaloneMutationIntent,
   LatestFollowUpQueue,
 } from "@/lib/mission/classifyFollowUp";
 import type { FollowUpResolutionRecord, ProjectTurnIntent } from "@/lib/mission/classifyFollowUp";
+import type { DeliveredProjectFile } from "@/lib/mission/model";
+import { explicitProjectFileNames, isExplicitLocalProjectFileRequest } from "@/lib/sources/intent";
 
 export type WorkspaceNote = {
   id: string;
@@ -39,6 +44,8 @@ export type WorkspaceNote = {
   attachments?: WorkspaceAttachment[];
   sources?: SourceReference[];
   visualArtifact?: VisualArtifact;
+  /** Durable ownership for asynchronous answers; never infer this from whichever turn is active later. */
+  replyToMessageId?: string;
 };
 
 export type StagedAttachment = WorkspaceAttachment;
@@ -63,6 +70,7 @@ type ProjectMessageIntent = ProjectTurnIntent;
 const projectMessageIntents: ProjectMessageIntent[] = ["question", "inspection", "diagnose", "status", "debug", "edit", "undo", "continue", "retrospective", "clarify"];
 
 type ProjectMessageIntentResolution = FollowUpResolutionRecord;
+type ProjectAnswerResult = { answer: string; deliveredFiles?: DeliveredProjectFile[]; sources?: SourceReference[] };
 
 function createInitialWorkspace(): WorkspaceState {
   const mission = createInitialMission();
@@ -279,7 +287,10 @@ function normalizeMission(mission: MissionState): MissionState {
     attachments: normalizeAttachments(message.attachments ?? []),
     visualArtifact: message.visualArtifact ? normalizeVisualArtifact(message.visualArtifact, mission.missionId) : undefined,
   }));
-  const executionMissions = recoverOverwrittenFollowUpTurn(mission, normalizeExecutionMissions(mission), messages);
+  const executionMissions = repairExplicitAnswerOwnership(
+    recoverOverwrittenFollowUpTurn(mission, repairUnsafeRecoveredFollowUpTurns(normalizeExecutionMissions(mission)), messages),
+    messages,
+  );
 
   return {
     ...mission,
@@ -337,9 +348,17 @@ function recoverOverwrittenFollowUpTurn(mission: MissionState, executions: Execu
 
   const requestTimestamp = Number(orphanedRequest.id.match(/^message-(\d+)/)?.[1]);
   if (!Number.isFinite(requestTimestamp)) return executions;
+  const activeStartedAt = Date.parse(active.created_at);
+  const activeEndedAt = Date.parse(active.updated_at);
+  // This migration is only valid when the orphaned request happened strictly inside the reused
+  // execution's lifetime. Older unrelated requests must never be grafted onto the newest answer.
+  if (!Number.isFinite(activeStartedAt) || !Number.isFinite(activeEndedAt) || requestTimestamp <= activeStartedAt || requestTimestamp > activeEndedAt) {
+    return executions;
+  }
   const requestIso = new Date(requestTimestamp).toISOString();
   const earlierTimeline = active.timeline.filter((event) => Date.parse(event.timestamp) < requestTimestamp);
   const followUpTimeline = active.timeline.filter((event) => Date.parse(event.timestamp) >= requestTimestamp);
+  if (!earlierTimeline.length || !followUpTimeline.length) return executions;
   const priorTerminal = [...earlierTimeline].reverse().find((event) => event.kind === "summary");
   const priorFailed = priorTerminal?.status === "error";
   const priorId = `${active.id}-recovered-prior-${requestTimestamp}`;
@@ -369,6 +388,44 @@ function recoverOverwrittenFollowUpTurn(mission: MissionState, executions: Execu
     created_at: requestIso,
   };
   return [...executions.slice(0, index), prior, current, ...executions.slice(index + 1)];
+}
+
+/** Undo previously persisted speculative recovery pairs that could bind a new answer to an old ask. */
+function repairUnsafeRecoveredFollowUpTurns(executions: ExecutionMission[]): ExecutionMission[] {
+  let repaired = [...executions];
+  for (const prior of executions) {
+    const recoveredAt = Number(prior.id.match(/-recovered-prior-(\d+)$/)?.[1]);
+    if (!Number.isFinite(recoveredAt)) continue;
+    const current = repaired.find((entry) => entry.parent_mission_id === prior.id);
+    if (!current) continue;
+    const validWindow = recoveredAt > Date.parse(prior.created_at) && recoveredAt <= Date.parse(current.updated_at);
+    if (validWindow && prior.timeline.length && current.timeline.length) continue;
+    const restored: ExecutionMission = {
+      ...current,
+      source_requirements: prior.source_requirements,
+      request_message_id: prior.request_message_id,
+      parent_mission_id: prior.parent_mission_id,
+      created_at: prior.created_at,
+      timeline: mergeExecutionTimeline(prior.timeline, current.timeline),
+    };
+    repaired = repaired.filter((entry) => entry.id !== prior.id).map((entry) => entry.id === current.id ? restored : entry);
+  }
+  return repaired;
+}
+
+/** New records carry an explicit reply edge, allowing reload normalization without temporal guesses. */
+function repairExplicitAnswerOwnership(executions: ExecutionMission[], messages: WorkspaceNote[]): ExecutionMission[] {
+  const messagesById = new Map(messages.map((message) => [message.id, message]));
+  return executions.map((execution) => {
+    const resultMessage = execution.result_message_id ? messagesById.get(execution.result_message_id) : undefined;
+    const requestMessage = resultMessage?.replyToMessageId ? messagesById.get(resultMessage.replyToMessageId) : undefined;
+    if (!requestMessage || requestMessage.author !== "You") return execution;
+    return {
+      ...execution,
+      request_message_id: requestMessage.id,
+      source_requirements: [requestMessage.body],
+    };
+  });
 }
 
 function normalizeExecutionMissions(mission: MissionState): ExecutionMission[] {
@@ -793,7 +850,7 @@ export function WorkspaceShell() {
     }));
   }
 
-  async function executeProjectMission(missionId: string, task: string, approvalResponse?: FactoryExistingProjectRequest["approvalResponse"], evidenceFiles: File[] = []) {
+  async function executeProjectMission(missionId: string, task: string, approvalResponse?: FactoryExistingProjectRequest["approvalResponse"], evidenceFiles: File[] = [], control?: { retryExecutionId?: string; undoExecutionId?: string }) {
     const targetMission = workspaceRef.current.missions.find((item) => item.missionId === missionId);
     const recoveryQuestion = targetMission?.pendingClarification?.question.startsWith("A queued instruction survived the reload:");
     if (recoveryQuestion && /^Discard it\b/i.test(task.trim())) {
@@ -864,13 +921,92 @@ export function WorkspaceShell() {
       return;
     }
 
-    await executeProjectMissionNow(missionId, task, approvalResponse, evidenceAttachments);
+    await executeProjectMissionNow(missionId, task, approvalResponse, evidenceAttachments, control);
 
     let queuedTask = takeQueuedTask(missionId);
     while (queuedTask) {
       await executeProjectMissionNow(missionId, queuedTask.task, undefined, queuedTask.evidenceAttachments);
       queuedTask = takeQueuedTask(missionId);
     }
+  }
+
+  /** Reconcile a post-reload/manual preview probe into the same durable project truth used by the
+   * canvas, sidebar, and footer. A build-only historical result must not remain Complete after the
+   * real runtime returns an error, and a later proven recovery may clear only this preview blocker. */
+  function reconcileProjectPreview(
+    missionId: string,
+    preview: Pick<FactoryProjectResult, "previewState" | "previewUrl" | "previewPlatform" | "previewReason">,
+  ) {
+    const now = new Date().toISOString();
+    setWorkspace((current) => ({
+      ...current,
+      missions: current.missions.map((item) => {
+        if (item.missionId !== missionId) return item;
+        const artifact = item.createdArtifacts.find((entry) => entry.title === "Project Execution");
+        const result = artifact ? safeParseExecutionResult(artifact.body) : null;
+        const active = getActiveExecutionMission(item);
+        if (!artifact || !result || !active) return item;
+
+        const lostVerifiedWebPreview = preview.previewState === "unavailable"
+          && result.previewPlatform === "web"
+          && result.previewState === "ready";
+        const failed = preview.previewState === "error" || lostVerifiedWebPreview;
+        const verified = preview.previewState === "ready";
+        const failureReason = preview.previewReason || "The real preview failed its readiness check.";
+        const previewBlocker = `Preview verification failed: ${failureReason}`;
+        const recoveringPreviewBlocker = preview.previewState === "ready" && active.blocked_reason?.startsWith("Preview verification failed:");
+        const nextResult: FactoryProjectResult = {
+          ...result,
+          ...preview,
+          ...(failed ? { status: "failed", blocker: previewBlocker } : recoveringPreviewBlocker ? { status: "passed", blocker: undefined } : {}),
+        };
+        const previewEvidence = {
+          check_type: "preview" as const,
+          result: failed ? "fail" as const : verified ? "pass" as const : "skipped" as const,
+          evidence: failed || !verified ? failureReason : `Live preview responded successfully at ${preview.previewUrl || "its verified local URL"}.`,
+        };
+        const timelineEvent: FactoryExecutionEvent = {
+          id: `preview-reconciliation-${Date.now()}`,
+          timestamp: now,
+          tier: failed ? "flag" : "finding",
+          kind: "preview",
+          status: failed ? "error" : verified ? "completed" : "skipped",
+          title: failed ? "Preview failed its live readiness check" : verified ? "Preview readiness verified" : "Preview unavailable",
+          details: { state: preview.previewState, reason: preview.previewReason, previewUrl: preview.previewUrl },
+        };
+        const nextExecution = {
+          ...active,
+          ...(failed ? {
+            state: "failed" as const,
+            verification_status: "failed" as const,
+            blocked_reason: previewBlocker,
+          } : recoveringPreviewBlocker ? {
+            state: "complete" as const,
+            verification_status: "passed" as const,
+            blocked_reason: undefined,
+          } : {}),
+          verification: [...active.verification.filter((entry) => entry.check_type !== "preview"), previewEvidence],
+          timeline: [...active.timeline.filter((event) => event.id !== timelineEvent.id), timelineEvent],
+          updated_at: now,
+        };
+        const nextArtifact: CreatedArtifact = { ...artifact, body: JSON.stringify(nextResult, null, 2), description: `Factory execution ${nextResult.status}.` };
+
+        return {
+          ...item,
+          createdArtifacts: [nextArtifact, ...item.createdArtifacts.filter((entry) => entry.id !== artifact.id)],
+          executionMissions: item.executionMissions.map((entry) => entry.id === active.id ? nextExecution : entry),
+          lastResult: failed ? previewBlocker : recoveringPreviewBlocker ? "The real project runtime and preview are verified." : item.lastResult,
+          workMemory: {
+            ...item.workMemory,
+            currentBlocker: failed ? previewBlocker : recoveringPreviewBlocker ? "" : item.workMemory.currentBlocker,
+            latestEvidence: [previewEvidence.evidence, ...item.workMemory.latestEvidence.filter((entry) => entry !== previewEvidence.evidence)].slice(0, 12),
+            recommendedNextAction: failed ? "Configure the reported runtime dependency, then retry the preview." : item.workMemory.recommendedNextAction,
+            updatedAt: now,
+          },
+          updatedAt: now,
+        };
+      }),
+    }));
   }
 
   function takeQueuedTask(missionId: string) {
@@ -941,9 +1077,14 @@ export function WorkspaceShell() {
     }));
   }
 
-  async function executeProjectMissionNow(missionId: string, task: string, approvalResponse?: FactoryExistingProjectRequest["approvalResponse"], evidenceAttachments: WorkspaceAttachment[] = []) {
+  async function executeProjectMissionNow(missionId: string, task: string, approvalResponse?: FactoryExistingProjectRequest["approvalResponse"], evidenceAttachments: WorkspaceAttachment[] = [], control?: { retryExecutionId?: string; undoExecutionId?: string }) {
     const targetMission = workspaceRef.current.missions.find((item) => item.missionId === missionId);
     if (!targetMission) return;
+    const pendingInterpretation = targetMission.pendingClarification;
+    const confirmsPendingInterpretation = Boolean(pendingInterpretation && isAcceptedInterpretationReply(task));
+    const confirmedInterpretationTask = confirmsPendingInterpretation && pendingInterpretation
+      ? taskFromAcceptedInterpretation(pendingInterpretation)
+      : undefined;
 
     const requestedAt = new Date();
     const requestNote: WorkspaceNote = {
@@ -951,7 +1092,10 @@ export function WorkspaceShell() {
       author: "You",
       initials: "ME",
       time: requestedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      body: task,
+      // DecisionPrompt packages context into a synthetic control string for engine continuity. That
+      // payload is not what the user wrote and must never be rendered as their message. Show the
+      // concrete task they just accepted instead.
+      body: confirmedInterpretationTask || task,
       tone: "human",
       tags: ["Project request"],
       attachments: evidenceAttachments,
@@ -970,7 +1114,7 @@ export function WorkspaceShell() {
               attachments: mergeAttachments(item.attachments, evidenceAttachments),
               executionMissions: [
                 ...item.executionMissions,
-                createPendingExecutionMission(item, task, requestNote.id),
+                createPendingExecutionMission(item, confirmedInterpretationTask || task, requestNote.id),
               ],
               activeExecutionMissionId: pendingExecutionId,
               // Any new turn supersedes a still-open clarify prompt — whether this turn IS the answer
@@ -986,21 +1130,92 @@ export function WorkspaceShell() {
     }));
 
     const activeBeforeRequest = getActiveExecutionMission(targetMission);
+    const retryExecution = control?.retryExecutionId
+      ? targetMission.executionMissions.find((entry) => entry.id === control.retryExecutionId && (entry.state === "failed" || entry.state === "cancelled"))
+      : undefined;
+    const undoExecution = control?.undoExecutionId
+      ? targetMission.executionMissions.find((entry) => entry.id === control.undoExecutionId)
+      : undefined;
+    const exactMissionRetry = Boolean(retryExecution);
     const resolvesExecutionDecisions = activeBeforeRequest?.state === "waiting_for_user" && /^Resolved project decisions:/i.test(task.trim());
-    const explicitMissionContinuation = Boolean(
-      activeBeforeRequest
-      && isBareContinuationMessage(task)
-      && executionNeedsContinuation(activeBeforeRequest),
-    );
     const context = projectIntentContextForMission(targetMission);
-    const resolvedIntent = approvalResponse
+    const confirmedResolution = confirmedInterpretationTask
+      ? fallbackFollowUpResolution(confirmedInterpretationTask, context)
+      : undefined;
+    let resolvedIntent = undoExecution
+      ? {
+          ...fallbackFollowUpResolution(task, context),
+          currentIntent: "undo" as const,
+          continuity: "not_applicable" as const,
+          referencedPriorAction: {
+            executionId: undoExecution.id,
+            description: undoExecution.summary || undoExecution.source_requirements.join("\n") || undoExecution.title,
+            createdAt: undoExecution.created_at,
+            updatedAt: undoExecution.updated_at,
+          },
+          relevantFiles: undoExecution.files_touched.map((file) => file.path),
+          expectedScope: `Revert only the journaled file changes made by execution ${undoExecution.id}.`,
+          destructive: true,
+          referenceConfidence: 1,
+          plannedAction: `Restore the files changed by execution ${undoExecution.id} to their immediately preceding recorded versions.`,
+          rationale: "The user clicked the dedicated Undo control, which identifies the exact recorded execution without natural-language guessing.",
+          clarifyingQuestion: "",
+          clarifyingOptions: [],
+        }
+      : exactMissionRetry && retryExecution
+      ? {
+          ...fallbackFollowUpResolution(task, context),
+          currentIntent: "continue" as const,
+          continuity: "carry_forward_plan" as const,
+          referencedPriorAction: {
+            executionId: retryExecution.id,
+            description: retryExecution.source_requirements.join("\n") || retryExecution.title,
+            createdAt: retryExecution.created_at,
+            updatedAt: retryExecution.updated_at,
+          },
+          expectedScope: `Resume failed execution ${retryExecution.id} against the same connected project and authoritative saved brief.`,
+          destructive: false,
+          referenceConfidence: 1,
+          plannedAction: "Revalidate the exact failed mission cheaply; if a real gate still fails, repair that recorded evidence and repeat the same verification.",
+          rationale: "The user clicked the dedicated Retry this task control, which identifies the failed execution exactly.",
+          clarifyingQuestion: "",
+          clarifyingOptions: [],
+        }
+      : confirmedResolution
+      ? {
+          ...confirmedResolution,
+          currentIntent: confirmedResolution.currentIntent === "clarify" ? "edit" as const : confirmedResolution.currentIntent,
+          plannedAction: confirmedInterpretationTask!,
+          continuity: confirmedResolution.continuity === "not_applicable" ? "fresh_plan" as const : confirmedResolution.continuity,
+          referenceConfidence: 1,
+          clarifyingQuestion: "",
+          clarifyingOptions: [],
+          rationale: "The user explicitly accepted Foundry's pending interpretation. Execute that stored interpretation directly without reclassifying the synthetic control reply.",
+        }
+      : approvalResponse
       ? { ...fallbackFollowUpResolution(task, context), currentIntent: "edit" as const, continuity: "carry_forward_plan" as const, referenceConfidence: 1, plannedAction: `Resolve the recorded approval decision for ${approvalResponse.requestedCommand}.` }
-      : explicitMissionContinuation
-        ? fallbackFollowUpResolution(task, context)
-        : await resolveProjectMessageIntent(targetMission, task);
+      : await resolveProjectMessageIntent(targetMission, task);
+    const currentStandaloneMutation = standaloneMutationIntent(task);
+    if (!exactMissionRetry && !approvalResponse && currentStandaloneMutation && !isMutatingProjectIntent(resolvedIntent.currentIntent)) {
+      resolvedIntent = {
+        ...resolvedIntent,
+        currentIntent: currentStandaloneMutation,
+        referencedPriorAction: null,
+        relevantFiles: [],
+        expectedScope: "Implement only the current message against the active project.",
+        destructive: false,
+        referenceConfidence: 1,
+        plannedAction: task,
+        continuity: "fresh_plan",
+        rationale: "The current message contains a complete standalone change request, so a non-mutating model classification cannot turn it into a status answer or fold it into an older execution.",
+        clarifyingQuestion: "",
+        clarifyingOptions: [],
+      };
+    }
     const projectIntent = resolvesExecutionDecisions ? "edit" : resolvedIntent.currentIntent;
     const continuity = resolvesExecutionDecisions ? "carry_forward_plan" : resolvedIntent.continuity;
     const { clarifyingQuestion, clarifyingOptions } = resolvedIntent;
+    const effectiveTask = confirmedInterpretationTask || task;
 
     if (projectIntent === "clarify") {
       // Ambiguous follow-up: ask instead of guessing. Retract the pending execution mission created above
@@ -1014,14 +1229,17 @@ export function WorkspaceShell() {
           item.missionId === missionId
             ? {
                 ...item,
-                executionMissions: item.executionMissions.filter((entry) => entry.id !== pendingExecutionId),
-                activeExecutionMissionId: previousActiveExecutionMissionId,
+                executionMissions: item.executionMissions.map((entry) => entry.id === pendingExecutionId
+                  ? { ...entry, state: "waiting_for_user" as const, updated_at: requestedAt.toISOString() }
+                  : entry),
+                activeExecutionMissionId: pendingExecutionId,
                 liveWorkEvents: [],
                 lastResult: clarifyingQuestion || "Could you clarify what you'd like me to do here?",
                 pendingClarification: {
                   question: clarifyingQuestion || "Could you clarify what you'd like me to do here?",
                   options: clarifyingOptions.length ? clarifyingOptions : undefined,
                   originalTask: task,
+                  resolvedTask: resolvedIntent.plannedAction.trim() || undefined,
                 },
                 updatedAt: requestedAt.toISOString(),
               }
@@ -1033,7 +1251,7 @@ export function WorkspaceShell() {
 
     const isExistingProjectPlan = /^Mode:\s*Work on existing project/im.test(targetMission.objective);
 
-    const brief = `${targetMission.objective}\n\nCurrent task: ${task}`;
+    const brief = `${targetMission.objective}\n\nCurrent task: ${effectiveTask}`;
     setWorkspace((current) => ({
       ...current,
       missions: current.missions.map((item) =>
@@ -1049,21 +1267,41 @@ export function WorkspaceShell() {
     }));
 
     if (projectIntent === "inspection" || projectIntent === "diagnose" || projectIntent === "question" || projectIntent === "status" || projectIntent === "retrospective") {
-      // A read-only answer gets its own Mission entry (executionMissionFromAnswer, Section 16) — the
-      // placeholder created above must not also stick around as a second, permanently-"pending" ghost entry.
-      retractPendingExecutionMission(missionId, pendingExecutionId, previousActiveExecutionMissionId);
-      await answerProjectReadOnlyMessage(missionId, targetMission, task, projectIntent, resolvedIntent);
+      // Keep the accepted request's placeholder active while the slower project inspection runs. Retracting
+      // it here exposed the previous mission for the whole network gap, making the new question appear to
+      // disappear and then return with its answer. Completion replaces this exact placeholder in place.
+      await answerProjectReadOnlyMessage(
+        missionId,
+        targetMission,
+        effectiveTask,
+        projectIntent,
+        resolvedIntent,
+        pendingExecutionId,
+        requestNote.id,
+        previousActiveExecutionMissionId,
+        evidenceAttachments,
+      );
       return;
     }
 
-    const parentMission = isMutatingProjectIntent(projectIntent) ? parentMissionContextFor(targetMission) : undefined;
+    const parentMission = isMutatingProjectIntent(projectIntent) && continuity === "carry_forward_plan"
+      ? parentMissionContextFor(targetMission)
+      : undefined;
+    const idempotencyCandidate = isMutatingProjectIntent(projectIntent)
+      ? idempotencyCandidateFor(targetMission, effectiveTask)
+      : undefined;
     // An "Approved: run X" / "Denied approval to run X" reply is, by construction, always a continuation of
     // the mission that's currently paused waiting for it — trust that over the classifier's own read, since
     // forking a new mission entry here is exactly what left "waiting for approval" ghosts stuck in history.
     const isApprovalReply = isApprovalReplyMessage(task);
     const missionContinuity: "carry_forward_plan" | undefined =
-      parentMission && (continuity === "carry_forward_plan" || isApprovalReply) ? "carry_forward_plan" : undefined;
-    const resumesSameExecution = Boolean(parentMission && (isApprovalReply || resolvesExecutionDecisions || explicitMissionContinuation));
+      parentMission && (continuity === "carry_forward_plan" || isApprovalReply || confirmsPendingInterpretation) ? "carry_forward_plan" : undefined;
+    const resumesSameExecution = Boolean(parentMission && (
+      isApprovalReply
+      || resolvesExecutionDecisions
+      || resolvedIntent.currentIntent === "continue"
+      || confirmsPendingInterpretation
+    ));
     if (resumesSameExecution) {
       // Continue the SAME mission entry instead of leaving the one just paused ("waiting for approval"/
       // "waiting for user") stranded forever while a brand-new entry takes over as active (Section 16).
@@ -1088,21 +1326,21 @@ export function WorkspaceShell() {
     if (isExistingProjectPlan) {
       const localConnector = localConnectorFromMission(targetMission);
       if (localConnector?.url) {
-        await runExistingProjectExecutionForMission(missionId, targetMission.objective, task, uploadedProjectFilesFromMission(targetMission), localProjectPathFromMission(targetMission), localConnector, parentMission, missionContinuity, approvalResponse, evidenceAttachments, resolvedIntent);
+        await runExistingProjectExecutionForMission(missionId, targetMission.objective, effectiveTask, uploadedProjectFilesFromMission(targetMission), localProjectPathFromMission(targetMission), localConnector, parentMission, missionContinuity, approvalResponse, evidenceAttachments, resolvedIntent, idempotencyCandidate, exactMissionRetry ? retryExecution?.id : undefined);
         return;
       }
       const browserFolderHandleId = browserFolderHandleIdFromMission(targetMission);
       if (browserFolderHandleId) {
-        await runBrowserFolderExecutionForMission(missionId, targetMission.objective, task, browserFolderHandleId);
+        await runBrowserFolderExecutionForMission(missionId, targetMission.objective, effectiveTask, browserFolderHandleId);
         return;
       }
-      await runExistingProjectExecutionForMission(missionId, targetMission.objective, task, uploadedProjectFilesFromMission(targetMission), localProjectPathFromMission(targetMission), undefined, parentMission, missionContinuity, approvalResponse, evidenceAttachments, resolvedIntent);
+      await runExistingProjectExecutionForMission(missionId, targetMission.objective, effectiveTask, uploadedProjectFilesFromMission(targetMission), localProjectPathFromMission(targetMission), undefined, parentMission, missionContinuity, approvalResponse, evidenceAttachments, resolvedIntent, idempotencyCandidate, exactMissionRetry ? retryExecution?.id : undefined);
       return;
     }
 
     const previousExecutionPath = projectExecutionPathFromMission(targetMission);
     if (previousExecutionPath) {
-      await runExistingProjectExecutionForMission(missionId, targetMission.objective, task, [], previousExecutionPath, undefined, parentMission, missionContinuity, approvalResponse, evidenceAttachments, resolvedIntent);
+      await runExistingProjectExecutionForMission(missionId, targetMission.objective, effectiveTask, [], previousExecutionPath, undefined, parentMission, missionContinuity, approvalResponse, evidenceAttachments, resolvedIntent, idempotencyCandidate, exactMissionRetry ? retryExecution?.id : undefined);
       return;
     }
 
@@ -1125,26 +1363,59 @@ export function WorkspaceShell() {
       summary: "",
       parent_mission_id: previous?.id,
       request_message_id: requestMessageId,
-      timeline: [],
+      timeline: [{
+        id: `request-read-${requestMessageId ?? Date.now()}`,
+        timestamp: now,
+        kind: "planning",
+        status: "running",
+        title: "Reading your request",
+      }],
       created_at: now,
       updated_at: now,
     };
   }
 
-  async function answerProjectReadOnlyMessage(missionId: string, targetMission: MissionState, task: string, intent: ProjectMessageIntent, resolution: FollowUpResolutionRecord) {
-    const now = new Date();
-    let answer = "";
+  async function answerProjectReadOnlyMessage(
+    missionId: string,
+    targetMission: MissionState,
+    task: string,
+    intent: ProjectMessageIntent,
+    resolution: FollowUpResolutionRecord,
+    pendingExecutionId: string,
+    requestMessageId: string,
+    previousActiveExecutionMissionId: string | undefined,
+    evidenceAttachments: WorkspaceAttachment[] = [],
+  ) {
+    let result: ProjectAnswerResult;
+    const currentImages = evidenceAttachments.filter((attachment) => attachment.uploadStatus === "image" && Boolean(attachment.dataUrl));
+    const referencesVisualEvidence = /\b(?:this|that|the|attached|previous|earlier|above)\s+(?:screenshot|screen\s*shot|image|photo|picture)|\b(?:screenshot|screen\s*shot|image|photo|picture|font)\b/i.test(task);
+    const referencedImages = currentImages.length || !referencesVisualEvidence
+      ? currentImages
+      : targetMission.attachments.filter((attachment) => attachment.uploadStatus === "image" && Boolean(attachment.dataUrl)).slice(-4);
 
-    if (intent === "status") {
-      answer = projectStatusAnswer(targetMission);
+    if (referencedImages.length) {
+      result = await answerDirectQuestion(targetMission, task, referencedImages);
+    } else if (intent === "status") {
+      result = { answer: projectStatusAnswer(targetMission, resolution) };
     } else if (intent === "retrospective") {
-      answer =
-        missionMemoryAnswer(targetMission, task) ??
-        "I don't have a recorded reason for that in this mission's history yet. Ask me to inspect the file directly, or mention the specific file or command you mean.";
+      result = { answer:
+        missionMemoryAnswer(targetMission, task, resolution) ??
+        "I don't have a recorded reason for that in this mission's history yet. Ask me to inspect the file directly, or mention the specific file or command you mean." };
+    } else if (intent === "question") {
+      result = await answerDirectQuestion(targetMission, task);
     } else {
-      answer = await inspectProjectForAnswer(targetMission, task);
+      result = await inspectProjectForAnswer(targetMission, task, missionId, pendingExecutionId);
     }
+    if ((intent === "inspection" || intent === "diagnose") && !/^Read-only\b/i.test(result.answer)) {
+      const label = intent === "diagnose" ? "diagnosis" : "inspection";
+      result = {
+        ...result,
+        answer: `Read-only ${label} — I inspected relevant evidence without changing files or packages.\n\n${result.answer}`,
+      };
+    }
+    const answer = result.answer;
 
+    const now = new Date();
     const answerNote: WorkspaceNote = {
       id: `message-${now.getTime()}-project-answer`,
       author: "Foundry",
@@ -1154,30 +1425,47 @@ export function WorkspaceShell() {
       tone: "note",
       tags: ["Project answer"],
       attachments: [],
-      sources: [],
+      sources: result.sources ?? [],
+      replyToMessageId: requestMessageId,
     };
 
     setWorkspace((current) => ({
-      activeMissionId: missionId,
+      ...current,
       missions: current.missions.map((item) => {
         if (item.missionId !== missionId) return item;
-        // Every project request gets a Mission entry — even read-only ones — so "Previous Missions" is
-        // the single unified history (Section 16), not a separate plain-text message count. It must also
-        // become the active one immediately: leaving activeExecutionMissionId pointed at whatever was
-        // active before is what made every read-only follow-up (the most common kind) file itself straight
-        // into "Previous Missions" while its text rendered elsewhere — the single root cause behind the new
-        // message appearing in the wrong place, stale status pills, and stale suggestions surviving it.
-        const answerMission = executionMissionFromAnswer(task, answer, item.activeExecutionMissionId, answerNote.id, resolution);
+        // Complete the request that was already rendered at send time instead of removing it and appending
+        // a different mission later. This preserves one stable turn identity from acceptance through answer.
+        const pendingExecution = item.executionMissions.find((entry) => entry.id === pendingExecutionId);
+        const answerMission = executionMissionFromAnswer(
+          task,
+          answer,
+          previousActiveExecutionMissionId,
+          answerNote.id,
+          resolution,
+          pendingExecution,
+          result.deliveredFiles,
+        );
+        const executionMissions = pendingExecution
+          ? item.executionMissions.map((entry) => entry.id === pendingExecutionId ? answerMission : entry)
+          : [...item.executionMissions, answerMission];
+        const requestStillActive = item.activeExecutionMissionId === pendingExecutionId;
         return {
           ...item,
           messages: [...item.messages, answerNote],
-          liveWorkEvents: [],
-          lastResult: answer,
-          executionMissions: [...item.executionMissions, answerMission],
-          activeExecutionMissionId: answerMission.id,
+          sources: mergeSourceReferences(item.sources, result.sources ?? []),
+          liveWorkEvents: requestStillActive ? [] : item.liveWorkEvents,
+          lastResult: requestStillActive ? answer : item.lastResult,
+          executionMissions,
+          activeExecutionMissionId: requestStillActive ? answerMission.id : item.activeExecutionMissionId,
           workMemory: {
             ...item.workMemory,
-            latestEvidence: [intent === "status" ? "Read previous project result" : "Inspected project without writing files"],
+            latestEvidence: [
+              intent === "status" || intent === "retrospective"
+                ? "Read persisted mission evidence"
+                : intent === "question"
+                  ? "Answered without inspecting or changing the project"
+                  : "Inspected project without writing files",
+            ],
             recommendedNextAction: "Ask a follow-up question or describe the change you want Foundry to make.",
             updatedAt: now.toISOString(),
           },
@@ -1187,56 +1475,196 @@ export function WorkspaceShell() {
     }));
   }
 
-  async function inspectProjectForAnswer(targetMission: MissionState, task: string) {
+  async function answerDirectQuestion(targetMission: MissionState, task: string, attachments: WorkspaceAttachment[] = []): Promise<ProjectAnswerResult> {
+    const response = await fetch("/api/reason", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        missionTitle: targetMission.title,
+        userMessage: task,
+        priorMessages: targetMission.messages.slice(-8).map((message) => ({ author: message.author, body: message.body })),
+        attachments,
+        sources: targetMission.sources,
+      }),
+    });
+    const result = (await response.json().catch(() => ({}))) as { answer?: string; sources?: SourceReference[] };
+    return {
+      answer: result.answer || "I could not prepare a reliable answer to that question.",
+      sources: result.sources ?? [],
+    };
+  }
+
+  async function inspectProjectForAnswer(targetMission: MissionState, task: string, missionId: string, executionId: string): Promise<ProjectAnswerResult> {
+    if (await shouldUseExternalSources(targetMission, task)) {
+      return searchOfficialDocumentation(targetMission, task, missionId, executionId);
+    }
     const localConnector = localConnectorFromMission(targetMission);
     if (localConnector?.url) {
-      const response = await fetch("/api/factory/inspect", {
+      const response = await fetch("/api/factory/inspect?stream=1", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ localConnector, task, mode: readStoredModelMode() }),
       });
       if (!response.ok) {
         const error = (await response.json().catch(() => ({}))) as { error?: string };
-        return `I could not inspect the local agent project: ${error.error ?? "Agent inspection failed."}`;
+        return { answer: `I could not inspect the local agent project: ${error.error ?? "Agent inspection failed."}` };
       }
-      const result = (await response.json()) as { answer?: string; modelSelection?: { provider: string; model: string; tier: string } };
-      const answer = result.answer || "I inspected the local agent project, but could not produce a useful summary.";
-      return result.modelSelection ? `${answer}\n\n_Model · ${result.modelSelection.provider}/${result.modelSelection.model} · ${result.modelSelection.tier}_` : answer;
+      return await readProjectInspectionStream(response, missionId, executionId, "I inspected the local agent project, but could not produce a useful summary.");
     }
 
+    // A real project path must win over any stale uploaded copy attached to the mission: the server
+    // inspect route answers with a real model over real files, while the uploaded-files branch below
+    // can only produce a deterministic overview template. Checking uploads first is what made every
+    // question on a workspace-built project (which carries its brief as an upload) return the
+    // canned "I can see the project files" answer (test B01/B02).
+    const localPath = localProjectPathFromMission(targetMission) || projectExecutionPathFromMission(targetMission);
+
     const browserFolderHandleId = browserFolderHandleIdFromMission(targetMission);
-    if (browserFolderHandleId) {
+    if (!localPath && browserFolderHandleId) {
       const handle = await getBrowserFolderHandle(browserFolderHandleId);
-      if (!handle) return "I cannot inspect that live folder because the browser folder handle is no longer available. Re-open the folder, then ask again.";
+      if (!handle) return { answer: "I cannot inspect that live folder because the browser folder handle is no longer available. Re-open the folder, then ask again." };
+      appendProjectExecutionEvent(missionId, {
+        id: `browser-inspect-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        kind: "inspection",
+        status: "running",
+        title: "Reading the connected browser folder",
+      }, executionId);
       const files = await readBrowserFolderFiles(handle);
-      return projectInspectionAnswerFromFiles(files, task);
+      return await inspectUploadedProjectForAnswer(files, task, missionId, executionId);
     }
 
     const uploadedFiles = uploadedProjectFilesFromMission(targetMission);
-    if (uploadedFiles.length) return projectInspectionAnswerFromFiles(uploadedFiles, task);
+    if (!localPath && uploadedFiles.length) {
+      appendProjectExecutionEvent(missionId, {
+        id: `upload-inspect-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        kind: "inspection",
+        status: "completed",
+        title: `Reviewing ${uploadedFiles.length} uploaded project file${uploadedFiles.length === 1 ? "" : "s"}`,
+      }, executionId);
+      return await inspectUploadedProjectForAnswer(uploadedFiles, task, missionId, executionId);
+    }
 
-    const localPath = localProjectPathFromMission(targetMission) || projectExecutionPathFromMission(targetMission);
     if (localPath) {
-      const response = await fetch("/api/factory/inspect", {
+      const response = await fetch("/api/factory/inspect?stream=1", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ localPath, task, mode: readStoredModelMode() }),
       });
       if (!response.ok) {
         const error = (await response.json().catch(() => ({}))) as { error?: string };
-        return `I could not inspect the local project folder: ${error.error ?? "Project inspection failed."}`;
+        return { answer: `I could not inspect the local project folder: ${error.error ?? "Project inspection failed."}` };
       }
-      const result = (await response.json()) as { answer?: string; modelSelection?: { provider: string; model: string; tier: string } };
-      const answer = result.answer || "I inspected the project, but could not produce a useful summary.";
-      return result.modelSelection ? `${answer}\n\n_Model · ${result.modelSelection.provider}/${result.modelSelection.model} · ${result.modelSelection.tier}_` : answer;
+      return await readProjectInspectionStream(response, missionId, executionId, "I inspected the project, but could not produce a useful summary.");
     }
 
-    return "I do not have readable project files for this workspace yet. Open a local folder or upload the project files, then ask me to inspect it again.";
+    return { answer: "I do not have readable project files for this workspace yet. Open a local folder or upload the project files, then ask me to inspect it again." };
   }
 
-  async function createProjectBriefMission(brief: string, uploadedFiles: FactoryUploadedFile[] = [], discovery?: StructuredDiscovery) {
+  async function inspectUploadedProjectForAnswer(files: FactoryUploadedFile[], task: string, missionId: string, executionId: string): Promise<ProjectAnswerResult> {
+    const directDelivery = projectFileDeliveryFromUploadedFiles(files, task);
+    if (directDelivery) return directDelivery;
+    const response = await fetch("/api/factory/inspect?stream=1", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ files, task, mode: readStoredModelMode() }),
+    });
+    if (!response.ok) {
+      const error = (await response.json().catch(() => ({}))) as { error?: string };
+      return { answer: `I could not inspect the uploaded project: ${error.error ?? "Uploaded-project inspection failed."}` };
+    }
+    return await readProjectInspectionStream(response, missionId, executionId, "I found the uploaded project files, but could not produce a useful answer from them.");
+  }
+
+  async function shouldUseExternalSources(targetMission: MissionState, task: string) {
+    try {
+      const response = await fetch("/api/sources/intent", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          missionTitle: targetMission.title,
+          userMessage: task,
+          priorMessages: targetMission.messages.slice(-8).map((message) => ({ author: message.author, body: message.body })),
+          previousSources: targetMission.sources,
+        }),
+      });
+      if (!response.ok) return false;
+      const result = (await response.json()) as { needsSources?: boolean };
+      return result.needsSources === true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function searchOfficialDocumentation(targetMission: MissionState, task: string, missionId: string, executionId: string): Promise<ProjectAnswerResult> {
+    appendProjectExecutionEvent(missionId, {
+      id: `web-docs-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      kind: "inspection",
+      status: "running",
+      title: "Searching the web for official documentation",
+    }, executionId);
+    const response = await fetch("/api/reason", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        missionTitle: targetMission.title,
+        userMessage: task,
+        priorMessages: targetMission.messages.slice(-8).map((message) => ({ author: message.author, body: message.body })),
+        sources: targetMission.sources,
+      }),
+    });
+    const result = (await response.json().catch(() => ({}))) as { answer?: string; sources?: SourceReference[] };
+    const sources = (result.sources ?? []).filter((source) => /^https?:\/\//i.test(source.url));
+    appendProjectExecutionEvent(missionId, {
+      id: `web-docs-result-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      kind: "inspection",
+      status: sources.length ? "completed" : "warning",
+      title: sources.length ? `Verified ${sources.length} documentation URL${sources.length === 1 ? "" : "s"}` : "No verified documentation URL was returned",
+    }, executionId);
+    return {
+      answer: result.answer || "I searched, but could not verify an official documentation URL. I will not invent one.",
+      sources,
+    };
+  }
+
+  async function readProjectInspectionStream(response: Response, missionId: string, executionId: string, fallbackAnswer: string): Promise<ProjectAnswerResult> {
+    const reader = response.body?.getReader();
+    if (!reader) return { answer: fallbackAnswer };
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let result: ProjectAnswerResult | null = null;
+
+    function handleLine(line: string) {
+      if (!line.trim()) return;
+      const payload = JSON.parse(line) as
+        | { type: "event"; event: FactoryExecutionEvent }
+        | { type: "result"; result: ProjectAnswerResult }
+        | { type: "error"; error: string };
+      if (payload.type === "event") appendProjectExecutionEvent(missionId, payload.event, executionId);
+      else if (payload.type === "result") result = payload.result;
+      else throw new Error(payload.error);
+    }
+
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) handleLine(line);
+      if (done) break;
+    }
+    if (buffer.trim()) handleLine(buffer);
+    return result ?? { answer: fallbackAnswer };
+  }
+
+  async function createProjectBriefMission(brief: string, uploadedFiles: FactoryUploadedFile[] = [], discovery?: StructuredDiscovery, evidenceFiles: File[] = []) {
     const now = new Date();
     const iso = now.toISOString();
+    const missionId = `mission-${now.getTime()}`;
+    const evidenceAttachments = evidenceFiles.length ? await Promise.all(evidenceFiles.map((file) => ingestFile(file, missionId))) : [];
     const projectTitle = titleFromProjectBrief(brief);
     const briefNoteId = `message-${now.getTime()}-brief`;
     const statusNoteId = `message-${now.getTime()}-status`;
@@ -1254,7 +1682,7 @@ export function WorkspaceShell() {
       // instead of the real request/checklist/timeline, for every first build. Keep "Project brief" too
       // since projectBriefFromMission's artifact lookup is unrelated and other code may still expect it.
       tags: ["Project brief", "Project request"],
-      attachments: [],
+      attachments: evidenceAttachments,
       sources: [],
     };
     const isExistingProjectPlan = /^Mode:\s*Work on existing project/im.test(brief);
@@ -1274,7 +1702,6 @@ export function WorkspaceShell() {
       attachments: [],
       sources: [],
     };
-    const missionId = `mission-${now.getTime()}`;
     const projectMission: MissionState = {
       ...createInitialMission(now),
       missionId,
@@ -1286,7 +1713,7 @@ export function WorkspaceShell() {
       desiredOutcome: "project",
       artifactType: "project",
       messages: [briefNote, statusNote],
-      attachments: [],
+      attachments: evidenceAttachments,
       createdArtifacts: [
         {
           id: `artifact-${briefNoteId}`,
@@ -1321,7 +1748,7 @@ export function WorkspaceShell() {
         completedWork: ["Project brief created"],
         resolvedErrors: [],
         rejectedHypotheses: [],
-        latestEvidence: ["Saved project brief"],
+        latestEvidence: ["Saved project brief", ...evidenceAttachments.map((attachment) => `Attached project evidence: ${attachment.fileName}`)],
         relevantFiles: [],
         recommendedNextAction: isExistingProjectPlan ? "Describe the project task to perform next." : shouldAutoExecute ? "Wait for factory execution results." : "Describe the initial project build task.",
         summary: isExistingProjectPlan ? "Existing project plan saved." : shouldAutoExecute ? "Factory execution started from the saved brief." : "Project workspace is ready for a task.",
@@ -1337,7 +1764,7 @@ export function WorkspaceShell() {
     };
 
     const localConnector = isExistingProjectPlan ? localConnectorFromMission(projectMission) : undefined;
-    const instructions = brief.match(/^Custom instructions:\s*(.+)$/im)?.[1]?.trim() ?? "";
+    const instructions = customInstructionsFromProjectBrief(brief);
     const hasRealInstructions = Boolean(instructions && !/^none|no additional instructions?\.?$/i.test(instructions));
     const willExecuteNow = isExistingProjectPlan ? Boolean(localConnector?.url && hasRealInstructions) : shouldAutoExecute;
     // Every follow-up gets a pending ExecutionMission the instant it's submitted (executeProjectMissionNow),
@@ -1374,18 +1801,52 @@ export function WorkspaceShell() {
 
     if (!shouldAutoExecute) return;
 
-    await runFactoryExecutionForMission(projectMission.missionId, brief, discovery);
+    await runFactoryExecutionForMission(projectMission.missionId, brief, discovery, evidenceAttachments);
   }
 
-  async function runFactoryExecutionForMission(missionId: string, brief: string, discovery?: StructuredDiscovery) {
-    await runProjectExecutionRequest(missionId, "/api/factory/create?stream=1", { brief, discovery, modelMode: readStoredModelMode(), quality: readStoredMissionQuality() }, "Factory execution failed.", "Build the initial project");
+  async function runFactoryExecutionForMission(missionId: string, brief: string, discovery?: StructuredDiscovery, evidenceAttachments: WorkspaceAttachment[] = []) {
+    const executionAttachments = evidenceAttachments
+      .filter((attachment) =>
+        (attachment.uploadStatus === "image" && Boolean(attachment.dataUrl))
+        || (attachment.uploadStatus === "readable" && Boolean(attachment.rawText || attachment.dataUrl))
+        || (attachment.uploadStatus === "binary" && Boolean(attachment.dataUrl)))
+      .map((attachment) => ({
+        fileName: attachment.fileName,
+        mediaType: attachment.fileType || (attachment.uploadStatus === "image" ? "image/png" : "application/octet-stream"),
+        evidenceKind: attachment.evidenceKind,
+        uploadStatus: attachment.uploadStatus as "readable" | "image" | "binary",
+        dataUrl: attachment.dataUrl,
+        rawText: attachment.uploadStatus === "readable" ? attachment.rawText.slice(0, 100_000) : undefined,
+      }));
+    await runProjectExecutionRequest(missionId, "/api/factory/create?stream=1", { brief, discovery, modelMode: readStoredModelMode(), quality: readStoredMissionQuality(), evidenceAttachments: executionAttachments }, "Factory execution failed.", "Build the initial project");
   }
 
-  async function runExistingProjectExecutionForMission(missionId: string, brief: string, task: string, files: FactoryUploadedFile[], localPath: string, localConnector?: { url: string; token?: string; rootLabel?: string }, parentMission?: MissionParentContext, continuity?: "carry_forward_plan", approvalResponse?: FactoryExistingProjectRequest["approvalResponse"], evidenceAttachments: WorkspaceAttachment[] = [], followUpResolution?: FollowUpResolutionRecord) {
+  async function runExistingProjectExecutionForMission(missionId: string, brief: string, task: string, files: FactoryUploadedFile[], localPath: string, localConnector?: { url: string; token?: string; rootLabel?: string }, parentMission?: MissionParentContext, continuity?: "carry_forward_plan", approvalResponse?: FactoryExistingProjectRequest["approvalResponse"], evidenceAttachments: WorkspaceAttachment[] = [], followUpResolution?: FollowUpResolutionRecord, idempotencyCandidate?: MissionParentContext, retryExecutionId?: string) {
     const approvedCategories = approvedCommandCategories[missionId] ?? [];
     const approvedProjectCommands = approvedCommands[missionId] ?? [];
-    const evidenceImages = evidenceAttachments.filter((attachment) => attachment.uploadStatus === "image" && attachment.dataUrl).map((attachment) => ({ fileName: attachment.fileName, mediaType: attachment.fileType || "image/png", dataUrl: attachment.dataUrl! }));
-    await runProjectExecutionRequest(missionId, "/api/factory/existing?stream=1", { brief, task, files, localPath, localConnector, approvedCategories, approvedCommands: approvedProjectCommands, parentMission, followUpResolution, continuity, approvalResponse, quality: readStoredMissionQuality(), modelMode: readStoredModelMode(), evidenceImages }, "Existing project execution failed.", task);
+    const mission = workspaceRef.current.missions.find((item) => item.missionId === missionId);
+    const referencesAttachments = /\b(?:attached|uploaded|provided|previous|earlier|above|these|those)\b[^.!?\n]{0,120}\b(?:images?|photos?|pictures?|screenshots?|pngs?|jpe?gs?|assets?|media|files?|documents?|json|text|data|config)\b/i.test(task)
+      || /\b(?:images?|photos?|pictures?|screenshots?|pngs?|jpe?gs?|assets?|media|files?|documents?|json|text|data|config)\b[^.!?\n]{0,120}\b(?:attached|uploaded|provided|previous|earlier|above)\b/i.test(task)
+      || Boolean(parentMission?.source_requirements.some((requirement) => /\b(?:attached|uploaded|provided)\b[^.!?\n]{0,120}\b(?:images?|photos?|pictures?|screenshots?|assets?|files?|documents?|json|text|data|config)\b/i.test(requirement)));
+    const currentAttachments = evidenceAttachments.filter((attachment) =>
+      (attachment.uploadStatus === "image" && Boolean(attachment.dataUrl))
+      || (attachment.uploadStatus === "readable" && Boolean(attachment.rawText || attachment.dataUrl))
+      || (attachment.uploadStatus === "binary" && Boolean(attachment.dataUrl)));
+    const continuedAttachments = currentAttachments.length || !referencesAttachments
+      ? currentAttachments
+      : (mission?.attachments ?? []).filter((attachment) =>
+        (attachment.uploadStatus === "image" && Boolean(attachment.dataUrl))
+        || (attachment.uploadStatus === "readable" && Boolean(attachment.rawText || attachment.dataUrl))
+        || (attachment.uploadStatus === "binary" && Boolean(attachment.dataUrl))).slice(-8);
+    const executionAttachments = continuedAttachments.map((attachment) => ({
+      fileName: attachment.fileName,
+      mediaType: attachment.fileType || (attachment.uploadStatus === "image" ? "image/png" : "text/plain"),
+      evidenceKind: attachment.evidenceKind,
+      uploadStatus: attachment.uploadStatus as "readable" | "image" | "binary",
+      dataUrl: attachment.dataUrl,
+      rawText: attachment.uploadStatus === "readable" ? attachment.rawText.slice(0, 100_000) : undefined,
+    }));
+    await runProjectExecutionRequest(missionId, "/api/factory/existing?stream=1", { brief, task, files, localPath, localConnector, approvedCategories, approvedCommands: approvedProjectCommands, parentMission, idempotencyCandidate, retryExecutionId, followUpResolution, continuity, approvalResponse, quality: readStoredMissionQuality(), modelMode: readStoredModelMode(), evidenceAttachments: executionAttachments }, "Existing project execution failed.", task);
   }
 
   function approveCommandCategory(missionId: string, category: string) {
@@ -1447,19 +1908,26 @@ export function WorkspaceShell() {
     }
   }
 
-  function appendProjectExecutionEvent(missionId: string, event: FactoryExecutionEvent) {
+  function appendProjectExecutionEvent(missionId: string, event: FactoryExecutionEvent, executionId?: string) {
     if (event.internal) return;
     setWorkspace((current) => ({
       ...current,
       missions: current.missions.map((item) => {
         if (item.missionId !== missionId) return item;
         const artifact = item.createdArtifacts.find((entry) => entry.title === "Project Execution Timeline");
-        const previous = artifact ? safeParseTimeline(artifact.body) : [];
+        const targetExecution = executionId
+          ? item.executionMissions.find((entry) => entry.id === executionId)
+          : getActiveExecutionMission(item);
+        if (!targetExecution) return item;
+        const targetIsActive = targetExecution.id === item.activeExecutionMissionId;
+        // Every accepted request owns its evidence timeline. The artifact mirrors the active turn; it
+        // must never be used as a mission-wide accumulator or a new question will display old work.
+        const previous = targetExecution.timeline;
         const nextTimeline = [...previous.filter((entry) => entry.id !== event.id), event];
         const now = new Date().toISOString();
         const nextArtifact: CreatedArtifact = {
           id: artifact?.id ?? `artifact-${missionId}-timeline`,
-          sourceMessageId: artifact?.sourceMessageId ?? item.messages.at(-1)?.id ?? missionId,
+          sourceMessageId: targetExecution.request_message_id ?? artifact?.sourceMessageId ?? missionId,
           type: "project",
           kind: artifactKindForOutcome("project"),
           title: "Project Execution Timeline",
@@ -1469,13 +1937,16 @@ export function WorkspaceShell() {
         };
         return {
           ...item,
-          createdArtifacts: [nextArtifact, ...item.createdArtifacts.filter((entry) => entry.title !== "Project Execution Timeline")],
-          executionMissions: updateActiveExecutionMission(item, {
+          createdArtifacts: targetIsActive
+            ? [nextArtifact, ...item.createdArtifacts.filter((entry) => entry.title !== "Project Execution Timeline")]
+            : item.createdArtifacts,
+          executionMissions: item.executionMissions.map((entry) => entry.id === targetExecution.id ? {
+            ...entry,
             state: stateForLiveEvent(event, item),
             timeline: nextTimeline,
             updated_at: now,
-          }),
-          liveWorkEvents: liveWorkEventsForTimeline(nextTimeline),
+          } : entry),
+          liveWorkEvents: targetIsActive ? liveWorkEventsForTimeline(nextTimeline) : item.liveWorkEvents,
           updatedAt: now,
         };
       }),
@@ -1752,6 +2223,7 @@ export function WorkspaceShell() {
           onCreateProject={createProjectBriefMission}
           onUpdateProjectExecution={updateProjectExecution}
           onExecuteProject={executeProjectMission}
+          onPreviewStateChange={reconcileProjectPreview}
           onRollbackToEntry={rollbackToJournalEntry}
           onApproveCategory={approveCommandCategory}
           onApproveCommand={approveExactCommand}
@@ -1766,12 +2238,7 @@ export function WorkspaceShell() {
 }
 
 
-/** Approval/clarification "Allow once" / "Deny" etc. actions replay as one of these synthetic control strings, generated internally — never typed by the user — so they're safe to recognize literally here without turning this into a general keyword-based intent classifier. */
-function executionNeedsContinuation(execution: ExecutionMission) {
-  return execution.state !== "complete"
-    || execution.plan.some((item) => item.status !== "completed" && item.status !== "skipped");
-}
-
+/** Resolve free-form user language semantically; deterministic parsing is reserved for typed UI control payloads. */
 async function resolveProjectMessageIntent(mission: MissionState, message: string): Promise<ProjectMessageIntentResolution> {
   const context = projectIntentContextForMission(mission);
   try {
@@ -1836,6 +2303,10 @@ function projectIntentContextForMission(mission: MissionState) {
     objective: mission.objective,
     lastResult: mission.lastResult,
     source,
+    recentConversation: mission.messages.slice(-20).map((message) => ({
+      author: message.author === "You" ? "user" as const : "foundry" as const,
+      body: message.body,
+    })),
     execution: activeExecution
       ? {
           id: activeExecution.id,
@@ -1864,7 +2335,7 @@ function projectIntentContextForMission(mission: MissionState) {
           })),
         }
       : null,
-    recentMissionMemory: mission.executionMissions.slice(-5).map((run) => ({
+    recentMissionMemory: mission.executionMissions.slice(-20).map((run) => ({
       id: run.id,
       task: run.source_requirements.join("\n") || run.title,
       status: run.state,
@@ -1884,18 +2355,44 @@ function projectIntentContextForMission(mission: MissionState) {
   };
 }
 
-function projectStatusAnswer(mission: MissionState) {
-  const activeExecution = mission.executionMissions.find((item) => item.id === mission.activeExecutionMissionId) ?? mission.executionMissions.at(-1);
+function projectStatusAnswer(mission: MissionState, resolution: FollowUpResolutionRecord) {
+  const resolvedExecution = resolution.referencedPriorAction?.executionId
+    ? mission.executionMissions.find((item) => item.id === resolution.referencedPriorAction?.executionId)
+    : undefined;
+  const currentExecution = mission.executionMissions.find((item) => item.id === mission.activeExecutionMissionId) ?? mission.executionMissions.at(-1);
+  // "What changed?" means the last mission that actually did work. When the most recent turn is
+  // itself a read-only answer (the common case — the question right before this one), reporting its
+  // empty files_touched reads as "nothing ever changed", which is false. Fall back to the newest
+  // mission with real file or command activity.
+  const lastWorkingExecution = [...mission.executionMissions].reverse().find((item) => item.files_touched.length || item.commands_run.length);
+  const activeExecution = resolvedExecution
+    ?? (currentExecution?.files_touched.length || currentExecution?.commands_run.length ? currentExecution : lastWorkingExecution ?? currentExecution);
   if (activeExecution) {
     const completed = activeExecution.plan.filter((item) => item.status === "completed");
     const remaining = activeExecution.plan.filter((item) => item.status !== "completed" && item.status !== "skipped");
+    const changedFiles = activeExecution.files_touched.map((file) => {
+      const recordedEvidence = file.evidence?.trim()
+        || (file.diff ? diffLineSummary(file.diff) : "")
+        || (file.verified ? "verified on disk" : "no verification recorded");
+      return `${file.status ?? "changed"} ${file.path} — ${recordedEvidence}`;
+    });
+    const commands = activeExecution.commands_run.map((command) => `${command.command} (exit ${command.exitCode ?? "-"})`);
+    const latestVerification = [...activeExecution.verification.reduce(
+      (items, item) => items.set(item.check_type, item),
+      new Map<string, ExecutionMission["verification"][number]>(),
+    ).values()].filter((item) => item.check_type !== "preview" || item.result !== "skipped");
+    const verification = latestVerification.map((item) => `${item.check_type}: ${item.result} — ${item.evidence}`);
+    const originalRequest = activeExecution.request_message_id
+      ? mission.messages.find((message) => message.id === activeExecution.request_message_id && message.author === "You")?.body
+      : undefined;
     return [
-      `Current mission: ${activeExecution.state}${activeExecution.state === "complete" && activeExecution.verification_status !== "passed" ? " (unverified)" : ""}.`,
-      `Request: ${activeExecution.source_requirements.join("; ") || activeExecution.title}`,
-      activeExecution.files_touched.length ? `Changed files: ${activeExecution.files_touched.map((file) => `${file.status ?? "changed"} ${file.path}`).join(", ")}` : "Changed files: none reported.",
+      `${resolvedExecution ? "Referenced mission" : "Last evidence-bearing mission"}: ${activeExecution.state}${activeExecution.state === "complete" && activeExecution.verification_status !== "passed" ? " (unverified)" : ""}.`,
+      `Request: ${originalRequest || activeExecution.source_requirements.join("; ") || activeExecution.title}`,
+      changedFiles.length ? `Files and recorded diffs: ${changedFiles.join("; ")}` : "Files and recorded diffs: none.",
+      commands.length ? `Commands: ${commands.join("; ")}` : "Commands: none recorded.",
+      verification.length ? `Verification: ${verification.join("; ")}` : `Verification: no checks recorded (mission verification status: ${activeExecution.verification_status}).`,
       activeExecution.plan.length ? `Verified objective items: ${completed.length}/${activeExecution.plan.length}.` : "",
       remaining.length ? `Remaining: ${remaining.map((item) => item.label).join("; ")}` : "",
-      activeExecution.commands_run.length ? `Commands: ${activeExecution.commands_run.map((command) => `${command.command} (exit ${command.exitCode ?? "-"})`).join("; ")}` : "",
       activeExecution.blocked_reason ? `Blocker: ${activeExecution.blocked_reason}` : "",
     ].filter(Boolean).join("\n");
   }
@@ -1918,6 +2415,8 @@ function projectStatusAnswer(mission: MissionState) {
 const retrospectiveStopWords = new Set([
   "why", "what", "did", "you", "change", "changed", "exactly", "precisely", "fixed", "fix", "caused", "cause", "resolved", "broke",
   "the", "a", "an", "was", "is", "did", "does", "would", "that", "this", "it", "to", "in", "of", "and", "or", "for", "on", "with",
+  "any", "reason", "rationale", "reasoning", "justification", "motivation", "thinking", "logic", "basis", "tradeoff", "tradeoffs",
+  "done", "decision", "choice", "approach", "choose", "chose", "picked", "selected", "made", "here", "there", "behind",
 ]);
 
 function significantWords(task: string): string[] {
@@ -1929,12 +2428,11 @@ function significantWords(task: string): string[] {
 }
 
 /** Structured record of the mission this follow-up continues — sent verbatim to the server instead of a flattened prose digest, so the executor can act on real plan/decision state (see MissionParentContext). */
-function parentMissionContextFor(mission: MissionState): MissionParentContext | undefined {
-  const previous = mission.executionMissions.at(-1);
-  if (!previous) return undefined;
+function missionContextForExecution(previous: ExecutionMission, projectIdentity?: string): MissionParentContext {
   const narrative = previous.timeline.filter((event) => !event.internal && event.rationale);
   return {
     id: previous.id,
+    projectIdentity,
     source_requirements: previous.source_requirements,
     state: previous.state,
     plan: previous.plan,
@@ -1943,6 +2441,7 @@ function parentMissionContextFor(mission: MissionState): MissionParentContext | 
       status: file.status,
       diffSummary: file.diff ? diffLineSummary(file.diff) : undefined,
       verified: file.verified,
+      contentHash: file.contentHash,
     })),
     commands_run: previous.commands_run.map((command) => ({
       command: command.command,
@@ -1959,109 +2458,127 @@ function parentMissionContextFor(mission: MissionState): MissionParentContext | 
   };
 }
 
+function taskFromAcceptedInterpretation(pending: PendingClarification) {
+  if (pending.resolvedTask?.trim()) return pending.resolvedTask.trim();
+  // Backward compatibility for clarification cards persisted before resolvedTask existed. The
+  const quoteAgnosticInterpretation = pending.question
+    .match(/(?:current interpretation is:|understood your request as:)\s*([\s\S]+?)\s*Is that correct\??/i)?.[1]
+    ?.trim()
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}.!?]+$/gu, "");
+  if (quoteAgnosticInterpretation) return quoteAgnosticInterpretation;
+  // interpretation question has one quoted executable restatement followed by "Is that correct?".
+  const interpreted = pending.question.match(/(?:current interpretation is:|understood your request as:)\s*[â€œ"]([\s\S]+?)[â€"]\s*Is that correct\??/i)?.[1]?.trim();
+  return interpreted || pending.originalTask.trim();
+}
+
+function parentMissionContextFor(mission: MissionState): MissionParentContext | undefined {
+  const previous = mission.executionMissions.at(-1);
+  if (!previous) return undefined;
+  return missionContextForExecution(previous, projectIdentityForMission(mission));
+}
+
+function normalizeIdempotentRequest(value: string) {
+  return value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function idempotencyCandidateFor(mission: MissionState, task: string): MissionParentContext | undefined {
+  const requestKey = normalizeIdempotentRequest(task);
+  if (!requestKey) return undefined;
+  const candidate = [...mission.executionMissions].reverse().find((execution) =>
+    execution.state === "complete"
+    && execution.verification_status === "passed"
+    && execution.source_requirements.some((requirement) => normalizeIdempotentRequest(requirement) === requestKey)
+    && execution.files_touched.length > 0
+    && execution.files_touched.every((file) => file.verified && Boolean(file.contentHash)),
+  );
+  return candidate ? missionContextForExecution(candidate, projectIdentityForMission(mission)) : undefined;
+}
+
 function diffLineSummary(diff: string): string {
   const added = (diff.match(/^\+ /gm) ?? []).length;
   const removed = (diff.match(/^- /gm) ?? []).length;
   return `+${added} -${removed} lines`;
 }
 
-function missionMemoryAnswer(mission: MissionState, task: string): string | null {
+function missionMemoryAnswer(mission: MissionState, task: string, resolution: FollowUpResolutionRecord): string | null {
   const memory = mission.executionMissions ?? [];
   if (!memory.length) return null;
 
-  const label = (run: ExecutionMission) => run.source_requirements.join("; ") || run.title;
+  const label = (run: ExecutionMission) => (run.title || run.source_requirements.join("; ")).slice(0, 220);
 
+  const hasDurableEvidence = (run: ExecutionMission) =>
+    run.files_touched.length > 0
+    || run.commands_run.length > 0
+    || run.verification.length > 0
+    || run.timeline.some((event) =>
+      !event.internal
+      && event.tier === "decision"
+      && Boolean(event.rationale?.trim() || event.output?.trim() || event.title.trim()),
+    );
+  const evidenceBearingRuns = [...memory].reverse().filter(hasDurableEvidence);
+  if (!evidenceBearingRuns.length) return null;
+
+  const resolvedRun = resolution.referencedPriorAction?.executionId
+    ? evidenceBearingRuns.find((run) => run.id === resolution.referencedPriorAction?.executionId)
+    : undefined;
+
+  // Intent resolution already established that this is a retrospective. Select evidence by an
+  // explicit file first, then by topic, and finally by recency. The wording of the question must
+  // never be a second password users have to guess.
   const mentionedFiles = Array.from(new Set((task.match(/\b[\w./-]+\.[a-z0-9]{1,12}\b/gi) ?? []).map((path) => path.toLowerCase())));
-  for (const run of [...memory].reverse()) {
-    const hit = run.files_touched.find((file) => mentionedFiles.some((name) => file.path.toLowerCase().endsWith(name)));
-    if (hit) return `In "${label(run)}" I ${hit.status ?? "changed"} ${hit.path}. ${hit.evidence || run.summary}`;
-  }
-
+  const fileMatchedRun = mentionedFiles.length
+    ? evidenceBearingRuns.find((run) => run.files_touched.some((file) => mentionedFiles.some((name) => file.path.toLowerCase().endsWith(name))))
+    : undefined;
   const keywords = significantWords(task);
-  if (!keywords.length) return null;
-  for (const run of [...memory].reverse()) {
-    const haystack = `${label(run)} ${run.summary} ${run.commands_run.map((cmd) => cmd.command).join(" ")}`.toLowerCase();
-    if (keywords.some((keyword) => haystack.includes(keyword))) return `In "${label(run)}": ${run.summary}`;
-  }
+  const topicMatchedRun = keywords.length
+    ? evidenceBearingRuns.find((run) => {
+        const haystack = [
+          label(run),
+          run.summary,
+          ...run.files_touched.flatMap((file) => [file.path, file.evidence ?? ""]),
+          ...run.commands_run.map((command) => command.command),
+          ...run.timeline.filter((event) => !event.internal).flatMap((event) => [event.title, event.rationale ?? "", event.output ?? ""]),
+        ].join(" ").toLowerCase();
+        return keywords.some((keyword) => haystack.includes(keyword));
+      })
+    : undefined;
+  const run = resolvedRun ?? fileMatchedRun ?? topicMatchedRun ?? evidenceBearingRuns[0];
 
-  return null;
-}
-
-function projectInspectionAnswerFromFiles(files: FactoryUploadedFile[], task: string) {
-  const paths = files.map((file) => file.path.replace(/\\/g, "/"));
-  const stack = detectProjectStackFromPaths(paths);
-  const keyFiles = pickInspectionKeyFiles(files);
-  const purpose = inferInspectionPurpose(files, stack);
-  const askNext = /\b(can you|do you|what|why|how|see|tell|explain|inspect|look)\b/i.test(task)
-    ? "Tell me what you want to change next, or ask me to inspect a specific file or behavior."
-    : "What would you like Foundry to do next?";
-
+  // Quote only durable reasons and evidence that were actually recorded. A plausible reconstruction
+  // would be indistinguishable from a lie, especially for loosely worded questions.
+  const decisions = uniqueRecordedEvidence(run.timeline
+    .filter((event) => !event.internal && event.tier === "decision")
+    .map((event) => event.rationale?.trim() || event.output?.trim() || event.title.trim()));
+  const journalEvidence = uniqueRecordedEvidence(run.timeline
+    .filter((event) => !event.internal && event.kind !== "preview" && (event.tier === "finding" || event.tier === "flag"))
+    .map((event) => event.rationale?.trim() || event.output?.trim() || event.title.trim()))
+    .slice(-3);
+  const fileEvidence = uniqueRecordedEvidence(run.files_touched.map((file) => file.evidence?.trim() || ""));
+  const latestVerification = [...run.verification.reduce(
+    (items, item) => items.set(item.check_type, item),
+    new Map<string, ExecutionMission["verification"][number]>(),
+  ).values()].filter((item) => item.check_type !== "preview" || item.result !== "skipped");
+  const verificationEvidence = uniqueRecordedEvidence(latestVerification.map((item) => `${item.check_type}: ${item.result} — ${item.evidence}`));
+  const changedPaths = uniqueRecordedEvidence(run.files_touched.map((file) => file.path));
   return [
-    "I can see the project files.",
-    "",
-    `It appears to be a ${stack}.`,
-    `What it seems to do: ${purpose}`,
-    "",
-    "Main files I inspected:",
-    ...keyFiles.map((file) => `- ${file.path}${file.note ? `: ${file.note}` : ""}`),
-    paths.length > keyFiles.length ? `- ${paths.length - keyFiles.length} more readable file${paths.length - keyFiles.length === 1 ? "" : "s"}.` : "",
-    "",
-    askNext,
+    changedPaths.length
+      ? `For the evidence-bearing mission that changed ${changedPaths.join(", ")}:`
+      : `For "${label(run)}":`,
+    decisions.length ? `Stored decision: ${decisions.join("; ")}` : "Stored decision: no explicit rationale was recorded.",
+    journalEvidence.length ? `Recorded journal evidence: ${journalEvidence.join("; ")}` : "",
+    fileEvidence.length ? `Recorded file evidence: ${fileEvidence.join("; ")}` : "",
+    verificationEvidence.length ? `Recorded verification: ${verificationEvidence.join("; ")}` : "",
   ].filter(Boolean).join("\n");
 }
 
-function detectProjectStackFromPaths(paths: string[]) {
-  const lower = paths.map((item) => item.toLowerCase());
-  if (lower.some((item) => /next\.config\.(js|mjs|ts)$/.test(item))) return "Next.js project";
-  if (lower.some((item) => /vite\.config\.(js|ts)$/.test(item))) return "Vite project";
-  if (lower.some((item) => item.endsWith("package.json"))) return "JavaScript project";
-  if (lower.some((item) => item.endsWith(".html"))) return "static HTML/CSS/JS project";
-  if (lower.some((item) => item.endsWith(".py"))) return "Python project";
-  if (lower.some((item) => item.endsWith(".csproj") || item.endsWith(".sln"))) return ".NET project";
-  return "software project";
-}
-
-function pickInspectionKeyFiles(files: FactoryUploadedFile[]) {
-  const priority = [/package\.json$/i, /(^|\/)(index|main|app)\.html$/i, /(^|\/)(index|main|app)\.(js|jsx|ts|tsx)$/i, /README\.md$/i, /\.css$/i];
-  return files
-    .slice()
-    .sort((a, b) => {
-      const ai = priority.findIndex((pattern) => pattern.test(a.path));
-      const bi = priority.findIndex((pattern) => pattern.test(b.path));
-      return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi) || a.path.localeCompare(b.path);
-    })
-    .slice(0, 8)
-    .map((file) => ({ path: file.path, note: inspectionFileRole(file.path) }));
-}
-
-function inspectionFileRole(filePath: string) {
-  const lower = filePath.toLowerCase();
-  if (lower.endsWith("package.json")) return "project metadata and scripts";
-  if (lower.endsWith(".html")) return "browser page/markup";
-  if (lower.endsWith(".css")) return "styling";
-  if (/\.(js|jsx|ts|tsx)$/.test(lower)) return "application logic";
-  if (lower.endsWith("readme.md")) return "project documentation";
-  return "";
-}
-
-function inferInspectionPurpose(files: FactoryUploadedFile[], stack: string) {
-  const packageFile = files.find((file) => /(^|\/)package\.json$/i.test(file.path));
-  if (packageFile) {
-    try {
-      const pkg = JSON.parse(packageFile.content) as { name?: string; description?: string; scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
-      if (pkg.description) return pkg.description;
-      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-      if (deps.next) return "a Next.js web application";
-      if (deps.vite || deps["@vitejs/plugin-react"] || deps.react) return "a React/Vite-style web application";
-      if (pkg.scripts && Object.keys(pkg.scripts).length) return `a JavaScript project with ${Object.keys(pkg.scripts).join(", ")} script${Object.keys(pkg.scripts).length === 1 ? "" : "s"}`;
-      if (pkg.name) return `a JavaScript package named ${pkg.name}`;
-    } catch {
-      // Fall through to path-based inference.
-    }
-  }
-  if (stack.includes("HTML")) return "a static browser project with HTML, styling, and/or JavaScript";
-  if (files.some((file) => /\.(js|jsx|ts|tsx)$/i.test(file.path))) return "a script-based JavaScript project";
-  return "I can identify the structure, but there is not enough readable application code to confidently summarize behavior.";
+function uniqueRecordedEvidence(items: string[]) {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const normalized = item.replace(/\s+/g, " ").trim();
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
 }
 
 function projectExecutionFromWorkspaceMission(mission: MissionState): FactoryProjectResult | null {
@@ -2136,6 +2653,7 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
         verified,
         status: file.status,
         evidence: matchingEvent?.rationale || matchingEvent?.title,
+        contentHash: file.contentHash,
       };
     });
   const blockedReason = result.blocker || completionContradiction || (state === "complete" ? undefined : result.checklist?.find((item) => item.status === "blocked")?.evidence);
@@ -2144,11 +2662,7 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
     result.status === "awaiting-mock-approval"
       ? { message: result.blocker || "The first working mock is ready for review.", preview_url: result.previewUrl }
       : undefined;
-  const continuesExistingRequest = Boolean(existing) && (
-    isApprovalReplyMessage(task)
-    || /^Resolved project decisions:/i.test(task.trim())
-    || /^(?:yes|yes please|go ahead|continue|do it|proceed)[.!]?$/i.test(task.trim())
-  );
+  const continuesExistingRequest = Boolean(existing?.follow_up_resolution?.continuity === "carry_forward_plan");
   const existingApprovals = existing?.approvals ?? [];
   const resolvedApprovals = continuesExistingRequest
     ? existingApprovals.map((approval) => approval.decidedAs ? approval : { ...approval, decidedAs: /^Denied/i.test(task.trim()) ? "deny" as const : "allow_once" as const, decidedAt: now })
@@ -2199,17 +2713,24 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
 }
 
 function mergeExecutionTimeline(existing: FactoryExecutionEvent[], incoming: FactoryExecutionEvent[]) {
-  const seen = new Set(existing.map((event) => event.id));
-  return [...existing, ...incoming.filter((event) => !seen.has(event.id))];
+  return mergeExecutionTimelines(existing, incoming);
 }
 
 /** A read-only Q&A request never runs the mission executor, so it has no checklist/files/commands — but it
  * still gets a real Mission entry so "Previous Missions" is one unified list instead of a separate plain-text
  * message count (Section 16). */
-function executionMissionFromAnswer(task: string, answer: string, parentMissionId: string | undefined, resultMessageId: string, resolution: FollowUpResolutionRecord): ExecutionMission {
+function executionMissionFromAnswer(
+  task: string,
+  answer: string,
+  parentMissionId: string | undefined,
+  resultMessageId: string,
+  resolution: FollowUpResolutionRecord,
+  pendingExecution?: ExecutionMission,
+  deliveredFiles?: DeliveredProjectFile[],
+): ExecutionMission {
   const now = new Date().toISOString();
   return {
-    id: `execution-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id: pendingExecution?.id ?? `execution-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     title: taskTitle(task),
     source_requirements: [task],
     state: "complete",
@@ -2221,14 +2742,54 @@ function executionMissionFromAnswer(task: string, answer: string, parentMissionI
     blocked_reason: undefined,
     undo_snapshot: undefined,
     summary: answer,
-    parent_mission_id: parentMissionId,
+    delivered_files: deliveredFiles,
+    parent_mission_id: pendingExecution?.parent_mission_id ?? parentMissionId,
     follow_up_resolution: resolution,
-    request_message_id: undefined,
+    request_message_id: pendingExecution?.request_message_id,
     result_message_id: resultMessageId,
-    timeline: [],
-    created_at: now,
+    timeline: (pendingExecution?.timeline ?? []).map((event) => event.status === "running" ? { ...event, status: "completed" as const } : event),
+    created_at: pendingExecution?.created_at ?? now,
     updated_at: now,
   };
+}
+
+function projectFileDeliveryFromUploadedFiles(files: FactoryUploadedFile[], task: string): ProjectAnswerResult | null {
+  const deliveryRequest = /\b(send|share|give|attach|download|export|provide)\b/i.test(task)
+    && isExplicitLocalProjectFileRequest(task)
+    && (/\b(docs?|documentation|readme|manuals?|guides?|files?)\b/i.test(task) || /[\w@./-]+\.[a-z0-9]{1,10}\b/i.test(task));
+  if (!deliveryRequest) return null;
+
+  const explicitNames = explicitProjectFileNames(task).map((name) => name.toLowerCase());
+  const explicitFiles = files.filter((file) => {
+    const normalized = file.path.replace(/\\/g, "/").toLowerCase();
+    const basename = normalized.split("/").at(-1) ?? normalized;
+    return explicitNames.some((name) => normalized === name || basename === name.split("/").at(-1));
+  });
+  const candidates = explicitFiles.length ? explicitFiles : files.filter((file) => {
+    const normalized = file.path.replace(/\\/g, "/").toLowerCase();
+    const basename = normalized.split("/").at(-1) ?? normalized;
+    return normalized.startsWith("docs/")
+      || (!normalized.includes("/") && /^readme(?:\.|$)/i.test(basename))
+      || (!normalized.includes("/") && /^(?:contributing|architecture|api|setup|development|deployment|security|changelog)\.(?:md|mdx|txt|rst)$/i.test(basename));
+  });
+  const deliveredFiles = candidates.slice(0, 12).map((file) => ({
+    path: file.path.replace(/\\/g, "/"),
+    content: file.content,
+    mediaType: /\.mdx?$/i.test(file.path) ? "text/markdown" : /\.json$/i.test(file.path) ? "application/json" : "text/plain",
+    size: file.size,
+  }));
+  return {
+    answer: deliveredFiles.length
+      ? `I found and attached ${deliveredFiles.length} project file${deliveredFiles.length === 1 ? "" : "s"}.`
+      : "I couldn't find a matching project file to attach.",
+    deliveredFiles,
+  };
+}
+
+function mergeSourceReferences(existing: SourceReference[], incoming: SourceReference[]) {
+  const merged = new Map(existing.map((source) => [source.url, source]));
+  incoming.forEach((source) => merged.set(source.url, source));
+  return Array.from(merged.values()).slice(-40);
 }
 
 function taskTitle(task: string, result?: FactoryProjectResult) {
@@ -2296,6 +2857,12 @@ function localConnectorFromMission(mission: MissionState) {
   return { url, token, rootLabel };
 }
 
+function projectIdentityForMission(mission: MissionState) {
+  const connectorRoot = localConnectorFromMission(mission)?.rootLabel?.trim();
+  if (connectorRoot) return connectorRoot;
+  return localProjectPathFromMission(mission) || projectExecutionPathFromMission(mission) || undefined;
+}
+
 function projectExecutionPathFromMission(mission: MissionState) {
   const artifact = mission.createdArtifacts.find((item) => item.title === "Project Execution");
   if (artifact) {
@@ -2308,9 +2875,14 @@ function projectExecutionPathFromMission(mission: MissionState) {
     }
   }
 
+  const executionTimeline = mission.executionMissions.flatMap((execution) => execution.timeline);
   const timelineArtifact = mission.createdArtifacts.find((item) => item.title === "Project Execution Timeline");
-  if (!timelineArtifact) return "";
-  const createdFolder = safeParseTimeline(timelineArtifact.body).find((event) =>
+  const durableTimeline = executionTimeline.length
+    ? executionTimeline
+    : timelineArtifact
+      ? safeParseTimeline(timelineArtifact.body)
+      : [];
+  const createdFolder = durableTimeline.find((event) =>
     event.kind === "folder"
     && event.status === "completed"
     && (typeof event.details?.path === "string" || Boolean(event.filePath)),

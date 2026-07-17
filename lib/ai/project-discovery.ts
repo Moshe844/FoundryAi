@@ -359,11 +359,24 @@ export function discoverProject(prompt: string): ProjectDiscoveryResult {
 }
 
 function chooseProfile(prompt: string) {
-  const matches = profiles
-    .map((profile) => ({ profile, score: profile.patterns.reduce((score, pattern) => score + (pattern.test(prompt) ? 1 : 0), 0) }))
+  const rankedMatches = (value: string) => profiles
+    .map((profile) => ({ profile, score: profile.patterns.reduce((score, pattern) => score + (pattern.test(value) ? 1 : 0), 0) }))
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score);
-  return matches[0]?.profile;
+
+  // Classify the product the user named, not a secondary capability in a later feature list.
+  // "Build a repair-shop operations app. Include parts inventory" is a repair-shop product,
+  // not an inventory starter. The real discovery model still reasons over the full brief; this
+  // zero-cost seed is deliberately conservative so it cannot anchor that model or the UI wrongly.
+  const primaryClause = prompt
+    .split(/(?:[.!?]\s+|\b(?:include|including|features?|featuring|it (?:also )?needs?|with support for)\b)/i, 1)[0]
+    ?.trim() ?? prompt.trim();
+  const primaryMatch = rankedMatches(primaryClause)[0]?.profile;
+  if (primaryMatch) return primaryMatch;
+
+  const hasSecondaryFeatureList = primaryClause.length + 8 < prompt.trim().length;
+  if (hasSecondaryFeatureList) return undefined;
+  return rankedMatches(prompt)[0]?.profile;
 }
 
 function defaultProfile(prompt: string): SignalProfile {

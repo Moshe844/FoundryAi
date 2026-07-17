@@ -28,7 +28,7 @@ export function CollapsedMissionRow({
         type="button"
         aria-expanded={expanded}
         onClick={onToggle}
-        className="group/row flex h-10 w-full items-center gap-2.5 rounded px-1.5 text-left transition hover:bg-white/[0.03]"
+        className="group/row flex h-10 w-full items-center gap-2.5 rounded px-1.5 text-left transition hover:bg-overlay/[0.03]"
       >
         <span className={`shrink-0 font-mono text-[12px] ${glyphColor}`} aria-hidden="true">{glyph}</span>
         <span className="min-w-0 flex-1 truncate text-[14px] leading-6 text-foundry-muted">
@@ -40,7 +40,7 @@ export function CollapsedMissionRow({
         </span>
       </button>
       {expanded ? (
-        <div className="canvas-enter mt-2 border-l border-white/8 py-3 pl-4">
+        <div className="canvas-enter mt-2 border-l border-overlay/8 py-3 pl-4">
           <MissionBlock vm={vm} recorded />
         </div>
       ) : null}
