@@ -43,6 +43,7 @@ import { explicitProjectFileNames, isExplicitLocalProjectFileRequest } from "@/l
 import { stripTerminalFormatting } from "@/lib/text/terminal";
 import { actionableBuildLockMessage, forgetOwnedDesktopProcess, registerOwnedDesktopProcess } from "@/lib/factory/owned-desktop-processes";
 import { desktopInteractionActionsForTask } from "@/lib/factory/desktop-acceptance";
+import { classifyAcceptanceEvidence } from "@/lib/factory/acceptance-evidence";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 type EvidenceAttachments = NonNullable<FactoryExistingProjectRequest["evidenceAttachments"]>;
@@ -3313,6 +3314,71 @@ async function runExistingProjectMissionWithAccess(params: {
   let preModelBuildFailure: FactoryCommandEvent | undefined = retryBuildFailure;
   const preModelRepairReadPaths: string[] = [];
   let consumedOneTimeApproval = false;
+  const desktopPreflightActions = desktopInteractionActionsForTask(inheritedBrowserRequest);
+  const explicitDesktopDefectPreflight = currentDefectReport
+    && reusePreviewPlatform === "desktop"
+    && desktopPreflightActions.length > 0
+    && Boolean(previewTarget && access.validateDesktop);
+  if (explicitDesktopDefectPreflight && previewTarget && access.validateDesktop) {
+    await emitExecution(execution, "preview", "running", "Reproducing the reported native failure before model routing", {
+      details: { paidModelCalls: 0, platform: "desktop", actionsJson: JSON.stringify(desktopPreflightActions), purpose: "evidence-first native validation" },
+    });
+    const desktopPreflightBuild = await runCanonicalProjectBuild();
+    if (desktopPreflightBuild) preModelCommands.push(desktopPreflightBuild);
+    if (desktopPreflightBuild && desktopPreflightBuild.exitCode !== 0) {
+      preModelBuildFailure = desktopPreflightBuild;
+      const buildEvidence = `The canonical desktop build failed before native reproduction: ${summarizeCommandFailure(desktopPreflightBuild)}`;
+      preModelVerification.push({ check_type: "build", result: "fail", evidence: buildEvidence });
+      task = `${task}\n\nDeterministic evidence collected before any implementation model call. Repair this exact build failure before attempting runtime interaction:\n${buildEvidence}`;
+      workingSet = workspaceProjectPath
+        ? workingSetWithCommandFailure(await discoverProjectWorkingSet(access, task), desktopPreflightBuild, workspaceProjectPath)
+        : await discoverProjectWorkingSet(access, task);
+    } else {
+      const desktopPreview = await startProjectPreview(previewTarget, stackProfile.label, [], execution);
+      const connectorArtifact = connectorArtifactTargets.get(previewTarget.projectId);
+      let desktopResult: PlatformValidationResult | undefined;
+      if (desktopPreview.previewState === "ready" && desktopPreview.previewPlatform === "desktop" && connectorArtifact) {
+        desktopResult = await access.validateDesktop({
+          executable: connectorArtifact.relativePath,
+          args: [],
+          observeMs: 1500,
+          interactionTimeoutMs: 6000,
+          actions: desktopPreflightActions,
+        });
+      }
+      const verified = Boolean(desktopResult?.verified && desktopResult.interactionVerified);
+      const classification = classifyAcceptanceEvidence({
+        verified,
+        available: desktopResult?.available,
+        explicitRepairEligible: desktopResult?.repairEligible,
+        failureKind: desktopResult?.failureKind,
+      });
+      const baseEvidence = desktopResult?.reason || desktopPreview.previewReason || "The native preflight could not obtain a runnable desktop artifact.";
+      const evidence = desktopResult?.crashEvidence
+        ? `${baseEvidence}\n\nOperating-system crash evidence:\n${desktopResult.crashEvidence}`
+        : baseEvidence;
+      preModelVerification.push({ check_type: "preview", result: verified ? "pass" : "fail", evidence });
+      await emitExecution(execution, "preview", verified ? "completed" : classification.repairEligible ? "error" : "warning", verified ? "Reported desktop behavior now passes" : classification.repairEligible ? "Reproduced the real desktop application failure" : "Desktop validator could not establish product failure", {
+        details: { paidModelCalls: 0, platform: "desktop", actionsJson: JSON.stringify(desktopPreflightActions), failureOrigin: classification.origin, repairEligible: classification.repairEligible, failureKind: desktopResult?.failureKind, stepsJson: JSON.stringify(desktopResult?.steps ?? []), crashEvidence: desktopResult?.crashEvidence, evidence },
+      });
+      if (verified) {
+        for (const item of execution.checklist) {
+          item.status = "completed";
+          item.evidence = evidence;
+        }
+        finishObjectiveChecklist(execution, "passed");
+        await emitExecution(execution, "summary", "completed", "Current native behavior verified without a model call or source rewrite", { details: { paidModelCalls: 0 } });
+        return { status: "passed", changedFiles: [], commands: preModelCommands, verification: preModelVerification, events: [evidence], stackLabel: stackProfile.label };
+      }
+      if (!classification.repairEligible) {
+        const blocker = `${evidence}\n\nFoundry did not edit project source because this evidence originated in the validator or environment, not the application.`;
+        finishObjectiveChecklist(execution, "failed", blocker);
+        return { status: "failed", blocker, changedFiles: [], commands: preModelCommands, verification: preModelVerification, events: [blocker], stackLabel: stackProfile.label };
+      }
+      task = `${task}\n\nAuthoritative native runtime evidence collected before any implementation model call. Repair only this demonstrated application failure, then rebuild and repeat the same named-control interaction.\n\nVerified desktop failure:\n${evidence}`;
+      workingSet = await discoverProjectWorkingSet(access, task);
+    }
+  }
   if (explicitBrowserAcceptanceRequest && previewTarget) {
     await emitExecution(execution, "preview", "running", "Running the real build and desktop/mobile browser gate before model routing", {
       details: { paidModelCalls: 0, purpose: "evidence-first browser validation" },
@@ -4707,19 +4773,29 @@ async function runExistingProjectMissionWithAccess(params: {
         }
       }
       const verified = Boolean(desktopEvidence?.verified && (!interactionRequired || desktopEvidence.interactionVerified));
-      const evidence = verified
+      const acceptanceClassification = classifyAcceptanceEvidence({
+        verified,
+        available: desktopEvidence?.available,
+        explicitRepairEligible: desktopEvidence?.repairEligible,
+        failureKind: desktopEvidence?.failureKind,
+      });
+      if (desktopEvidence) desktopEvidence.repairEligible = acceptanceClassification.repairEligible;
+      const baseEvidence = verified
         ? desktopEvidence?.reason || "The requested desktop interaction completed and the application remained running."
         : desktopEvidence?.reason || desktopPreview.previewReason || "The desktop artifact could not be launched for behavioral acceptance.";
+      const evidence = desktopEvidence?.crashEvidence
+        ? `${baseEvidence}\n\nOperating-system crash evidence:\n${desktopEvidence.crashEvidence}`
+        : baseEvidence;
       await emitExecution(execution, "preview", verified ? "completed" : "error", verified ? "Desktop behavior verified" : "Desktop behavior still needs repair", {
-        details: { platform: "desktop", interactionRequired, actionsJson: JSON.stringify(desktopActions), interactionVerified: desktopEvidence?.interactionVerified, stepsJson: JSON.stringify(desktopEvidence?.steps ?? []), windowTitles: desktopEvidence?.windowTitles, evidence },
+        details: { platform: "desktop", interactionRequired, actionsJson: JSON.stringify(desktopActions), interactionVerified: desktopEvidence?.interactionVerified, repairEligible: acceptanceClassification.repairEligible, failureOrigin: acceptanceClassification.origin, failureKind: desktopEvidence?.failureKind, stepsJson: JSON.stringify(desktopEvidence?.steps ?? []), windowTitles: desktopEvidence?.windowTitles, crashEvidence: desktopEvidence?.crashEvidence, evidence },
       });
-      return { verified, evidence, desktopEvidence, connectorArtifact };
+      return { verified, evidence, desktopEvidence, connectorArtifact, acceptanceClassification };
     };
 
     let desktopAcceptance = await validateCurrentDesktop();
     const desktopRepairChangedFiles = new Set<string>();
     const attemptedDesktopRepairEvidence = new Set<string>();
-    for (let repairAttempt = 1; !desktopAcceptance.verified && desktopAcceptance.connectorArtifact && access.validateDesktop && repairAttempt <= 3; repairAttempt += 1) {
+    for (let repairAttempt = 1; !desktopAcceptance.verified && desktopAcceptance.desktopEvidence?.repairEligible && desktopAcceptance.connectorArtifact && access.validateDesktop && repairAttempt <= 3; repairAttempt += 1) {
       const evidenceFingerprint = createHash("sha256").update(desktopAcceptance.evidence).digest("hex");
       if (attemptedDesktopRepairEvidence.has(evidenceFingerprint)) {
         await emitExecution(execution, "planning", "warning", "Stopped repeated desktop repair on unchanged runtime evidence", {

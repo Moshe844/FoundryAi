@@ -205,13 +205,39 @@ function runProcess(command, args, options = {}) {
     const startedAt = Date.now();
     const child = spawn(command, args, { cwd: options.cwd, windowsHide: true });
     let stdout = ""; let stderr = ""; let settled = false;
-    const finish = (result) => { if (settled) return; settled = true; clearTimeout(timeout); resolve(result); };
+    let watchInterval;
+    const finish = (result) => { if (settled) return; settled = true; clearTimeout(timeout); if (watchInterval) clearInterval(watchInterval); resolve(result); };
     const timeout = setTimeout(() => { child.kill(); finish({ exitCode: null, stdout, stderr: `${stderr}\nTimed out.`.trim(), durationMs: Date.now() - startedAt }); }, options.timeoutMs || 30000);
+    if (Number(options.watchProcessId) > 0) {
+      watchInterval = setInterval(() => {
+        if (processIsAlive(Number(options.watchProcessId))) return;
+        child.kill();
+        finish({ exitCode: null, stdout, stderr, durationMs: Date.now() - startedAt, targetExited: true });
+      }, 100);
+    }
     child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
     child.on("error", (error) => finish({ exitCode: null, stdout, stderr: error.message, durationMs: Date.now() - startedAt }));
     child.on("close", (exitCode) => finish({ exitCode, stdout, stderr, durationMs: Date.now() - startedAt }));
   });
+}
+
+async function readWindowsCrashEvidence(processName, startedAt) {
+  if (process.platform !== "win32" || !processName) return "";
+  const diagnostic = await runProcess("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", path.join(__dirname, "read-windows-application-crash.ps1"),
+    "-ProcessName", processName,
+    "-StartedAtUtc", startedAt.toISOString(),
+    "-MaxWaitMs", "4000",
+  ], { timeoutMs: 7000 });
+  try {
+    const parsed = JSON.parse(diagnostic.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) || "{}");
+    return String(parsed.evidence || "");
+  } catch {
+    return diagnostic.stderr || diagnostic.stdout || "";
+  }
 }
 
 function safeIdentifier(value, label) {
@@ -247,12 +273,13 @@ async function runDesktopValidation(input) {
   const executable = path.resolve(input.root, String(input.executable || ""));
   if (executable !== path.resolve(input.root) && !executable.startsWith(`${path.resolve(input.root)}${path.sep}`)) throw new Error("Desktop executable must be inside the connected project.");
   if (!fs.existsSync(executable)) return { available: true, verified: false, reason: "Desktop executable was not found." };
+  const validationStartedAt = new Date();
   const child = spawn(executable, Array.isArray(input.args) ? input.args.map(String) : [], { cwd: path.dirname(executable), windowsHide: false, detached: true, stdio: "ignore" });
   await new Promise((resolve) => setTimeout(resolve, Math.max(500, Math.min(10000, Number(input.observeMs || 2000)))));
   let running = child.exitCode === null && !child.killed;
   const actions = Array.isArray(input.actions) ? input.actions.filter((action) => action && typeof action === "object") : [];
-  let interaction = { verified: false, reason: actions.length ? "Desktop interaction is unavailable on this host." : "No semantic desktop interaction was requested.", steps: [], windowTitles: [] };
-  if (running && actions.length && process.platform === "win32" && child.pid) {
+  let interaction = { verified: false, repairEligible: false, failureKind: actions.length ? "validator-driver-unavailable" : "", reason: actions.length ? "Desktop interaction is unavailable on this host." : "No semantic desktop interaction was requested.", crashEvidence: "", steps: [], windowTitles: [] };
+  if (actions.length && process.platform === "win32" && child.pid) {
     const actionsBase64 = Buffer.from(JSON.stringify(actions), "utf8").toString("base64");
     const automation = await runProcess("powershell.exe", [
       "-NoProfile",
@@ -260,14 +287,29 @@ async function runDesktopValidation(input) {
       "-File", path.join(__dirname, "validate-windows-desktop-ui.ps1"),
       "-ProcessId", String(child.pid),
       "-ActionsBase64", actionsBase64,
+      "-ExpectedProcessName", path.basename(executable, path.extname(executable)),
+      "-StartedAtUtc", validationStartedAt.toISOString(),
       "-TimeoutMs", String(Math.max(1000, Math.min(15000, Number(input.interactionTimeoutMs || 8000)))),
-    ], { timeoutMs: Math.max(5000, Math.min(20000, Number(input.interactionTimeoutMs || 8000) + 5000)) });
+    ], { timeoutMs: Math.max(4000, Math.min(12000, Number(input.interactionTimeoutMs || 8000) + 2000)), watchProcessId: child.pid });
+    const runningAfterAutomation = processIsAlive(child.pid);
     try {
       interaction = JSON.parse(automation.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) || "{}");
     } catch {
-      interaction = { verified: false, reason: automation.stderr || automation.stdout || "Windows UI Automation returned no readable result.", steps: [], windowTitles: [] };
+      if (!runningAfterAutomation || automation.targetExited) {
+        interaction = {
+          verified: false,
+          repairEligible: true,
+          failureKind: "application-exited-during-action",
+          reason: "The application exited while the desktop validator was invoking the requested control. This is application evidence and is eligible for source repair.",
+          crashEvidence: await readWindowsCrashEvidence(path.basename(executable, path.extname(executable)), validationStartedAt),
+          steps: [],
+          windowTitles: [],
+        };
+      } else {
+        interaction = { verified: false, repairEligible: false, failureKind: "validator-invalid-result", reason: automation.stderr || automation.stdout || "Windows UI Automation returned no readable result. No source repair was authorized.", crashEvidence: "", steps: [], windowTitles: [] };
+      }
     }
-    running = child.exitCode === null && !child.killed;
+    running = child.pid ? processIsAlive(child.pid) : child.exitCode === null && !child.killed;
   }
   if (running && child.pid) {
     ownedDesktopProcesses.set(child.pid, {
@@ -279,7 +321,13 @@ async function runDesktopValidation(input) {
     child.once("exit", () => ownedDesktopProcesses.delete(child.pid));
     child.unref();
   }
+  if (!running && process.platform === "win32" && !interaction.crashEvidence) {
+    interaction.crashEvidence = await readWindowsCrashEvidence(path.basename(executable, path.extname(executable)), validationStartedAt);
+  }
   const interactionVerified = actions.length > 0 && Boolean(interaction.verified);
+  const exitedDuringValidation = !running && !interaction.repairEligible;
+  const repairEligible = Boolean(interaction.repairEligible) || exitedDuringValidation;
+  const failureKind = interaction.failureKind || (exitedDuringValidation ? "application-exited-during-validation" : "");
   return {
     available: true,
     verified: running && (!actions.length || interactionVerified),
@@ -287,10 +335,15 @@ async function runDesktopValidation(input) {
     pid: child.pid,
     running,
     interactionVerified,
+    repairEligible,
+    failureKind,
+    crashEvidence: interaction.crashEvidence || "",
     steps: interaction.steps,
     windowTitles: interaction.windowTitles,
     reason: !running
-      ? `The process exited with code ${child.exitCode}.`
+      ? interaction.repairEligible
+        ? interaction.reason
+        : `The application exited before the desktop validator could confirm the requested interaction (exit code ${child.exitCode}). Operating-system crash evidence determines the repair target.`
       : actions.length
         ? interaction.reason
         : "The process launched and remained alive during the observation window; semantic UI interaction was not requested.",

@@ -3,7 +3,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 
 const NODE_MISSING_MESSAGE = "Node.js is required to run the Foundry Local Agent. Download it from https://nodejs.org/ and run this file again.";
-type AgentScripts = { connector: string; validation: string; staticPreview: string; windowsDesktopUi: string };
+type AgentScripts = { connector: string; validation: string; staticPreview: string; windowsDesktopUi: string; windowsCrashReader: string };
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -11,13 +11,14 @@ export async function GET(request: Request) {
 
   let scripts: AgentScripts;
   try {
-    const [connector, validation, staticPreview, windowsDesktopUi] = await Promise.all([
+    const [connector, validation, staticPreview, windowsDesktopUi, windowsCrashReader] = await Promise.all([
       readFile(path.join(process.cwd(), "scripts", "foundry-local-connector.cjs"), "utf8"),
       readFile(path.join(process.cwd(), "scripts", "local-agent-validation.cjs"), "utf8"),
       readFile(path.join(process.cwd(), "scripts", "foundry-static-preview.cjs"), "utf8"),
       readFile(path.join(process.cwd(), "scripts", "validate-windows-desktop-ui.ps1"), "utf8"),
+      readFile(path.join(process.cwd(), "scripts", "read-windows-application-crash.ps1"), "utf8"),
     ]);
-    scripts = { connector, validation, staticPreview, windowsDesktopUi };
+    scripts = { connector, validation, staticPreview, windowsDesktopUi, windowsCrashReader };
   } catch {
     return NextResponse.json({ error: "The complete local agent runtime is not available on this server." }, { status: 500 });
   }
@@ -87,6 +88,7 @@ function buildWindowsLauncher(scripts: AgentScripts) {
     ...windowsBase64FileLines("local-agent-validation.cjs", scripts.validation, "VALIDATION"),
     ...windowsBase64FileLines("foundry-static-preview.cjs", scripts.staticPreview, "PREVIEW"),
     ...windowsBase64FileLines("validate-windows-desktop-ui.ps1", scripts.windowsDesktopUi, "DESKTOP_UI"),
+    ...windowsBase64FileLines("read-windows-application-crash.ps1", scripts.windowsCrashReader, "CRASH_READER"),
     "echo Installing Foundry Local Agent to %INSTALL_DIR% ...",
     "set \"LAUNCH_VBS=%INSTALL_DIR%\\launch-agent.vbs\"",
     "> \"%LAUNCH_VBS%\" echo Set objShell = CreateObject(\"WScript.Shell\")",

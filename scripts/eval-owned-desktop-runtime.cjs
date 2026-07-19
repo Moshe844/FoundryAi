@@ -15,6 +15,21 @@ function processIsAlive(processId) {
   try { process.kill(processId, 0); return true; } catch { return false; }
 }
 
+function copyFileAfterWindowsLockRelease(source, destination) {
+  let lastError;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      fs.copyFileSync(source, destination);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!error || !["EBUSY", "EPERM", "EACCES"].includes(error.code)) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+  throw lastError;
+}
+
 async function run() {
   fs.mkdirSync(fixture, { recursive: true });
   const source = fs.readFileSync(path.join(root, "lib", "factory", "owned-desktop-processes.ts"), "utf8");
@@ -22,7 +37,7 @@ async function run() {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText;
   fs.writeFileSync(compiledModule, compiled, "utf8");
-  fs.copyFileSync(process.execPath, executable);
+  copyFileAfterWindowsLockRelease(process.execPath, executable);
   const lifecycle = require(compiledModule);
   const acceptanceSource = fs.readFileSync(path.join(root, "lib", "factory", "desktop-acceptance.ts"), "utf8");
   const acceptanceCompiled = ts.transpileModule(acceptanceSource, {
@@ -31,8 +46,16 @@ async function run() {
   const acceptanceModule = { exports: {} };
   new Function("module", "exports", "require", acceptanceCompiled)(acceptanceModule, acceptanceModule.exports, require);
   const desktopAcceptance = acceptanceModule.exports;
+  const evidenceSource = fs.readFileSync(path.join(root, "lib", "factory", "acceptance-evidence.ts"), "utf8");
+  const evidenceCompiled = ts.transpileModule(evidenceSource, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const evidenceModule = { exports: {} };
+  new Function("module", "exports", "require", evidenceCompiled)(evidenceModule, evidenceModule.exports, require);
+  const acceptanceEvidence = evidenceModule.exports;
   const runtimeSource = fs.readFileSync(path.join(root, "lib", "factory", "runtime.ts"), "utf8");
   const validatorSource = fs.readFileSync(path.join(root, "scripts", "local-agent-validation.cjs"), "utf8");
+  const windowsUiSource = fs.readFileSync(path.join(root, "scripts", "validate-windows-desktop-ui.ps1"), "utf8");
 
   assert.deepEqual(
     desktopAcceptance.desktopInteractionActionsForTask("When clicking on Settings, the entire app closes down."),
@@ -44,15 +67,29 @@ async function run() {
     [{ action: "click", name: "Export", automationId: "" }, { action: "click", name: "Settings", automationId: "" }],
     "Multiple desktop controls are not preserved in user-request order.",
   );
+  assert.deepEqual(acceptanceEvidence.classifyAcceptanceEvidence({ verified: false, explicitRepairEligible: true, failureKind: "application-exited-after-action" }), { origin: "product", repairEligible: true });
+  assert.deepEqual(acceptanceEvidence.classifyAcceptanceEvidence({ verified: false, failureKind: "validator-control-not-found" }), { origin: "validator", repairEligible: false });
+  assert.deepEqual(acceptanceEvidence.classifyAcceptanceEvidence({ verified: false, infrastructureFailure: true }), { origin: "infrastructure", repairEligible: false });
+  assert.deepEqual(acceptanceEvidence.classifyAcceptanceEvidence({ verified: false, failureKind: "ambiguous-result" }), { origin: "unknown", repairEligible: false });
   assert.match(runtimeSource, /currentPreviewPlatform === "web" && \(Boolean\(preModelBrowserEvidence\)/, "Native artifacts can still enter the web-browser acceptance branch.");
   assert.match(runtimeSource, /Checklist item\\\(s\\\) not completed/, "A verified partial implementation cannot continue when the executor leaves checklist work unfinished.");
   assert.match(runtimeSource, /deterministicDesktopAcceptanceRequested/, "Behavioral desktop work has no deterministic native acceptance stage.");
   assert.match(runtimeSource, /desktop runtime repair/, "A failed native acceptance check cannot re-enter autonomous source repair.");
   assert.match(runtimeSource, /attemptedDesktopRepairEvidence/, "Native repair can repeat paid attempts against unchanged runtime evidence.");
+  assert.match(runtimeSource, /desktopAcceptance\.desktopEvidence\?\.repairEligible/, "Validator limitations can still authorize paid product source repair.");
+  assert.match(runtimeSource, /explicitDesktopDefectPreflight/, "Reported native runtime defects can still reach an implementation model before reproduction.");
+  assert.match(runtimeSource, /Authoritative native runtime evidence collected before any implementation model call/, "Native application evidence is not injected into the first repair pass.");
+  assert.match(runtimeSource, /Foundry did not edit project source because this evidence originated in the validator or environment/, "Validator and environment failures can still fall through into source mutation.");
   assert.match(runtimeSource, /desktopAcceptance = await validateCurrentDesktop\(\)/, "Foundry does not repeat the same native interaction after rebuilding a repair.");
   assert.match(validatorSource, /validate-windows-desktop-ui\.ps1/, "The Local Agent does not exercise named desktop controls through Windows accessibility automation.");
   assert.match(validatorSource, /interactionVerified/, "Desktop validation can still claim interaction success from process launch alone.");
   assert.match(validatorSource, /driver: process\.platform === "win32" \? "windows-ui-automation"/, "Local Agent discovery still hides the installed Windows semantic-interaction driver.");
+  assert.match(windowsUiSource, /Normalize-ControlName/, "Desktop control lookup does not normalize accessibility mnemonics and repeated-letter user typos.");
+  assert.match(windowsUiSource, /SelectionItemPattern/, "Desktop interaction cannot invoke controls exposed as selectable menu items.");
+  assert.match(windowsUiSource, /RawViewWalker/, "Desktop interaction cannot walk from a labeled child to its actionable accessibility parent.");
+  assert.match(windowsUiSource, /No source repair was authorized/, "Validator limitations are not explicitly prevented from becoming source-repair evidence.");
+  const crashReaderSource = fs.readFileSync(path.join(root, "scripts", "read-windows-application-crash.ps1"), "utf8");
+  assert.match(crashReaderSource, /-MaxEvents 60/, "Windows crash diagnostics can still scan an unbounded Application event log.");
 
   assert.equal(lifecycle.commandProducesBuildArtifacts("dotnet build App.sln --no-restore"), true);
   assert.equal(lifecycle.commandProducesBuildArtifacts("npm.cmd run build"), true);
@@ -77,7 +114,7 @@ async function run() {
   assert.equal(suspended.suspended.length, 1, "Foundry did not recognize its owned desktop process.");
   assert.equal(processIsAlive(child.pid), false, "The owned executable remained locked after suspension.");
 
-  fs.copyFileSync(process.execPath, executable);
+  copyFileAfterWindowsLockRelease(process.execPath, executable);
   const resumed = await lifecycle.resumeOwnedDesktopProcesses(suspended.suspended);
   assert.equal(resumed.failed.length, 0, "Foundry could not restore its owned desktop process after the build.");
   assert.equal(resumed.resumed.length, 1);
