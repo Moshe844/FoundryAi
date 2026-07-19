@@ -35,6 +35,16 @@ function loadBrowserInfrastructurePolicy() {
   return loadedModule.exports;
 }
 
+function loadDebugIntentPolicy() {
+  const source = fs.readFileSync(path.join(root, "lib/ai/mission/debug-intent.ts"), "utf8");
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const loadedModule = { exports: {} };
+  vm.runInNewContext(compiled, { module: loadedModule, exports: loadedModule.exports, require }, { filename: "debug-intent.js" });
+  return loadedModule.exports;
+}
+
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
@@ -42,8 +52,11 @@ function assert(condition, message) {
 const policy = loadPolicy();
 const followUpPolicy = loadFollowUpPolicy();
 const browserInfrastructure = loadBrowserInfrastructurePolicy();
+const debugIntentPolicy = loadDebugIntentPolicy();
 const repeatedImplementationRequest = "make option to upload more pictures\nI should also be able to update pricing on my own, also the whole styling is ugly, needs to be really really nice eye catching";
 assert(followUpPolicy.standaloneMutationIntent(repeatedImplementationRequest) === "edit", "The reported standalone implementation request is not recognized as a mutation.");
+assert(followUpPolicy.standaloneMutationIntent("When clicking on Settings the app closes.") === "debug", "A plain-language current desktop failure is not routed as repair work.");
+assert(debugIntentPolicy.isConcreteDebugRequest("When clicking on Settings the app closes."), "The planner does not recognize the Settings exit as a concrete debug request.");
 assert(followUpPolicy.standaloneMutationIntent("What changed in the last mission?") === null, "A genuine status question was incorrectly converted into an edit.");
 const uiRequests = [
   "Make the checkout easier and more pleasant for customers to use.",
@@ -55,6 +68,16 @@ for (const request of uiRequests) {
   assert(policy.isUserFacingUiOutcome(request), `UI outcome was not recognized: ${request}`);
 }
 assert(!policy.isUserFacingUiOutcome("Rename a private backend helper without changing behavior."), "Backend-only work was misclassified as a UI outcome.");
+assert(policy.reportsCurrentBehaviorFailure("When clicking on Settings the app closes."), "A fresh desktop crash report does not override historical completion evidence.");
+assert(policy.reportsCurrentBehaviorFailure("Opening the profile page crashes the application."), "A current navigation crash is not recognized as stronger evidence than a prior fingerprint.");
+assert(policy.requiresFreshBehavioralAcceptance("Fix the API endpoint returning the wrong response."), "API behavior can still be declared complete from source fingerprints and a build alone.");
+assert(policy.requiresFreshBehavioralAcceptance("Add an option to upload more pictures."), "A newly requested product capability does not require fresh behavioral acceptance.");
+assert(!policy.requiresFreshBehavioralAcceptance("Rename a private backend helper without changing behavior."), "A source-only rename was incorrectly forced through a runtime acceptance gate.");
+assert(!policy.mayAttemptPriorCompletionReuse("When clicking on Settings the app closes.", "desktop"), "The exact reported Settings crash can still be short-circuited as already complete.");
+assert(!policy.mayAttemptPriorCompletionReuse("Add a pricing editor to the desktop app.", "desktop"), "Desktop behavior can still reuse fingerprints without current interaction acceptance.");
+assert(!policy.mayAttemptPriorCompletionReuse("Fix the API endpoint returning the wrong response.", "api"), "API behavior can still reuse fingerprints without current request/response acceptance.");
+assert(policy.mayAttemptPriorCompletionReuse("Add an option to upload more pictures.", "web"), "Web behavior cannot enter provisional reuse before its mandatory browser acceptance gate.");
+assert(policy.mayAttemptPriorCompletionReuse("Rename a private backend helper without changing behavior.", "desktop"), "A source-only exact request cannot use verified fingerprints.");
 assert(policy.requiresPresentationLayerChange("Modify the UX to be much nicer."), "Broad UX work must require a presentation-layer change.");
 const requestedStoreContract = policy.observableBrowserContractForTask("make option to upload more pictures\nI should also be able to update pricing on my own\nalso the whole styling is ugly, needs to be really really nice eye catching");
 const requestedStoreCapabilities = new Set(requestedStoreContract.requirements.flatMap((item) => item.capabilities));
@@ -95,6 +118,7 @@ const factoryRuntime = fs.readFileSync(path.join(root, "lib/factory/runtime.ts")
 const followUpClassifier = fs.readFileSync(path.join(root, "lib/mission/classifyFollowUp.ts"), "utf8");
 const intentRoute = fs.readFileSync(path.join(root, "app/api/factory/intent/route.ts"), "utf8");
 const missionPlanner = fs.readFileSync(path.join(root, "lib/ai/mission/mission-planner.ts"), "utf8");
+const intentClassifier = fs.readFileSync(path.join(root, "lib/ai/mission/intent-classifier.ts"), "utf8");
 const projectAccess = fs.readFileSync(path.join(root, "lib/ai/mission/project-access.ts"), "utf8");
 const phraseSpecificContinuation = /yes please\|go ahead|go ahead\|continue|BARE_CONTINUE_PATTERN|isBareContinuationMessage/;
 assert(!phraseSpecificContinuation.test(`${workspaceShell}\n${factoryRuntime}\n${followUpClassifier}`), "Phrase-specific continuation routing returned.");
@@ -130,12 +154,18 @@ assert(factoryRuntime.includes("Implemented the requested project change and ver
 assert(factoryRuntime.includes("findUnreachableVerifiedUiFiles"), "Fingerprint reuse does not check whether changed UI components are reachable from the application.");
 assert(factoryRuntime.includes("their UI is not connected to the application"), "Disconnected UI can still be reported as an already-completed implementation.");
 assert(workspaceShell.includes("currentStandaloneMutation && !isMutatingProjectIntent(resolvedIntent.currentIntent)"), "A standalone implementation request can still be rendered as a status evidence packet after semantic misclassification.");
+assert(workspaceShell.includes("if (reportsCurrentBehaviorFailure(task)) return undefined"), "The client can still attach stale completion evidence to a fresh defect report.");
 assert(intentRoute.includes('intent === "status" || intent === "retrospective"'), "The server policy does not correct imperative mutations misclassified as status or retrospective requests.");
+assert(intentClassifier.includes("shuts?\\s+down") && intentClassifier.includes("clos(?:e|es|ed|ing)"), "Plain-language unexpected app exits are missing from deterministic debug routing.");
 assert(factoryRuntime.includes("observableBrowserContractForTask") && factoryRuntime.includes("validateObservableBrowserContract"), "The browser gate does not derive and exercise observable capabilities from the user's atomic requirements.");
 assert(factoryRuntime.includes("acceptanceScreenshotUrl") && factoryRuntime.includes("strongest matching surface"), "Browser evidence can still screenshot an arbitrary last route instead of the strongest requested surface.");
 assert(factoryRuntime.includes("hasDisposableFrameworkAssetFailure(problems)"), "A stale generated chunk mixed with downstream DOM failures can still be routed into paid product repair.");
 assert(factoryRuntime.includes("browserAcceptanceTask") && factoryRuntime.includes("previewTarget && verificationProfile.commands.some"), "Required builds can still invalidate a live preview or validate internal planning prose instead of the user request.");
 assert(factoryRuntime.includes('page.waitForLoadState("networkidle"'), "Client-rendered controls can still be judged missing before route data and hydration settle.");
 assert(factoryRuntime.includes("Matching files alone were insufficient; executing the unverified requirements"), "Idempotency reuse can still accept matching fingerprints without rendered requirement acceptance.");
+assert(factoryRuntime.includes("currentDefectReport") && factoryRuntime.includes("priorCompletionCanBeReused"), "A fresh defect report can still reuse an older completed mission.");
+assert(factoryRuntime.includes("File fingerprints and a build cannot prove the requested") && factoryRuntime.includes("executing normally"), "Non-web behavior can still be marked complete from hashes and compilation alone.");
+assert(factoryRuntime.includes("Current defect evidence supersedes the matching historical completion record"), "The server-side reuse function lacks a final defense against stale defect completion.");
+assert(factoryRuntime.includes("initializeObjectiveChecklist(execution, requestedTask, sourceMode)"), "A rejected reuse attempt can leave stale completed checklist items visible while repair continues.");
 
 console.log("Completion truthfulness regression checks passed.");

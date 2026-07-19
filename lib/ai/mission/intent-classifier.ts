@@ -21,7 +21,7 @@ export type IntentClassification = {
 // question about a change, not a request to make one — the deterministic mutation guard must stand
 // down and let the read-only classification survive (test B08/B09).
 const EXPLICIT_ADVICE_PATTERN = /\b(?:only|just)\s+(?:explain|advise|inspect|review|analy[sz]e|tell me|show me|summarize)\b|\b(?:how would|how should|what would be the best way to|what should i|would it be better|is it better|would you recommend|do you (?:think|recommend)|should (?:i|we|it)|what do you think|advice only)\b|\b(?:don'?t|do not)\s+(?:change|implement|edit|touch|modify|apply)\b/i;
-const DEBUG_PATTERN = /\b(?:fix|repair|bug|error|crash|broken|exception|stack trace|failing|failed)\b/i;
+const DEBUG_PATTERN = /\b(?:fix|repair|bug|error|crash(?:es|ed|ing)?|broken|exception|stack trace|failing|failed|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|freezes?|hangs?|disappears?)\b/i;
 const BUILD_PATTERN = /\b(?:create|build|scaffold|generate(?: a new)?|set up|make a new)\b/i;
 const MUTATION_PATTERN =
   /\b(?:add|create|make|build|generate|implement|edit|change|update|modify|fix|repair|separate|split|extract|move|delete|remove|rename|refactor|install|allow|enable|wire|hook up|replace)\b/i;
@@ -192,7 +192,7 @@ export function guessIntentHeuristically(message: string): MissionIntent {
   if (/\b(can you see|what does|what is this|explain|tell me about|do you understand)\b/.test(text)) return "question";
   if (/\b(undo|revert|roll back|rollback)\b/.test(text)) return "undo";
   if (/\b(deploy|production|release|ship it|hosting)\b/.test(text)) return "deploy";
-  if (/\b(fix|bug|error|crash|broken|exception|stack trace)\b/.test(text)) return "debug";
+  if (/\b(?:fix|bug|error|crash(?:es|ed|ing)?|broken|exception|stack trace|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|freezes?|hangs?|disappears?)\b/.test(text)) return "debug";
   if (/\b(review|audit|analy[sz]e|architecture assessment)\b/.test(text)) return "analyze";
   if (/\b(status|what happened|last run|previous run)\b/.test(text)) return "status";
   if (/\b(create|build|scaffold|generate a new)\b/.test(text)) return "build";

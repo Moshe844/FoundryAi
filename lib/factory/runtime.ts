@@ -8,7 +8,7 @@ import { capabilityLevelForStackChoice, checklistForRequest, detectStackProfile,
 import { classifyIntent, deterministicMutationIntent, deterministicTaskAssessment } from "@/lib/ai/mission/intent-classifier";
 import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { planMission } from "@/lib/ai/mission/mission-planner";
-import { extractAtomicUserRequirements, isUserFacingUiOutcome, observableBrowserContractForTask, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
+import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
 import { hasRunnableProjectEntry, runMissionExecutor } from "@/lib/ai/mission/executor";
 import { reviewArchitecture } from "@/lib/ai/mission/architecture-review";
 import { verifyMissionResult } from "@/lib/ai/mission/mission-verifier";
@@ -2979,7 +2979,7 @@ async function runExistingProjectMissionWithAccess(params: {
   idempotencyCandidate?: MissionParentContext;
   retryExecutionId?: string;
 }): Promise<{ status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: MissionClarification[]; changedFiles: string[]; commands?: FactoryCommandEvent[]; sessionSummary?: FactorySessionSummary; verification?: ExecutionMissionVerification[]; events: string[]; stackLabel?: string; projectDeleted?: boolean }> {
-  const { access, task: requestedTask, execution, projectSnapshot, workspaceProjectPath, previewTarget, signal, approvedCategories = [], approvedCommands = [], parentMission, followUpResolution, continuity, approvalResponse: structuredApprovalResponse, quality = DEFAULT_MISSION_QUALITY, modelMode = "auto", evidenceAttachments = [], idempotencyCandidate, retryExecutionId } = params;
+  const { access, task: requestedTask, sourceMode, execution, projectSnapshot, workspaceProjectPath, previewTarget, signal, approvedCategories = [], approvedCommands = [], parentMission, followUpResolution, continuity, approvalResponse: structuredApprovalResponse, quality = DEFAULT_MISSION_QUALITY, modelMode = "auto", evidenceAttachments = [], idempotencyCandidate, retryExecutionId } = params;
   // Older browser bundles sent approval controls as synthetic prose. Treat that wire format as a
   // control response on the server too, so a stale tab can never restart a premium Builder mission.
   const legacyDeniedCommand = requestedTask.match(/^Denied approval to run "([\s\S]+)" - mark the checklist item/i)?.[1]?.trim();
@@ -3094,6 +3094,14 @@ async function runExistingProjectMissionWithAccess(params: {
     const selectedStack = savedBrief.content.match(/^Selected stack:\s*(.+)$/im)?.[1]?.trim();
     if (selectedStack) stackProfile = capabilityLevelForStackChoice(selectedStack);
   }
+  const reusePreviewPlatform = previewPlatformForStack(stackProfile.label);
+  const currentDefectReport = reportsCurrentBehaviorFailure(requestedTask);
+  const requiresCurrentBehaviorAcceptance = requiresFreshBehavioralAcceptance(requestedTask);
+  // A current defect report always overrides older completion evidence. For other behavioral work,
+  // reuse is permitted only where Foundry can immediately run a requirement-directed web gate.
+  // Native desktop/mobile, APIs, CLIs, and background workflows must execute normally until their
+  // behavior is exercised by a platform-specific acceptance driver.
+  const priorCompletionCanBeReused = mayAttemptPriorCompletionReuse(requestedTask, reusePreviewPlatform);
   const exactFailedRetry = Boolean(
     exactRetry
     && retryExecutionId === parentMission?.id
@@ -3109,16 +3117,25 @@ async function runExistingProjectMissionWithAccess(params: {
   let retryRepairEvidence: string | undefined;
   let retryBuildFailure: FactoryCommandEvent | undefined;
   if (exactFailedRetry && parentMission) {
-    const reused = await reuseVerifiedMissionIfCurrent({
-      candidate: parentMission,
-      requestedTask,
-      access,
-      execution,
-      verificationProfile,
-      workspaceProjectPath,
-      stackLabel: stackProfile.label,
-      allowIncompleteMission: true,
-    });
+    const reused = priorCompletionCanBeReused
+      ? await reuseVerifiedMissionIfCurrent({
+          candidate: parentMission,
+          requestedTask,
+          access,
+          execution,
+          verificationProfile,
+          workspaceProjectPath,
+          stackLabel: stackProfile.label,
+          allowIncompleteMission: true,
+        })
+      : undefined;
+    if (!priorCompletionCanBeReused) {
+      await emitExecution(execution, "inspection", "completed", currentDefectReport
+        ? "The new defect report overrides the older completion record; investigating current behavior"
+        : `File fingerprints and a build cannot prove the requested ${reusePreviewPlatform} behavior; executing normally`, {
+        details: { priorMissionId: parentMission.id, paidModelCalls: 0, currentDefectReport, requiresCurrentBehaviorAcceptance, previewPlatform: reusePreviewPlatform },
+      });
+    }
     if (reused) {
       if (stackHasBuildStep(stackProfile.id)) {
         const build = await runCanonicalProjectBuild();
@@ -3154,13 +3171,14 @@ async function runExistingProjectMissionWithAccess(params: {
       }
       if (!retryRepairEvidence) return reused;
     }
-    if (!reused && parentMission.files_touched.length > 0) {
+    if (!reused && priorCompletionCanBeReused && parentMission.files_touched.length > 0) {
       await emitExecution(execution, "inspection", "completed", "Retry snapshot changed; executing the recorded request against current files", {
         details: { priorMissionId: parentMission.id, paidModelCalls: 0, reason: "A generic build or browser pass cannot prove that the failed mission's requested features exist." },
       });
     }
   }
   if (retryRepairEvidence) {
+    initializeObjectiveChecklist(execution, requestedTask, sourceMode);
     task = `${task}\n\nRetry preflight found a real verification failure. Repair this exact evidence, preserve the working implementation, then rebuild and repeat the same gate.\n\nVerified failure:\n${retryRepairEvidence}`;
     workingSet = retryBuildFailure && workspaceProjectPath
       ? workingSetWithCommandFailure(await discoverProjectWorkingSet(access, task), retryBuildFailure, workspaceProjectPath)
@@ -3169,7 +3187,7 @@ async function runExistingProjectMissionWithAccess(params: {
       details: { paidModelCalls: 0, repairRequired: true, priorMissionId: parentMission?.id, likelyFiles: workingSet.likelyFiles },
     });
   }
-  if (idempotencyCandidate && !approvalResponse && continuity !== "carry_forward_plan") {
+  if (idempotencyCandidate && !approvalResponse && continuity !== "carry_forward_plan" && priorCompletionCanBeReused) {
     const reused = await reuseVerifiedMissionIfCurrent({
       candidate: idempotencyCandidate,
       requestedTask,
@@ -3180,7 +3198,7 @@ async function runExistingProjectMissionWithAccess(params: {
       stackLabel: stackProfile.label,
     });
     if (reused) {
-      const requiresRenderedAcceptance = isUserFacingUiOutcome(requestedTask) && previewPlatformForStack(stackProfile.label) === "web";
+      const requiresRenderedAcceptance = requiresCurrentBehaviorAcceptance && reusePreviewPlatform === "web";
       if (!requiresRenderedAcceptance) return reused;
 
       let reuseFailure = "";
@@ -3208,12 +3226,19 @@ async function runExistingProjectMissionWithAccess(params: {
         }
       }
       if (!reuseFailure) reuseFailure = "Foundry could not establish requirement-directed browser acceptance for the unchanged implementation.";
+      initializeObjectiveChecklist(execution, requestedTask, sourceMode);
       task = `${task}\n\nExisting-work acceptance did not prove the request is already complete. Inspect and implement only the missing behavior, then repeat the same requirement-directed gate.\n\nAcceptance evidence:\n${reuseFailure}`;
       workingSet = await discoverProjectWorkingSet(access, task);
       await emitExecution(execution, "inspection", "completed", "Matching files alone were insufficient; executing the unverified requirements", {
         details: { priorMissionId: idempotencyCandidate.id, paidModelCalls: 0, acceptanceEvidence: reuseFailure },
       });
     }
+  } else if (idempotencyCandidate && !approvalResponse && continuity !== "carry_forward_plan" && !priorCompletionCanBeReused) {
+    await emitExecution(execution, "inspection", "completed", currentDefectReport
+      ? "The user's current defect report conflicts with the older completion record; executing the repair normally"
+      : `The older file fingerprints do not prove current ${reusePreviewPlatform} behavior; executing the request normally`, {
+      details: { priorMissionId: idempotencyCandidate.id, paidModelCalls: 0, currentDefectReport, requiresCurrentBehaviorAcceptance, previewPlatform: reusePreviewPlatform },
+    });
   }
   const failedAtModelBudgetBoundary = parentMission?.state === "failed"
     && /Estimated request cost would exceed|Model-call limit reached|configured execution limit/i.test(parentMission.blocked_reason ?? "");
@@ -6507,6 +6532,13 @@ async function reuseVerifiedMissionIfCurrent(input: {
   allowIncompleteMission?: boolean;
 }): Promise<{ status: "passed"; changedFiles: string[]; commands: FactoryCommandEvent[]; sessionSummary: FactorySessionSummary; verification: ExecutionMissionVerification[]; events: string[]; stackLabel: string } | undefined> {
   const { candidate, requestedTask, access, execution, verificationProfile, workspaceProjectPath, stackLabel, allowIncompleteMission = false } = input;
+  if (reportsCurrentBehaviorFailure(requestedTask)) {
+    await emitExecution(execution, "inspection", "completed", "Current defect evidence supersedes the matching historical completion record", {
+      internal: true,
+      details: { priorMissionId: candidate.id, currentDefectReport: true, paidModelCalls: 0 },
+    });
+    return undefined;
+  }
   const requestKey = normalizeIdempotentRequest(requestedTask);
   const exactRequestMatch = requestKey.length > 0
     && candidate.source_requirements.some((requirement) => normalizeIdempotentRequest(requirement) === requestKey);

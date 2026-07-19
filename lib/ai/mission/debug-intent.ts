@@ -1,5 +1,5 @@
-const FAILURE_SIGNAL = /\b(error|exception|failure|failed|fails?|failing|broken|crash(?:es|ing)?|bug|issue|problem|diagnose|debug|unexpected character|syntaxerror|typeerror|referenceerror|uncaught|traceback|status\s+(?:500|404|403|401))\b/i;
-const TECHNICAL_TARGET = /\b(parse|parser|json|upload|request|response|stack trace|console|terminal|build|compile|api|route|endpoint|auth|login|runtime)\b/i;
+const FAILURE_SIGNAL = /\b(error|exception|failure|failed|fails?|failing|broken|crash(?:es|ed|ing)?|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|freezes?|hangs?|disappears?|bug|issue|problem|diagnose|debug|unexpected character|syntaxerror|typeerror|referenceerror|uncaught|traceback|status\s+(?:500|404|403|401))\b/i;
+const TECHNICAL_TARGET = /\b(parse|parser|json|upload|request|response|stack trace|console|terminal|build|compile|api|route|endpoint|auth|login|runtime|app|application|settings?|button|menu|dialog|window|screen|page|navigation)\b/i;
 
 /** Requires both a real failure signal and a technical target. Ordinary product briefs that mention
  * uploads, requests, JSON, builds, or future failure handling are creation work, not bug reports. */

@@ -139,6 +139,7 @@ const HARD_STOP_PATTERN = /^(?:stop|halt|cancel|wait[, ]+stop)\b/i;
 const APPROVAL_REPLY_PATTERN = /^(?:approved:\s*run\s|denied approval to run\s)/i;
 const DESTRUCTIVE_PATTERN = /\b(?:undo|revert|roll back|rollback|delete|remove|drop|erase|clear|reset|change (?:it|that) back)\b/i;
 const MUTATING_PATTERN = /\b(?:add|create|make|build|implement|edit|change|update|modify|fix|repair|move|delete|remove|rename|refactor|install|enable|wire|replace|style|darken|lighten)\b/i;
+const CURRENT_RUNTIME_FAILURE_PATTERN = /\b(?:crash(?:es|ed|ing)?|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|does\s+not\s+work|doesn['’]?t\s+work|not\s+working|freezes?|hangs?|disappears?|broken|failing|failed|throws?|errors?)\b/i;
 const MANUAL_GUIDANCE_PATTERN = /\bhow\s+(?:do|can|should|would)\s+i\b[^.!?\n]{0,180}\b(?:manually|myself|by hand|on my own)\b|\b(?:manually|myself|by hand|on my own)\b[^.!?\n]{0,180}\b(?:steps?|instructions?|how)\b/i;
 const EXPLICIT_NO_MUTATION_PATTERN = /\b(?:do not|don't|never)\b[^.!?\n]{0,100}\b(?:make|apply|perform|write|edit|modify|change|touch|implement|create|delete|remove|rewrite)(?:ing)?\b[^.!?\n]{0,80}\b(?:changes?|edits?|files?|code|anything)\b|\bwithout\b[^.!?\n]{0,100}\b(?:changing|editing|modifying|writing|touching|creating|deleting|removing)\b|\bno\s+(?:changes?|edits?|writes?|file changes?|code changes?)\b/i;
 const READ_ONLY_REQUEST_PATTERN = /\b(?:explain|describe|summarize|inspect|review|analy[sz]e|walk me through|tell me|show me|what|why|how)\b/i;
@@ -153,7 +154,7 @@ const EXPLICIT_FOLLOW_ON_MUTATION_PATTERN = /(?:\b(?:then|and|also|now)\s+|[.!?;
 export function standaloneMutationIntent(message: string): "edit" | "debug" | null {
   const text = message.trim();
   if (!text || explicitReadOnlyProjectIntent(text)) return null;
-  if (/\b(?:fix|repair|bug|error|crash|broken|failing|failed)\b/i.test(text)) return "debug";
+  if (/\b(?:fix|repair|bug|error|crash(?:es|ed|ing)?|broken|failing|failed|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|freezes?|hangs?|disappears?)\b/i.test(text)) return "debug";
   return MUTATING_PATTERN.test(text) ? "edit" : null;
 }
 
@@ -314,14 +315,14 @@ export function fallbackFollowUpResolution(message: string, context: ProjectInte
     });
   }
 
-  if (MUTATING_PATTERN.test(text)) {
+  if (MUTATING_PATTERN.test(text) || CURRENT_RUNTIME_FAILURE_PATTERN.test(text)) {
     const referential = hasReferentialTarget(text);
     if (referential && !referencedPriorAction && explicitFiles.length === 0) {
       return clarifyRecord("edit", "Which prior change, file, or component are you referring to?", 0.25, DESTRUCTIVE_PATTERN.test(text));
     }
     const files = explicitFiles.length ? explicitFiles : referential ? recentFiles : [];
     return record({
-      currentIntent: /\b(?:bug|broken|error|failing|crash)\b/i.test(text) ? "debug" : "edit",
+      currentIntent: CURRENT_RUNTIME_FAILURE_PATTERN.test(text) || /\b(?:bug|broken|error|failing|crash)\b/i.test(text) ? "debug" : "edit",
       referencedPriorAction: referential ? referencedPriorAction : null,
       relevantFiles: files,
       expectedScope: files.length ? `Modify only ${files.join(", ")} unless a dependency is explicitly recorded.` : "Plan the new request from current project evidence and record every file before modifying it.",

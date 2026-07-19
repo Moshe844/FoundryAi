@@ -32,6 +32,7 @@ import {
 import type { FollowUpResolutionRecord, ProjectTurnIntent } from "@/lib/mission/classifyFollowUp";
 import type { DeliveredProjectFile } from "@/lib/mission/model";
 import { explicitProjectFileNames, isExplicitLocalProjectFileRequest } from "@/lib/sources/intent";
+import { reportsCurrentBehaviorFailure } from "@/lib/ai/mission/requirement-contract";
 
 export type WorkspaceNote = {
   id: string;
@@ -2482,6 +2483,9 @@ function normalizeIdempotentRequest(value: string) {
 }
 
 function idempotencyCandidateFor(mission: MissionState, task: string): MissionParentContext | undefined {
+  // A current user-observed failure is new authoritative evidence. Do not even offer the server an
+  // older "complete" mission as an idempotency candidate for this turn.
+  if (reportsCurrentBehaviorFailure(task)) return undefined;
   const requestKey = normalizeIdempotentRequest(task);
   if (!requestKey) return undefined;
   const candidate = [...mission.executionMissions].reverse().find((execution) =>

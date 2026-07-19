@@ -82,6 +82,39 @@ export function isUserFacingUiOutcome(task: string, visualNeed?: number): boolea
   return new RegExp(`\\b(?:${experientialQuality})\\b[^.\\n]{0,80}\\b(?:${productSurface})\\b|\\b(?:${productSurface})\\b[^.\\n]{0,80}\\b(?:${experientialQuality})\\b`, "i").test(task);
 }
 
+/**
+ * A user's current observation that behavior is broken is stronger evidence than an older
+ * "complete" mission. File hashes and a compiler pass can prove source integrity, but they can
+ * never disprove a newly reported crash, unexpected exit, failed interaction, or wrong response.
+ */
+export function reportsCurrentBehaviorFailure(task: string): boolean {
+  const failure = /\b(?:crash(?:es|ed|ing)?|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|disappears?|freezes?|hangs?|stops?\s+working|does\s+not\s+work|doesn['’]?t\s+work|not\s+working|fails?|failing|throws?|errors?|broken|wrong|unexpected)\b/i;
+  const runtimeSurface = /\b(?:click(?:ing|ed)?|tap(?:ping|ped)?|press(?:ing|ed)?|open(?:ing|ed)?|launch(?:ing|ed)?|start(?:ing|ed)?|navigat(?:e|es|ed|ing|ion)|settings?|button|menu|dialog|screen|page|form|window|app|application|workflow|login|sign[ -]?in|upload|download|save|endpoint|request|response|command)\b/i;
+  return failure.test(task) && runtimeSurface.test(task);
+}
+
+/**
+ * Repeated runtime/capability work needs a current, requirement-directed acceptance check before
+ * Foundry may reuse a prior mission. Non-behavioral source requests (for example a private symbol
+ * rename or documentation edit) can still use exact fingerprints and deterministic checks.
+ */
+export function requiresFreshBehavioralAcceptance(task: string, visualNeed?: number): boolean {
+  if (reportsCurrentBehaviorFailure(task) || isUserFacingUiOutcome(task, visualNeed)) return true;
+  const behaviorAction = /\b(?:add|allow|change|connect|create|enable|ensure|fix|implement|include|make|prevent|redirect|remove|repair|show|stop|support|update)\b/i;
+  const runtimeSurface = /\b(?:settings?|button|menu|dialog|screen|page|form|window|app|application|website|site|workflow|navigation|route|login|sign[ -]?in|auth(?:entication)?|upload|download|save|checkout|endpoint|api|request|response|command|runtime|feature)\b/i;
+  return behaviorAction.test(task) && runtimeSurface.test(task);
+}
+
+/**
+ * Web behavior may enter provisional fingerprint reuse only because the caller immediately runs a
+ * fresh requirement-directed browser gate. Other platforms currently lack an equivalent general
+ * interaction driver, so their behavioral requests must execute normally.
+ */
+export function mayAttemptPriorCompletionReuse(task: string, previewPlatform: string): boolean {
+  if (reportsCurrentBehaviorFailure(task)) return false;
+  return !requiresFreshBehavioralAcceptance(task) || previewPlatform === "web";
+}
+
 /** A broad aesthetic improvement must land in the rendered presentation layer, not only in logic. */
 export function requiresPresentationLayerChange(task: string, visualNeed?: number): boolean {
   if (requiresPolishedUiAcceptance(task)) return true;
