@@ -71,12 +71,25 @@ async function run() {
   assert.deepEqual(acceptanceEvidence.classifyAcceptanceEvidence({ verified: false, failureKind: "validator-control-not-found" }), { origin: "validator", repairEligible: false });
   assert.deepEqual(acceptanceEvidence.classifyAcceptanceEvidence({ verified: false, infrastructureFailure: true }), { origin: "infrastructure", repairEligible: false });
   assert.deepEqual(acceptanceEvidence.classifyAcceptanceEvidence({ verified: false, failureKind: "ambiguous-result" }), { origin: "unknown", repairEligible: false });
+  assert.deepEqual(
+    acceptanceEvidence.nativeAcceptanceBoundaryPolicy({ status: "failed", changedFileCount: 1, blocker: "Model-call limit reached (24)", behaviorAcceptanceRequired: true }),
+    { shouldValidate: true, maySpendRepairCall: false, budgetBoundaryAfterVerifiedEdit: true, noProgressBoundaryAfterVerifiedEdit: false },
+    "A late model budget boundary still prevents deterministic native acceptance or authorizes another paid repair call.",
+  );
+  assert.deepEqual(
+    acceptanceEvidence.nativeAcceptanceBoundaryPolicy({ status: "failed", changedFileCount: 0, blocker: "Model-call limit reached (24)", behaviorAcceptanceRequired: true }),
+    { shouldValidate: false, maySpendRepairCall: true, budgetBoundaryAfterVerifiedEdit: false, noProgressBoundaryAfterVerifiedEdit: false },
+    "A write-free failed mission can be falsely reconciled as completed native work.",
+  );
   assert.match(runtimeSource, /currentPreviewPlatform === "web" && \(Boolean\(preModelBrowserEvidence\)/, "Native artifacts can still enter the web-browser acceptance branch.");
   assert.match(runtimeSource, /Checklist item\\\(s\\\) not completed/, "A verified partial implementation cannot continue when the executor leaves checklist work unfinished.");
   assert.match(runtimeSource, /deterministicDesktopAcceptanceRequested/, "Behavioral desktop work has no deterministic native acceptance stage.");
   assert.match(runtimeSource, /desktop runtime repair/, "A failed native acceptance check cannot re-enter autonomous source repair.");
   assert.match(runtimeSource, /attemptedDesktopRepairEvidence/, "Native repair can repeat paid attempts against unchanged runtime evidence.");
   assert.match(runtimeSource, /desktopAcceptance\.desktopEvidence\?\.repairEligible/, "Validator limitations can still authorize paid product source repair.");
+  assert.match(runtimeSource, /desktopBudgetBoundaryAfterVerifiedEdit/, "A verified native interaction cannot reconcile a late model-budget boundary.");
+  assert.match(runtimeSource, /Native behavior verified; cleared the earlier execution boundary/, "Native acceptance does not clear a stale execution-boundary failure after real success.");
+  assert.match(runtimeSource, /desktopBoundaryPolicy\.maySpendRepairCall/, "Native verification can still buy another repair call after execution has reached its model boundary.");
   assert.match(runtimeSource, /explicitDesktopDefectPreflight/, "Reported native runtime defects can still reach an implementation model before reproduction.");
   assert.match(runtimeSource, /Authoritative native runtime evidence collected before any implementation model call/, "Native application evidence is not injected into the first repair pass.");
   assert.match(runtimeSource, /Foundry did not edit project source because this evidence originated in the validator or environment/, "Validator and environment failures can still fall through into source mutation.");

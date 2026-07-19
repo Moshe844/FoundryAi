@@ -43,7 +43,7 @@ import { explicitProjectFileNames, isExplicitLocalProjectFileRequest } from "@/l
 import { stripTerminalFormatting } from "@/lib/text/terminal";
 import { actionableBuildLockMessage, forgetOwnedDesktopProcess, registerOwnedDesktopProcess } from "@/lib/factory/owned-desktop-processes";
 import { desktopInteractionActionsForTask } from "@/lib/factory/desktop-acceptance";
-import { classifyAcceptanceEvidence } from "@/lib/factory/acceptance-evidence";
+import { classifyAcceptanceEvidence, nativeAcceptanceBoundaryPolicy } from "@/lib/factory/acceptance-evidence";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 type EvidenceAttachments = NonNullable<FactoryExistingProjectRequest["evidenceAttachments"]>;
@@ -4738,10 +4738,15 @@ async function runExistingProjectMissionWithAccess(params: {
   }
 
   const desktopActions = desktopInteractionActionsForTask(inheritedOperationRequest);
-  const deterministicDesktopAcceptanceRequested = currentPreviewPlatform === "desktop"
-    && result.status === "passed"
-    && result.changedFiles.length > 0
-    && requiresFreshBehavioralAcceptance(inheritedOperationRequest);
+  const desktopBoundaryPolicy = nativeAcceptanceBoundaryPolicy({
+    status: result.status,
+    changedFileCount: result.changedFiles.length,
+    blocker: result.blocker,
+    behaviorAcceptanceRequired: requiresFreshBehavioralAcceptance(inheritedOperationRequest),
+  });
+  const desktopBudgetBoundaryAfterVerifiedEdit = desktopBoundaryPolicy.budgetBoundaryAfterVerifiedEdit;
+  const desktopNoProgressBoundaryAfterVerifiedEdit = desktopBoundaryPolicy.noProgressBoundaryAfterVerifiedEdit;
+  const deterministicDesktopAcceptanceRequested = currentPreviewPlatform === "desktop" && desktopBoundaryPolicy.shouldValidate;
   if (deterministicDesktopAcceptanceRequested) {
     const interactionRequired = desktopActions.length > 0;
     const validateCurrentDesktop = async () => {
@@ -4795,7 +4800,7 @@ async function runExistingProjectMissionWithAccess(params: {
     let desktopAcceptance = await validateCurrentDesktop();
     const desktopRepairChangedFiles = new Set<string>();
     const attemptedDesktopRepairEvidence = new Set<string>();
-    for (let repairAttempt = 1; !desktopAcceptance.verified && desktopAcceptance.desktopEvidence?.repairEligible && desktopAcceptance.connectorArtifact && access.validateDesktop && repairAttempt <= 3; repairAttempt += 1) {
+    for (let repairAttempt = 1; !desktopAcceptance.verified && desktopBoundaryPolicy.maySpendRepairCall && desktopAcceptance.desktopEvidence?.repairEligible && desktopAcceptance.connectorArtifact && access.validateDesktop && repairAttempt <= 3; repairAttempt += 1) {
       const evidenceFingerprint = createHash("sha256").update(desktopAcceptance.evidence).digest("hex");
       if (attemptedDesktopRepairEvidence.has(evidenceFingerprint)) {
         await emitExecution(execution, "planning", "warning", "Stopped repeated desktop repair on unchanged runtime evidence", {
@@ -4867,6 +4872,20 @@ async function runExistingProjectMissionWithAccess(params: {
     if (desktopAcceptance.verified) {
       result.status = "passed";
       result.blocker = undefined;
+      for (const item of result.checklist) {
+        if (item.status === "pending" || item.status === "running" || item.status === "blocked") {
+          item.status = "completed";
+          item.evidence = desktopAcceptance.evidence;
+        }
+      }
+      if (desktopBudgetBoundaryAfterVerifiedEdit || desktopNoProgressBoundaryAfterVerifiedEdit) {
+        result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
+        result.sessionSummary.outcome = "The requested native behavior was exercised successfully after the verified source edit; no additional model call was needed.";
+        result.sessionSummary.flags = result.sessionSummary.flags.filter((flag) => !/model-call limit|configured execution limit|provider fallbacks|another paid model call|NO_PROGRESS_AFTER_MUTATION/i.test(flag));
+        await emitExecution(execution, "summary", "completed", "Native behavior verified; cleared the earlier execution boundary", {
+          details: { paidModelCallsAfterBoundary: 0, reconciledModelBudgetBoundary: desktopBudgetBoundaryAfterVerifiedEdit, reconciledNoProgressBoundary: desktopNoProgressBoundaryAfterVerifiedEdit },
+        });
+      }
       if (desktopRepairChangedFiles.size > 0) {
         result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
         result.sessionSummary.outcome = "Foundry repaired the real native runtime failure, rebuilt the project, exercised the requested desktop interaction, and verified that the application remained running.";
