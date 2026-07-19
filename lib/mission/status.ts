@@ -76,8 +76,79 @@ export function isSoftwareProjectMission(mission: MissionState) {
 }
 
 export function projectTitleFor(mission: MissionState) {
-  const source = mission.title || mission.conversationTitle || mission.objective || "Untitled project";
-  return source.replace(/^Create Project:\s*/i, "").trim() || "Untitled project";
+  const stored = (mission.title || mission.conversationTitle || "")
+    .replace(/^Create Project:\s*/i, "")
+    .trim();
+  // The stored title is usually just the flow's generic label — "Open Existing Project" for an opened
+  // project, or the bare template/domain name ("E-commerce Store") for a created one — neither of which
+  // says what THIS workspace actually is. Prefer a specific title derived from the durable brief the
+  // mission carries (the opened folder's name, or what the user described building). Only fall back to
+  // the stored label when the brief yields nothing more specific. Runs at render time, so it also fixes
+  // workspaces that were saved before this change.
+  const derived = deriveTitleFromBrief(mission.objective ?? "");
+  if (derived) return derived;
+  if (stored && !isGenericProjectTitle(stored)) return stored;
+  return stored || "Untitled project";
+}
+
+const GENERIC_PROJECT_TITLES = new Set([
+  "open existing project",
+  "convert existing project",
+  "clone into another stack",
+  "new project",
+  "untitled project",
+  "untitled",
+  "project",
+]);
+
+function isGenericProjectTitle(title: string) {
+  return GENERIC_PROJECT_TITLES.has(title.toLowerCase().trim());
+}
+
+function briefField(brief: string, label: string): string {
+  const match = brief.match(new RegExp(`^\\s*${label}\\s*:\\s*(.+)$`, "im"));
+  const value = match?.[1]?.trim();
+  if (!value || /^(not described yet\.?|none|n\/a|no additional instructions\.?|not selected)$/i.test(value)) return "";
+  return value;
+}
+
+function baseName(pathValue: string): string {
+  return pathValue.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() ?? "";
+}
+
+function humanizeName(value: string): string {
+  const words = value
+    .replace(/\.[a-z0-9]{1,8}$/i, "")
+    .replace(/[-_]+/g, " ")
+    .replace(/^\s*(?:a|an|the)\s+/i, "")
+    .replace(/\b(build|create|make)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean)
+    .slice(0, 6)
+    .map((word) => (/^[a-z]/.test(word) ? word.charAt(0).toUpperCase() + word.slice(1) : word));
+  return words.join(" ");
+}
+
+/** Derive a specific, human title from the durable project brief the mission stores as its objective. */
+function deriveTitleFromBrief(brief: string): string {
+  if (!brief.trim()) return "";
+  // Opened/existing projects: the real identity is the folder or upload being worked on.
+  const folder = briefField(brief, "Local connector root")
+    || briefField(brief, "Local project path")
+    || briefField(brief, "Browser folder name");
+  if (folder) return humanizeName(baseName(folder));
+  const selection = briefField(brief, "Existing project selection");
+  if (selection && !/^\d+\s/.test(selection)) return humanizeName(selection);
+  // Created projects: prefer what the user described, then the resolved specific type.
+  const description = briefField(brief, "Project description") || briefField(brief, "Initial requested task");
+  if (description) return humanizeName(description);
+  const type = briefField(brief, "Project type");
+  if (type) return humanizeName(type);
+  const name = briefField(brief, "Project name");
+  if (name && !isGenericProjectTitle(name)) return humanizeName(name);
+  return "";
 }
 
 export function projectBriefFromMission(mission: MissionState) {
