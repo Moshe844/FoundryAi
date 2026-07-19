@@ -3,7 +3,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 
 const NODE_MISSING_MESSAGE = "Node.js is required to run the Foundry Local Agent. Download it from https://nodejs.org/ and run this file again.";
-type AgentScripts = { connector: string; validation: string; staticPreview: string };
+type AgentScripts = { connector: string; validation: string; staticPreview: string; windowsDesktopUi: string };
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -11,12 +11,13 @@ export async function GET(request: Request) {
 
   let scripts: AgentScripts;
   try {
-    const [connector, validation, staticPreview] = await Promise.all([
+    const [connector, validation, staticPreview, windowsDesktopUi] = await Promise.all([
       readFile(path.join(process.cwd(), "scripts", "foundry-local-connector.cjs"), "utf8"),
       readFile(path.join(process.cwd(), "scripts", "local-agent-validation.cjs"), "utf8"),
       readFile(path.join(process.cwd(), "scripts", "foundry-static-preview.cjs"), "utf8"),
+      readFile(path.join(process.cwd(), "scripts", "validate-windows-desktop-ui.ps1"), "utf8"),
     ]);
-    scripts = { connector, validation, staticPreview };
+    scripts = { connector, validation, staticPreview, windowsDesktopUi };
   } catch {
     return NextResponse.json({ error: "The complete local agent runtime is not available on this server." }, { status: 500 });
   }
@@ -85,6 +86,7 @@ function buildWindowsLauncher(scripts: AgentScripts) {
     "more +__HEADER_LINES__ \"%~f0\" > \"%SCRIPT%\"",
     ...windowsBase64FileLines("local-agent-validation.cjs", scripts.validation, "VALIDATION"),
     ...windowsBase64FileLines("foundry-static-preview.cjs", scripts.staticPreview, "PREVIEW"),
+    ...windowsBase64FileLines("validate-windows-desktop-ui.ps1", scripts.windowsDesktopUi, "DESKTOP_UI"),
     "echo Installing Foundry Local Agent to %INSTALL_DIR% ...",
     "set \"LAUNCH_VBS=%INSTALL_DIR%\\launch-agent.vbs\"",
     "> \"%LAUNCH_VBS%\" echo Set objShell = CreateObject(\"WScript.Shell\")",

@@ -28,7 +28,7 @@ import { routeDynamically } from "@/lib/ai/routing/dynamic-router";
 import { profileTask } from "@/lib/ai/routing/task-profiler";
 import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
 import { discoverProjectWorkingSet, type ProjectWorkingSet } from "@/lib/ai/routing/project-working-set";
-import { connectLocalConnectorRoot, createLocalConnectorProjectAccess, createServerProjectAccess, createUploadedProjectAccess, isSensitiveFilePath, type LocalConnectorConfig, type ProjectAccess } from "@/lib/ai/mission/project-access";
+import { connectLocalConnectorRoot, createLocalConnectorProjectAccess, createServerProjectAccess, createUploadedProjectAccess, isSensitiveFilePath, type LocalConnectorConfig, type PlatformValidationResult, type ProjectAccess } from "@/lib/ai/mission/project-access";
 import type { ExecutionMissionVerification, FactoryArtifact, FactoryCommandEvent, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryExistingProjectRequest, FactoryFileEntry, FactoryJournalEntry, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactoryPreviewPlatform, FactoryPreviewState, FactoryProjectResult, FactorySessionSummary, FactorySourceMode, FactoryUploadedFile, MissionClarification, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
 import { environmentReadinessForStack } from "@/lib/toolchains/provisioner";
 import { explicitReadOnlyProjectIntent, type FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
@@ -42,6 +42,7 @@ import { redactSensitiveData, redactSensitiveText } from "@/lib/security/secret-
 import { explicitProjectFileNames, isExplicitLocalProjectFileRequest } from "@/lib/sources/intent";
 import { stripTerminalFormatting } from "@/lib/text/terminal";
 import { actionableBuildLockMessage, forgetOwnedDesktopProcess, registerOwnedDesktopProcess } from "@/lib/factory/owned-desktop-processes";
+import { desktopInteractionActionsForTask } from "@/lib/factory/desktop-acceptance";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 type EvidenceAttachments = NonNullable<FactoryExistingProjectRequest["evidenceAttachments"]>;
@@ -4297,7 +4298,7 @@ async function runExistingProjectMissionWithAccess(params: {
     && (resumingIncompleteProject || candidate.changedFiles.length > 0)
     && !assessAutonomousBlocker(candidate.blocker ?? "").terminal
     && !(noProgressBoundaryAfterVerifiedEdit && acceptedUiOutcome && previewPlatformForStack(stackProfile.label) === "web")
-    && /NO_PROGRESS_(?:BEFORE|AFTER)_MUTATION|command or file write failed|production build (?:not verified|failed)/i.test(candidate.blocker ?? "");
+    && /NO_PROGRESS_(?:BEFORE|AFTER)_MUTATION|command or file write failed|production build (?:not verified|failed)|Checklist item\(s\) not completed/i.test(candidate.blocker ?? "");
   const needsGeneratedEntryContinuation = resumingIncompleteProject
     && !(await hasRunnableProjectEntry(executorAccess));
   // A substantial greenfield product can legitimately need more than one bounded executor batch.
@@ -4467,12 +4468,16 @@ async function runExistingProjectMissionWithAccess(params: {
   }
 
   const inheritedOperationRequest = acceptedRequirementTask;
-  const recoveringGeneratedWebProject = resumingIncompleteProject && previewPlatformForStack(stackProfile.label) === "web";
-  const budgetBoundaryNeedsWebVerification = (modelBudgetBoundaryAfterVerifiedEdit || result.alreadySatisfied) && previewPlatformForStack(stackProfile.label) === "web";
+  const currentPreviewPlatform = previewPlatformForStack(stackProfile.label);
+  const recoveringGeneratedWebProject = resumingIncompleteProject && currentPreviewPlatform === "web";
+  const budgetBoundaryNeedsWebVerification = (modelBudgetBoundaryAfterVerifiedEdit || result.alreadySatisfied) && currentPreviewPlatform === "web";
   const boundedStaticChangeNeedsBrowserVerification = boundedStaticFollowUp && result.status === "passed" && result.changedFiles.length > 0;
-  const uiChangeNeedsBrowserVerification = acceptedUiOutcome && result.status === "passed" && result.changedFiles.length > 0 && previewPlatformForStack(stackProfile.label) === "web";
-  const deterministicBrowserOperationRequested = Boolean(preModelBrowserEvidence) || recoveringGeneratedWebProject || budgetBoundaryNeedsWebVerification || boundedStaticChangeNeedsBrowserVerification || uiChangeNeedsBrowserVerification || (noProgressBoundaryAfterVerifiedEdit && acceptedUiOutcome) || (/\b(?:validate|revalidate|verify|test|retest|exercise|check|recheck)\b/i.test(inheritedOperationRequest)
-    && /\b(?:browser|preview|live\s+(?:site|app)|navigation|user\s+flow|click(?:ing)?)\b/i.test(inheritedOperationRequest));
+  const uiChangeNeedsBrowserVerification = acceptedUiOutcome && result.status === "passed" && result.changedFiles.length > 0 && currentPreviewPlatform === "web";
+  // Browser verification is a web-only contract. Native build artifacts intentionally have no URL;
+  // treating their positive readiness message as a missing-web-preview error produced contradictory
+  // results such as `failure: App.exe is built and ready to launch or download`.
+  const deterministicBrowserOperationRequested = currentPreviewPlatform === "web" && (Boolean(preModelBrowserEvidence) || recoveringGeneratedWebProject || budgetBoundaryNeedsWebVerification || boundedStaticChangeNeedsBrowserVerification || uiChangeNeedsBrowserVerification || (noProgressBoundaryAfterVerifiedEdit && acceptedUiOutcome) || (/\b(?:validate|revalidate|verify|test|retest|exercise|check|recheck)\b/i.test(inheritedOperationRequest)
+    && /\b(?:browser|preview|live\s+(?:site|app)|navigation|user\s+flow|click(?:ing)?)\b/i.test(inheritedOperationRequest)));
   if (deterministicBrowserOperationRequested) {
     if (preModelBrowserEvidence && result.changedFiles.length > 0 && stackHasBuildStep(stackProfile.id)) {
       const repairedBuild = await runCanonicalProjectBuild();
@@ -4664,6 +4669,57 @@ async function runExistingProjectMissionWithAccess(params: {
     });
     result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
     result.sessionSummary.changes = [...new Set([...assetPaths, ...result.sessionSummary.changes])];
+  }
+
+  const desktopActions = desktopInteractionActionsForTask(inheritedOperationRequest);
+  const deterministicDesktopAcceptanceRequested = currentPreviewPlatform === "desktop"
+    && result.status === "passed"
+    && result.changedFiles.length > 0
+    && requiresFreshBehavioralAcceptance(inheritedOperationRequest);
+  if (deterministicDesktopAcceptanceRequested) {
+    const desktopPreview = previewTarget
+      ? await startProjectPreview(previewTarget, stackProfile.label, [], execution)
+      : { previewState: "unavailable" as const, previewPlatform: "desktop" as const, previewReason: "This project source does not expose an owned desktop target." };
+    const connectorArtifact = previewTarget ? connectorArtifactTargets.get(previewTarget.projectId) : undefined;
+    let desktopEvidence: PlatformValidationResult | undefined;
+    if (desktopPreview.previewState === "ready" && desktopPreview.previewPlatform === "desktop") {
+      if (connectorArtifact && access.validateDesktop) {
+        desktopEvidence = await access.validateDesktop({
+          executable: connectorArtifact.relativePath,
+          args: [],
+          observeMs: 2500,
+          interactionTimeoutMs: 8000,
+          actions: desktopActions,
+        });
+      } else if (previewTarget) {
+        const launched = await launchDesktopPreview(previewTarget.projectId, previewTarget.kind === "workspace" ? previewTarget.projectPath : undefined);
+        desktopEvidence = {
+          available: true,
+          verified: launched.ok && desktopActions.length === 0,
+          running: launched.ok,
+          interactionVerified: false,
+          reason: launched.ok
+            ? "The desktop process launched and remained alive, but semantic interaction requires the Local Agent accessibility driver."
+            : launched.error,
+        };
+      }
+    }
+    const interactionRequired = desktopActions.length > 0;
+    const desktopVerified = Boolean(desktopEvidence?.verified && (!interactionRequired || desktopEvidence.interactionVerified));
+    const evidence = desktopVerified
+      ? desktopEvidence?.reason || "The requested desktop interaction completed and the application remained running."
+      : desktopEvidence?.reason || desktopPreview.previewReason || "The desktop artifact could not be launched for behavioral acceptance.";
+    result.verification.push({ check_type: "preview", result: desktopVerified ? "pass" : "fail", evidence });
+    await emitExecution(execution, "preview", desktopVerified ? "completed" : "error", desktopVerified ? "Desktop behavior verified" : "Desktop behavior still needs repair", {
+      details: { platform: "desktop", interactionRequired, actionsJson: JSON.stringify(desktopActions), interactionVerified: desktopEvidence?.interactionVerified, stepsJson: JSON.stringify(desktopEvidence?.steps ?? []), windowTitles: desktopEvidence?.windowTitles, evidence },
+    });
+    if (!desktopVerified) {
+      result.status = "failed";
+      result.blocker = evidence;
+      result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
+      result.sessionSummary.outcome = "The source change and desktop build are preserved, but the requested native interaction did not pass.";
+      result.sessionSummary.flags = [evidence];
+    }
   }
   if (result.status === "failed" && result.blocker) {
     const terminalAssessment = assessAutonomousBlocker(result.blocker);

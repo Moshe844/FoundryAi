@@ -239,9 +239,28 @@ async function runDesktopValidation(input) {
   const executable = path.resolve(input.root, String(input.executable || ""));
   if (executable !== path.resolve(input.root) && !executable.startsWith(`${path.resolve(input.root)}${path.sep}`)) throw new Error("Desktop executable must be inside the connected project.");
   if (!fs.existsSync(executable)) return { available: true, verified: false, reason: "Desktop executable was not found." };
-  const child = spawn(executable, Array.isArray(input.args) ? input.args.map(String) : [], { cwd: path.dirname(executable), windowsHide: false, detached: true });
+  const child = spawn(executable, Array.isArray(input.args) ? input.args.map(String) : [], { cwd: path.dirname(executable), windowsHide: false, detached: true, stdio: "ignore" });
   await new Promise((resolve) => setTimeout(resolve, Math.max(500, Math.min(10000, Number(input.observeMs || 2000)))));
-  const running = child.exitCode === null && !child.killed;
+  let running = child.exitCode === null && !child.killed;
+  const actions = Array.isArray(input.actions) ? input.actions.filter((action) => action && typeof action === "object") : [];
+  let interaction = { verified: false, reason: actions.length ? "Desktop interaction is unavailable on this host." : "No semantic desktop interaction was requested.", steps: [], windowTitles: [] };
+  if (running && actions.length && process.platform === "win32" && child.pid) {
+    const actionsBase64 = Buffer.from(JSON.stringify(actions), "utf8").toString("base64");
+    const automation = await runProcess("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-File", path.join(__dirname, "validate-windows-desktop-ui.ps1"),
+      "-ProcessId", String(child.pid),
+      "-ActionsBase64", actionsBase64,
+      "-TimeoutMs", String(Math.max(1000, Math.min(15000, Number(input.interactionTimeoutMs || 8000)))),
+    ], { timeoutMs: Math.max(5000, Math.min(20000, Number(input.interactionTimeoutMs || 8000) + 5000)) });
+    try {
+      interaction = JSON.parse(automation.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) || "{}");
+    } catch {
+      interaction = { verified: false, reason: automation.stderr || automation.stdout || "Windows UI Automation returned no readable result.", steps: [], windowTitles: [] };
+    }
+    running = child.exitCode === null && !child.killed;
+  }
   if (running && child.pid) {
     ownedDesktopProcesses.set(child.pid, {
       projectPath: path.resolve(input.root),
@@ -252,7 +271,22 @@ async function runDesktopValidation(input) {
     child.once("exit", () => ownedDesktopProcesses.delete(child.pid));
     child.unref();
   }
-  return { available: true, verified: running, pid: child.pid, running, interactionVerified: false, reason: running ? "The process launched and remained alive during the observation window; semantic UI interaction was not verified." : `The process exited with code ${child.exitCode}.` };
+  const interactionVerified = actions.length > 0 && Boolean(interaction.verified);
+  return {
+    available: true,
+    verified: running && (!actions.length || interactionVerified),
+    exitCode: child.exitCode,
+    pid: child.pid,
+    running,
+    interactionVerified,
+    steps: interaction.steps,
+    windowTitles: interaction.windowTitles,
+    reason: !running
+      ? `The process exited with code ${child.exitCode}.`
+      : actions.length
+        ? interaction.reason
+        : "The process launched and remained alive during the observation window; semantic UI interaction was not requested.",
+  };
 }
 
 module.exports = {

@@ -24,6 +24,31 @@ async function run() {
   fs.writeFileSync(compiledModule, compiled, "utf8");
   fs.copyFileSync(process.execPath, executable);
   const lifecycle = require(compiledModule);
+  const acceptanceSource = fs.readFileSync(path.join(root, "lib", "factory", "desktop-acceptance.ts"), "utf8");
+  const acceptanceCompiled = ts.transpileModule(acceptanceSource, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const acceptanceModule = { exports: {} };
+  new Function("module", "exports", "require", acceptanceCompiled)(acceptanceModule, acceptanceModule.exports, require);
+  const desktopAcceptance = acceptanceModule.exports;
+  const runtimeSource = fs.readFileSync(path.join(root, "lib", "factory", "runtime.ts"), "utf8");
+  const validatorSource = fs.readFileSync(path.join(root, "scripts", "local-agent-validation.cjs"), "utf8");
+
+  assert.deepEqual(
+    desktopAcceptance.desktopInteractionActionsForTask("When clicking on Settings, the entire app closes down."),
+    [{ action: "click", name: "Settings", automationId: "" }],
+    "Plain-language desktop controls are not converted into semantic acceptance actions.",
+  );
+  assert.deepEqual(
+    desktopAcceptance.desktopInteractionActionsForTask("Press the Export button, then click Settings."),
+    [{ action: "click", name: "Export", automationId: "" }, { action: "click", name: "Settings", automationId: "" }],
+    "Multiple desktop controls are not preserved in user-request order.",
+  );
+  assert.match(runtimeSource, /currentPreviewPlatform === "web" && \(Boolean\(preModelBrowserEvidence\)/, "Native artifacts can still enter the web-browser acceptance branch.");
+  assert.match(runtimeSource, /Checklist item\\\(s\\\) not completed/, "A verified partial implementation cannot continue when the executor leaves checklist work unfinished.");
+  assert.match(runtimeSource, /deterministicDesktopAcceptanceRequested/, "Behavioral desktop work has no deterministic native acceptance stage.");
+  assert.match(validatorSource, /validate-windows-desktop-ui\.ps1/, "The Local Agent does not exercise named desktop controls through Windows accessibility automation.");
+  assert.match(validatorSource, /interactionVerified/, "Desktop validation can still claim interaction success from process launch alone.");
 
   assert.equal(lifecycle.commandProducesBuildArtifacts("dotnet build App.sln --no-restore"), true);
   assert.equal(lifecycle.commandProducesBuildArtifacts("npm.cmd run build"), true);

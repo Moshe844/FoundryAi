@@ -684,7 +684,7 @@ function actionableDeletionFailure(root: string, error: unknown): ProjectDeleteR
 }
 export type BrowserValidationInput = { url: string; actions?: Array<{ action: string; selector?: string; value?: string; text?: string; key?: string; ms?: number; exact?: boolean; expected?: number }>; viewport?: { width: number; height: number }; screenshotName?: string; baselineScreenshot?: string };
 export type BrowserValidationResult = { available: boolean; verified: boolean; reason?: string; url?: string; title?: string; screenshotPath?: string; consoleErrors?: string[]; failedRequests?: Array<{ url: string; method: string; error: string }>; steps?: Array<{ action: string; target: string; ok: boolean; status?: number }>; visualComparison?: { comparable: boolean; changedPixels?: number; changedRatio?: number; diffPath?: string; reason?: string } };
-export type PlatformValidationResult = { available: boolean; verified?: boolean; reason?: string; action?: string; exitCode?: number | null; stdout?: string; stderr?: string; durationMs?: number; screenshotPath?: string; pid?: number; running?: boolean; interactionVerified?: boolean };
+export type PlatformValidationResult = { available: boolean; verified?: boolean; reason?: string; action?: string; exitCode?: number | null; stdout?: string; stderr?: string; durationMs?: number; screenshotPath?: string; pid?: number; running?: boolean; interactionVerified?: boolean; steps?: Array<{ action: string; target?: string; ok: boolean; reason?: string }>; windowTitles?: string[] };
 
 export interface ProjectAccess {
   readonly mode: ProjectAccessMode;

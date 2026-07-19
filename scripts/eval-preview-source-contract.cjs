@@ -65,7 +65,9 @@ assert(
 assert(
   agentDownloadRoute.includes('readFile(path.join(process.cwd(), "scripts", "foundry-static-preview.cjs"), "utf8")')
     && agentDownloadRoute.includes('readFile(path.join(process.cwd(), "scripts", "local-agent-validation.cjs"), "utf8")')
+    && agentDownloadRoute.includes('readFile(path.join(process.cwd(), "scripts", "validate-windows-desktop-ui.ps1"), "utf8")')
     && agentDownloadRoute.includes('windowsBase64FileLines("foundry-static-preview.cjs"')
+    && agentDownloadRoute.includes('windowsBase64FileLines("validate-windows-desktop-ui.ps1"')
     && agentDownloadRoute.includes("FOUNDRY_AGENT_PREVIEW_EOF"),
   "The downloadable Local Agent still omits runtime files required by owned previews or validation.",
 );

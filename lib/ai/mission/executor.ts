@@ -417,8 +417,26 @@ function toolSchemas(canRunCommands: boolean, canBrowserValidate = false): Neutr
     });
     tools.push({
       name: "validate_desktop",
-      description: "Launch a desktop executable inside the connected project and verify that the real process remains alive. This does not claim semantic UI interaction unless an app-specific driver exists.",
-      parameters: { type: "object", additionalProperties: false, properties: { executable: { type: "string" }, args: { type: "array", items: { type: "string" } }, observe_ms: { type: "integer" } }, required: ["executable", "args", "observe_ms"] },
+      description: "Launch a desktop executable inside the connected project, optionally click named or automation-id controls through the operating system accessibility API, and verify that the real process remains alive after the requested interactions.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          executable: { type: "string" },
+          args: { type: "array", items: { type: "string" } },
+          observe_ms: { type: "integer" },
+          actions: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: { action: { type: "string", enum: ["click"] }, name: { type: "string" }, automation_id: { type: "string" } },
+              required: ["action", "name", "automation_id"],
+            },
+          },
+        },
+        required: ["executable", "args", "observe_ms", "actions"],
+      },
     });
   }
 
@@ -2491,8 +2509,12 @@ async function executeTool(
       if (!access.validateDesktop) return { available: false, verified: false, reason: "Desktop validation is not available in this connection mode." };
       const executable = String(args.executable || "");
       await emit("inspection", "running", `Launching ${executable} for desktop validation`, { tier: "trace", filePath: executable });
-      const result = await access.validateDesktop({ executable, args: Array.isArray(args.args) ? args.args.map(String) : [], observeMs: Number(args.observe_ms || 2000) });
-      await emit("inspection", result.verified ? "completed" : "error", result.verified ? "Desktop application launched successfully" : "Desktop application validation failed", { tier: "trace", filePath: executable, details: { resultJson: JSON.stringify(result) } });
+      const actions = Array.isArray(args.actions) ? args.actions.map((action) => {
+        const item = action && typeof action === "object" ? action as Record<string, unknown> : {};
+        return { action: "click", name: String(item.name || ""), automationId: String(item.automation_id || "") };
+      }) : [];
+      const result = await access.validateDesktop({ executable, args: Array.isArray(args.args) ? args.args.map(String) : [], observeMs: Number(args.observe_ms || 2000), actions });
+      await emit("inspection", result.verified ? "completed" : "error", result.verified ? (result.interactionVerified ? "Desktop interaction passed" : "Desktop application launched successfully") : "Desktop application validation failed", { tier: "trace", filePath: executable, details: { resultJson: JSON.stringify(result), stepsJson: JSON.stringify(result.steps ?? []), windowTitles: result.windowTitles ?? [] } });
       return result;
     }
     case "record_finding": {
