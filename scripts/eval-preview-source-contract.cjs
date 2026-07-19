@@ -6,6 +6,7 @@ const runtime = fs.readFileSync(path.join(root, "lib/factory/runtime.ts"), "utf8
 const recoveryPolicy = fs.readFileSync(path.join(root, "lib/factory/recovery-policy.ts"), "utf8");
 const connector = fs.readFileSync(path.join(root, "scripts/foundry-local-connector.cjs"), "utf8");
 const previewRoute = fs.readFileSync(path.join(root, "app/api/factory/preview/route.ts"), "utf8");
+const agentDownloadRoute = fs.readFileSync(path.join(root, "app/api/factory/agent/download/route.ts"), "utf8");
 const missionCanvas = fs.readFileSync(path.join(root, "components/canvas/MissionCanvas.tsx"), "utf8");
 const canvasAdapter = fs.readFileSync(path.join(root, "lib/canvas/adapter.ts"), "utf8");
 const dashboard = fs.readFileSync(path.join(root, "components/BuildDashboard.tsx"), "utf8");
@@ -60,6 +61,21 @@ assert(
     && connector.includes('const previewUrl = `http://127.0.0.1:${port}`')
     && connector.includes('state: "ready", previewUrl, port, ownershipToken'),
   "Static connector projects can still report ready without an owned HTTP preview URL.",
+);
+assert(
+  agentDownloadRoute.includes('readFile(path.join(process.cwd(), "scripts", "foundry-static-preview.cjs"), "utf8")')
+    && agentDownloadRoute.includes('readFile(path.join(process.cwd(), "scripts", "local-agent-validation.cjs"), "utf8")')
+    && agentDownloadRoute.includes('windowsBase64FileLines("foundry-static-preview.cjs"')
+    && agentDownloadRoute.includes("FOUNDRY_AGENT_PREVIEW_EOF"),
+  "The downloadable Local Agent still omits runtime files required by owned previews or validation.",
+);
+assert(
+  runtime.includes("findConnectorBuildArtifact")
+    && runtime.includes('connectorArtifactTargets.set(projectId')
+    && runtime.includes('platform === "android" || platform === "mobile" || platform === "report"')
+    && connector.includes('url.pathname === "/artifact/find"')
+    && connector.includes('url.pathname === "/artifact/download"'),
+  "Platform projects can still be replaced by a fake web preview instead of exposing their real build artifact.",
 );
 assert(
   connector.includes('canBindPreviewHost(port, "127.0.0.1")')
@@ -189,8 +205,17 @@ assert(
 assert(
   previewRoute.includes("refreshPreviewForProject(body.projectId, localConnector)")
     && runtime.includes("connectorPreviews.set(projectId, localConnector)")
-    && runtime.includes("return startConnectorPreview(localConnector)"),
+    && runtime.includes("await connectLocalConnectorRoot(connector, connector.rootLabel)")
+    && runtime.includes("detectStackProfileAndEntriesForAccess(access)")
+    && runtime.includes('return startProjectPreview(connectorPreviewTarget(projectId, localConnector), detected.profile.label)'),
   "Opening a connector folder still cannot register and start its preview before an AI mission runs.",
+);
+assert(
+  projectAccess.includes("async function reconnectRoot()")
+    && projectAccess.includes("/not connected yet/i.test(payload.error)")
+    && projectAccess.includes("await reconnectRoot()")
+    && projectAccess.includes("response = await send()"),
+  "Connector project access does not recover its approved root after the Local Agent restarts.",
 );
 assert(
   dashboard.includes("localConnector={connectorInfo ?")

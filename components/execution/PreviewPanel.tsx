@@ -160,7 +160,20 @@ function previewReadyTitle(platform: FactoryProjectResult["previewPlatform"]) {
   if (platform === "api") return "API server is running";
   if (platform === "game") return "Playable build is ready";
   if (platform === "desktop") return "Desktop build is ready";
+  if (platform === "android") return "Android build is ready";
+  if (platform === "mobile") return "Mobile build is ready";
+  if (platform === "report") return "Report artifact is ready";
   return "Interactive preview is ready";
+}
+
+function previewWorkspaceTitle(platform: FactoryProjectResult["previewPlatform"]) {
+  if (platform === "api") return "API Playground";
+  if (platform === "game") return "Playable Preview";
+  if (platform === "desktop") return "Desktop Build";
+  if (platform === "android") return "Android Build";
+  if (platform === "mobile") return "Mobile Build";
+  if (platform === "report") return "Report Preview";
+  return "Local Interactive Preview";
 }
 
 export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = false, onToggleFullScreen }: { execution: FactoryProjectResult | null; onCollapse: () => void; fullScreen?: boolean; onToggleFullScreen?: () => void }) {
@@ -172,7 +185,7 @@ export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = 
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-overlay/10 bg-shade/20 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">
-            {execution?.previewPlatform === "api" ? "API Playground" : execution?.previewPlatform === "game" ? "Playable Preview" : "Local Interactive Preview"}
+            {previewWorkspaceTitle(execution?.previewPlatform)}
           </span>
           {execution?.previewState === "ready" ? <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-foundry-teal" /> : null}
           {previewUrl ? <a href={previewUrl} target="_blank" rel="noreferrer" className="min-w-0 truncate font-mono text-[10px] text-foundry-subtle underline decoration-overlay/20 underline-offset-2 transition hover:text-foundry-ink" title={`Open ${previewUrl}`}>{previewUrl}</a> : null}

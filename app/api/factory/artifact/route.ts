@@ -1,7 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
-import { safeProjectPath } from "@/lib/factory/runtime";
+import { readConnectorProjectArtifact, safeProjectPath } from "@/lib/factory/runtime";
 
 export async function GET(request: Request) {
   try {
@@ -9,6 +9,19 @@ export async function GET(request: Request) {
     const projectId = url.searchParams.get("projectId") ?? "";
     const relativePath = url.searchParams.get("path") ?? "";
     if (!projectId || !relativePath) return NextResponse.json({ error: "Project id and artifact path are required." }, { status: 400 });
+
+    const connectorArtifact = await readConnectorProjectArtifact(projectId, relativePath);
+    if (connectorArtifact) {
+      const filename = connectorArtifact.filename.replace(/["\r\n]/g, "_");
+      return new NextResponse(connectorArtifact.file, {
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(connectorArtifact.file.length),
+          "content-disposition": `attachment; filename="${filename}"`,
+          "cache-control": "no-store",
+        },
+      });
+    }
 
     const projectPath = safeProjectPath(projectId);
     const artifactPath = path.resolve(projectPath, relativePath);

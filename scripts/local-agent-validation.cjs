@@ -3,6 +3,97 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 
+const ownedDesktopProcesses = new Map();
+
+function pathIsInside(root, candidate) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function projectsOverlap(left, right) {
+  return pathIsInside(left, right) || pathIsInside(right, left);
+}
+
+function processIsAlive(processId) {
+  try { process.kill(processId, 0); return true; } catch { return false; }
+}
+
+function killProcessTree(processId) {
+  if (process.platform === "win32") {
+    spawnSync("taskkill.exe", ["/pid", String(processId), "/t", "/f"], { stdio: "ignore", windowsHide: true, timeout: 8000 });
+    return;
+  }
+  try { process.kill(processId, "SIGTERM"); } catch { /* Verify below. */ }
+}
+
+async function waitForExit(processId, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processIsAlive(processId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !processIsAlive(processId);
+}
+
+function commandProducesBuildArtifacts(command) {
+  const normalized = String(command || "").trim().replace(/\s+/g, " ");
+  return /\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:build|compile|package)\b/i.test(normalized)
+    || /\bdotnet\s+(?:build|publish|pack|test)\b/i.test(normalized)
+    || /\b(?:msbuild|xbuild)(?:\.exe)?\b/i.test(normalized)
+    || /\b(?:cargo|swift)\s+(?:build|test)\b/i.test(normalized)
+    || /\bgo\s+(?:build|install|test)\b/i.test(normalized)
+    || /\b(?:gradle|gradlew)(?:\.bat)?\b[^\r\n]*(?:build|assemble|bundle|test)\b/i.test(normalized)
+    || /\bmvnw?(?:\.cmd)?\b[^\r\n]*(?:package|verify|install|test)\b/i.test(normalized)
+    || /\b(?:cmake\s+--build|ninja\b|make\b|xcodebuild\b|flutter\s+build\b|python(?:3)?\s+-m\s+build\b|mix\s+(?:compile|test)\b)/i.test(normalized);
+}
+
+async function suspendOwnedDesktopProcesses(projectPath) {
+  const matching = Array.from(ownedDesktopProcesses.values()).filter((record) => projectsOverlap(projectPath, record.projectPath));
+  const suspended = [];
+  const failed = [];
+  for (const record of matching) {
+    if (!processIsAlive(record.processId)) {
+      ownedDesktopProcesses.delete(record.processId);
+      continue;
+    }
+    killProcessTree(record.processId);
+    if (await waitForExit(record.processId)) {
+      suspended.push(record);
+      ownedDesktopProcesses.delete(record.processId);
+    } else {
+      failed.push(record);
+    }
+  }
+  return { suspended, failed };
+}
+
+async function resumeOwnedDesktopProcesses(records) {
+  const resumed = [];
+  const failed = [];
+  for (const record of records) {
+    if (!fs.existsSync(record.executable)) {
+      failed.push({ record, reason: "The rebuilt executable was not produced." });
+      continue;
+    }
+    try {
+      const child = spawn(record.executable, record.args, { cwd: path.dirname(record.executable), windowsHide: false, detached: true, stdio: "ignore" });
+      await new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("spawn", resolve);
+      });
+      if (!child.pid) throw new Error("The operating system did not return a process id.");
+      const resumedRecord = { ...record, processId: child.pid };
+      ownedDesktopProcesses.set(child.pid, resumedRecord);
+      child.once("exit", () => ownedDesktopProcesses.delete(child.pid));
+      child.unref();
+      resumed.push(resumedRecord);
+    } catch (error) {
+      failed.push({ record, reason: error instanceof Error ? error.message : "The desktop app could not be relaunched." });
+    }
+  }
+  return { resumed, failed };
+}
+
 function executableAvailable(command, args = ["--version"]) {
   const result = spawnSync(command, args, { windowsHide: true, encoding: "utf8", timeout: 5000 });
   return !result.error && result.status === 0;
@@ -151,8 +242,27 @@ async function runDesktopValidation(input) {
   const child = spawn(executable, Array.isArray(input.args) ? input.args.map(String) : [], { cwd: path.dirname(executable), windowsHide: false, detached: true });
   await new Promise((resolve) => setTimeout(resolve, Math.max(500, Math.min(10000, Number(input.observeMs || 2000)))));
   const running = child.exitCode === null && !child.killed;
-  if (running) child.unref();
+  if (running && child.pid) {
+    ownedDesktopProcesses.set(child.pid, {
+      projectPath: path.resolve(input.root),
+      executable,
+      args: Array.isArray(input.args) ? input.args.map(String) : [],
+      processId: child.pid,
+    });
+    child.once("exit", () => ownedDesktopProcesses.delete(child.pid));
+    child.unref();
+  }
   return { available: true, verified: running, pid: child.pid, running, interactionVerified: false, reason: running ? "The process launched and remained alive during the observation window; semantic UI interaction was not verified." : `The process exited with code ${child.exitCode}.` };
 }
 
-module.exports = { validationCapabilities, runBrowserValidation, compareScreenshots, runAndroidValidation, runIosValidation, runDesktopValidation };
+module.exports = {
+  validationCapabilities,
+  runBrowserValidation,
+  compareScreenshots,
+  runAndroidValidation,
+  runIosValidation,
+  runDesktopValidation,
+  commandProducesBuildArtifacts,
+  suspendOwnedDesktopProcesses,
+  resumeOwnedDesktopProcesses,
+};

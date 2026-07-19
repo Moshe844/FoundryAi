@@ -3,20 +3,26 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 
 const NODE_MISSING_MESSAGE = "Node.js is required to run the Foundry Local Agent. Download it from https://nodejs.org/ and run this file again.";
+type AgentScripts = { connector: string; validation: string; staticPreview: string };
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const platform = (url.searchParams.get("platform") || "windows").toLowerCase();
 
-  let scriptContent: string;
+  let scripts: AgentScripts;
   try {
-    scriptContent = await readFile(path.join(process.cwd(), "scripts", "foundry-local-connector.cjs"), "utf8");
+    const [connector, validation, staticPreview] = await Promise.all([
+      readFile(path.join(process.cwd(), "scripts", "foundry-local-connector.cjs"), "utf8"),
+      readFile(path.join(process.cwd(), "scripts", "local-agent-validation.cjs"), "utf8"),
+      readFile(path.join(process.cwd(), "scripts", "foundry-static-preview.cjs"), "utf8"),
+    ]);
+    scripts = { connector, validation, staticPreview };
   } catch {
-    return NextResponse.json({ error: "The local agent script is not available on this server." }, { status: 500 });
+    return NextResponse.json({ error: "The complete local agent runtime is not available on this server." }, { status: 500 });
   }
 
   if (platform === "mac") {
-    return new Response(buildMacLauncher(scriptContent), {
+    return new Response(buildMacLauncher(scripts), {
       headers: {
         "Content-Type": "text/x-sh; charset=utf-8",
         "Content-Disposition": "attachment; filename=\"foundry-local-agent.command\"",
@@ -25,7 +31,7 @@ export async function GET(request: Request) {
   }
 
   if (platform === "linux") {
-    return new Response(buildLinuxLauncher(scriptContent), {
+    return new Response(buildLinuxLauncher(scripts), {
       headers: {
         "Content-Type": "text/x-sh; charset=utf-8",
         "Content-Disposition": "attachment; filename=\"foundry-local-agent.sh\"",
@@ -33,7 +39,7 @@ export async function GET(request: Request) {
     });
   }
 
-  return new Response(buildWindowsLauncher(scriptContent), {
+  return new Response(buildWindowsLauncher(scripts), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Content-Disposition": "attachment; filename=\"foundry-local-agent.bat\"",
@@ -41,7 +47,23 @@ export async function GET(request: Request) {
   });
 }
 
-function buildWindowsLauncher(scriptContent: string) {
+function windowsBase64FileLines(fileName: string, content: string, suffix: string) {
+  const chunks = Buffer.from(content, "utf8").toString("base64").match(/.{1,700}/g) ?? [];
+  const temporaryVariable = `FOUNDRY_${suffix}_B64`;
+  return [
+    `set "${temporaryVariable}=%TEMP%\\foundry-${suffix.toLowerCase()}-%RANDOM%.b64"`,
+    ...chunks.map((chunk, index) => `${index === 0 ? ">" : ">>"} "%${temporaryVariable}%" echo ${chunk}`),
+    `certutil -f -decode "%${temporaryVariable}%" "%INSTALL_DIR%\\${fileName}" >nul 2>nul`,
+    "if errorlevel 1 (",
+    `  echo Could not install ${fileName}.`,
+    "  pause",
+    "  exit /b 1",
+    ")",
+    `del /q "%${temporaryVariable}%" >nul 2>nul`,
+  ];
+}
+
+function buildWindowsLauncher(scripts: AgentScripts) {
   const header = [
     "@echo off",
     "setlocal",
@@ -61,6 +83,8 @@ function buildWindowsLauncher(scriptContent: string) {
     "if not exist \"%INSTALL_DIR%\" mkdir \"%INSTALL_DIR%\" >nul 2>nul",
     "set \"SCRIPT=%INSTALL_DIR%\\foundry-local-connector.cjs\"",
     "more +__HEADER_LINES__ \"%~f0\" > \"%SCRIPT%\"",
+    ...windowsBase64FileLines("local-agent-validation.cjs", scripts.validation, "VALIDATION"),
+    ...windowsBase64FileLines("foundry-static-preview.cjs", scripts.staticPreview, "PREVIEW"),
     "echo Installing Foundry Local Agent to %INSTALL_DIR% ...",
     "set \"LAUNCH_VBS=%INSTALL_DIR%\\launch-agent.vbs\"",
     "> \"%LAUNCH_VBS%\" echo Set objShell = CreateObject(\"WScript.Shell\")",
@@ -82,10 +106,10 @@ function buildWindowsLauncher(scriptContent: string) {
     "exit /b 0",
   ];
   const headerWithLineCount = header.map((line) => line.replace("__HEADER_LINES__", String(header.length)));
-  return `${headerWithLineCount.join("\r\n")}\r\n${scriptContent}`;
+  return `${headerWithLineCount.join("\r\n")}\r\n${scripts.connector}`;
 }
 
-function buildMacLauncher(scriptContent: string) {
+function buildMacLauncher(scripts: AgentScripts) {
   const lines = [
     "#!/usr/bin/env bash",
     "if ! command -v node >/dev/null 2>&1; then",
@@ -100,8 +124,14 @@ function buildMacLauncher(scriptContent: string) {
     "mkdir -p \"$INSTALL_DIR\"",
     "SCRIPT=\"$INSTALL_DIR/foundry-local-connector.cjs\"",
     "cat > \"$SCRIPT\" <<'FOUNDRY_AGENT_SCRIPT_EOF'",
-    scriptContent,
+    scripts.connector,
     "FOUNDRY_AGENT_SCRIPT_EOF",
+    "cat > \"$INSTALL_DIR/local-agent-validation.cjs\" <<'FOUNDRY_AGENT_VALIDATION_EOF'",
+    scripts.validation,
+    "FOUNDRY_AGENT_VALIDATION_EOF",
+    "cat > \"$INSTALL_DIR/foundry-static-preview.cjs\" <<'FOUNDRY_AGENT_PREVIEW_EOF'",
+    scripts.staticPreview,
+    "FOUNDRY_AGENT_PREVIEW_EOF",
     "PLIST_DIR=\"$HOME/Library/LaunchAgents\"",
     "mkdir -p \"$PLIST_DIR\"",
     "PLIST=\"$PLIST_DIR/com.foundry.localagent.plist\"",
@@ -133,7 +163,7 @@ function buildMacLauncher(scriptContent: string) {
   return lines.join("\n");
 }
 
-function buildLinuxLauncher(scriptContent: string) {
+function buildLinuxLauncher(scripts: AgentScripts) {
   const lines = [
     "#!/usr/bin/env bash",
     "if ! command -v node >/dev/null 2>&1; then",
@@ -148,8 +178,14 @@ function buildLinuxLauncher(scriptContent: string) {
     "mkdir -p \"$INSTALL_DIR\"",
     "SCRIPT=\"$INSTALL_DIR/foundry-local-connector.cjs\"",
     "cat > \"$SCRIPT\" <<'FOUNDRY_AGENT_SCRIPT_EOF'",
-    scriptContent,
+    scripts.connector,
     "FOUNDRY_AGENT_SCRIPT_EOF",
+    "cat > \"$INSTALL_DIR/local-agent-validation.cjs\" <<'FOUNDRY_AGENT_VALIDATION_EOF'",
+    scripts.validation,
+    "FOUNDRY_AGENT_VALIDATION_EOF",
+    "cat > \"$INSTALL_DIR/foundry-static-preview.cjs\" <<'FOUNDRY_AGENT_PREVIEW_EOF'",
+    scripts.staticPreview,
+    "FOUNDRY_AGENT_PREVIEW_EOF",
     "AUTOSTART_DIR=\"$HOME/.config/autostart\"",
     "mkdir -p \"$AUTOSTART_DIR\"",
     "cat > \"$AUTOSTART_DIR/foundry-local-agent.desktop\" <<DESKTOP_EOF",

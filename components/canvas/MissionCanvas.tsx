@@ -218,11 +218,10 @@ export function MissionCanvas({
   }
 
   useEffect(() => {
-    // A persisted runtime failure is already truthful evidence. Do not automatically relaunch the
-    // broken server on every parent-state reconciliation; that both churns processes and can replace
-    // the concrete first failure (for example a missing DATABASE_URL) with a generic second-attempt
-    // timeout. The explicit Retry preview action is the only recovery trigger from an error state.
-    if (projectDeleted || !connectedProjectId || execution?.previewState === "error" || execution?.status === "failed" || activeExecution?.state === "failed") return;
+    // Opening a project is itself a preview trigger. Retry a persisted preview error once during
+    // project reconciliation so a repaired Local Agent or newly available runtime recovers without
+    // making the user press Retry preview first.
+    if (projectDeleted || !connectedProjectId) return;
     // Keep the last proven preview mounted while an edit is running. Clearing it here made the app
     // disappear exactly when users need to watch their changes land, then reappear only at completion.
     if (missionStatus.isBusy && hasExecution) return;
@@ -241,7 +240,7 @@ export function MissionCanvas({
       if (!cancelled) setPreviewLoading(false);
     });
     return () => { cancelled = true; };
-  }, [activeExecution?.state, connectedProjectId, execution?.previewState, execution?.status, hasExecution, previewConnector, missionStatus.isBusy, projectDeleted]);
+  }, [connectedProjectId, execution?.previewState, hasExecution, previewConnector, missionStatus.isBusy, projectDeleted]);
 
   useEffect(() => {
     const previewIdentity = connectedProjectId

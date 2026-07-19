@@ -28,7 +28,7 @@ import { routeDynamically } from "@/lib/ai/routing/dynamic-router";
 import { profileTask } from "@/lib/ai/routing/task-profiler";
 import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
 import { discoverProjectWorkingSet, type ProjectWorkingSet } from "@/lib/ai/routing/project-working-set";
-import { createLocalConnectorProjectAccess, createServerProjectAccess, createUploadedProjectAccess, isSensitiveFilePath, type LocalConnectorConfig, type ProjectAccess } from "@/lib/ai/mission/project-access";
+import { connectLocalConnectorRoot, createLocalConnectorProjectAccess, createServerProjectAccess, createUploadedProjectAccess, isSensitiveFilePath, type LocalConnectorConfig, type ProjectAccess } from "@/lib/ai/mission/project-access";
 import type { ExecutionMissionVerification, FactoryArtifact, FactoryCommandEvent, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryExistingProjectRequest, FactoryFileEntry, FactoryJournalEntry, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactoryPreviewPlatform, FactoryPreviewState, FactoryProjectResult, FactorySessionSummary, FactorySourceMode, FactoryUploadedFile, MissionClarification, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
 import { environmentReadinessForStack } from "@/lib/toolchains/provisioner";
 import { explicitReadOnlyProjectIntent, type FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
@@ -41,6 +41,7 @@ import { buildOnlyRecoveryCanComplete, shouldResumeIncompleteGeneratedProject } 
 import { redactSensitiveData, redactSensitiveText } from "@/lib/security/secret-redaction";
 import { explicitProjectFileNames, isExplicitLocalProjectFileRequest } from "@/lib/sources/intent";
 import { stripTerminalFormatting } from "@/lib/text/terminal";
+import { actionableBuildLockMessage, forgetOwnedDesktopProcess, registerOwnedDesktopProcess } from "@/lib/factory/owned-desktop-processes";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 type EvidenceAttachments = NonNullable<FactoryExistingProjectRequest["evidenceAttachments"]>;
@@ -493,8 +494,12 @@ const connectorPreviewGlobal = globalThis as typeof globalThis & { __foundryConn
 // connection details process-global so the execution route and the later preview status/refresh
 // route observe the same runtime instead of immediately downgrading a proven preview to unavailable.
 const connectorPreviews = connectorPreviewGlobal.__foundryConnectorPreviews ??= new Map<string, LocalConnectorConfig>();
-const desktopPreviewGlobal = globalThis as typeof globalThis & { __foundryDesktopPreviewTargets?: Map<string, string> };
-const desktopPreviewTargets = desktopPreviewGlobal.__foundryDesktopPreviewTargets ??= new Map<string, string>();
+type ConnectorArtifactTarget = { connector: LocalConnectorConfig; relativePath: string; platform: FactoryPreviewPlatform };
+const connectorArtifactGlobal = globalThis as typeof globalThis & { __foundryConnectorArtifactTargets?: Map<string, ConnectorArtifactTarget> };
+const connectorArtifactTargets = connectorArtifactGlobal.__foundryConnectorArtifactTargets ??= new Map<string, ConnectorArtifactTarget>();
+type DesktopPreviewTargetRecord = { projectPath: string; executable: string };
+const desktopPreviewGlobal = globalThis as typeof globalThis & { __foundryDesktopPreviewTargets?: Map<string, DesktopPreviewTargetRecord> };
+const desktopPreviewTargets = desktopPreviewGlobal.__foundryDesktopPreviewTargets ??= new Map<string, DesktopPreviewTargetRecord>();
 const desktopPreviewRegistryDirectory = path.join(process.cwd(), ".foundry-data", "desktop-targets-v1");
 
 function desktopPreviewRecordPath(projectId: string) {
@@ -508,10 +513,11 @@ function pathIsInside(root: string, candidate: string) {
 
 function persistDesktopPreviewTarget(projectId: string, projectPath: string, executable: string) {
   if (!pathIsInside(projectPath, executable) || !/\.exe$/i.test(executable)) return;
-  desktopPreviewTargets.set(projectId, executable);
+  const target = { projectPath: path.resolve(projectPath), executable: path.resolve(executable) };
+  desktopPreviewTargets.set(projectId, target);
   try {
     mkdirSync(desktopPreviewRegistryDirectory, { recursive: true });
-    writeFileSync(desktopPreviewRecordPath(projectId), JSON.stringify({ projectId, projectPath: path.resolve(projectPath), executable: path.resolve(executable), recordedAt: Date.now() }), "utf8");
+    writeFileSync(desktopPreviewRecordPath(projectId), JSON.stringify({ projectId, ...target, recordedAt: Date.now() }), "utf8");
   } catch {
     // The process-global target remains usable until the next full server restart.
   }
@@ -522,8 +528,9 @@ function restoreDesktopPreviewTarget(projectId: string) {
     const record = JSON.parse(readFileSync(desktopPreviewRecordPath(projectId), "utf8")) as { projectId?: string; projectPath?: string; executable?: string; recordedAt?: number };
     if (record.projectId !== projectId || !record.projectPath || !record.executable || Date.now() - Number(record.recordedAt || 0) > 2_592_000_000) return undefined;
     if (!pathIsInside(record.projectPath, record.executable) || !existsSync(record.executable) || !/\.exe$/i.test(record.executable)) return undefined;
-    desktopPreviewTargets.set(projectId, record.executable);
-    return record.executable;
+    const target = { projectPath: path.resolve(record.projectPath), executable: path.resolve(record.executable) };
+    desktopPreviewTargets.set(projectId, target);
+    return target;
   } catch {
     return undefined;
   }
@@ -6286,10 +6293,60 @@ function previewArtifactRoot(target: ProjectPreviewTarget): string {
   return path.join(process.cwd(), ".foundry-data", "artifacts", safeProjectId);
 }
 
+async function findConnectorBuildArtifact(projectId: string, connector: LocalConnectorConfig, platform: FactoryPreviewPlatform): Promise<PreviewOutcome | undefined> {
+  if (!connector.rootLabel) return undefined;
+  const registration = await connectLocalConnectorRoot(connector, connector.rootLabel);
+  if (!registration.ok) return { previewState: "error", previewPlatform: platform, previewReason: registration.error || "The selected project folder could not be reconnected to the Local Agent." };
+  const baseUrl = connector.url.replace(/\/+$/, "");
+  const headers = { "content-type": "application/json", ...(connector.token ? { authorization: `Bearer ${connector.token}` } : {}) };
+  const response = await fetch(`${baseUrl}/artifact/find`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ root: connector.rootLabel, platform }),
+  });
+  const found = (await response.json().catch(() => ({}))) as {
+    found?: boolean;
+    path?: string;
+    name?: string;
+    sizeBytes?: number;
+    createdAt?: string;
+    platform?: string;
+    fileType?: string;
+    version?: string;
+    error?: string;
+  };
+  if (!response.ok) return { previewState: "error", previewPlatform: platform, previewReason: found.error || "The Local Agent could not inspect build artifacts." };
+  if (!found.found || !found.path || !found.name) return undefined;
+  connectorPreviews.set(projectId, connector);
+  connectorArtifactTargets.set(projectId, { connector, relativePath: found.path, platform });
+  const artifact: FactoryArtifact = {
+    name: found.name,
+    platform: found.platform || (platform === "android" ? "Android" : platform === "mobile" ? "Mobile" : "Desktop"),
+    version: found.version || "1.0.0",
+    fileType: found.fileType || "Build artifact",
+    sizeBytes: Number(found.sizeBytes || 0),
+    createdAt: found.createdAt || new Date().toISOString(),
+    buildStatus: "verified",
+    downloadUrl: `/api/factory/artifact?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(found.path)}`,
+  };
+  return {
+    previewState: "ready",
+    previewPlatform: platform,
+    previewReason: `${artifact.name} is built and ready to ${platform === "desktop" ? "launch or download" : "install or download"}.`,
+    artifact,
+  };
+}
+
 async function startProjectPreview(target: ProjectPreviewTarget, stack: string, events: string[] = [], execution?: ExecutionContext): Promise<PreviewOutcome> {
   if (target.kind === "connector") {
     connectorPreviews.set(target.projectId, target.connector);
-    return startConnectorPreview(target.connector);
+    const platform = previewPlatformForStack(stack);
+    if (["desktop", "android", "mobile", "report"].includes(platform)) {
+      const artifact = await findConnectorBuildArtifact(target.projectId, target.connector, platform);
+      if (artifact) return artifact;
+      return { previewState: "unavailable", previewPlatform: platform, previewReason: previewUnavailableReason(platform, stack) };
+    }
+    return startConnectorPreview(target.connector, platform);
   }
   return startPreview(target.projectId, target.projectPath, stack, events, execution);
 }
@@ -6825,9 +6882,61 @@ async function startPreview(projectId: string, projectPath: string, stack: strin
     }
   }
 
+  if (platform === "android" || platform === "mobile" || platform === "report") {
+    const packaged = await findPackagedArtifact(projectPath, platform);
+    if (packaged) {
+      const relativeArtifactPath = path.relative(projectPath, packaged.path).replace(/\\/g, "/");
+      const artifact: FactoryArtifact = {
+        name: path.basename(packaged.path),
+        platform: packaged.platform,
+        version: await desktopVersionForProject(projectPath),
+        fileType: packaged.fileType,
+        sizeBytes: packaged.size,
+        createdAt: packaged.createdAt,
+        buildStatus: "verified",
+        downloadUrl: `/api/factory/artifact?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(relativeArtifactPath)}`,
+      };
+      const reason = `${artifact.name} is built and ready to ${platform === "report" ? "open or download" : "install or download"}.`;
+      if (execution) await emitExecution(execution, "preview", "completed", "Platform artifact ready", { details: { artifact: artifact.name, platform: artifact.platform, sizeBytes: artifact.sizeBytes } });
+      return { previewState: "ready", previewPlatform: platform, previewReason: reason, artifact };
+    }
+  }
+
   const reason = previewUnavailableReason(platform, stack);
   if (execution) await emitExecution(execution, "preview", "skipped", "Preview unavailable", { details: { reason, stack } });
   return { previewState: "unavailable", previewPlatform: platform, previewReason: reason };
+}
+
+async function findPackagedArtifact(projectPath: string, platform: "android" | "mobile" | "report") {
+  const extensions = platform === "android" ? new Set([".apk", ".aab"]) : platform === "mobile" ? new Set([".ipa", ".apk", ".aab"]) : new Set([".pdf"]);
+  const queue = [projectPath];
+  const candidates: Array<{ path: string; size: number; createdAt: string; extension: string; score: number }> = [];
+  let visited = 0;
+  while (queue.length && visited < 600) {
+    const current = queue.shift() as string;
+    visited += 1;
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if ([".git", ".next", ".turbo", "node_modules", "obj", ".gradle", ".dart_tool", "coverage"].includes(entry.name)) continue;
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (queue.length < 600) queue.push(fullPath);
+        continue;
+      }
+      const extension = path.extname(entry.name).toLowerCase();
+      if (!extensions.has(extension)) continue;
+      const details = await stat(fullPath).catch(() => undefined);
+      if (!details?.isFile()) continue;
+      const normalized = fullPath.replace(/\\/g, "/").toLowerCase();
+      const score = [".aab", ".ipa"].includes(extension) ? 0 : /\/(release|publish|artifacts?|outputs?)\//.test(normalized) ? 1 : 2;
+      candidates.push({ path: fullPath, size: details.size, createdAt: details.mtime.toISOString(), extension, score });
+    }
+  }
+  const selected = candidates.sort((left, right) => left.score - right.score || right.createdAt.localeCompare(left.createdAt))[0];
+  if (!selected) return undefined;
+  const platformLabel = [".apk", ".aab"].includes(selected.extension) ? "Android" : selected.extension === ".ipa" ? "iOS" : "Document";
+  const fileType = selected.extension === ".apk" ? "Android package (.apk)" : selected.extension === ".aab" ? "Android App Bundle (.aab)" : selected.extension === ".ipa" ? "iOS application archive (.ipa)" : "PDF document (.pdf)";
+  return { ...selected, platform: platformLabel, fileType };
 }
 
 async function findDesktopExecutable(projectPath: string): Promise<string | undefined> {
@@ -6866,34 +6975,90 @@ function desktopExecutableRank(filePath: string) {
 }
 
 export async function launchDesktopPreview(projectId: string, requestedProjectPath?: string) {
-  let executable = desktopPreviewTargets.get(projectId) ?? restoreDesktopPreviewTarget(projectId);
+  const connectorTarget = connectorArtifactTargets.get(projectId);
+  if (connectorTarget?.platform === "desktop") {
+    const { connector, relativePath } = connectorTarget;
+    try {
+      const baseUrl = connector.url.replace(/\/+$/, "");
+      const headers = { "content-type": "application/json", ...(connector.token ? { authorization: `Bearer ${connector.token}` } : {}) };
+      const response = await fetch(`${baseUrl}/validation/desktop/run`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ root: connector.rootLabel || "", executable: relativePath, observeMs: 2000 }),
+      });
+      const result = (await response.json().catch(() => ({}))) as { verified?: boolean; reason?: string; error?: string };
+      return result.verified
+        ? { ok: true, executable: path.basename(relativePath) }
+        : { ok: false, error: result.error || result.reason || "The desktop artifact did not remain running after launch." };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : "The Local Agent could not launch the desktop artifact." };
+    }
+  }
+  let target = desktopPreviewTargets.get(projectId) ?? restoreDesktopPreviewTarget(projectId);
+  let executable = target?.executable;
+  let projectPath = target?.projectPath;
   if (!executable || !existsSync(executable)) {
     try {
       const resolvedRequestedPath = requestedProjectPath ? path.resolve(requestedProjectPath) : undefined;
       const managedRoot = path.resolve(projectsRoot);
-      const projectPath = resolvedRequestedPath && pathIsInside(managedRoot, resolvedRequestedPath) && existsSync(resolvedRequestedPath)
+      projectPath = resolvedRequestedPath && pathIsInside(managedRoot, resolvedRequestedPath) && existsSync(resolvedRequestedPath)
         ? resolvedRequestedPath
         : safeProjectPath(projectId);
       executable = await findDesktopExecutable(projectPath);
-      if (executable) persistDesktopPreviewTarget(projectId, projectPath, executable);
+      if (executable) {
+        persistDesktopPreviewTarget(projectId, projectPath, executable);
+        target = { projectPath, executable };
+      }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : "The desktop project path is unavailable." };
     }
   }
   if (!executable || !existsSync(executable)) return { ok: false, error: "No built desktop executable was found in this project. Build it once, then launch again." };
   try {
-    await new Promise<void>((resolve, reject) => {
+    const processId = await new Promise<number>((resolve, reject) => {
       const child = spawn(executable!, [], { cwd: path.dirname(executable!), detached: true, stdio: "ignore", windowsHide: false });
       child.once("error", reject);
       child.once("spawn", () => {
+        if (typeof child.pid !== "number") {
+          reject(new Error("Windows did not return a process id for the desktop app."));
+          return;
+        }
         child.unref();
-        resolve();
+        resolve(child.pid);
+      });
+      child.once("exit", () => {
+        if (typeof child.pid === "number") forgetOwnedDesktopProcess(child.pid);
       });
     });
-    return { ok: true, executable: path.basename(executable) };
+    registerOwnedDesktopProcess({
+      projectId,
+      projectPath: projectPath || path.dirname(executable),
+      executable,
+      args: [],
+      processId,
+    });
+    return { ok: true, executable: path.basename(executable), processId };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : "Windows rejected the desktop executable." };
   }
+}
+
+export async function readConnectorProjectArtifact(projectId: string, requestedRelativePath: string) {
+  const target = connectorArtifactTargets.get(projectId);
+  if (!target || target.relativePath.replace(/\\/g, "/") !== requestedRelativePath.replace(/\\/g, "/")) return undefined;
+  const { connector } = target;
+  const baseUrl = connector.url.replace(/\/+$/, "");
+  const headers = { "content-type": "application/json", ...(connector.token ? { authorization: `Bearer ${connector.token}` } : {}) };
+  const response = await fetch(`${baseUrl}/artifact/download`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ root: connector.rootLabel || "", path: target.relativePath }),
+  });
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(payload.error || "The Local Agent could not read the build artifact.");
+  }
+  return { file: Buffer.from(await response.arrayBuffer()), filename: path.basename(target.relativePath) };
 }
 
 async function startStaticPreview(projectId: string, projectPath: string, entryFile: string, events: string[], execution?: ExecutionContext): Promise<PreviewOutcome> {
@@ -7282,20 +7447,30 @@ async function detectNextPreviewScript(projectPath: string): Promise<string | un
   }
 }
 
-async function startConnectorPreview(connector: LocalConnectorConfig): Promise<PreviewOutcome> {
+async function startConnectorPreview(connector: LocalConnectorConfig, platform: FactoryPreviewPlatform = "web"): Promise<PreviewOutcome> {
   try {
     const baseUrl = connector.url.replace(/\/+$/, "");
     const headers = { "content-type": "application/json", ...(connector.token ? { authorization: `Bearer ${connector.token}` } : {}) };
+    if (connector.rootLabel) {
+      const registration = await connectLocalConnectorRoot(connector, connector.rootLabel);
+      if (!registration.ok) {
+        return {
+          previewState: "error",
+          previewPlatform: platform,
+          previewReason: registration.error || "The selected project folder could not be reconnected to the Local Agent.",
+        };
+      }
+    }
     const response = await fetch(`${baseUrl}/preview/start`, { method: "POST", headers, body: JSON.stringify({ root: connector.rootLabel || "", path: "" }) });
     const payload = (await response.json().catch(() => ({}))) as { previewUrl?: string; state?: string; reason?: string; error?: string };
-    if (!response.ok) return { previewState: "error", previewPlatform: "web", previewReason: payload.error || "The local connector could not start a preview." };
+    if (!response.ok) return { previewState: "error", previewPlatform: platform, previewReason: payload.error || "The local connector could not start a preview." };
     if (payload.state === "ready") {
       const previewUrl = canonicalConnectorPreviewUrl(payload.previewUrl);
       return previewUrl
-        ? { previewUrl, previewState: "ready", previewPlatform: "web" }
-        : { previewState: "error", previewPlatform: "web", previewReason: "The local connector reported a ready web preview without an HTTP URL. Restart the Local Agent so it can serve static projects through the owned preview runtime." };
+        ? { previewUrl, previewState: "ready", previewPlatform: platform }
+        : { previewState: "error", previewPlatform: platform, previewReason: "The local connector reported a ready web preview without an HTTP URL. Restart the Local Agent so it can serve static projects through the owned preview runtime." };
     }
-    if (payload.state !== "starting") return { previewState: "error", previewPlatform: "web", previewReason: payload.reason || "The local connector preview did not start." };
+    if (payload.state !== "starting") return { previewState: "error", previewPlatform: platform, previewReason: payload.reason || "The local connector preview did not start." };
     // The connector intentionally returns `starting` after a short first probe for frameworks that
     // are still compiling. Poll its authoritative process registry before deciding the mission's
     // terminal state instead of converting a healthy slow start into an immediate failure.
@@ -7306,16 +7481,16 @@ async function startConnectorPreview(connector: LocalConnectorConfig): Promise<P
       if (statusResponse.ok && status.state === "ready") {
         const previewUrl = canonicalConnectorPreviewUrl(status.previewUrl || payload.previewUrl);
         return previewUrl
-          ? { previewUrl, previewState: "ready", previewPlatform: "web" }
-          : { previewState: "error", previewPlatform: "web", previewReason: "The local connector reported a ready web preview without an HTTP URL. Restart the Local Agent so it can serve static projects through the owned preview runtime." };
+          ? { previewUrl, previewState: "ready", previewPlatform: platform }
+          : { previewState: "error", previewPlatform: platform, previewReason: "The local connector reported a ready web preview without an HTTP URL. Restart the Local Agent so it can serve static projects through the owned preview runtime." };
       }
       if (!statusResponse.ok || status.state === "error" || status.state === "unavailable") {
-        return { previewState: "error", previewPlatform: "web", previewReason: status.error || status.reason || "The connector preview process exited before becoming ready." };
+        return { previewState: "error", previewPlatform: platform, previewReason: status.error || status.reason || "The connector preview process exited before becoming ready." };
       }
     }
-    return { previewState: "error", previewPlatform: "web", previewReason: payload.reason || "The connector preview did not become reachable before the readiness deadline." };
+    return { previewState: "error", previewPlatform: platform, previewReason: payload.reason || "The connector preview did not become reachable before the readiness deadline." };
   } catch (error) {
-    return { previewState: "error", previewPlatform: "web", previewReason: error instanceof Error ? error.message : "Could not reach the local connector to start a preview." };
+    return { previewState: "error", previewPlatform: platform, previewReason: error instanceof Error ? error.message : "Could not reach the local connector to start a preview." };
   }
 }
 
@@ -7399,11 +7574,31 @@ export async function refreshPreviewForProject(projectId: string, localConnector
   // time so opening a project is sufficient to establish a real preview; execution must not be a
   // hidden prerequisite for the basic workspace lifecycle.
   if (localConnector?.url && localConnector.rootLabel) {
+    const registration = await connectLocalConnectorRoot(localConnector, localConnector.rootLabel);
+    if (!registration.ok) return { previewState: "error" as const, previewPlatform: "web" as const, previewReason: registration.error || "The selected project folder could not be reconnected to the Local Agent." };
+    try {
+      const managedProjectPath = safeProjectPath(projectId);
+      if (path.resolve(managedProjectPath).toLowerCase() === path.resolve(localConnector.rootLabel).toLowerCase()) {
+        connectorPreviews.delete(projectId);
+        connectorArtifactTargets.delete(projectId);
+        const access = createServerProjectAccess(managedProjectPath, "local-folder");
+        const detected = await detectStackProfileAndEntriesForAccess(access);
+        return startProjectPreview({ kind: "workspace", projectId, projectPath: managedProjectPath }, detected.profile.label);
+      }
+    } catch {
+      // An external connector root is expected not to resolve inside Foundry's managed projects.
+    }
     connectorPreviews.set(projectId, localConnector);
-    return startConnectorPreview(localConnector);
+    const access = createLocalConnectorProjectAccess(localConnector);
+    const detected = await detectStackProfileAndEntriesForAccess(access);
+    return startProjectPreview(connectorPreviewTarget(projectId, localConnector), detected.profile.label);
   }
   const connector = connectorPreviews.get(projectId);
-  if (connector) return startConnectorPreview(connector);
+  if (connector) {
+    const access = createLocalConnectorProjectAccess(connector);
+    const detected = await detectStackProfileAndEntriesForAccess(access);
+    return startProjectPreview(connectorPreviewTarget(projectId, connector), detected.profile.label);
+  }
   let projectPath: string;
   try {
     projectPath = safeProjectPath(projectId);
@@ -7423,7 +7618,7 @@ export async function refreshPreviewForProject(projectId: string, localConnector
     const brief = await access.readFile("foundry-brief.md", { limitBytes: 100_000 }).catch(() => undefined);
     stack = brief?.content.match(/^Selected stack:\s*(.+)$/im)?.[1]?.trim() || stack;
   }
-  return startPreview(projectId, projectPath, stack, []);
+  return startProjectPreview({ kind: "workspace", projectId, projectPath }, stack);
 }
 
 function desktopPlatformForPath(executable: string) {
@@ -7532,6 +7727,8 @@ function isPortAvailable(port: number) {
 
 function summarizeCommandFailure(command: FactoryCommandEvent) {
   const output = stripTerminalFormatting(`${command.stderr}\n${command.stdout}`).trim();
+  const lockGuidance = actionableBuildLockMessage(output);
+  if (lockGuidance) return lockGuidance;
   const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const diagnostics = lines.filter((line) =>
     !/^at\s+/i.test(line)

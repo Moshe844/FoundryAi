@@ -6,6 +6,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { decideCommandPermission, type CommandApprovalScope, type CommandPermissionCategory } from "./command-permissions";
 import { assessWriteVerification } from "./write-verification";
+import { commandProducesBuildArtifacts, resumeOwnedDesktopProcesses, suspendOwnedDesktopProcesses } from "@/lib/factory/owned-desktop-processes";
 
 const LONG_RUNNING_COMMAND_PATTERN =
   /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\b(?:npx|pnpx|bunx)(?:\.cmd)?\s+(?:--yes\s+)?(?:serve|http-server)\b|\b(?:python|python3|py)(?:\.exe)?\s+-m\s+http\.server\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
@@ -1081,15 +1082,42 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
         return { ...result, approvalScope };
       }
 
-      if (/\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?build\b/i.test(command)) {
+      if (commandProducesBuildArtifacts(command)) {
         const backgroundPid = backgroundServerPids.get(requestedCwd);
         if (backgroundPid) {
           killProcessTree(backgroundPid);
           backgroundServerPids.delete(requestedCwd);
+          backgroundServerUrls.delete(requestedCwd);
         }
       }
 
-      return { ...(await runCommandWithShellFallback(command, requestedCwd, shellSession, COMMAND_TIMEOUT_MS, false, signal)), approvalScope };
+      const desktopSuspension = commandProducesBuildArtifacts(command)
+        ? await suspendOwnedDesktopProcesses(resolvedRoot)
+        : { suspended: [], failed: [] };
+      if (desktopSuspension.failed.length) {
+        const owners = desktopSuspension.failed.map((record) => `${path.basename(record.executable)} (PID ${record.processId})`).join(", ");
+        return {
+          exitCode: null,
+          stdout: "",
+          stderr: `Foundry could not pause its running desktop app before rebuilding: ${owners}. Close the app, then choose Verify again.`,
+          durationMs: 0,
+          timedOut: false,
+          skipped: "owned-runtime-lock",
+          approvalScope,
+        };
+      }
+      const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, COMMAND_TIMEOUT_MS, false, signal);
+      const resumed = await resumeOwnedDesktopProcesses(desktopSuspension.suspended);
+      const lifecycleNote = desktopSuspension.suspended.length
+        ? resumed.failed.length
+          ? `Foundry paused ${desktopSuspension.suspended.length} running desktop app before the build, but could not relaunch ${resumed.failed.map((item) => path.basename(item.record.executable)).join(", ")}: ${resumed.failed.map((item) => item.reason).join("; ")}`
+          : `Foundry paused and restored ${resumed.resumed.length} running desktop app${resumed.resumed.length === 1 ? "" : "s"} around the build.`
+        : "";
+      return {
+        ...result,
+        stderr: [result.stderr, lifecycleNote].filter(Boolean).join("\n"),
+        approvalScope,
+      };
     },
 
     async searchFiles(query, opts = {}) {
@@ -1230,15 +1258,34 @@ export function createLocalConnectorProjectAccess(config: LocalConnectorConfig, 
     "content-type": "application/json",
     ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),
   };
+  let reconnectingRoot: Promise<void> | undefined;
+
+  async function reconnectRoot() {
+    if (!config.rootLabel) throw new Error("The Local Agent project root is missing, so Foundry cannot reconnect it.");
+    if (!reconnectingRoot) {
+      reconnectingRoot = connectLocalConnectorRoot(config, config.rootLabel).then((result) => {
+        if (!result.ok) throw new Error(result.error || "The selected project folder could not be reconnected to the Local Agent.");
+      }).finally(() => {
+        reconnectingRoot = undefined;
+      });
+    }
+    return reconnectingRoot;
+  }
 
   async function post<T>(endpoint: string, body: Record<string, unknown>, requestSignal?: AbortSignal): Promise<T> {
-    const response = await fetch(`${baseUrl}${endpoint}`, {
+    const send = () => fetch(`${baseUrl}${endpoint}`, {
       method: "POST",
       headers,
       body: JSON.stringify({ root, ...body }),
       signal: requestSignal,
     });
-    const payload = await response.json().catch(() => ({}));
+    let response = await send();
+    let payload = await response.json().catch(() => ({}));
+    if (response.status === 403 && typeof payload.error === "string" && /not connected yet/i.test(payload.error)) {
+      await reconnectRoot();
+      response = await send();
+      payload = await response.json().catch(() => ({}));
+    }
     if (!response.ok) throw new Error(typeof payload.error === "string" ? payload.error : `Connector ${endpoint} failed with HTTP ${response.status}.`);
     return payload as T;
   }

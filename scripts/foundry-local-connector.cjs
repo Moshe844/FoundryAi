@@ -6,7 +6,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
-const { validationCapabilities, runBrowserValidation, compareScreenshots, runAndroidValidation, runIosValidation, runDesktopValidation } = require("./local-agent-validation.cjs");
+const { validationCapabilities, runBrowserValidation, compareScreenshots, runAndroidValidation, runIosValidation, runDesktopValidation, commandProducesBuildArtifacts, suspendOwnedDesktopProcesses, resumeOwnedDesktopProcesses } = require("./local-agent-validation.cjs");
 
 const initialRoot = process.env.FOUNDRY_CONNECTOR_ROOT || process.argv[2] || "";
 const port = Number(process.env.FOUNDRY_CONNECTOR_PORT || process.argv[3] || 3917);
@@ -807,6 +807,95 @@ function stopPreview(root, relativePath) {
   return { state: "unavailable" };
 }
 
+const artifactExtensionsByPlatform = {
+  desktop: new Set([".exe", ".msi", ".msix", ".dmg", ".pkg", ".appimage", ".deb", ".rpm"]),
+  android: new Set([".apk", ".aab"]),
+  mobile: new Set([".ipa", ".apk", ".aab"]),
+  report: new Set([".pdf"]),
+};
+
+function artifactCandidateRank(relativePath, extension) {
+  const normalized = relativePath.replace(/\\/g, "/").toLowerCase();
+  if ([".msix", ".msi", ".dmg", ".pkg", ".appimage", ".deb", ".rpm", ".aab", ".ipa"].includes(extension)) return 0;
+  if (/(^|\/)(publish|release|artifacts?|outputs?)(\/|$)/.test(normalized)) return 1;
+  if (/(^|\/)bin\/debug(\/|$)/.test(normalized)) return 3;
+  return 2;
+}
+
+function artifactPlatformLabel(extension) {
+  if ([".apk", ".aab"].includes(extension)) return "Android";
+  if (extension === ".ipa") return "iOS";
+  if ([".dmg", ".pkg"].includes(extension)) return "macOS";
+  if ([".appimage", ".deb", ".rpm"].includes(extension)) return "Linux";
+  if (extension === ".pdf") return "Document";
+  return "Windows";
+}
+
+function artifactFileType(extension) {
+  const labels = {
+    ".exe": "Windows executable (.exe)", ".msi": "Windows installer (.msi)", ".msix": "Windows app package (.msix)",
+    ".apk": "Android package (.apk)", ".aab": "Android App Bundle (.aab)", ".ipa": "iOS application archive (.ipa)",
+    ".dmg": "macOS disk image (.dmg)", ".pkg": "macOS installer (.pkg)", ".appimage": "Linux AppImage",
+    ".deb": "Debian package (.deb)", ".rpm": "RPM package (.rpm)", ".pdf": "PDF document (.pdf)",
+  };
+  return labels[extension] || `Build artifact (${extension})`;
+}
+
+async function findProjectArtifact(root, platform) {
+  const normalizedRoot = normalizeRoot(root);
+  const extensions = artifactExtensionsByPlatform[platform];
+  if (!normalizedRoot || !extensions) return { found: false };
+  const queue = [normalizedRoot];
+  const candidates = [];
+  let visited = 0;
+  while (queue.length && visited < 600) {
+    const directory = queue.shift();
+    visited += 1;
+    const entries = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if ([".git", ".next", ".turbo", "node_modules", "obj", ".gradle", ".dart_tool", "coverage"].includes(entry.name)) continue;
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (queue.length < 600) queue.push(fullPath);
+        continue;
+      }
+      const extension = path.extname(entry.name).toLowerCase();
+      if (!extensions.has(extension)) continue;
+      const relativePath = path.relative(normalizedRoot, fullPath).replace(/\\/g, "/");
+      const details = await fsp.stat(fullPath).catch(() => undefined);
+      if (details?.isFile()) candidates.push({ fullPath, relativePath, extension, details });
+    }
+  }
+  const selected = candidates.sort((left, right) => artifactCandidateRank(left.relativePath, left.extension) - artifactCandidateRank(right.relativePath, right.extension) || right.details.mtimeMs - left.details.mtimeMs)[0];
+  if (!selected) return { found: false };
+  return {
+    found: true,
+    path: selected.relativePath,
+    name: path.basename(selected.fullPath),
+    sizeBytes: selected.details.size,
+    createdAt: selected.details.mtime.toISOString(),
+    platform: artifactPlatformLabel(selected.extension),
+    fileType: artifactFileType(selected.extension),
+    version: "1.0.0",
+  };
+}
+
+async function sendProjectArtifact(res, root, relativePath) {
+  const fullPath = resolveContained(root, relativePath);
+  if (!fullPath || !fs.existsSync(fullPath)) return send(res, 404, { error: "Build artifact was not found." });
+  const details = await fsp.stat(fullPath).catch(() => undefined);
+  if (!details?.isFile()) return send(res, 404, { error: "Build artifact is not a file." });
+  const filename = path.basename(fullPath).replace(/["\r\n]/g, "_");
+  res.writeHead(200, {
+    "content-type": "application/octet-stream",
+    "content-length": String(details.size),
+    "content-disposition": `attachment; filename="${filename}"`,
+    "cache-control": "no-store",
+    "access-control-allow-origin": "*",
+  });
+  fs.createReadStream(fullPath).pipe(res);
+}
+
 async function stopPreviewsForRoot(root) {
   const canonicalRoot = normalizeRoot(root);
   const stoppedPids = [];
@@ -1248,19 +1337,19 @@ async function runCommandWithShellFallback(command, cwd, timeoutMs, keepAliveOnT
   return { ...lastResult, shellUsed: lastShellId };
 }
 
-function runCommand(root, command, cwd = "", approvedCommands = [], approvedCategories = [], signal) {
+async function runCommand(root, command, cwd = "", approvedCommands = [], approvedCategories = [], signal) {
   command = normalizeCommandForExecution(command);
   const portableMkdir = process.platform === "win32" ? leadingPosixMkdir(command) : undefined;
   const requestedCwd = resolveContained(root, cwd);
-  if (!requestedCwd) return Promise.resolve({ exitCode: null, stdout: "", stderr: "Refusing to run outside the connected folder.", durationMs: 0, timedOut: false, skipped: "outside-root" });
+  if (!requestedCwd) return { exitCode: null, stdout: "", stderr: "Refusing to run outside the connected folder.", durationMs: 0, timedOut: false, skipped: "outside-root" };
   const dependencyPreflight = dependencyInstallAlreadySatisfied(command, requestedCwd);
-  if (dependencyPreflight) return Promise.resolve(dependencyPreflight);
+  if (dependencyPreflight) return dependencyPreflight;
   const permission = decideCommandPermission(command);
   const exactApproved = approvedCommands.some((entry) => commandPermissionIdentity(entry) === commandPermissionIdentity(command));
   const categoryApproved = Boolean(permission.category && approvedCategories.includes(permission.category));
   const bypassed = permission.status === "permission-required" && (exactApproved || categoryApproved);
   if (!permission.allowed && !bypassed) {
-    return Promise.resolve({
+    return {
       exitCode: null,
       stdout: "",
       stderr: permission.reason || "Command requires approval.",
@@ -1269,7 +1358,7 @@ function runCommand(root, command, cwd = "", approvedCommands = [], approvedCate
       skipped: permission.status || "permission-required",
       reason: permission.reason,
       category: permission.category,
-    });
+    };
   }
   if (portableMkdir) {
     try {
@@ -1299,7 +1388,29 @@ function runCommand(root, command, cwd = "", approvedCommands = [], approvedCate
     });
   }
 
-  return runCommandWithShellFallback(command, requestedCwd, commandTimeoutMs, false, signal);
+  if (commandProducesBuildArtifacts(command)) await stopPreviewsForRoot(root);
+  const desktopSuspension = commandProducesBuildArtifacts(command)
+    ? await suspendOwnedDesktopProcesses(root)
+    : { suspended: [], failed: [] };
+  if (desktopSuspension.failed.length) {
+    const owners = desktopSuspension.failed.map((record) => `${path.basename(record.executable)} (PID ${record.processId})`).join(", ");
+    return {
+      exitCode: null,
+      stdout: "",
+      stderr: `Foundry could not pause its running desktop app before rebuilding: ${owners}. Close the app, then choose Verify again.`,
+      durationMs: 0,
+      timedOut: false,
+      skipped: "owned-runtime-lock",
+    };
+  }
+  const result = await runCommandWithShellFallback(command, requestedCwd, commandTimeoutMs, false, signal);
+  const resumed = await resumeOwnedDesktopProcesses(desktopSuspension.suspended);
+  const lifecycleNote = desktopSuspension.suspended.length
+    ? resumed.failed.length
+      ? `Foundry paused ${desktopSuspension.suspended.length} running desktop app before the build, but could not relaunch ${resumed.failed.map((item) => path.basename(item.record.executable)).join(", ")}: ${resumed.failed.map((item) => item.reason).join("; ")}`
+      : `Foundry paused and restored ${resumed.resumed.length} running desktop app${resumed.resumed.length === 1 ? "" : "s"} around the build.`
+    : "";
+  return { ...result, stderr: [result.stderr, lifecycleNote].filter(Boolean).join("\n") };
 }
 
 function requireApprovedRoot(res, root) {
@@ -1372,6 +1483,14 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/preview/status") {
       if (!requireApprovedRoot(res, body.root)) return;
       return send(res, 200, await previewStatus(body.root, String(body.path || "")));
+    }
+    if (url.pathname === "/artifact/find") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await findProjectArtifact(body.root, String(body.platform || "")));
+    }
+    if (url.pathname === "/artifact/download") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return sendProjectArtifact(res, body.root, String(body.path || ""));
     }
     if (url.pathname === "/validation/capabilities") return send(res, 200, validationCapabilities());
     if (url.pathname === "/validation/browser/run") {

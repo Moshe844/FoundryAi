@@ -17,6 +17,8 @@
     "eval:live-build-continuity": "node scripts/eval-live-build-continuity.cjs",
     "eval:event-contract": "node scripts/eval-event-contract.cjs",
     "eval:framework-generation-recovery": "node scripts/eval-framework-generation-recovery.cjs",
+    "eval:project-lifecycle-matrix": "node scripts/eval-project-lifecycle-matrix.cjs",
+    "eval:owned-desktop-runtime": "node scripts/eval-owned-desktop-runtime.cjs",
     "connector": "node --use-system-ca scripts/foundry-local-connector.cjs",
     "agent": "node --use-system-ca scripts/foundry-local-connector.cjs"
   },
