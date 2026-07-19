@@ -4677,48 +4677,132 @@ async function runExistingProjectMissionWithAccess(params: {
     && result.changedFiles.length > 0
     && requiresFreshBehavioralAcceptance(inheritedOperationRequest);
   if (deterministicDesktopAcceptanceRequested) {
-    const desktopPreview = previewTarget
-      ? await startProjectPreview(previewTarget, stackProfile.label, [], execution)
-      : { previewState: "unavailable" as const, previewPlatform: "desktop" as const, previewReason: "This project source does not expose an owned desktop target." };
-    const connectorArtifact = previewTarget ? connectorArtifactTargets.get(previewTarget.projectId) : undefined;
-    let desktopEvidence: PlatformValidationResult | undefined;
-    if (desktopPreview.previewState === "ready" && desktopPreview.previewPlatform === "desktop") {
-      if (connectorArtifact && access.validateDesktop) {
-        desktopEvidence = await access.validateDesktop({
-          executable: connectorArtifact.relativePath,
-          args: [],
-          observeMs: 2500,
-          interactionTimeoutMs: 8000,
-          actions: desktopActions,
-        });
-      } else if (previewTarget) {
-        const launched = await launchDesktopPreview(previewTarget.projectId, previewTarget.kind === "workspace" ? previewTarget.projectPath : undefined);
-        desktopEvidence = {
-          available: true,
-          verified: launched.ok && desktopActions.length === 0,
-          running: launched.ok,
-          interactionVerified: false,
-          reason: launched.ok
-            ? "The desktop process launched and remained alive, but semantic interaction requires the Local Agent accessibility driver."
-            : launched.error,
-        };
-      }
-    }
     const interactionRequired = desktopActions.length > 0;
-    const desktopVerified = Boolean(desktopEvidence?.verified && (!interactionRequired || desktopEvidence.interactionVerified));
-    const evidence = desktopVerified
-      ? desktopEvidence?.reason || "The requested desktop interaction completed and the application remained running."
-      : desktopEvidence?.reason || desktopPreview.previewReason || "The desktop artifact could not be launched for behavioral acceptance.";
-    result.verification.push({ check_type: "preview", result: desktopVerified ? "pass" : "fail", evidence });
-    await emitExecution(execution, "preview", desktopVerified ? "completed" : "error", desktopVerified ? "Desktop behavior verified" : "Desktop behavior still needs repair", {
-      details: { platform: "desktop", interactionRequired, actionsJson: JSON.stringify(desktopActions), interactionVerified: desktopEvidence?.interactionVerified, stepsJson: JSON.stringify(desktopEvidence?.steps ?? []), windowTitles: desktopEvidence?.windowTitles, evidence },
-    });
-    if (!desktopVerified) {
+    const validateCurrentDesktop = async () => {
+      const desktopPreview = previewTarget
+        ? await startProjectPreview(previewTarget, stackProfile.label, [], execution)
+        : { previewState: "unavailable" as const, previewPlatform: "desktop" as const, previewReason: "This project source does not expose an owned desktop target." };
+      const connectorArtifact = previewTarget ? connectorArtifactTargets.get(previewTarget.projectId) : undefined;
+      let desktopEvidence: PlatformValidationResult | undefined;
+      if (desktopPreview.previewState === "ready" && desktopPreview.previewPlatform === "desktop") {
+        if (connectorArtifact && access.validateDesktop) {
+          desktopEvidence = await access.validateDesktop({
+            executable: connectorArtifact.relativePath,
+            args: [],
+            observeMs: 2500,
+            interactionTimeoutMs: 8000,
+            actions: desktopActions,
+          });
+        } else if (previewTarget) {
+          const launched = await launchDesktopPreview(previewTarget.projectId, previewTarget.kind === "workspace" ? previewTarget.projectPath : undefined);
+          desktopEvidence = {
+            available: true,
+            verified: launched.ok && desktopActions.length === 0,
+            running: launched.ok,
+            interactionVerified: false,
+            reason: launched.ok
+              ? "The desktop process launched and remained alive, but semantic interaction requires the Local Agent accessibility driver."
+              : launched.error,
+          };
+        }
+      }
+      const verified = Boolean(desktopEvidence?.verified && (!interactionRequired || desktopEvidence.interactionVerified));
+      const evidence = verified
+        ? desktopEvidence?.reason || "The requested desktop interaction completed and the application remained running."
+        : desktopEvidence?.reason || desktopPreview.previewReason || "The desktop artifact could not be launched for behavioral acceptance.";
+      await emitExecution(execution, "preview", verified ? "completed" : "error", verified ? "Desktop behavior verified" : "Desktop behavior still needs repair", {
+        details: { platform: "desktop", interactionRequired, actionsJson: JSON.stringify(desktopActions), interactionVerified: desktopEvidence?.interactionVerified, stepsJson: JSON.stringify(desktopEvidence?.steps ?? []), windowTitles: desktopEvidence?.windowTitles, evidence },
+      });
+      return { verified, evidence, desktopEvidence, connectorArtifact };
+    };
+
+    let desktopAcceptance = await validateCurrentDesktop();
+    const desktopRepairChangedFiles = new Set<string>();
+    const attemptedDesktopRepairEvidence = new Set<string>();
+    for (let repairAttempt = 1; !desktopAcceptance.verified && desktopAcceptance.connectorArtifact && access.validateDesktop && repairAttempt <= 3; repairAttempt += 1) {
+      const evidenceFingerprint = createHash("sha256").update(desktopAcceptance.evidence).digest("hex");
+      if (attemptedDesktopRepairEvidence.has(evidenceFingerprint)) {
+        await emitExecution(execution, "planning", "warning", "Stopped repeated desktop repair on unchanged runtime evidence", {
+          internal: true,
+          details: { evidenceFingerprint, paidCallPrevented: true, repairAttempt },
+        });
+        break;
+      }
+      attemptedDesktopRepairEvidence.add(evidenceFingerprint);
+      await emitExecution(execution, "reasoning", "completed", `The real desktop acceptance check failed after implementation pass ${repairAttempt}. I'm repairing that exact runtime evidence, rebuilding, and exercising the same native interaction again.`);
+      const repairModel = await modelForMissionStage(inheritedOperationRequest, modelMode, "builder", workingSet, repairAttempt - 1, routingAssessment);
+      if (!repairModel) break;
+      await emitModelSelection(execution, `desktop runtime repair ${repairAttempt}`, repairModel);
+      const repair = await runMissionExecutor({
+        objective,
+        task: `Repair the existing native desktop project from the real runtime evidence below. Inspect the actual startup and named-control navigation path, preserve working behavior, fix the root cause, run the canonical build, and use validate_desktop with the requested actions before reporting completion. Do not merely restate the error or mark checklist items complete from compilation alone.\n\nOriginal user requirement:\n${inheritedOperationRequest}\n\nReal desktop failure:\n${desktopAcceptance.evidence}`,
+        checklist: [{ id: `desktop-evidenced-repair-${repairAttempt}`, label: "Repair and re-exercise the real native desktop failure", status: "pending" }],
+        costScopeId: execution.costScopeId,
+        access: capabilityAccess,
+        apiKey: repairModel.apiKey,
+        provider: repairModel.provider,
+        tier: repairModel.tier,
+        onEvent,
+        signal,
+        preApprovedCommands,
+        approvedCategories: effectiveApprovedCategories,
+        standingApprovedCommands: approvedCommands,
+        deniedActions: parentMission?.denied_actions ?? [],
+        priorContext: parentMission,
+        followUpResolution,
+        fastLane: false,
+        highRisk,
+        hasBuildTooling: stackHasBuildStep(stackProfile.id),
+        verificationProfile,
+        executionStrategy: missionStrategy,
+        routingAssessment,
+        maxTurns: 12,
+        maxNudges: 1,
+      });
+      result.changedFiles = [...new Set([...result.changedFiles, ...repair.changedFiles])];
+      result.commands.push(...repair.commands);
+      result.verification.push(...repair.verification);
+      result.timeline.push(...repair.timeline);
+      result.usage.push(...repair.usage);
+      result.turnsUsed += repair.turnsUsed;
+      if (repair.changedFiles.length === 0 || repair.status === "stopped" || signal?.aborted) break;
+      repair.changedFiles.forEach((file) => desktopRepairChangedFiles.add(file));
+      const repairedBuild = await runCanonicalProjectBuild();
+      if (!repairedBuild) {
+        desktopAcceptance = { ...desktopAcceptance, verified: false, evidence: "The desktop repair changed source, but the canonical build command was unavailable." };
+        break;
+      }
+      result.commands.push(repairedBuild);
+      result.verification.push({
+        check_type: "build",
+        result: repairedBuild.exitCode === 0 ? "pass" : "fail",
+        evidence: repairedBuild.exitCode === 0
+          ? "The canonical desktop build passed after the evidence-driven repair."
+          : `The canonical desktop build failed after repair: ${summarizeCommandFailure(repairedBuild)}`,
+      });
+      if (repairedBuild.exitCode !== 0) {
+        desktopAcceptance = { ...desktopAcceptance, verified: false, evidence: `Desktop recheck is waiting on a successful canonical build: ${summarizeCommandFailure(repairedBuild)}` };
+        continue;
+      }
+      desktopAcceptance = await validateCurrentDesktop();
+    }
+
+    result.verification.push({ check_type: "preview", result: desktopAcceptance.verified ? "pass" : "fail", evidence: desktopAcceptance.evidence });
+    if (desktopAcceptance.verified) {
+      result.status = "passed";
+      result.blocker = undefined;
+      if (desktopRepairChangedFiles.size > 0) {
+        result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
+        result.sessionSummary.outcome = "Foundry repaired the real native runtime failure, rebuilt the project, exercised the requested desktop interaction, and verified that the application remained running.";
+        result.sessionSummary.changes = [...new Set([...result.sessionSummary.changes, ...desktopRepairChangedFiles])];
+        result.sessionSummary.flags = [];
+      }
+    } else {
       result.status = "failed";
-      result.blocker = evidence;
+      result.blocker = desktopAcceptance.evidence;
       result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
       result.sessionSummary.outcome = "The source change and desktop build are preserved, but the requested native interaction did not pass.";
-      result.sessionSummary.flags = [evidence];
+      result.sessionSummary.flags = [desktopAcceptance.evidence];
     }
   }
   if (result.status === "failed" && result.blocker) {

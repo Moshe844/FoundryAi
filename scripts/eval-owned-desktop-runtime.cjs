@@ -47,6 +47,9 @@ async function run() {
   assert.match(runtimeSource, /currentPreviewPlatform === "web" && \(Boolean\(preModelBrowserEvidence\)/, "Native artifacts can still enter the web-browser acceptance branch.");
   assert.match(runtimeSource, /Checklist item\\\(s\\\) not completed/, "A verified partial implementation cannot continue when the executor leaves checklist work unfinished.");
   assert.match(runtimeSource, /deterministicDesktopAcceptanceRequested/, "Behavioral desktop work has no deterministic native acceptance stage.");
+  assert.match(runtimeSource, /desktop runtime repair/, "A failed native acceptance check cannot re-enter autonomous source repair.");
+  assert.match(runtimeSource, /attemptedDesktopRepairEvidence/, "Native repair can repeat paid attempts against unchanged runtime evidence.");
+  assert.match(runtimeSource, /desktopAcceptance = await validateCurrentDesktop\(\)/, "Foundry does not repeat the same native interaction after rebuilding a repair.");
   assert.match(validatorSource, /validate-windows-desktop-ui\.ps1/, "The Local Agent does not exercise named desktop controls through Windows accessibility automation.");
   assert.match(validatorSource, /interactionVerified/, "Desktop validation can still claim interaction success from process launch alone.");
   assert.match(validatorSource, /driver: process\.platform === "win32" \? "windows-ui-automation"/, "Local Agent discovery still hides the installed Windows semantic-interaction driver.");
