@@ -49,6 +49,7 @@ async function run() {
   assert.match(runtimeSource, /deterministicDesktopAcceptanceRequested/, "Behavioral desktop work has no deterministic native acceptance stage.");
   assert.match(validatorSource, /validate-windows-desktop-ui\.ps1/, "The Local Agent does not exercise named desktop controls through Windows accessibility automation.");
   assert.match(validatorSource, /interactionVerified/, "Desktop validation can still claim interaction success from process launch alone.");
+  assert.match(validatorSource, /driver: process\.platform === "win32" \? "windows-ui-automation"/, "Local Agent discovery still hides the installed Windows semantic-interaction driver.");
 
   assert.equal(lifecycle.commandProducesBuildArtifacts("dotnet build App.sln --no-restore"), true);
   assert.equal(lifecycle.commandProducesBuildArtifacts("npm.cmd run build"), true);

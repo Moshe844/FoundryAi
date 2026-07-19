@@ -106,7 +106,15 @@ function validationCapabilities() {
     browser: { available: playwright, engine: playwright ? "playwright-chromium" : undefined, reason: playwright ? undefined : "Playwright is not installed in the Local Agent." },
     android: { available: executableAvailable("adb", ["version"]), adb: executableAvailable("adb", ["version"]), reason: executableAvailable("adb", ["version"]) ? undefined : "Android platform-tools (adb) were not found." },
     ios: { available: process.platform === "darwin" && executableAvailable("xcrun", ["simctl", "help"]), reason: process.platform === "darwin" ? "Xcode simctl was not found." : "iOS simulation requires a macOS Local Agent with Xcode." },
-    desktop: { available: true, platform: process.platform, interaction: false, reason: "Native app launch is available; cross-platform semantic UI interaction requires an app-specific driver." },
+    desktop: {
+      available: true,
+      platform: process.platform,
+      interaction: process.platform === "win32",
+      driver: process.platform === "win32" ? "windows-ui-automation" : undefined,
+      reason: process.platform === "win32"
+        ? "Native launch and named-control interaction are available through Windows UI Automation."
+        : "Native app launch is available; semantic UI interaction requires a host accessibility driver.",
+    },
   };
 }
 
