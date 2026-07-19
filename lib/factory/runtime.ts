@@ -5209,8 +5209,13 @@ async function handleWholeProjectDeletion(input: {
   events: string[];
   projectDeleted?: boolean;
 } | undefined> {
-  const originalRequest = input.parentMission?.source_requirements.join("\n") || input.requestedTask;
-  if (!isWholeProjectDeletionRequest(originalRequest)) return undefined;
+  // A deletion request must be recognized whether it arrives as the current message (the first ask)
+  // OR is carried in the parent mission (an approval continuation, where requestedTask is the control
+  // message). Reading only the parent first meant that on any already-built project — where the parent
+  // holds the original *build* brief, not the delete — "delete this project" fell through to the edit
+  // path and mangled files instead of deleting. Match either source.
+  const parentRequest = input.parentMission?.source_requirements.join("\n") || "";
+  if (!isWholeProjectDeletionRequest(input.requestedTask) && !isWholeProjectDeletionRequest(parentRequest)) return undefined;
 
   const projectPath = input.access.rootLabel;
   const exactAction = projectDeletionApprovalCommand(projectPath);
