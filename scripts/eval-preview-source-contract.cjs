@@ -9,6 +9,7 @@ const previewRoute = fs.readFileSync(path.join(root, "app/api/factory/preview/ro
 const agentDownloadRoute = fs.readFileSync(path.join(root, "app/api/factory/agent/download/route.ts"), "utf8");
 const missionCanvas = fs.readFileSync(path.join(root, "components/canvas/MissionCanvas.tsx"), "utf8");
 const canvasAdapter = fs.readFileSync(path.join(root, "lib/canvas/adapter.ts"), "utf8");
+const canvasModel = fs.readFileSync(path.join(root, "lib/canvas/model.ts"), "utf8");
 const dashboard = fs.readFileSync(path.join(root, "components/BuildDashboard.tsx"), "utf8");
 const workspaceShell = fs.readFileSync(path.join(root, "components/WorkspaceShell.tsx"), "utf8");
 const projectAccess = fs.readFileSync(path.join(root, "lib/ai/mission/project-access.ts"), "utf8");
@@ -99,15 +100,19 @@ assert(
 );
 assert(
   runtime.includes("const exactFailedRetry")
-    && runtime.includes("retryExecutionId === parentMission?.id")
+    && runtime.includes("shouldResumeExactFailedRetry")
+    && runtime.includes("retryIdMatchesParent: Boolean(parentMission && retryExecutionId === parentMission.id)")
+    && !recoveryPolicy.includes("followUpResolution")
+    && !recoveryPolicy.includes("carry_forward_plan")
     && runtime.includes("allowIncompleteMission: true")
     && runtime.includes("Existing implementation verified; no model call needed")
     && runtime.includes("Retry snapshot changed; executing the recorded request against current files")
     && !runtime.includes("Current implementation verified; retry did not rewrite it")
     && runtime.includes("retryRepairEvidence")
-    && runtime.includes("one bounded repair pass")
+    && runtime.includes("exactVerificationRepairLane")
+    && runtime.includes("!directExecutionLane && !resumingIncompleteProject && shouldRunArchitectureReview")
     && runtime.includes("Boolean(preModelBrowserEvidence) || recoveringGeneratedWebProject"),
-  "Retry does not verify cheaply first and route a remaining real failure into a bounded repair plus repeat verification.",
+  "The dedicated retry control can still be overridden by classification, buy a fresh architecture plan, or skip deterministic preflight.",
 );
 assert(
   workspaceShell.includes("standaloneMutationIntent")
@@ -120,18 +125,25 @@ assert(
 );
 assert(
   runtime.includes("for (let repairAttempt = 1; !browserEvidence.verified")
-    && runtime.includes("repair.changedFiles.length === 0) break")
+    && runtime.includes("attemptedBrowserRepairFingerprints")
+    && runtime.includes("semanticRepairFingerprint")
+    && runtime.includes("sourceProgressFingerprint")
+    && runtime.includes("FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES")
+    && runtime.includes("Repair reported no source change; repeating the exact browser gate without another model call")
+    && runtime.includes("Changing browser repair strategy after unchanged source and evidence")
+    && runtime.includes("strategyReset: true, terminal: false")
     && runtime.includes("await stopProjectPreview(previewTarget!)")
     && runtime.includes("restarted its owned preview")
     && runtime.includes("real browser gate still has unresolved product defects"),
-  "Residual browser failures can still stop after one partial repair, reuse a stale production preview, or report a stale build-only outcome.",
+  "Residual browser failures can still stop after a fixed three passes, buy duplicate repairs, reuse stale evidence, or skip a zero-cost recheck.",
 );
 assert(
   runtime.includes("generatedPreviewTarget")
     && runtime.includes("generated-browser-repair-${repairAttempt}")
     && runtime.includes("Automatic repair made no further source change")
     && runtime.includes("repaired generated preview did not become ready")
-    && runtime.includes("generated project’s browser-evidenced defects"),
+    && runtime.includes('Foundry built ${spec.projectName} as a ${stackProfile.label} project')
+    && runtime.includes("resolved the concrete issues found by browser verification"),
   "Fresh generated projects still use a one-shot browser repair or recheck a stale production preview after source changes.",
 );
 assert(
@@ -191,9 +203,14 @@ assert(
   "A source-scoped missing-export build failure can still spend repeated calls reading consumers instead of forcing the owning module repair first.",
 );
 assert(
-  missionCanvas.includes("Fix verified issues")
-    && canvasAdapter.includes('needsRepairAction(execution) ? "Needs repair"'),
-  "A failed verification is still presented as a generic failed task with a generic retry action.",
+  missionCanvas.includes("Continue autonomous repair")
+    && missionCanvas.includes("Recheck verification")
+    && canvasAdapter.includes('hasVerificationConflict(execution) ? "Ready to continue"')
+    && canvasModel.includes("[FOUNDRY_VERIFICATION_CONFLICT]")
+    && canvasModel.includes("Missions persisted before structured verification was mandatory")
+    && !missionCanvas.includes("Fix verified issues")
+    && !canvasAdapter.includes('needsRepairAction(execution) ? "Needs repair"'),
+  "Recoverable verification is still presented as generic Needs repair, or validator conflicts are still disguised as project defects.",
 );
 assert(
   runtime.includes("advertisedCredentials")
@@ -225,8 +242,39 @@ assert(
   dashboard.includes("localConnector={connectorInfo ?")
     && missionCanvas.includes('action: "refresh", localConnector: previewConnector')
     && missionCanvas.includes("if (missionStatus.isBusy && hasExecution) return")
-    && missionCanvas.includes("previewLoading ? \"Starting preview...\""),
-  "The open-project workspace does not immediately start and visibly expose its connector preview.",
+    && missionCanvas.includes("Preview is an always-available engineering workspace")
+    && missionCanvas.includes("setPreviewOpen(true)")
+    && missionCanvas.includes("const dockOpen = previewOpen && Boolean(effectiveExecution || recoveredExecutionBase)")
+    && !missionCanvas.includes("disabled={previewLoading}"),
+  "Preview is still gated on successful readiness or cannot be opened while execution is active.",
+);
+assert(
+  runtime.includes("observableAcceptanceProbe.bestUrl")
+    && runtime.includes("clippedOrScrollableAncestor")
+    && runtime.includes("escapedBy > Math.min(24")
+    && runtime.includes("nonFatalHydrationDiagnostics")
+    && runtime.includes("requestedWorkflowRendered"),
+  "Browser completion can still audit unrelated routes, flag intentional horizontal scrollers, or make a recoverable hydration diagnostic fatal after the requested workflow passes.",
+);
+assert(
+  runtime.includes("validateNamedBrokenControl")
+    && runtime.includes("namedBrokenControlFromTask")
+    && runtime.includes('The reported "${controlName}" control still does nothing in the real browser.')
+    && runtime.includes("const acceptanceVerified = placementProbe.applicable")
+    && runtime.includes(": namedControlProbe.applicable")
+    && runtime.includes("? namedControlProbe.verified")
+    && runtime.includes("modelBudgetBoundaryAfterVerifiedEdit || noProgressBoundaryAfterVerifiedEdit"),
+  "A named no-op control can still be marked complete from a generic click, or verified browser evidence can still leak NO_PROGRESS_AFTER_MUTATION into the final handoff.",
+);
+assert(
+  missionExecutor.includes("changedFiles.size > 0")
+    && missionExecutor.includes("NO_PROGRESS_AFTER_MUTATION: Source changes are on disk")
+    && !missionExecutor.includes("I lost a clear next step partway through"),
+  "A model that stops after editing can still bypass deterministic acceptance with an unstructured terminal message.",
+);
+assert(
+  /refreshPreviewForProject[\s\S]+stopProjectPreview\(\{ kind: "workspace", projectId, projectPath \}\)[\s\S]+startProjectPreview\(\{ kind: "workspace", projectId, projectPath \}/.test(runtime),
+  "Preview refresh can still report ready while reusing a stale production process.",
 );
 assert(
   runtime.includes("requestsAttachedFilesAsProjectAssets")
@@ -316,6 +364,20 @@ assert(
     && runtime.includes('child.once("error", reject)')
     && previewRoute.includes("await launchDesktopPreview(body.projectId, body.projectPath)"),
   "Desktop launch still depends on an in-memory preview cache or reports success before Windows accepts the executable.",
+);
+assert(
+  runtime.includes("verificationFindingFingerprint(browserEvidence.evidence)")
+    && runtime.includes("findingCount > 4")
+    && runtime.includes("Stopped repeated repair on unchanged browser findings"),
+  "Repeated identical browser findings can still consume the full autonomous repair budget.",
+);
+assert(
+  runtime.includes("detectNextPreviewCommand")
+    && runtime.includes('kind: "direct"')
+    && runtime.includes('path.join(projectPath, "out", "index.html")')
+    && connector.includes('kind: "next-cli"')
+    && connector.includes('node_modules", "next", "dist", "bin", "next"'),
+  "A Next.js project without dev/start script names still cannot use its installed CLI or static export as a real preview.",
 );
 
 console.log("Preview source contract regression checks passed.");

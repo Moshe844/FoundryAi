@@ -5,7 +5,7 @@ import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import { routingContext } from "@/lib/ai/routing/request-context";
 import { profileTask } from "@/lib/ai/routing/task-profiler";
 import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
-import { explicitReadOnlyProjectIntent } from "@/lib/mission/classifyFollowUp";
+import { explicitReadOnlyProjectIntent, looksLikeReadOnlyQuestionForm } from "@/lib/mission/classifyFollowUp";
 
 export type MissionIntent = "question" | "edit" | "debug" | "build" | "analyze" | "status" | "undo" | "deploy";
 
@@ -36,10 +36,11 @@ export function deterministicMutationIntent(message: string): MissionIntent | un
   if (!text || explicitReadOnlyProjectIntent(text) || EXPLICIT_ADVICE_PATTERN.test(text)) return undefined;
   if (/\b(?:undo|revert|roll back|rollback)\b/i.test(text)) return "undo";
   if (/\b(?:deploy|production|release|ship it|hosting)\b/i.test(text) && /\b(?:deploy|ship|release|publish|prepare)\b/i.test(text)) return "deploy";
-  if (BUILD_PATTERN.test(text)) return "build";
+  const questionForm = looksLikeReadOnlyQuestionForm(text);
+  if (BUILD_PATTERN.test(text) && !questionForm) return "build";
   if (DEBUG_PATTERN.test(text)) return "debug";
   if (SERVER_ACTION_PATTERN.test(text)) return "edit";
-  if (MUTATION_PATTERN.test(text)) return "edit";
+  if (MUTATION_PATTERN.test(text) && !questionForm) return "edit";
   return undefined;
 }
 

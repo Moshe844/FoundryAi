@@ -141,13 +141,14 @@ function deriveTitleFromBrief(brief: string): string {
   if (folder) return humanizeName(baseName(folder));
   const selection = briefField(brief, "Existing project selection");
   if (selection && !/^\d+\s/.test(selection)) return humanizeName(selection);
-  // Created projects: prefer what the user described, then the resolved specific type.
-  const description = briefField(brief, "Project description") || briefField(brief, "Initial requested task");
-  if (description) return humanizeName(description);
+  // Created projects: the resolved type/name is the canonical identity. The full description is a
+  // requirements document and must never become a truncated six-word workspace title.
   const type = briefField(brief, "Project type");
   if (type) return humanizeName(type);
   const name = briefField(brief, "Project name");
   if (name && !isGenericProjectTitle(name)) return humanizeName(name);
+  const description = briefField(brief, "Project description") || briefField(brief, "Initial requested task");
+  if (description) return humanizeName(description);
   return "";
 }
 

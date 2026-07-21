@@ -21,6 +21,7 @@ export function seedDiscovery(prompt: string): DiscoverySeed {
 
 export type DiscoveryEngineResult = {
   ok: boolean;
+  provenance?: "model" | "brief";
   discovery?: ProjectDiscoveryResult;
   alternativeStacks?: string[];
   deploymentNote?: string;

@@ -68,12 +68,18 @@ export function reserveModelCall(request: ManagedModelRequest, context: CostGuar
     premiumCallLimit: budget.premiumCallLimit,
     estimatedCostLimitUsd: budget.estimatedCostUsd,
   };
-  // One mission can move from Builder implementation to a cheaper Fast repair. The shared ledger
-  // preserves the greatest capacity already granted during that mission; changing stage/model tier
-  // must never retroactively lower the ceiling beneath calls or spend that were already authorized.
-  ledger.maximumModelCalls = Math.max(ledger.maximumModelCalls, budget.maximumModelCalls);
-  ledger.premiumCallLimit = Math.max(ledger.premiumCallLimit, budget.premiumCallLimit);
-  ledger.estimatedCostLimitUsd = Math.max(ledger.estimatedCostLimitUsd, budget.estimatedCostUsd);
+  // Most multi-stage missions preserve the greatest capacity already granted. Explicitly bounded
+  // interaction repairs are different: their ceiling is the user's protection against a small fix
+  // silently becoming a full-price mission, so later stages must not widen it.
+  ledger.maximumModelCalls = context.budget?.hardCeiling
+    ? Math.min(ledger.maximumModelCalls, budget.maximumModelCalls)
+    : Math.max(ledger.maximumModelCalls, budget.maximumModelCalls);
+  ledger.premiumCallLimit = context.budget?.hardCeiling
+    ? Math.min(ledger.premiumCallLimit, budget.premiumCallLimit)
+    : Math.max(ledger.premiumCallLimit, budget.premiumCallLimit);
+  ledger.estimatedCostLimitUsd = context.budget?.hardCeiling
+    ? Math.min(ledger.estimatedCostLimitUsd, budget.estimatedCostUsd)
+    : Math.max(ledger.estimatedCostLimitUsd, budget.estimatedCostUsd);
   // "High" is the normal Builder/Architect workhorse class. Counting every high-capability turn as
   // premium made ordinary debugging exhaust the premium allowance during inspection, before an edit.
   // The estimated-dollar and total-call ceilings still bound those turns; this counter is reserved

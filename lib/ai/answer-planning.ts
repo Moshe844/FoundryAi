@@ -290,6 +290,10 @@ function summarizeAttachedFiles(request: ReasoningRequest) {
 
 function recommendedApproachFor(request: ReasoningRequest, intent: IntentResolution) {
   const workflow = request.conversationContext.workflowState;
+  const asksForWholeCodeExplanation = /\b(?:what|explain|describe)\b[\s\S]{0,80}\b(?:code|snippet|component|function|class|file)\b|\bwhat does this (?:code|snippet|component|function|class) do\b/i.test(request.userMessage);
+  if (asksForWholeCodeExplanation) {
+    return "Explain the selected or pasted code as one complete unit: its purpose, inputs and types, defaults, execution/data flow, returned or rendered output, and meaningful styling, accessibility, side effects, or framework behavior. Mention individual syntax only in service of that full explanation; do not answer one token while ignoring the rest of the snippet.";
+  }
   if (intent.clarificationRequired) return "Ask one targeted clarification before giving operational steps.";
   if (request.conversationContext.currentRequest.hasNewEvidence && (request.conversationContext.currentRequest.containsDiagnosticEvidence || request.investigation.newAttachmentIds.length)) {
     return [

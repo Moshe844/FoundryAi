@@ -11,7 +11,7 @@ import { commandProducesBuildArtifacts, resumeOwnedDesktopProcesses, suspendOwne
 const LONG_RUNNING_COMMAND_PATTERN =
   /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\b(?:npx|pnpx|bunx)(?:\.cmd)?\s+(?:--yes\s+)?(?:serve|http-server)\b|\b(?:python|python3|py)(?:\.exe)?\s+-m\s+http\.server\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
 
-function isLongRunningServerCommand(command: string) {
+export function isLongRunningServerCommand(command: string) {
   return LONG_RUNNING_COMMAND_PATTERN.test(command);
 }
 

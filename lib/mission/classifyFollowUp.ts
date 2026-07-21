@@ -146,6 +146,47 @@ const READ_ONLY_REQUEST_PATTERN = /\b(?:explain|describe|summarize|inspect|revie
 const PROJECT_EVIDENCE_PATTERN = /\b(?:this|current|connected)\b[^.!?\n]{0,50}\b(?:project|codebase|repo(?:sitory)?|application|app)\b|(?:^|[\s`"'])(?:src|app|lib|components|packages)[/\\][\w./\\-]+|\b[\w./\\-]+\.(?:js|jsx|ts|tsx|mjs|cjs|css|html?|json|py|rb|php|java|kt|swift|cs|go|rs|vue|svelte|md|yml|yaml|toml)\b/i;
 const RECORDED_STATUS_PATTERN = /\b(?:what (?:has )?changed|what did you (?:change|do)|what happened|last (?:run|mission)|previous (?:run|mission))\b/i;
 const EXPLICIT_FOLLOW_ON_MUTATION_PATTERN = /(?:\b(?:then|and|also|now)\s+|[.!?;]\s*)(?:(?:can|could|would)\s+you\s+|please\s+)?(?:implement|apply|make|change|edit|create|add|fix|update)\b/i;
+const PROJECT_BEHAVIOR_QUESTION_PATTERN = /^(?:where|which|what|why|how|is|are|was|were|does|do|did|can|could|would|will|has|have)\b[^?\n]{0,240}\??(?:\s|$)/i;
+const PROJECT_BEHAVIOR_SUBJECT_PATTERN = /\b(?:data|record|item|state|value|file|database|storage|cache|session|setting|report|page|screen|form|button|control|route|navigation|request|response|api|server|app|application|project|feature|result|output|save|saved|store|stored|persist|display|show|shown|appear|visible|find|found|location|path|account|email|inbox|verification|password|login|log[ -]?in|sign[ -]?in|sign[ -]?up|signup|authentication|auth)\b/i;
+
+// Change verbs are ordinary English words. "How does the data move around?", "where does the update
+// happen?", "what happens when I remove an expense?" each carry one, yet none asks for a change —
+// matching the verb alone let a question silently rewrite the user's source. Enumerating safe phrasings
+// one at a time never converges, so this reads sentence *form* instead.
+const INTERROGATIVE_OPENER =
+  /^(?:so\s+|and\s+|but\s+|ok(?:ay)?[,\s]+|hey[,\s]+|just\s+)*(?:how|what|what'?s|why|where|when|which|who|whose|whom|does|do|did|is|are|am|was|were|can|could|will|would|should|shall|has|have|had|any|explain|describe|summari[sz]e|clarify|walk me through|tell me|show me|help me understand|curious|wondering|i'?m curious|i wonder)\b/i;
+
+// Polite and connector-led commands. These *look* interrogative ("can you add…", "how about you add…")
+// but are real change requests, so they must keep their imperative reading.
+const IMPERATIVE_COMMAND =
+  /^(?:please\s+|just\s+|go ahead and\s+|now\s+|then\s+|also\s+|kindly\s+)*(?:(?:can|could|would|will)\s+(?:you|we)\s+(?:please\s+|now\s+|just\s+)?|(?:how|what)\s+about\s+(?:you\s+)?|why\s+(?:don'?t\s+you|not)\s+|i(?:'d| would)\s+like\s+(?:you\s+)?to\s+|i\s+(?:want|need)\s+(?:you\s+)?to\s+|let'?s\s+)?(?:add|create|make|build|generate|implement|edit|change|update|modify|fix|repair|separate|split|extract|move|delete|remove|rename|refactor|install|enable|disable|wire|hook up|replace|switch|convert|redesign|restyle|migrate|rewrite)\b|\b(?:then|and then|and also|also|after that)\s+(?:please\s+)?(?:add|create|make|build|implement|edit|change|update|modify|fix|move|delete|remove|rename|refactor|install|enable|wire|replace|switch|apply)\b/i;
+
+// A trailing qualifier such as "steps only" or "just curious" is neither question nor command, so it must
+// not disqualify the message around it. Verbless and short is the test: it cannot carry an instruction or
+// a claim. "The button is broken" holds a copula and so still counts as a real statement — a bug report
+// bundled with a question keeps its debug reading.
+const FINITE_VERB = /\b(?:is|are|was|were|be|been|being|am|has|have|had|do|does|did|will|would|can|could|should|shall|must|may|might|isn'?t|aren'?t|wasn'?t|doesn'?t|don'?t|won'?t|can'?t|broke|broken|fails?|failed|crashe?[sd]?|wrong|works?|worked)\b/i;
+
+function isNeutralQualifier(sentence: string): boolean {
+  const words = sentence.replace(/[^\w\s'-]/g, " ").trim().split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.length <= 4 && !FINITE_VERB.test(sentence);
+}
+
+/**
+ * True when the message reads as a question and never as a command — a question no matter which change
+ * verbs it happens to contain. Deliberately strict: one imperative clause anywhere ("explain the flow,
+ * then add a comment") disqualifies the whole message, so a bundled request still acts.
+ */
+export function looksLikeReadOnlyQuestionForm(message: string): boolean {
+  const sentences = (message.match(/[^.!?]+[.!?]*/g) ?? [])
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+  if (!sentences.length) return false;
+  if (sentences.some((sentence) => IMPERATIVE_COMMAND.test(sentence))) return false;
+
+  const isQuestion = (sentence: string) => /\?\s*$/.test(sentence) || INTERROGATIVE_OPENER.test(sentence);
+  return sentences.some(isQuestion) && sentences.every((sentence) => isQuestion(sentence) || isNeutralQualifier(sentence));
+}
 
 /** Client-safe guard for a complete new change request. This prevents a semantic follow-up model
  * from folding a self-contained task into an older failed execution merely because both concern the
@@ -155,7 +196,15 @@ export function standaloneMutationIntent(message: string): "edit" | "debug" | nu
   const text = message.trim();
   if (!text || explicitReadOnlyProjectIntent(text)) return null;
   if (/\b(?:fix|repair|bug|error|crash(?:es|ed|ing)?|broken|failing|failed|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|freezes?|hangs?|disappears?)\b/i.test(text)) return "debug";
-  return MUTATING_PATTERN.test(text) ? "edit" : null;
+  return MUTATING_PATTERN.test(text) && !looksLikeReadOnlyQuestionForm(text) ? "edit" : null;
+}
+
+/** A question plus a current product symptom requires evidence from the active project, not generic advice. */
+export function projectBehaviorDiagnosisIntent(message: string): boolean {
+  const text = message.trim();
+  if (!text || !CURRENT_RUNTIME_FAILURE_PATTERN.test(text) || !PROJECT_BEHAVIOR_SUBJECT_PATTERN.test(text)) return false;
+  const asksForEvidence = /\?|\b(?:why|how|what|where|did|does|is|are|was|were|really|actually)\b/i.test(text);
+  return asksForEvidence && !IMPERATIVE_COMMAND.test(text) && !EXPLICIT_FOLLOW_ON_MUTATION_PATTERN.test(text);
 }
 
 /**
@@ -201,7 +250,17 @@ export function explicitReadOnlyProjectIntent(message: string): "question" | "in
   if (!text || RECORDED_STATUS_PATTERN.test(text) || EXPLICIT_FOLLOW_ON_MUTATION_PATTERN.test(text)) return null;
   const manualGuidance = MANUAL_GUIDANCE_PATTERN.test(text);
   const explicitNoMutation = EXPLICIT_NO_MUTATION_PATTERN.test(text) && READ_ONLY_REQUEST_PATTERN.test(text);
-  if (!manualGuidance && !explicitNoMutation) return null;
+  // Two ways to qualify as a read-only evidence question. The subject-noun route needs the message to
+  // be free of change verbs; the sentence-form route does not, because an all-interrogative message with
+  // no imperative clause is a question whatever verbs it contains. Without the second route, asking
+  // "how does the data move around in here?" started an edit mission and rewrote the user's page.
+  const evidenceQuestion = !EXPLICIT_FOLLOW_ON_MUTATION_PATTERN.test(text)
+    && (looksLikeReadOnlyQuestionForm(text)
+      || (PROJECT_BEHAVIOR_QUESTION_PATTERN.test(text)
+        && PROJECT_BEHAVIOR_SUBJECT_PATTERN.test(text)
+        && !MUTATING_PATTERN.test(text)));
+  if (!manualGuidance && !explicitNoMutation && !evidenceQuestion) return null;
+  if (evidenceQuestion) return "inspection";
   return PROJECT_EVIDENCE_PATTERN.test(text) ? "inspection" : "question";
 }
 

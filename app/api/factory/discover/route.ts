@@ -5,10 +5,10 @@ import { TIER_DISPLAY } from "@/lib/ai/model-router";
 import { profileTask } from "@/lib/ai/routing/task-profiler";
 import { routePayloadDynamically } from "@/lib/ai/routing/dynamic-router";
 import type { ModelMode, ModelTier } from "@/lib/ai/model-router";
-import { DISCOVERY_REFINEMENT_SYSTEM_PROMPT, REFINE_PROJECT_DISCOVERY_TOOL, discoveryRefinementUserText, hasCompleteDiscoveryRefinement, parseDiscoveryRefinement } from "@/lib/ai/project-discovery-llm";
+import { DISCOVERY_REFINEMENT_SYSTEM_PROMPT, REFINE_PROJECT_DISCOVERY_TOOL, discoveryRefinementDepth, discoveryRefinementUserText, hasCompleteDiscoveryRefinement, parseDiscoveryRefinement } from "@/lib/ai/project-discovery-llm";
 import type { DiscoveryRefinementResult } from "@/lib/ai/project-discovery-llm";
 import type { DiscoveryRefinementContext } from "@/lib/ai/project-discovery-llm";
-import type { ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
+import { explicitPersistenceFromPrompt, explicitProjectNameFromPrompt, explicitStackFromPrompt, reconcileDiscoveryWithExplicitBrief, reconcileDiscoveryWithUserProductSignal, type ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import type { ProviderId } from "@/lib/ai/providers/types";
 import type { NeutralTool } from "@/lib/ai/providers/types";
 import { reconcilePlatformStackOptions } from "@/lib/discovery/platform-stack-policy";
@@ -90,13 +90,25 @@ export async function POST(request: Request) {
     }
 
     const context = compactContext(body.context);
+    const subtypeSignal = (context.customSubtype || context.subtype || "").trim();
+    const subtypeIsGeneric = !subtypeSignal || /^(other\s*\/?\s*custom|other|general|custom|none|misc(?:ellaneous)?)$/i.test(subtypeSignal);
+    const authoritativeBrief = [
+      context.projectDescription.trim(),
+      subtypeIsGeneric ? "" : `Selected product: ${subtypeSignal}`,
+      context.starter.title ? `Selected starter: ${context.starter.title}` : "",
+      heuristic.prompt,
+    ].filter(Boolean).join("\n");
+    const preserveUserProductSignal = (discovery: ProjectDiscoveryResult) => reconcileDiscoveryWithUserProductSignal(
+      reconcileDiscoveryWithExplicitBrief(discovery, authoritativeBrief),
+      { productSignal: subtypeIsGeneric ? context.projectDescription.trim() : subtypeSignal, starterTitle: context.starter.title },
+    );
     // mode defaults to "builder" — the fixed tier this route always used before the mode selector
     // existed, so a client that doesn't send mode gets byte-identical behavior. "auto" classifies from
     // the actual project context/description rather than re-deriving anything client-side.
     const mode: ModelMode = body.mode ?? DEFAULT_MODE;
     const autoSelected = mode === "auto";
     const discoveryProfile = profileTask({
-      message: `Create project: ${context.projectDescription || heuristic.projectType}. Stack: ${heuristic.recommendedStack}. ${heuristic.keyFacts.join(" ")}`,
+      message: `Create project: ${authoritativeBrief || heuristic.projectType}. Stack: ${heuristic.recommendedStack}. ${heuristic.keyFacts.join(" ")}`,
       likelyFiles: /\b(?:html|css|vanilla|static)\b/i.test(heuristic.recommendedStack) ? ["index.html", "styles.css", "script.js"] : undefined,
       requestedDepth: "standard",
     });
@@ -109,33 +121,43 @@ export async function POST(request: Request) {
     const knownStarter = Boolean(context.starter.id && context.starter.id !== "custom");
     const domainDecision = heuristic.decisions.find((decision) => decision.dimension === "domain");
     const platformDecision = heuristic.decisions.find((decision) => decision.dimension === "platform");
+    const descriptionWordCount = context.projectDescription.trim().split(/\s+/).filter(Boolean).length;
+    // The subtype/category the user picked is real product signal, not decoration. Exclude placeholder
+    // values ("Other / Custom", "General", etc.) so an unmodified default doesn't force a full pass.
+    const subtypeWordCount = subtypeIsGeneric ? 0 : subtypeSignal.split(/\s+/).filter(Boolean).length;
     const highConfidenceCustom = !knownStarter
-      && context.projectDescription.trim().split(/\s+/).length >= 12
+      && descriptionWordCount >= 12
       && (domainDecision?.confidence ?? 0) >= 85
       && (platformDecision?.confidence ?? 0) >= 85;
-    // A clear custom brief already has a reliable local product memo. Ask the model only for the
-    // language/stack judgment the user expects instead of resending a large principal-architect
-    // essay and ten-decision schema. Ambiguous briefs still receive the full refinement call.
-    const stackDecisionOnly = knownStarter || highConfidenceCustom;
+    // Depth = how much of the understanding the model regenerates. A starter card with no product signal
+    // (no description AND only a generic subtype) gets a stack-only pass — the category template is all
+    // we know. A starter card WITH a typed description OR a specific chosen subtype, or an ambiguous
+    // custom brief, gets the full description-driven refinement so features/entities/architecture
+    // reflect what the user actually picked — not a generic template.
+    const depth = discoveryRefinementDepth({ knownStarter, descriptionWordCount, subtypeWordCount, highConfidenceCustom });
+    const starterStackOnly = depth === "starter-stack";
+    const useCompactCustom = depth === "compact-custom";
+    // Controls model effort/timeout only; the stack-only and compact-custom passes are both fast.
+    const stackDecisionOnly = starterStackOnly || useCompactCustom;
 
     const result = await callManagedModel(
       {
         provider,
         model,
         effort: stackDecisionOnly ? "low" : effort ?? "low",
-        system: knownStarter ? STARTER_STACK_SYSTEM_PROMPT : highConfidenceCustom ? COMPACT_CUSTOM_DISCOVERY_SYSTEM_PROMPT : DISCOVERY_REFINEMENT_SYSTEM_PROMPT,
+        system: starterStackOnly ? STARTER_STACK_SYSTEM_PROMPT : useCompactCustom ? COMPACT_CUSTOM_DISCOVERY_SYSTEM_PROMPT : DISCOVERY_REFINEMENT_SYSTEM_PROMPT,
         messages: [
           {
             role: "user",
             content: [{ type: "text", text: discoveryRefinementUserText(context, heuristic) }],
           },
         ],
-        tools: [knownStarter ? STARTER_STACK_TOOL : highConfidenceCustom ? COMPACT_CUSTOM_DISCOVERY_TOOL : REFINE_PROJECT_DISCOVERY_TOOL],
+        tools: [starterStackOnly ? STARTER_STACK_TOOL : useCompactCustom ? COMPACT_CUSTOM_DISCOVERY_TOOL : REFINE_PROJECT_DISCOVERY_TOOL],
         toolChoice: { name: "refine_project_discovery" },
         // Was 3000 — with stack_options added, that budget was too tight and the model's tool-call JSON
         // was getting truncated before parsing could succeed, silently falling back to defaults on every
         // call. Reasoning tokens count against this same budget, so headroom matters here.
-        maxOutputTokens: knownStarter ? 1000 : highConfidenceCustom ? 1800 : 3200,
+        maxOutputTokens: starterStackOnly ? 1000 : useCompactCustom ? 1800 : 3200,
       },
       {
         apiKey,
@@ -149,17 +171,56 @@ export async function POST(request: Request) {
 
     const call = result.toolCalls.find((item) => item.name === "refine_project_discovery");
     if (!call?.arguments
-      || (highConfidenceCustom && !hasCompleteCompactCustomRefinement(call.arguments))
+      || (useCompactCustom && !hasCompleteCompactCustomRefinement(call.arguments))
       || (!stackDecisionOnly && !hasCompleteDiscoveryRefinement(call.arguments))) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: result.errorMessage || "The discovery model did not return a complete project decision before the time limit.",
+      const explicitBriefCanProceed = !knownStarter
+        && Boolean(explicitStackFromPrompt(authoritativeBrief))
+        && context.projectDescription.trim().split(/\s+/).length >= 12;
+      // A heuristic seed is always present (required at the top of this handler), and showing it is
+      // always better than a hard error: it is exactly what the user saw before refinement ran, plus
+      // the correct platform/stack contract. The full description-specific refinement is the model's
+      // real value-add, but it can time out or truncate — when it does, degrade to the seed, never to a
+      // 502. This makes discovery reliable across the board: worst case is the generic-but-valid seed,
+      // best case is the specific understanding.
+      const fallbackDiscovery = { ...preserveUserProductSignal(heuristic), prompt: authoritativeBrief };
+      const platformContract = reconcilePlatformStackOptions(context.starter.id, fallbackDiscovery, []);
+      return NextResponse.json({
+        ok: true,
+        provenance: "brief",
+        discovery: { ...fallbackDiscovery, recommendedStack: platformContract.recommendedStack },
+        alternativeStacks: platformContract.stackOptions.filter((option) => !option.recommended).map((option) => option.name),
+        deploymentNote: deploymentNoteRespectingExplicitPersistence(
+          authoritativeBrief,
+          "The starter's platform and stack contract is authoritative; deployment will be verified from the generated project's real tooling.",
+        ),
+        lede: explicitBriefCanProceed
+          ? "Foundry preserved the explicit project brief after the optional discovery refinement returned an incomplete payload."
+          : "Foundry preserved your selected product scope with deterministic discovery because optional model refinement did not complete; you can still edit any decision before building.",
+        stackOptions: platformContract.stackOptions,
+        usage: result.usage,
+        incompleteRefinement: true,
+        modelSelection: {
+          tier,
+          provider,
+          model,
+          autoSelected,
+          reason: "The model refinement was incomplete, so Foundry used the explicit brief-derived decision instead of blocking or inventing a different stack.",
+          taskType: discoveryProfile.taskType,
+          missionComplexity: discoveryProfile.missionComplexity,
+          repositoryComplexity: discoveryProfile.repositoryComplexity,
+          expectedFiles: discoveryProfile.expectedFiles,
+          executionDepth: discoveryProfile.recommendedExecutionDepth,
+          platformContractRepaired: platformContract.repaired,
+          platformFamily: platformContract.family,
         },
-        { status: 502 },
-      );
+      });
     }
     const parsedRefinement = sanitizeDiscoveryStackLabels(parseDiscoveryRefinement(call?.arguments, heuristic));
+    const explicitProjectName = explicitProjectNameFromPrompt(authoritativeBrief);
+    if (explicitProjectName) parsedRefinement.discovery.projectType = explicitProjectName;
+    // `prompt` records user evidence. A model can echo its own proposed stack there, but that must
+    // never turn the model's React Native suggestion into an explicit user constraint.
+    parsedRefinement.discovery = { ...preserveUserProductSignal(parsedRefinement.discovery), prompt: authoritativeBrief };
     const platformContract = reconcilePlatformStackOptions(context.starter.id, parsedRefinement.discovery, parsedRefinement.stackOptions);
     const refined: DiscoveryRefinementResult = {
       ...parsedRefinement,
@@ -170,9 +231,10 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       ok: true,
+      provenance: "model",
       discovery: refined.discovery,
       alternativeStacks: refined.alternativeStacks,
-      deploymentNote: refined.deploymentNote,
+      deploymentNote: deploymentNoteRespectingExplicitPersistence(authoritativeBrief, refined.deploymentNote),
       lede: refined.lede,
       stackOptions: refined.stackOptions,
       usage: result.usage,
@@ -223,6 +285,16 @@ function compactContext(context: DiscoveryRefinementContext | undefined): Discov
 function truncate(value: string | undefined, maxLength: number) {
   if (!value) return undefined;
   return value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+}
+
+function deploymentNoteRespectingExplicitPersistence(prompt: string, proposed: string) {
+  const persistence = explicitPersistenceFromPrompt(prompt);
+  if (!persistence) return proposed;
+  const datastorePattern = /\b(?:SQLite|PostgreSQL|Postgres|MySQL|MongoDB|SQL Server|Supabase|localStorage)\b/gi;
+  const conflicts = Array.from(proposed.matchAll(datastorePattern)).some((match) => match[0].toLowerCase() !== persistence.toLowerCase()
+    && !(persistence === "PostgreSQL" && match[0].toLowerCase() === "postgres"));
+  const safeProposed = conflicts ? "" : proposed.trim();
+  return [`Persistence uses the explicitly selected ${persistence} datastore through replaceable repository and migration boundaries.`, safeProposed].filter(Boolean).join(" ");
 }
 
 function hasCompleteCompactCustomRefinement(rawArguments: string | undefined) {

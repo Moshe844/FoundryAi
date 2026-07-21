@@ -25,14 +25,32 @@ completion status.
 ## Extension Boundary
 
 Each ecosystem implements `EcosystemAdapter` and registers independently. The
-runtime consumes only `VerificationProfile`; it does not branch on languages.
-The initial registry covers Next.js/Node.js, Android Gradle, Java/Maven, .NET,
-Python, PHP/Composer, Go, Rust, Flutter, and static web projects.
+runtime consumes only `VerificationProfile`; it does not branch on languages or
+project identities. The registry currently contains 36 adapters spanning Node
+and major web frameworks, Android/Gradle/Maven, .NET, Python, PHP, Go, Rust,
+Flutter/Dart, Ruby, Swift, CMake/Meson/Make, Elixir, Scala, R, Lua, PowerShell,
+shell projects, containers and infrastructure, Godot, Unity, SQL, and static web.
 
 Profiles contain only checks supported by files found in the project. For Node
 projects, scripts come from the real `package.json`; absent scripts are not
 invented. Other adapters activate from ecosystem manifests and prefer checked-in
 wrappers when available.
+
+## Coverage Claims
+
+Foundry keeps two proof levels separate:
+
+- **Adapter contract coverage** proves every registered ecosystem can be
+  detected from representative project evidence and emits either a complete
+  verification profile or an explicit limitation. This matrix must cover the
+  registry exactly, so a newly registered adapter cannot silently escape tests.
+- **Executable lifecycle coverage** proves real commands ran successfully
+  through the Local Agent. Its score includes only toolchains installed on the
+  test machine and names those toolchains explicitly.
+
+Contract coverage is not described as a real build. Missing toolchains,
+credentials, device runtimes, licensed editors, and infrastructure approval
+remain visible limitations instead of simulated passes.
 
 ## Truthfulness Rules
 

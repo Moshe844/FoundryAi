@@ -30,17 +30,74 @@ export function extractAtomicUserRequirements(task: string): string[] {
   });
 }
 
-export type ObservableBrowserCapability = "multiple-file-upload" | "editable-pricing" | "visual-polish";
+export type ObservableBrowserCapability =
+  | "multiple-file-upload"
+  | "editable-pricing"
+  | "visual-polish"
+  | "create-record"
+  | "search-filter"
+  | "update-record"
+  | "assign-record"
+  | "complete-record"
+  | "permission-denied"
+  | "cancel-record"
+  | "conflict-rejection"
+  | "toggle-state"
+  | "delete-record"
+  | "persistent-state";
+
+const recordNounPattern = "item|items|record|records|note|notes|task|tasks|booking|bookings|reservation|reservations|entry|entries|product|products|event|events|post|posts|customer|customers|order|orders|work[ -]?orders?|assets?|technicians?|schedules?|tickets?|issues?";
+
+function actionTargetsRecord(text: string, actionPattern: string): boolean {
+  return new RegExp(`\\b(?:${actionPattern})\\b[^.;\\n]{0,48}\\b(?:${recordNounPattern})\\b|\\b(?:${recordNounPattern})\\b[^.;\\n]{0,48}\\b(?:${actionPattern})\\b`, "i").test(text);
+}
+
+// In a relocation request the landmark names *where* something goes, not a feature being asked for.
+// "Move the total above the filter bar" mentions a filter only to point at a place on the page, but a
+// bare keyword scan read it as "this project must have a working filter" and failed the mission for
+// missing a search control it was never asked to build — while the requested move had been applied
+// correctly and typecheck, build and preview all passed.
+//
+// Scoped deliberately to relocation phrasing. In "add a filter above the header" the filter is the
+// real request, and only the trailing landmark is dropped.
+const POSITIONAL_LANDMARK =
+  /\b(?:above|below|under|underneath|beneath|over|on top of|next to|beside|alongside|to the left of|to the right of|in front of|before|after|inside|within)\s+(?:the\s+|a\s+|an\s+|its\s+|their\s+|my\s+)?(?:[\w-]+\s+){0,3}[\w-]+/gi;
+
+function withoutPositionalLandmarks(text: string): string {
+  if (!/\b(?:move|reposition|reorder|relocate|place|put|shift|drag|show|display)\b/i.test(text)) return text;
+  return text.replace(POSITIONAL_LANDMARK, " ");
+}
+
+/**
+ * A follow-up edit is accepted on what it was asked to do, not on everything the project already does.
+ *
+ * The implementation blob appends the saved brief as background context, so capability extraction was
+ * reading the whole product description and demanding this mission demonstrate every pre-existing
+ * feature in the browser. Asking to move a number failed on "missing capability: search-filter" — a
+ * filter the project has had since it was built and that this edit never touched. That is the
+ * "it failed even though the build succeeded" class of false failure.
+ *
+ * `Current instruction:` marks a follow-up against a finished project, so acceptance narrows to it.
+ * `Current continuation instruction:` marks an unfinished build being resumed, where the brief really
+ * is the requirement source — that blob is left whole.
+ */
+function acceptanceScopeForFollowUp(text: string): string {
+  if (/(?:^|\n)\s*Current continuation instruction:/i.test(text)) return text;
+  const followUp = text.match(/(?:^|\n)\s*Current instruction:\s*([\s\S]*)$/i);
+  if (!followUp) return text;
+  const instruction = followUp[1].split(/\n\s*(?:Saved project brief|Attached readable evidence|Referenced request)\b/i)[0];
+  return instruction.trim() || text;
+}
 
 /** Framework-independent DOM capabilities that Foundry can verify without another model call. */
 export function observableBrowserContractForTask(task: string) {
   // Runtime continuity labels are useful context for the planner, but they are not product
   // requirements. Remove the labels here so browser acceptance never reports Foundry's own
   // bookkeeping language as a missing user-facing feature.
-  const acceptanceText = task.replace(
+  const acceptanceText = withoutPositionalLandmarks(acceptanceScopeForFollowUp(task).replace(
     /(?:^|\n)\s*(?:Foundry's referenced proposal \([^\n]+\)|Referenced request|Current instruction|Continuation decision|Saved project brief \([^\n]+\)):\s*/gi,
     "\n",
-  );
+  ));
   const requirements = extractAtomicUserRequirements(acceptanceText).map((text) => {
     const capabilities = new Set<ObservableBrowserCapability>();
     const upload = /\b(?:upload|attach|import|add)\b/i.test(text) && /\b(?:image|images|picture|pictures|photo|photos|media|file|files)\b/i.test(text);
@@ -52,9 +109,24 @@ export function observableBrowserContractForTask(task: string) {
     const visual = /\b(?:style|styles|styling|visual|design|look|appearance|layout|ui|ux|interface|website|site|app)\b/i.test(text);
     const quality = /\b(?:nice|nicer|beautiful|polished|premium|professional|modern|eye[- ]catching|ugly|redesign|overhaul|improve|better)\b/i.test(text);
     if (visual && quality) capabilities.add("visual-polish");
+    const recordNoun = new RegExp(`\\b(?:${recordNounPattern})\\b`, "i").test(text);
+    if (/\b(?:add|create|new)\b/i.test(text) && recordNoun) capabilities.add("create-record");
+    if (/\b(?:search|filter|find)\b/i.test(text)) capabilities.add("search-filter");
+    if (actionTargetsRecord(text, "edit|update|modify")) capabilities.add("update-record");
+    if (actionTargetsRecord(text, "assign|assignment|reassign")) capabilities.add("assign-record");
+    if (actionTargetsRecord(text, "complete|completion|resolve|close")) capabilities.add("complete-record");
+    if (/\b(?:permission[- ]denied|forbidden|unauthori[sz]ed|access[- ]denied|insufficient permissions?|role permissions?)\b/i.test(text)) capabilities.add("permission-denied");
+    if (/\bcancel(?:led|ing)?\b/i.test(text) && /\b(?:booking|bookings|reservation|reservations|event|events|order|orders)\b/i.test(text)) capabilities.add("cancel-record");
+    if (/\b(?:conflict|conflicts|overlap|overlapping|collision|double[- ]book|reject(?:ed|ion)?)\b/i.test(text)) capabilities.add("conflict-rejection");
+    if (actionTargetsRecord(text, "pin|unpin|favorite|favourite|star|toggle")) capabilities.add("toggle-state");
+    if (actionTargetsRecord(text, "delete|remove|discard")) capabilities.add("delete-record");
+    const requestsPersistence = /\b(?:local\s*storage|localstorage|persist(?:s|ed|ence|ent)?|keep (?:the |their )?data|survive\s+(?:a\s+)?reload)\b/i.test(text)
+      || /\b(?:save|store|remember|retain)\b[^.;\n]{0,60}\b(?:data|records?|items?|entries|drafts?|reports?|settings?|preferences?|history|state|values?)\b|\b(?:data|records?|items?|entries|drafts?|reports?|settings?|preferences?|history|state|values?)\b[^.;\n]{0,60}\b(?:save|store|remember|retain)\b/i.test(text);
+    const rejectsPersistence = /\b(?:no|not|without)\s+(?:any\s+)?(?:data\s+)?persist(?:ence|ent|ing)?\b|\bdo(?:es)?\s+not\s+persist\b|\btransient\b|\bin[- ]memory\s+only\b|\bsession[- ]only\b/i.test(text);
+    if (requestsPersistence && !rejectsPersistence) capabilities.add("persistent-state");
     return { text, capabilities: [...capabilities] };
   });
-  const operationalEvidenceClause = /^(?:inspect|review|read|open|run|build|compile|test|verify|validate|check|analy[sz]e|plan)\b/i;
+  const operationalEvidenceClause = /^(?:verification[- ]only|(?:re[- ]?)?run|inspect|review|read|open|build|compile|test|verify|validate|check|analy[sz]e|plan)\b|^(?:do\s+not|don't)\b[^.\n]{0,100}\b(?:edit|change|modify|rewrite|touch)\b/i;
   return {
     requirements,
     unsupported: requirements

@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { pricingForModel } from "@/lib/ai/model-router";
 import { DailySpendLimitError, releaseGlobalModelSpend, reserveGlobalModelSpend, settleGlobalModelSpend } from "@/lib/ai/routing/spend-ledger";
+import { routingBudgetForTier } from "@/lib/ai/routing/cost-guard";
 
 type RuntimeOpenAIResponse = {
   output_text?: string;
@@ -547,8 +548,13 @@ function reserveDirectAttempt(requestId: string, estimatedCostUsd: number) {
   const now = Date.now();
   for (const [key, value] of directCallBudgets) if (value.expiresAt < now) directCallBudgets.delete(key);
   const budget = directCallBudgets.get(requestId) ?? { calls: 0, estimatedCostUsd: 0, expiresAt: now + 30 * 60_000 };
-  const maxCalls = positiveEnv("FOUNDRY_MAX_MODEL_CALLS_PER_REQUEST", 4);
-  const maxCost = positiveEnv("FOUNDRY_MAX_ESTIMATED_COST_USD_PER_REQUEST", 0.25);
+  // These are last-resort runaway ceilings for calls that manage their own budget, and they must never
+  // be stricter than the tier-aware guard in lib/ai/routing/cost-guard.ts — otherwise a legitimate
+  // multi-step mission dies at "Model-call limit reached (4)" / "cost would exceed $0.25" while its
+  // real tier budget still had capacity. Deriving them from the Fast tier keeps one source of truth.
+  const fastTierFloor = routingBudgetForTier("fast");
+  const maxCalls = positiveEnv("FOUNDRY_MAX_MODEL_CALLS_PER_REQUEST", fastTierFloor.maximumModelCalls);
+  const maxCost = positiveEnv("FOUNDRY_MAX_ESTIMATED_COST_USD_PER_REQUEST", fastTierFloor.estimatedCostUsd);
   if (budget.calls >= maxCalls) return `Model-call limit reached (${maxCalls}) for this request.`;
   if (budget.estimatedCostUsd + estimatedCostUsd > maxCost) return `Estimated request cost would exceed the $${maxCost.toFixed(2)} limit.`;
   budget.calls += 1;

@@ -1,0 +1,5 @@
+import { NextResponse } from "next/server";
+import { detectProjectIntegrations, type ProjectEvidenceFile } from "@/lib/integrations/detection";
+import { getCredentialSummary, normalizeScope } from "@/lib/integrations/manager";
+import { serviceState } from "@/lib/integrations/health";
+export async function POST(request:Request){try{const body=await request.json() as {files?:ProjectEvidenceFile[];environment?:Record<string,string>;scope?:Record<string,unknown>};const result=detectProjectIntegrations(Array.isArray(body.files)?body.files:[],body.environment||{});const services=await Promise.all(result.detected.map(async(item)=>{const scope=normalizeScope({...body.scope,provider:item.definition.id});const credential=await getCredentialSummary(scope);return {...item,state:serviceState(item,credential),credential};}));return NextResponse.json({...result,detected:services});}catch(error){return NextResponse.json({error:error instanceof Error?error.message:"Could not inspect project integrations."},{status:400});}}

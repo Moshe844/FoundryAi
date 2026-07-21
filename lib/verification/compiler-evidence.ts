@@ -38,7 +38,12 @@ function safeRelativeSourcePath(candidate: string, projectRoot: string, fileExis
   const absolute = path.isAbsolute(normalized) ? path.resolve(normalized) : path.resolve(projectRoot, normalized);
   const relative = path.relative(path.resolve(projectRoot), absolute);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || !fileExists(absolute)) return undefined;
-  return relative.replace(/\\/g, "/");
+  const portable = relative.replace(/\\/g, "/");
+  // Dependency and generated-output frames explain how a compiler reached the failure; they are
+  // never customer-owned repair targets. Let framework adapters map generated contracts back to
+  // their application source instead of sending paid repair calls into node_modules or caches.
+  if (/(?:^|\/)(?:node_modules|vendor|\.next|\.next-build|dist|build|out|target|bin|obj)(?:\/|$)/i.test(portable)) return undefined;
+  return portable;
 }
 
 /** Extracts real source paths from diagnostics emitted by TypeScript/Vite, Python, Rust, Go,
@@ -91,4 +96,43 @@ export function compilerFailureFingerprint(command: CompilerCommandEvidence, pro
 
 export function isCompilerSourcePath(filePath: string) {
   return new RegExp(`\\.${SOURCE_EXTENSION}$`, "i").test(filePath);
+}
+
+/**
+ * A *structural* signature of a compiler failure: what broke and where, with the concrete type text
+ * erased. compilerFailureFingerprint() hashes the full diagnostic, so a repair that only reshuffles a
+ * type annotation produces a brand-new fingerprint and reads as forward progress. That is how one
+ * defect burns an entire repair budget — e.g. a contextually-typed callback prop reported four times as
+ *
+ *   Type '(v: number) => [string]' is not assignable to type 'Formatter<…>'
+ *   Type '(l: string) => string'  is not assignable to type '…'
+ *
+ * which is one mistake, not four. Collapsing quoted types and identifiers to placeholders makes those
+ * repeats recognizable so the loop can stop paying for the same failure instead of oscillating.
+ */
+export function compilerFailureSignature(command: CompilerCommandEvidence, projectRoot = "") {
+  let normalized = compilerDiagnosticOutput(command, 40_000).toLowerCase();
+  const canonicalRoot = projectRoot ? path.resolve(projectRoot).replace(/\\/g, "/").toLowerCase() : "";
+  normalized = normalized.replace(/\\/g, "/");
+  if (canonicalRoot) normalized = normalized.split(canonicalRoot).join("<project>");
+  const lines = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !/^at\s+/.test(line));
+  // Keep only the diagnostic-bearing lines, then erase every concrete type/identifier/position so two
+  // reports of the same defect hash identically.
+  const structural = lines
+    .filter((line) => /(?:error|warning)\b|\bts\d{4}\b|is not assignable|cannot find|module not found|can't resolve|possibly '?undefined|does not exist/.test(line))
+    .map((line) =>
+      line
+        .replace(/'[^']*'/g, "<type>")
+        .replace(/"[^"]*"/g, "<type>")
+        .replace(/`[^`]*`/g, "<type>")
+        .replace(/\b\d+\b/g, "<n>")
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
+  const files = [...new Set(lines.flatMap((line) => line.match(new RegExp(`[\\w./<>-]+\\.${SOURCE_EXTENSION}`, "gi")) ?? []))].sort();
+  const payload = `${command.command.trim().toLowerCase()}\n${files.join("|")}\n${[...new Set(structural)].sort().join("\n")}`;
+  return createHash("sha256").update(payload).digest("hex");
 }

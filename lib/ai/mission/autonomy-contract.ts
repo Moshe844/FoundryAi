@@ -11,6 +11,7 @@ const AUTHORITY_REQUIRED = /\b(?:approval|permission|consent) (?:is )?required\b
 const MISSING_CREDENTIALS = /\b(?:missing|unset|invalid|expired)\s+(?:api[_ -]?key|credential|token|secret|certificate|signing identity|password)\b|authentication failed|unauthorized|forbidden/i;
 const PROVIDER_OUTAGE = /\b(?:providers?|services?|registr(?:y|ies)|networks?)\b[^.\n]{0,80}\b(?:unavailable|unreachable|outage|timed? out|timeout|dns|connection refused)\b|econnrefused|enotfound|eai_again/i;
 const PLATFORM_IMPOSSIBLE = /requires (?:macos|windows|linux|xcode|a connected device|an emulator)|not available on this (?:operating system|platform)|unsupported host platform/i;
+const EXTERNAL_PROCESS_LOCK = /build output is locked|not safely identified as Foundry-owned|could not pause its running (?:desktop )?app before rebuilding/i;
 
 /**
  * Foundry's enforceable autonomy contract. Project defects are recoverable by default; a model's
@@ -46,6 +47,13 @@ export function assessAutonomousBlocker(reason: string): AutonomousTerminalAsses
       disposition: "external-dependency",
       terminal: true,
       nextAction: "Connect a compatible host, SDK, emulator, or device for the named platform check, then resume from the existing project state.",
+    };
+  }
+  if (EXTERNAL_PROCESS_LOCK.test(text)) {
+    return {
+      disposition: "external-dependency",
+      terminal: true,
+      nextAction: "Close the specifically identified external process, then verify again; Foundry will not spend model calls trying to repair source for an operating-system file lock.",
     };
   }
   return { disposition: "recoverable-engineering", terminal: false };

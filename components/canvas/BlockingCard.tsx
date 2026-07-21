@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FactoryExecutionEvent } from "@/lib/factory/types";
 import type { CanvasBlocking } from "@/lib/canvas/model";
 import { questionQueueOf } from "@/lib/canvas/adapter";
@@ -16,10 +16,14 @@ export function BlockingCard({
   blocking,
   onAnswer,
   onApprove,
+  onUpload,
+  onLocateSdk,
 }: {
   blocking: CanvasBlocking;
   onAnswer: (answers: Array<{ question: string; answer: string }>) => void;
   onApprove: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
+  onUpload?: (files: File[]) => void;
+  onLocateSdk?: () => void;
 }) {
   if (blocking.kind === "approval") {
     const deletionPath = blocking.event.details?.actionKind === "delete-project" || blocking.event.details?.actionKind === "delete-project-lock"
@@ -31,20 +35,25 @@ export function BlockingCard({
       </div>
     );
   }
-  return <QuestionCard blocking={blocking} onAnswer={onAnswer} />;
+  return <QuestionCard blocking={blocking} onAnswer={onAnswer} onUpload={onUpload} onLocateSdk={onLocateSdk} />;
 }
 
 function QuestionCard({
   blocking,
   onAnswer,
+  onUpload,
+  onLocateSdk,
 }: {
   blocking: Extract<CanvasBlocking, { kind: "question" }>;
   onAnswer: (answers: Array<{ question: string; answer: string }>) => void;
+  onUpload?: (files: File[]) => void;
+  onLocateSdk?: () => void;
 }) {
   const queue = questionQueueOf(blocking);
   const [index, setIndex] = useState(0);
   const [collected, setCollected] = useState<Array<{ question: string; answer: string }>>([]);
   const [custom, setCustom] = useState("");
+  const sdkInputRef = useRef<HTMLInputElement | null>(null);
   const current = queue[index];
   const remaining = queue.length - index - 1;
 
@@ -58,6 +67,7 @@ function QuestionCard({
 
   if (!current) return null;
   const activeQuestion = current;
+  const acceptsSdkEvidence = /\b(?:sdk|documentation|licensed package|local agent|hardware diagnostic)\b/i.test(activeQuestion.question);
 
   function submit(answer: string) {
     const trimmed = answer.trim();
@@ -95,6 +105,33 @@ function QuestionCard({
               {option}
             </button>
           ))}
+        </div>
+      ) : null}
+      {acceptsSdkEvidence && onUpload ? (
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <button type="button" onClick={() => sdkInputRef.current?.click()} className="min-h-[44px] rounded-md border border-foundry-teal/30 bg-foundry-teal/[0.08] px-3.5 py-2 text-left text-sm font-semibold text-foundry-ink hover:bg-foundry-teal/[0.14]">
+            Upload SDK or specification files
+          </button>
+          {onLocateSdk ? <button type="button" onClick={onLocateSdk} className="min-h-[44px] rounded-md border border-foundry-teal/30 bg-foundry-teal/[0.08] px-3.5 py-2 text-left text-sm font-semibold text-foundry-ink hover:bg-foundry-teal/[0.14]">Search the connected Local Agent folder</button> : null}
+          <button type="button" onClick={() => { sdkInputRef.current?.setAttribute("webkitdirectory", ""); sdkInputRef.current?.click(); }} className="min-h-[44px] rounded-md border border-overlay/12 bg-overlay/[0.025] px-3.5 py-2 text-left text-sm font-semibold text-foundry-ink hover:border-foundry-teal/35">
+            Select an existing SDK folder
+          </button>
+          <input
+            ref={sdkInputRef}
+            type="file"
+            multiple
+            accept=".zip,.aar,.jar,.dll,.so,.pdf,.doc,.docx,.txt,.md,.html,.xml,.json,.yaml,.yml"
+            className="hidden"
+            onClick={(event) => {
+              if (!(event.currentTarget as HTMLInputElement).hasAttribute("webkitdirectory")) event.currentTarget.removeAttribute("webkitdirectory");
+            }}
+            onChange={(event) => {
+              const files = Array.from(event.target.files ?? []);
+              if (files.length) onUpload(files);
+              event.target.value = "";
+              event.target.removeAttribute("webkitdirectory");
+            }}
+          />
         </div>
       ) : null}
       <form

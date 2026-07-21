@@ -102,6 +102,7 @@ export async function runReadOnlyInspection(input: {
     "Most questions can be answered from a small number of well-chosen files — an entry point, a config/README, and whatever plausibly matches the question's own keywords. Do not read the whole project and do not open a file you have no real reason to open.",
     "If the question is general programming/technology knowledge and not about this project's own code or behavior, answer it directly from knowledge — do not read any files first.",
     "Answer as soon as you have a real, useful answer — never keep reading just to be thorough. A grounded partial answer beats an exhaustive one that never arrives.",
+    "When the user asks what code does, explain the selected, pasted, or inspected code as a whole: overall purpose, inputs/types/defaults, execution or data flow, returned or rendered output, and meaningful styling, accessibility, side effects, or framework behavior. Do not stop after explaining one optional property or isolated syntax detail unless that is explicitly all they asked about.",
     "Never invent file names or behavior. Only describe what you actually read.",
     "Do not write or modify any files — you have no ability to do so in this mode.",
     "When ready, call answer with a concise, specific response, and end by asking what the user wants next.",

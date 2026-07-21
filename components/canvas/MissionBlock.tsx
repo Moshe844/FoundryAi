@@ -25,6 +25,8 @@ export function MissionBlock({
   suggestions = [],
   onAnswer,
   onApprove,
+  onUpload,
+  onLocateSdk,
   onEvidenceClick,
   onSuggestion,
 }: {
@@ -37,6 +39,8 @@ export function MissionBlock({
   suggestions?: MissionRecommendation[];
   onAnswer?: (answers: Array<{ question: string; answer: string }>) => void;
   onApprove?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
+  onUpload?: (files: File[]) => void;
+  onLocateSdk?: () => void;
   onEvidenceClick?: (eventIds: string[]) => void;
   onSuggestion?: (recommendation: MissionRecommendation) => void;
 }) {
@@ -66,7 +70,7 @@ export function MissionBlock({
       {vm.deliveredFiles.length ? <DeliveredFiles files={vm.deliveredFiles} /> : null}
 
       {!recorded && vm.blocking && onAnswer && onApprove ? (
-        <BlockingCard blocking={vm.blocking} onAnswer={onAnswer} onApprove={onApprove} />
+        <BlockingCard blocking={vm.blocking} onAnswer={onAnswer} onApprove={onApprove} onUpload={onUpload} onLocateSdk={onLocateSdk} />
       ) : null}
 
       {!blocked && currentLiveActivity ? (

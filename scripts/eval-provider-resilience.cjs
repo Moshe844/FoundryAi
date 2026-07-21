@@ -21,6 +21,51 @@ const foundryRuntime = read("lib/ai/foundry-runtime.ts");
 const costGuard = read("lib/ai/routing/cost-guard.ts");
 const canvasModel = read("lib/canvas/model.ts");
 const executionTimeline = read("components/execution/ExecutionTimeline.tsx");
+const projectWorkingSet = read("lib/ai/routing/project-working-set.ts");
+const answerContract = read("lib/ai/answer-contract.ts");
+const answerPlanning = read("lib/ai/answer-planning.ts");
+const inspector = read("lib/ai/mission/inspector.ts");
+
+assert(
+  answerContract.includes("explain the code unit as a whole")
+    && answerPlanning.includes("asksForWholeCodeExplanation")
+    && inspector.includes("selected, pasted, or inspected code as a whole"),
+  "Code explanation requests can still collapse into an answer about one isolated token.",
+);
+
+assert(
+  factoryRuntime.includes("const boundedSmallEdit = !approvalResponse")
+    && factoryRuntime.includes("namedControlDefect || looksUnambiguouslyLikeSmallEdit")
+    && factoryRuntime.includes("maximumModelCalls: 6, premiumCallLimit: 1, estimatedCostUsd: 0.15, hardCeiling: true")
+    && factoryRuntime.includes('boundedSmallEdit\n    ? "fast"')
+    && factoryRuntime.includes("maximumBrowserRepairStages = boundedSmallEdit ? 1")
+    && factoryRuntime.includes("shouldRunVerify(quality) && !boundedStaticFollowUp && !boundedSmallEdit"),
+  "A small explicit UI edit can still expand into an expensive multi-stage mission.",
+);
+
+assert(
+  costGuard.includes("context.budget?.hardCeiling")
+    && factoryRuntime.includes("reportsNamedControlFailure(requestedTask)")
+    && factoryRuntime.includes("htmlTheme: document.documentElement.getAttribute")
+    && factoryRuntime.includes("backgroundColor: getComputedStyle(body).backgroundColor"),
+  "A reported control failure can still bypass its hard cost ceiling or pass without observable UI-state evidence.",
+);
+
+assert(
+  factoryRuntime.includes("looksLikeBoundedClientInteraction")
+    && factoryRuntime.includes("client[- ]side|search|filter|sort|pagination|toggle")
+    && factoryRuntime.includes("needsProbeRecord = requested.some")
+    && factoryRuntime.includes('if (includes("search-filter"))')
+    && factoryRuntime.includes("the search control did not reduce the visible data"),
+  "A bounded client interaction can still escape the cost lane or require an unrelated create workflow before search is verified.",
+);
+
+assert(
+  projectWorkingSet.includes("package-lock\\.json")
+    && projectWorkingSet.includes("tsbuildinfo")
+    && projectWorkingSet.includes("search|filter|sort|pagination|toggle"),
+  "Generated metadata can still displace the producer and consumer components from an interaction working set.",
+);
 
 assert(
   dispatch.includes("providerFallbackWindowMs(candidateTimeoutMs, candidates.length)"),
@@ -60,7 +105,7 @@ assert(
   "A known bounded static working set can still enter paid model discovery without deterministic source evidence.",
 );
 assert(
-  factoryRuntime.includes("shouldRunVerify(quality) && !boundedStaticFollowUp")
+  factoryRuntime.includes("shouldRunVerify(quality) && !boundedStaticFollowUp && !boundedSmallEdit")
     && factoryRuntime.includes("const boundedStaticChangeNeedsBrowserVerification")
     && factoryRuntime.includes("budgetBoundaryNeedsWebVerification || boundedStaticChangeNeedsBrowserVerification"),
   "A bounded static edit can still buy a model verification turn instead of using the deterministic browser gate.",
@@ -116,7 +161,7 @@ assert(
     && executor.includes('return finalize("passed", undefined, turn)')
     && executor.includes("redesign|overhaul|rewrite|rebuild|replace")
     && factoryRuntime.includes("const boundedStaticWriteAwaitingBrowser = boundedStaticFollowUp")
-    && factoryRuntime.includes("boundedStaticWholeRewrite ? 16_000 : boundedStaticFollowUp ? 3_000")
+    && factoryRuntime.includes("boundedStaticWholeRewrite ? 16_000 : boundedSmallEdit ? 3_500 : boundedStaticFollowUp ? 3_000")
     && factoryRuntime.includes("Verified static edit handed to browser validation"),
   "A localized static visual edit can still buy narration/server turns or become a false terminal failure after a verified write.",
 );

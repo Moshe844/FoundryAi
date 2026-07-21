@@ -1,13 +1,14 @@
 import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
 import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
-import { commandPermissionIdentity, isSensitiveFilePath, normalizeCommandForExecution, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
+import { commandPermissionIdentity, isLongRunningServerCommand, isSensitiveFilePath, normalizeCommandForExecution, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
 import { approvalScopeLabel, type CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 import { isEmptySourceWrite } from "@/lib/ai/mission/write-verification";
 import type { ManagedToolCall, NeutralContentPart, NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
-import type { ExecutionMissionVerification, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactorySessionSummary, MissionParentContext } from "@/lib/factory/types";
+import type { ExecutionMissionVerification, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactorySessionSummary, MissionClarification, MissionParentContext } from "@/lib/factory/types";
 import { matchingRunningEventId, upsertExecutionEvent } from "@/lib/factory/event-contract";
 import { formatVerificationProfile } from "@/lib/verification/project-detector";
+import { complianceVerdict, correctionInstruction, deriveOutcomeAssertions } from "@/lib/verification/outcome-compliance";
 import type { VerificationProfile } from "@/lib/verification/types";
 import type { ExecutionStrategy } from "@/lib/ai/mission/execution-strategy";
 import { assessAutonomousBlocker } from "@/lib/ai/mission/autonomy-contract";
@@ -38,6 +39,10 @@ export type MissionExecutorInput = {
   routingBudget?: RoutingBudget;
   /** The caller owns a larger phased mission and will immediately continue a bounded batch. */
   continuableBatch?: boolean;
+  /** A repair that re-reads a real multi-file generated project before fixing it — it legitimately
+   * inspects across several calls, so it keeps the full pre-mutation allowance instead of the tight
+   * edit cap that would otherwise strangle it before it can act. */
+  multiFileRepair?: boolean;
   maxNudges?: number;
   signal?: AbortSignal;
   /** Commands the user has just explicitly approved for this run only (e.g. via an "Approve and retry" action). Matched by exact normalized text, not a standing grant. */
@@ -97,8 +102,10 @@ export type MissionExecutorInput = {
 };
 
 export type MissionExecutorResult = {
-  status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval";
+  status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval" | "needs-clarification";
   blocker?: string;
+  /** Resumable decision requested when autonomous work is preserved instead of being mislabeled as failed. */
+  clarificationQuestions?: MissionClarification[];
   /** Only set when status is "awaiting-approval" — the exact action blocked, for a precise approval prompt instead of parsing `blocker`'s free text. */
   blockedStep?: { kind: "write" | "delete" | "command"; target: string; category: string };
   checklist: FactoryObjectiveChecklistItem[];
@@ -666,6 +673,16 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               ? "For a multi-file greenfield build, keep each write_files response to 3–4 complete coordinated files and at most roughly 36,000 characters of file content. Finish the executable foundation over multiple verified batches. Do not attempt the entire repository in one oversized tool call: a truncated JSON action writes nothing and wastes the model call."
               : "",
             "Never create an empty placeholder source file and plan to fill it in on a later turn. Write complete meaningful content on the first write_file call. Empty HTML, CSS, JavaScript, TypeScript, component, config, or data files are not implementation progress.",
+            "The first working version must actually IMPLEMENT the requested features — not a shell that announces them. A screen whose entire content is a title plus text like \"coming soon\", \"preparing…\", \"under construction\", \"first workflow\", or \"feature will be added\" is NOT a working version; it is a placeholder that fails the request. If the user asked for a workout logger, a calorie tracker, and a meditation timer with a dashboard, the first build must contain a real workout logging UI with input and a list, a real calorie entry UI, a real timer, and a dashboard that reads from them — with local state wired up — not a landing screen describing them. Build the real screens and their interactions in the first pass; a scaffold that only renders a heading is an incomplete build, not a milestone.",
+            "Conform to the project structure that already exists on disk — do not invent a parallel one. Before creating a file, check whether the project already has a file for that role and extend it in place. Never create a SECOND application entry point (a second `@main`, `main()`, root layout, `index` page, or App component) and never create a second file with the same name in a different folder. Two entry points break the build, and duplicate-named files leave the real implementation next to a dead copy. If earlier work placed files under one folder, keep using that folder.",
+            // A production `next build`/`tsc` fails on this constantly: the model annotates an inline
+            // callback passed to a generically-typed library prop (recharts formatter/labelFormatter,
+            // table cell renderers, chart tooltips), the annotation disagrees with the library's own
+            // generic, and every "fix" that re-annotates produces a new variant of the same error.
+            "In TypeScript, never add explicit parameter type annotations to an inline callback you pass to a library prop or generic API (chart formatter/labelFormatter/tickFormatter, table cell renderers, event handlers, array callbacks). Let TypeScript infer the parameter contextually — write `formatter={(value) => ...}`, not `formatter={(value: number) => ...}`. Library generics often admit undefined or a union, so an explicit annotation makes the production build fail. If the body needs a specific type, coerce inside it (`Number(value).toFixed(2)`, `String(label)`) instead of annotating the parameter.",
+            "Declare every package you import in package.json with a real version before you finish. An import of a library that is not in the manifest fails the production build even though the dev server may still render.",
+            "Moving something is two edits, not one: remove it from its old place AND insert it in the new one. Before you finish a move, read the file back and confirm the moved content still exists exactly once. Deleting it and never reinserting it is the most common way this fails, and it passes typecheck, build, and preview because the code is still valid — the user just silently loses working UI.",
+            "Never write a CSS rule for a class or attribute you have not seen in this project's markup. Read the component first and style the class names it actually uses. Inventing selectors such as `.page-shell` or `[data-total-spend]` produces rules that match nothing: every build still passes, the user's requested change silently does not happen, and dead code is left behind. If the change needs a hook that does not exist yet, add it to the markup in the same edit rather than styling a name you hope is there.",
             input.newProject && input.staticProject
               ? "This exported static project must still render useful content when index.html is opened directly from disk. Browsers may block fetch('data.json') under file://, so never make local JSON fetch the only initialization path. Embed seed data in a normal script file or provide a real bundled fallback, handle initialization errors visibly, and then use localStorage for local-first edits."
               : "",
@@ -811,7 +828,28 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const coordinatedMutationCounts = new Map<string, number>();
   let lastCoordinatedMutationPath = "";
   const coordinatedDiversityNudges = new Set<string>();
-  const maxModelCallsWithoutDurableProgress = Math.max(1, Number(process.env.FOUNDRY_MAX_NO_PROGRESS_MODEL_CALLS) || 4);
+  // Idle calls are not free, and they get *more* expensive as the transcript grows. Observed on a
+  // one-line reposition: four consecutive pre-mutation calls returned 66-134 output tokens each while
+  // input climbed 9.3k -> 12.1k, burning ~$0.20 before the escalation lane even started.
+  //
+  // Patience is worth paying for only after something durable exists. Before the first mutation the
+  // model is stuck, not working — that is exactly the state the stronger action-enforced route was
+  // built to rescue, so reaching it sooner is strictly better. After a mutation, keep the original
+  // allowance: continuing is often genuinely productive there.
+  const configuredNoProgressCalls = Math.max(1, Number(process.env.FOUNDRY_MAX_NO_PROGRESS_MODEL_CALLS) || 4);
+  // The tight pre-mutation cap catches a stuck EDIT fast — an edit should be editing, not spelunking, so
+  // reaching the action-enforced route sooner is strictly better. But a new-project BUILD (and its
+  // browser-repair, which re-reads a real multi-file project before fixing it) legitimately inspects,
+  // scaffolds, and plans across several calls before or between writes. Applying the edit cap to a build
+  // strangled it: a fresh Expo app rendered a placeholder, the repair read the project twice to fix it,
+  // and got cut off at 2 calls before it could add the real features. Builds keep the full allowance.
+  // Gate on newProject (a build) and multiFileRepair (re-reading a real generated project to fix it),
+  // NOT on initialProjectEvidence — that is also set for a bounded one-file edit, which is exactly the
+  // stuck-edit case the tight cap must still catch to avoid the pre-mutation money bleed.
+  const buildLikeGeneration = input.newProject || Boolean(input.multiFileRepair);
+  const preMutationNoProgressCalls = buildLikeGeneration
+    ? configuredNoProgressCalls
+    : Math.max(1, Math.min(2, configuredNoProgressCalls));
   let forcedMutationRecovery: "replace_in_file" | "write_file" | undefined = input.requireFirstMutation ? mutationToolForExistingProject() : undefined;
   let mutationRecoveryUsed = false;
   let alreadySatisfied = false;
@@ -878,8 +916,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         }],
       });
     }
+    const durableWorkExistsNow = changedFiles.size > 0 || successfulCommandSignatures.size > 0;
+    const maxModelCallsWithoutDurableProgress = durableWorkExistsNow ? configuredNoProgressCalls : preMutationNoProgressCalls;
     if (modelCallsSinceDurableProgress >= maxModelCallsWithoutDurableProgress) {
-      const durableWorkExists = changedFiles.size > 0 || successfulCommandSignatures.size > 0;
+      const durableWorkExists = durableWorkExistsNow;
       const reason = durableWorkExists
         ? `NO_PROGRESS_AFTER_MUTATION: ${changedFiles.size} verified file change${changedFiles.size === 1 ? " is" : "s are"} already on disk, but the current implementation batch then used ${modelCallsSinceDurableProgress} model calls without another durable change or unique successful command. Preserve the written work and continue with deterministic verification or one refreshed continuation batch.`
         : `NO_PROGRESS_BEFORE_MUTATION: The initial implementation route used ${modelCallsSinceDurableProgress} consecutive model calls without a new file change or unique successful command. No additional provider call was sent; the runtime should preserve the inspected evidence and try one stronger action-enforced route.`;
@@ -992,7 +1032,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         cacheKey: `${input.workspaceId ?? "workspace"}:${effectiveTier}:executor`,
         system,
         messages: conversation,
-        tools: forcedMutationRecovery && changedFiles.size === 0
+        tools: pendingEvidenceRepairReadPath
+          ? turnTools.filter((tool) => tool.name === "read_file")
+          : forcedMutationRecovery && changedFiles.size === 0
           ? turnTools.filter((tool) => tool.name === forcedMutationRecovery)
           : forceRequiredFile
           ? turnTools.filter((tool) => tool.name === "write_file")
@@ -1208,7 +1250,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     if (!functionCalls.length) {
       nudgesUsed += 1;
       if (nudgesUsed > maxNudges) {
-        const stuckReason = "I lost a clear next step partway through and couldn't confirm the work was actually done, so I'm stopping instead of guessing further.";
+        const stuckReason = changedFiles.size > 0
+          ? "NO_PROGRESS_AFTER_MUTATION: Source changes are on disk, but the model stopped producing executable actions. Continue with deterministic verification and requirement-directed acceptance; do not treat model narration as the completion verdict."
+          : "NO_PROGRESS_BEFORE_MUTATION: The model stopped producing executable actions before a verified source change.";
         await emitBlockedOrContinuation(stuckReason);
         return finalize("failed", stuckReason, turn);
       }
@@ -1262,6 +1306,12 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       const rawArgs = call.arguments ?? "{}";
       const parsedArgs = safeJsonParse(rawArgs);
       const args = parsedArgs ?? {};
+      // Models sometimes pass ABSOLUTE paths ("C:\...\project\app\index.tsx"). The access layer writes
+      // the right file anyway (containment check passes), but every event, changed-file record, and the
+      // file tree then carries a second spelling of the same file — the user saw the whole project
+      // duplicated in the tree, once relative and once absolute. Canonicalize to project-relative at
+      // this single dispatch point so every consumer downstream sees one spelling.
+      normalizeToolCallPaths(args, input.access.rootLabel);
       if (explorationToolNames.has(call.name ?? "")) inspectedExistingProject = true;
       if (!parsedArgs && rawArgs.length > 2) {
         const reason = "The tool call arguments could not be parsed, most likely because the file content was too large and got cut off mid-write. Split this into a smaller change and try again.";
@@ -1371,7 +1421,12 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       const runnableEntryExistsNow = input.newProject ? await hasRunnableProjectEntry(input.access) : true;
       const protectedBatchPath = input.newProject ? generatedMutationPaths.find((path) => /(?:^|\/)foundry-brief\.md$/i.test(path)) : undefined;
       const generatedBatchDocumentationPath = input.newProject && !runnableEntryExistsNow ? generatedMutationPaths.find((path) => /(?:^|\/)(?:readme(?:\.[^/]+)?|changelog(?:\.[^/]+)?|notes?(?:\.[^/]+)?|scratch(?:\.[^/]+)?|temp(?:\.[^/]+)?|todo(?:\.[^/]+)?|\.init-stamp)$/i.test(path)) : undefined;
-      const generatedBatchMarkerPath = input.newProject ? generatedMutationPaths.find((path) => /(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch)(?:\.[^/]*)?|fix\.txt|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe|noop|fix[-_ ]?note|repair[-_ ]?note|debug[-_ ]?note|verification[-_ ]?note)[^/]*)(?:\.[^/]*)?$|\.(?:tmp|log)$/i.test(path)) : undefined;
+      const generatedBatchMarkerPath = input.newProject ? generatedMutationPaths.find((path) => /(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch|placeholder)(?:\.[^/]*)?|fix\.txt|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe|noop|marker|fix[-_ ]?(?:note|placeholder|stub|temp)|repair[-_ ]?note|debug[-_ ]?note|verification[-_ ]?note)[^/]*)(?:\.[^/]*)?$|\.(?:tmp|log)$/i.test(path)) : undefined;
+      const generatedOrchestrationArtifactPath = input.newProject ? generatedMutationPaths.find((candidate) => {
+        const normalized = candidate.replace(/\\/g, "/");
+        return /(?:^|\/)[^/]*(?:build[-_ ]?lock|verification[-_ ]?repair|compiler[-_ ]?repair|provider[-_ ]?fallback|scaffold[-_ ]?repair)[^/]*\.[^/]+$/i.test(normalized)
+          || /(?:^|\/)[^/]*marker[^/]*\.(?:txt|md|json|log)$/i.test(normalized);
+      }) : undefined;
       const competingProjectManifestPath = input.newProject && !explicitProjectExpansion
         ? generatedMutationPaths.find((candidate) => {
             const family = projectManifestFamily(candidate);
@@ -1389,15 +1444,21 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             : undefined;
         if (manifestWrite && typeof manifestWrite.content === "string") {
           try {
-            const proposed = JSON.parse(manifestWrite.content) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+            const proposed = JSON.parse(manifestWrite.content) as { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
             const previous = await input.access.readFile(String(manifestWrite.path ?? "package.json"), { limitBytes: 200_000 });
-            const current = previous.exists ? JSON.parse(previous.content) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> } : undefined;
+            const current = previous.exists ? JSON.parse(previous.content) as { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> } : undefined;
             const proposedEntries = { ...(proposed.dependencies ?? {}), ...(proposed.devDependencies ?? {}) };
             const currentEntries = { ...(current?.dependencies ?? {}), ...(current?.devDependencies ?? {}) };
             const changedFoundation = Object.entries(currentEntries).find(([name, version]) => proposedEntries[name] && proposedEntries[name] !== version);
+            const removedFoundation = Object.keys(currentEntries).find((name) => proposedEntries[name] === undefined);
+            const removedScaffoldScript = Object.keys(current?.scripts ?? {}).find((name) => proposed.scripts?.[name] === undefined);
             const floatingVersion = Object.entries(proposedEntries).find(([, version]) => /^latest$/i.test(version));
             if (changedFoundation) {
               generatedManifestIssue = `The verified scaffold already pins ${changedFoundation[0]} at ${changedFoundation[1]}. Preserve its compatible foundation versions and add only genuinely required packages; do not replace the scaffold dependency set.`;
+            } else if (removedFoundation) {
+              generatedManifestIssue = `The verified scaffold requires ${removedFoundation}. Generated implementation may add dependencies, but it cannot delete the selected stack's foundation packages.`;
+            } else if (removedScaffoldScript) {
+              generatedManifestIssue = `The verified scaffold requires the ${removedScaffoldScript} script. Generated implementation cannot delete canonical build, typecheck, test, start, or preview commands.`;
             } else if (floatingVersion) {
               generatedManifestIssue = `${floatingVersion[0]} uses the floating \"latest\" tag. Generated projects must use an explicit compatible version range so a future registry release cannot silently break the build.`;
             }
@@ -1413,7 +1474,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         ? "Documentation cannot substitute for the unfinished application. Write the missing coordinated application source, configuration, data, or tests first; update README only after the real project builds."
         : undefined;
       const generatedMarkerIssue = input.newProject && (call.name === "write_file" || call.name === "replace_in_file")
-        && (/(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch)(?:\.[^/]*)?|fix\.txt|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe|noop|fix[-_ ]?note|repair[-_ ]?note|debug[-_ ]?note|verification[-_ ]?note)[^/]*)(?:\.[^/]*)?$/i.test(writePath)
+        && (/(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch|placeholder)(?:\.[^/]*)?|fix\.txt|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe|noop|marker|fix[-_ ]?(?:note|placeholder|stub|temp)|repair[-_ ]?note|debug[-_ ]?note|verification[-_ ]?note)[^/]*)(?:\.[^/]*)?$/i.test(writePath)
           || /\.(?:tmp|log)$/i.test(writePath))
         ? "Internal marker, status, progress, bootstrap, handoff, temp, and log files are not customer application source. Write a real executable source, style, configuration, domain-data, route, component, or test file instead."
         : undefined;
@@ -1428,12 +1489,23 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         ? "foundry-brief.md is the authoritative saved requirement and cannot be overwritten as generated application output."
         : competingProjectManifestPath
           ? `${competingProjectManifestPath} would create a competing project root beside the established ${establishedProjectManifests.join(", ")}. Repair the existing project in place; do not scaffold a replacement unless the user explicitly requests another project or module.`
+        : generatedOrchestrationArtifactPath
+          ? `${generatedOrchestrationArtifactPath} describes Foundry's own build, verification, provider, scaffold, or progress machinery. Internal orchestration artifacts are never customer application source and cannot be written into a generated project.`
         : generatedBatchDocumentationPath
           ? `${generatedBatchDocumentationPath} is documentation, not the unfinished customer application. Write the coordinated application source first.`
           : generatedBatchMarkerPath
             ? `${generatedBatchMarkerPath} is an internal marker/progress artifact, not customer application source.`
             : undefined;
-      const staticWriteIssue = wrongForcedRequiredPath ?? repeatedGeneratedWriteIssue ?? generatedApplicationRootIssue ?? generatedManifestIssue ?? coordinatedGeneratedWriteIssue ?? protectedGeneratedBriefIssue ?? generatedDocumentationIssue ?? generatedMarkerIssue ?? generatedRecoveryWriteIssue ?? firstStaticArtifactIssue ?? (input.staticProject && call.name === "write_file"
+      // Structural-drift guard: a write whose relative imports point at files that do not exist is not
+      // an implementation — it is an invented parallel structure. Observed live: a repair wrote screens
+      // importing ../src/state/MoodContext while the real module lived at src/context/JournalContext;
+      // typecheck was recorded before the writes, the bundler failed after the mission concluded, and
+      // the app shipped broken. Every import must resolve against the real project (or a file in the
+      // same coordinated batch) BEFORE the write touches disk.
+      const unresolvedImportIssue = ["write_file", "write_files", "replace_in_file"].includes(call.name ?? "")
+        ? await unresolvedRelativeImportIssue(input.access, call.name ?? "", args, generatedMutationPaths).catch(() => undefined)
+        : undefined;
+      const staticWriteIssue = wrongForcedRequiredPath ?? unresolvedImportIssue ?? repeatedGeneratedWriteIssue ?? generatedApplicationRootIssue ?? generatedManifestIssue ?? coordinatedGeneratedWriteIssue ?? protectedGeneratedBriefIssue ?? generatedDocumentationIssue ?? generatedMarkerIssue ?? generatedRecoveryWriteIssue ?? firstStaticArtifactIssue ?? (input.staticProject && call.name === "write_file"
         ? invalidStaticEntryWrite(writePath, String(args.content ?? ""))
         : undefined);
       const evidenceRepairReplacement = typeof args.new_text === "string" ? args.new_text : "";
@@ -1444,10 +1516,15 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         && !/(?:\.primary-nav|#primary-nav|nav(?:[#.][\w-]+)*)\s*\{/i.test(evidenceRepairReplacement)
           ? "The browser proved these navigation links are direct children of the nav and there is no list wrapper. A nav ul/nav ol rule cannot affect this DOM. Target the verified nav container or its direct anchors instead."
           : undefined;
+      const modelOwnedPreviewCommandIssue = !input.commandOnly
+        && call.name === "run_command"
+        && isLongRunningServerCommand(String(args.command ?? ""))
+        ? "Foundry owns preview startup outside the implementation model. Run the canonical finite build/test command instead; a dev or start server cannot count as successful production verification."
+        : undefined;
       let toolResult: unknown;
-      if (staticWriteIssue ?? evidenceRepairWriteIssue) {
-        const rejectedWriteReason = staticWriteIssue ?? evidenceRepairWriteIssue!;
-        await emit("edit", "warning", "Incomplete page write rejected before touching disk", {
+      if (staticWriteIssue ?? evidenceRepairWriteIssue ?? modelOwnedPreviewCommandIssue) {
+        const rejectedWriteReason = staticWriteIssue ?? evidenceRepairWriteIssue ?? modelOwnedPreviewCommandIssue!;
+        await emit(modelOwnedPreviewCommandIssue ? "command" : "edit", "warning", modelOwnedPreviewCommandIssue ? "Model-owned preview command rejected" : "Incomplete page write rejected before touching disk", {
           filePath: String(args.path ?? ""),
           details: { reason: rejectedWriteReason },
         });
@@ -1547,10 +1624,11 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         if (writeResult.skipped === "permission-required") {
           const writePath = typeof args.path === "string" ? args.path : "coordinated project files";
           const requestedAction = writeResult.requestedCommand ?? `write ${writePath}`;
+          const approvalActionKind = writeResult.requestedCommand ? "command" : "write";
           const reason = writeResult.reason ?? "This write needs your approval before Foundry can continue.";
           await emit("blocked", "warning", `Permission needed: ${requestedAction}`, {
             command: requestedAction,
-            details: { reason, category: writeResult.category ?? "unrecognized" },
+            details: { reason, category: writeResult.category ?? "unrecognized", approvalActionKind, approvalTarget: writeResult.requestedCommand ? requestedAction : writePath },
           });
           return finalize("awaiting-approval", `Waiting for your approval to run: ${requestedAction}`, turn, {
             kind: writeResult.requestedCommand ? "command" : "write",
@@ -1633,14 +1711,47 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         && (toolResult as { noOp?: boolean }).noOp
       ) {
         if (input.fastLane && checklist.length <= 1) {
+          // A no-op write proves the model wrote what it intended — not that what it intended satisfies
+          // the request. Treating the two as the same is how a mission declares victory without looking:
+          // it re-wrote the file byte-identically, concluded the work was already done, and returned
+          // "passed" with every checklist item completed while the user's request was untouched.
+          //
+          // So the claim has to be checked against the file as it actually stands. When the request
+          // yields no derivable assertion the verdict is "underivable" rather than "violated", so this
+          // guard stays silent on requests it cannot judge instead of blocking them.
+          const noOpPath = String(args.path ?? "");
+          const currentFile = noOpPath ? await input.access.readFile(noOpPath, { limitBytes: 400_000 }).catch(() => undefined) : undefined;
+          const currentContent = currentFile?.exists ? currentFile.content : undefined;
+          const satisfiedClaim = currentContent === undefined
+            ? { status: "underivable" as const, summary: "", assertions: [] }
+            : complianceVerdict(deriveOutcomeAssertions(input.task, [{ path: noOpPath, before: currentContent, after: currentContent }]));
+
+          if (satisfiedClaim.status === "violated") {
+            const remedy = satisfiedClaim.assertions.map(correctionInstruction).filter(Boolean).join(" ");
+            await emit("edit", "warning", "That write changed nothing and the request is not yet satisfied", {
+              internal: true,
+              details: { reason: satisfiedClaim.summary, rejectedAlreadySatisfiedClaim: true },
+            });
+            conversation.push({
+              role: "user",
+              content: [{
+                type: "text",
+                text: `Your write changed nothing, and the request is NOT already satisfied. Checking the current file contents against the request: ${satisfiedClaim.summary}${remedy ? ` ${remedy}` : ""}\n\nDo not claim this is already done. Read the current file, find the exact content the request refers to, and make a real edit now.`,
+              }],
+            });
+            continue;
+          }
+
           alreadySatisfied = true;
-          const evidence = `${String(args.path ?? "The target file")} already contains the exact requested content; the verified write was a no-op.`;
+          const evidence = satisfiedClaim.status === "satisfied"
+            ? `${noOpPath || "The target file"} already contains the requested content, confirmed against the request: ${satisfiedClaim.summary}`
+            : `${noOpPath || "The target file"} already contains the exact requested content; the verified write was a no-op.`;
           for (const item of checklist) {
             item.status = "completed";
             item.evidence = evidence;
           }
           await emit("summary", "completed", "Request already satisfied", {
-            details: { reason: evidence, alreadySatisfied: true, paidWrapUpCalls: 0 },
+            details: { reason: evidence, alreadySatisfied: true, verifiedAgainstRequest: satisfiedClaim.status === "satisfied", paidWrapUpCalls: 0 },
           });
           return finalize("passed", undefined, turn);
         }
@@ -1672,7 +1783,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           const reason = deleteResult.reason ?? "This delete needs your approval before Foundry can continue.";
           await emit("blocked", "warning", `Permission needed: delete ${deletePath}`, {
             command: `delete ${deletePath}`,
-            details: { reason, category: deleteResult.category ?? "unrecognized" },
+            details: { reason, category: deleteResult.category ?? "unrecognized", approvalActionKind: "delete", approvalTarget: deletePath },
           });
           return finalize("awaiting-approval", `Waiting for your approval to delete: ${deletePath}`, turn, {
             kind: "delete",
@@ -1748,6 +1859,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const tookTooLongReason = ranOutOfTurnsButActuallyDone.reason;
   if (input.continuableBatch) {
     await emit("planning", "completed", "Execution batch complete", { details: { reason: tookTooLongReason, continuation: true } });
+  } else if (input.fastLane && input.requireFirstMutation) {
+    await emit("reasoning", "warning", "Repair pass returned without a verified mutation; the runtime will change strategy using the preserved diagnostic", { details: { reason: exactFailureReason(tookTooLongReason, commands), recoverable: true, terminal: false } });
   } else {
     await emit("summary", "error", "Mission blocked", { details: { reason: exactFailureReason(tookTooLongReason, commands) } });
   }
@@ -2244,7 +2357,7 @@ async function executeTool(
       if (!normalized.length) return { verified: false, reason: "files must contain at least one complete project file." };
       const invalid = normalized.find((file) => !file.path.trim() || /^[./\\]*$/.test(file.path.trim()) || isEmptySourceWrite(file.path, file.content));
       if (invalid) return { verified: false, reason: `Invalid or empty batch file: ${invalid.path || "(blank path)"}.` };
-      const marker = normalized.find((file) => /(?:^|\/)[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe)[^/]*$|\.(?:tmp|log)$/i.test(file.path.replace(/\\/g, "/")));
+      const marker = normalized.find((file) => /(?:^|\/)(?:\.placeholder|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe|noop|marker|fix[-_ ]?(?:placeholder|stub|temp))[^/]*)$|\.(?:tmp|log)$/i.test(file.path.replace(/\\/g, "/")));
       if (marker) return { verified: false, reason: `${marker.path} is an internal marker/progress artifact, not customer application source.` };
       for (const file of normalized.filter((item) => /^(?:package\.json|deno\.json)$/i.test(item.path.split("/").pop() ?? ""))) {
         const before = await access.readFile(file.path, { limitBytes: 200_000 });
@@ -2733,6 +2846,104 @@ function safeJsonParse(value: string): Record<string, unknown> | undefined {
     return JSON.parse(value);
   } catch {
     return undefined;
+  }
+}
+
+const RELATIVE_IMPORT_PATTERN = /(?:from\s+|import\s*\(\s*|require\s*\(\s*)["'](\.\.?\/[^"']+)["']/g;
+const IMPORT_CHECK_EXTENSIONS = /\.(?:ts|tsx|js|jsx|mjs|cjs|vue|svelte)$/i;
+const IMPORT_RESOLUTION_CANDIDATES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", "/index.ts", "/index.tsx", "/index.js", ".json", ".css"];
+
+/** Pure POSIX-style resolution of a relative specifier against the importing file's directory. */
+export function resolveRelativeImport(importerPath: string, specifier: string): string {
+  const parts = importerPath.replace(/\\/g, "/").split("/").slice(0, -1);
+  for (const segment of specifier.replace(/\\/g, "/").split("/")) {
+    if (segment === "." || segment === "") continue;
+    if (segment === "..") parts.pop();
+    else parts.push(segment);
+  }
+  return parts.join("/");
+}
+
+/** Every relative specifier the file imports, deduplicated, capped for cheap checking. */
+export function relativeImportSpecifiers(content: string): string[] {
+  const specifiers = new Set<string>();
+  for (const match of content.matchAll(RELATIVE_IMPORT_PATTERN)) {
+    specifiers.add(match[1]);
+    if (specifiers.size >= 24) break;
+  }
+  return [...specifiers];
+}
+
+/**
+ * Rejects a write whose relative imports resolve to nothing — on disk or in the same coordinated batch.
+ * Returns the exact missing targets so the model corrects the import instead of re-guessing structure.
+ */
+export async function unresolvedRelativeImportIssue(
+  access: ProjectAccess,
+  toolName: string,
+  args: Record<string, unknown>,
+  batchPaths: readonly string[],
+): Promise<string | undefined> {
+  const files: { path: string; content: string }[] = [];
+  if (toolName === "write_files" && Array.isArray(args.files)) {
+    for (const entry of args.files) {
+      if (entry && typeof entry === "object") {
+        const filePath = String((entry as Record<string, unknown>).path ?? "");
+        const content = String((entry as Record<string, unknown>).content ?? "");
+        if (filePath && content) files.push({ path: filePath, content });
+      }
+    }
+  } else {
+    const filePath = String(args.path ?? "");
+    const content = String(args.content ?? args.new_text ?? "");
+    if (filePath && content) files.push({ path: filePath, content });
+  }
+
+  const batch = new Set(batchPaths.filter(Boolean).map((path) => path.toLowerCase()));
+  const missing: string[] = [];
+  for (const file of files) {
+    if (!IMPORT_CHECK_EXTENSIONS.test(file.path)) continue;
+    for (const specifier of relativeImportSpecifiers(file.content)) {
+      const base = resolveRelativeImport(file.path, specifier);
+      let resolves = false;
+      for (const suffix of IMPORT_RESOLUTION_CANDIDATES) {
+        const candidate = `${base}${suffix}`;
+        if (batch.has(candidate.toLowerCase())) { resolves = true; break; }
+        const read = await access.readFile(candidate, { limitBytes: 1 }).catch(() => undefined);
+        if (read?.exists) { resolves = true; break; }
+      }
+      if (!resolves) missing.push(`${file.path} imports "${specifier}" -> no file at ${base} (any known extension)`);
+      if (missing.length >= 6) break;
+    }
+    if (missing.length >= 6) break;
+  }
+  if (!missing.length) return undefined;
+  return `Rejected before touching disk: this write imports modules that DO NOT EXIST in this project — ${missing.join("; ")}. Do not invent a parallel structure. Use list_dir/read_file to find the real module paths that already exist and import those, or create the missing module in the same coordinated write batch.`;
+}
+
+/** One file path, canonicalized to forward-slash project-relative form. An absolute path inside the
+ * project root is stripped to its relative remainder; anything else is returned cleaned but intact. */
+export function canonicalProjectRelativePath(rawPath: string, rootLabel: string): string {
+  const cleaned = rawPath.replace(/\\/g, "/").trim();
+  const root = rootLabel.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (root && cleaned.toLowerCase().startsWith(`${root.toLowerCase()}/`)) {
+    return cleaned.slice(root.length + 1).replace(/^\/+/, "");
+  }
+  if (root && cleaned.toLowerCase() === root.toLowerCase()) return "";
+  return cleaned.replace(/^\.\//, "");
+}
+
+/** Mutates a parsed tool call's path arguments in place — single-file `path` and `write_files` batches —
+ * so every downstream consumer (access, events, changed-file records, the file tree) sees one spelling. */
+function normalizeToolCallPaths(args: Record<string, unknown>, rootLabel: string): void {
+  if (typeof args.path === "string") args.path = canonicalProjectRelativePath(args.path, rootLabel);
+  if (typeof args.cwd === "string") args.cwd = canonicalProjectRelativePath(args.cwd, rootLabel);
+  if (Array.isArray(args.files)) {
+    for (const entry of args.files) {
+      if (entry && typeof entry === "object" && typeof (entry as { path?: unknown }).path === "string") {
+        (entry as { path: string }).path = canonicalProjectRelativePath((entry as { path: string }).path, rootLabel);
+      }
+    }
   }
 }
 

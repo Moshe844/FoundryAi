@@ -77,6 +77,31 @@ const SAFE_COMMAND_PATTERNS: RegExp[] = [
   /\b(Get-NetTCPConnection|Test-NetConnection)\b/i,
 ];
 
+/** Adapter-generated verification commands that are safe to run without widening an entire
+ * executable into the safe list. These patterns are anchored to read/build/test operations, and
+ * shell control operators are rejected so a valid prefix cannot authorize a chained mutation. */
+const SAFE_ADAPTER_VERIFICATION_PATTERNS: RegExp[] = [
+  /^R(?:\.exe)?\s+CMD\s+(?:check|build)\b/i,
+  /^composer(?:\.bat)?\s+validate\b/i,
+  /^bundle(?:\.bat)?\s+exec\s+(?:rubocop|rspec|rails\s+test)\b/i,
+  /^swift\s+(?:build|test)\b/i,
+  /^cmake\s+(?:-S\b|--build\b)/i,
+  /^ctest\s+--test-dir\b/i,
+  /^meson\s+(?:setup|compile|test)\b/i,
+  /^mix\s+(?:format\s+--check-formatted|compile\s+--warnings-as-errors|test)\b/i,
+  /^sbt\s+(?:compile|test)\b/i,
+  /^dart\s+(?:format\s+--output=none|analyze|test)\b/i,
+  /^(?:luacheck|busted)\b/i,
+  /^pwsh(?:\.exe)?\s+-NoProfile\s+-Command\s+Invoke-ScriptAnalyzer\b/i,
+  /^shellcheck\b/i,
+  /^godot(?:\.exe)?\s+--headless\s+--editor\b/i,
+];
+
+function isSafeAdapterVerificationCommand(command: string) {
+  if (/[&|;<>`$\r\n]/.test(command)) return false;
+  return SAFE_ADAPTER_VERIFICATION_PATTERNS.some((pattern) => pattern.test(command));
+}
+
 /**
  * A read-only existence probe the model routinely emits before deciding whether a dependency actually
  * needs installing — e.g. `dir node_modules\pkg 2>nul || echo NOT_FOUND`, `ls node_modules/pkg 2>/dev/null
@@ -124,7 +149,7 @@ export function decideCommandPermission(command: string): CommandPermissionDecis
     return { allowed: false, status: "permission-required", reason: approvalMatch.reason, category: approvalMatch.category };
   }
 
-  if (SAFE_COMMAND_PATTERNS.some((pattern) => pattern.test(trimmed)) || isReadOnlyExistenceProbe(trimmed)) {
+  if (SAFE_COMMAND_PATTERNS.some((pattern) => pattern.test(trimmed)) || isReadOnlyExistenceProbe(trimmed) || isSafeAdapterVerificationCommand(trimmed)) {
     return { allowed: true };
   }
 

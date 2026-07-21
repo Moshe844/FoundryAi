@@ -12,7 +12,7 @@ const EXECUTION_BOUNDARY_PATTERN = /Estimated request cost would exceed|Model-ca
 const NO_PROGRESS_AFTER_MUTATION_PATTERN = /NO_PROGRESS_AFTER_MUTATION/i;
 
 export function nativeAcceptanceBoundaryPolicy(input: {
-  status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval";
+  status: "passed" | "failed" | "stopped" | "awaiting-approval" | "awaiting-mock-approval" | "needs-clarification";
   changedFileCount: number;
   blocker?: string;
   behaviorAcceptanceRequired: boolean;

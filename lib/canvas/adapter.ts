@@ -2,7 +2,7 @@ import type { FactoryExecutionEvent, FactoryProjectResult, MissionClarification 
 import type { ExecutionMission, MissionState, PendingClarification } from "@/lib/mission-engine";
 import { missionStateLabel, pendingApprovalOf, busyMissionStates } from "@/lib/mission/model";
 import type { CanvasBlocking, CanvasMissionVM, CanvasSummary, CanvasSummaryLine } from "@/lib/canvas/model";
-import { groupTimeline, needsRepairAction, outcomeOf, phasesOf, tierOf } from "@/lib/canvas/model";
+import { groupTimeline, hasVerificationConflict, needsRepairAction, outcomeOf, phasesOf, tierOf } from "@/lib/canvas/model";
 import { stripTerminalFormatting } from "@/lib/text/terminal";
 import { customInstructionsFromProjectBrief } from "@/lib/factory/project-brief";
 import { compactEvidenceText } from "@/lib/factory/event-contract";
@@ -161,7 +161,7 @@ export function questionQueueOf(blocking: Extract<CanvasBlocking, { kind: "quest
 
 /** §9: terminal block built only from recorded evidence. */
 function summaryOf(execution: ExecutionMission): CanvasSummary {
-  const heading = execution.state === "complete" ? "Done" : execution.state === "cancelled" ? "Stopped" : execution.state === "blocked" ? "Blocked" : needsRepairAction(execution) ? "Needs repair" : "Failed";
+  const heading = execution.state === "complete" ? "Done" : execution.state === "cancelled" ? "Stopped" : execution.state === "blocked" ? "Blocked" : hasVerificationConflict(execution) ? "Ready to continue" : needsRepairAction(execution) ? "Ready to continue" : "Failed";
 
   const behaviorChanges: CanvasSummaryLine[] = execution.timeline
     .filter((event) => event.tier === "decision" && Boolean(event.rationale?.trim()))
@@ -206,7 +206,7 @@ function summaryOf(execution: ExecutionMission): CanvasSummary {
   const elapsedMs = Number.isFinite(started) && Number.isFinite(ended) && ended > started ? ended - started : undefined;
 
   const outcome = execution.summary ? compactEvidenceText(stripTerminalFormatting(execution.summary)) : undefined;
-  return { heading, verificationStatus: execution.verification_status, outcome, whatChanged, verified, failedChecks, watchFor, elapsedMs };
+  return { heading, verificationStatus: execution.verification_status, outcome, whatChanged, verified, failedChecks, watchFor, elapsedMs, engineeringReport: execution.engineering_report, lifecycle: execution.lifecycle };
 }
 
 function uniqueEvidence(items: string[]): string[] {

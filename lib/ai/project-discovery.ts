@@ -46,6 +46,189 @@ export type ProjectDiscoveryResult = {
   futureCapabilities: string[];
 };
 
+/** Returns the technology the user explicitly named, without inferring a different stack. */
+export function explicitStackFromPrompt(prompt: string): string | undefined {
+  const choices: Array<[RegExp, string]> = [
+    [/\b(?:plain|static|vanilla)\s+html\b[^.\n]{0,40}\bcss\b[^.\n]{0,40}\b(?:javascript|java\s*script|js)\b|\bhtml\s*(?:\+|\/|,|and)\s*css\s*(?:\+|\/|,|and)\s*(?:javascript|java\s*script|js)\b/i, "Static HTML + CSS + JavaScript"],
+    [/\bnext\.?js\b[^.\n]{0,40}\btypescript\b|\btypescript\b[^.\n]{0,40}\bnext\.?js\b/i, "Next.js + TypeScript"],
+    [/\b(?:vite\s*(?:\+|\/|and|with)?\s*)?react\b[^.\n]{0,40}\btypescript\b|\btypescript\b[^.\n]{0,40}\breact\b[^.\n]{0,25}\bvite\b/i, "Vite + React + TypeScript"],
+    [/\bvue\b[^.\n]{0,40}\btypescript\b/i, "Vue + TypeScript"],
+    [/\bsveltekit\b[^.\n]{0,40}\btypescript\b/i, "SvelteKit + TypeScript"],
+    [/\bastro\b[^.\n]{0,40}\btypescript\b/i, "Astro + TypeScript"],
+    [/\bnode\.?js\b[^.\n]{0,40}\bexpress\b[^.\n]{0,40}\btypescript\b|\bexpress\b[^.\n]{0,40}\btypescript\b/i, "Node.js + Express + TypeScript"],
+    [/\bpython\b[^.\n]{0,30}\bfastapi\b|\bfastapi\b/i, "Python + FastAPI"],
+    [/\bpython\b[^.\n]{0,30}\bdjango\b|\bdjango\b/i, "Python + Django"],
+    [/\basp\.?net\s+core\b|\b\.net\s+(?:web\s+)?api\b/i, "ASP.NET Core"],
+    [/\b\.net\s+wpf\b|\bwpf\b/i, ".NET WPF"],
+    [/\breact\s+native\b[^.\n]{0,25}\bexpo\b|\bexpo\b[^.\n]{0,25}\breact\s+native\b/i, "React Native + Expo"],
+    [/\belectron\b[^.\n]{0,30}\breact\b/i, "Electron + React + TypeScript"],
+    [/\btauri\b[^.\n]{0,30}\breact\b/i, "Tauri + React + TypeScript"],
+    [/\bphaser\b[^.\n]{0,30}\btypescript\b/i, "Phaser + TypeScript"],
+    [/\bgodot\b/i, "Godot"],
+    [/\bunity\b/i, "Unity"],
+  ];
+  return choices.find(([pattern]) => pattern.test(prompt))?.[1];
+}
+
+export function explicitPlatformFromPrompt(prompt: string): string | undefined {
+  if (/\b(?:static|plain|vanilla)\s+(?:web|website|site|html)|\bbrowser(?:-based)?\b|\bweb\s+(?:app|application|site|website|dashboard)\b/i.test(prompt)) return "Web app";
+  if (/\bdesktop\s+(?:app|application)|\bwindows\s+(?:app|application)|\bmacos\s+(?:app|application)\b/i.test(prompt)) return "Desktop app";
+  if (/\bmobile\s+(?:app|application)|\bios\s+(?:app|application)|\bandroid\s+(?:app|application)\b/i.test(prompt)) return "Mobile app";
+  if (/\b(?:backend|server-only|microservice|rest\s+api|web\s+api|api\s+(?:service|server))\b/i.test(prompt)) return "Backend service";
+  if (/\b(?:browser\s+game|web\s+game|desktop\s+game|mobile\s+game|game)\b/i.test(prompt)) return "Game";
+  return undefined;
+}
+
+/** Returns a datastore explicitly selected by the user. It is a build constraint, not a suggestion. */
+export function explicitPersistenceFromPrompt(prompt: string): string | undefined {
+  const choices: Array<[RegExp, string]> = [
+    [/\bpostgres(?:ql)?\b/i, "PostgreSQL"],
+    [/\bmysql\b/i, "MySQL"],
+    [/\bsql\s+server\b|\bmssql\b/i, "SQL Server"],
+    [/\bsqlite\b/i, "SQLite"],
+    [/\bmongo(?:db)?\b/i, "MongoDB"],
+    [/\bsupabase\b/i, "Supabase"],
+    [/\b(?:localstorage|local storage)\b/i, "localStorage"],
+  ];
+  return choices.find(([pattern]) => pattern.test(prompt))?.[1];
+}
+
+function normalizedBriefItem(value: string): string {
+  const clean = value
+    .replace(/^\s*(?:and|or)\s+/i, "")
+    .replace(/^\s*(?:include|including|with|plus)\s+/i, "")
+    .replace(/[.;,:]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean ? clean.charAt(0).toUpperCase() + clean.slice(1) : "";
+}
+
+/** Extracts user-named product capabilities without relying on a project-specific catalogue. */
+export function explicitFeaturesFromPrompt(prompt: string): string[] {
+  const signal = /\b(?:acceptance|accessible|assign|assignment|audit|build|cancel|complete|completion|create|dashboard|delete|deploy|edit|empty|error|feedback|filter|health|history|import|integration tests?|kpis?|loading|migration|navigation|optimistic|overdue|permissions?|preventive|responsive|roles?|schedule|search|seeded|service|sort|status|test|typecheck|update|validation|workflow)\b/i;
+  const clauses = prompt
+    .replace(/\r/g, "")
+    .split(/(?:\n+|[.;]\s+|,\s*)/)
+    .map(normalizedBriefItem)
+    .filter((clause) => clause.length >= 4 && clause.length <= 180)
+    .filter((clause) => signal.test(clause))
+    .filter((clause) => !/^build\s+[^.]{0,100}\b(?:using|with)\b/i.test(clause));
+  return Array.from(new Map(clauses.map((clause) => [clause.toLowerCase(), clause])).values()).slice(0, 24);
+}
+
+function singularEntity(value: string): string {
+  const clean = value
+    .replace(/^(?:a|an|the|their|its|and)\s+/i, "")
+    .replace(/\b(?:records?|models?|entities?)$/i, "")
+    .replace(/ies$/i, "y")
+    .replace(/(?<!s)s$/i, "")
+    .trim();
+  return clean ? clean.split(/\s+/).map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(" ") : "";
+}
+
+/** Extracts explicitly enumerated domain nouns such as "organizations contain sites, assets, and work orders". */
+export function explicitEntitiesFromPrompt(prompt: string): string[] {
+  const candidates: string[] = [];
+  for (const match of prompt.matchAll(/\b([a-z][a-z -]{1,40}?)\s+(?:contain|contains|has|have|includes?|comprises?)\s+([^.!?\n]{3,220})/gi)) {
+    candidates.push(match[1]);
+    candidates.push(...match[2].split(/\s*,\s*|\s+and\s+/i));
+  }
+  for (const match of prompt.matchAll(/\b([a-z][a-z-]{2,})\s+(?:tables?|details?|records?|history|flows?)\b/gi)) {
+    candidates.push(match[1]);
+  }
+  if (/\b(?:role permissions?|role-based|role-aware|roles?\s+for)\b/i.test(prompt)) candidates.push("Role");
+  const ignored = /^(?:And|Core|Create|Data|Edit|Filterable|Immutable|Migration Ready|Realistic|Searchable|Service|Status|Unit|Integration|Browser Acceptance)$/i;
+  return Array.from(new Map(candidates
+    .map(singularEntity)
+    .filter((entity) => entity.length >= 3 && entity.length <= 50 && !ignored.test(entity))
+    .map((entity) => [entity.toLowerCase(), entity])).values()).slice(0, 16);
+}
+
+/** Re-applies explicit brief facts after model refinement so a lossy response cannot weaken the contract. */
+export function reconcileDiscoveryWithExplicitBrief(discovery: ProjectDiscoveryResult, prompt: string): ProjectDiscoveryResult {
+  const features = explicitFeaturesFromPrompt(prompt);
+  const entities = explicitEntitiesFromPrompt(prompt);
+  const persistence = explicitPersistenceFromPrompt(prompt);
+  const canonical = (item: string) => item.toLowerCase().replace(/^(?:and|also)\s+/, "").replace(/[^a-z0-9]+/g, " ").trim();
+  const merge = (explicit: string[], proposed: string[]) => {
+    const merged: string[] = [];
+    for (const item of [...explicit, ...proposed]) {
+      const key = canonical(item);
+      if (!key || merged.some((existing) => {
+        const existingKey = canonical(existing);
+        return existingKey === key || (existingKey.length >= 12 && key.length >= 12 && (existingKey.includes(key) || key.includes(existingKey)));
+      })) continue;
+      merged.push(item);
+    }
+    return merged;
+  };
+  const mainFeatures = merge(features, discovery.mainFeatures);
+  const dataModel = merge(entities, discovery.dataModel);
+  const decisions = discovery.decisions.map((item) => {
+    if (item.dimension === "features" && features.length) return { ...item, hypothesis: mainFeatures.join(", "), confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined };
+    if (item.dimension === "data-shape" && entities.length) return { ...item, hypothesis: dataModel.join(", "), confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined };
+    if (item.dimension === "auth-database-api" && persistence) return { ...item, hypothesis: `${persistence} persistence with replaceable repository and migration boundaries`, confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined };
+    return item;
+  });
+  const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
+  const keyFacts = persistence
+    ? merge([`${persistence} persistence`], discovery.keyFacts.filter((fact) => !/\b(?:database later|local-first|sqlite|postgres(?:ql)?|mysql|mongodb|supabase)\b/i.test(fact)))
+    : discovery.keyFacts;
+  const futureCapabilities = persistence
+    ? discovery.futureCapabilities.filter((item) => !/\b(?:real database|add a database|database once|postgres(?:ql)? later)\b/i.test(item))
+    : discovery.futureCapabilities;
+  return { ...discovery, mainFeatures, dataModel, decisions, questions, assumptions, keyFacts, futureCapabilities };
+}
+
+export type UserProductSignal = { productSignal: string; starterTitle?: string };
+
+/** Preserves user-selected product scope without relying on a product-specific catalogue. */
+export function reconcileDiscoveryWithUserProductSignal(
+  discovery: ProjectDiscoveryResult,
+  { productSignal, starterTitle }: UserProductSignal,
+): ProjectDiscoveryResult {
+  const signal = productSignal.replace(/\s+/g, " ").trim();
+  if (!signal || /^(?:other\s*\/?\s*custom|other|general|custom|none|misc(?:ellaneous)?)$/i.test(signal)) return discovery;
+
+  const platformWords = /\b(?:ios|android|mobile|desktop|web|website|app|application|game|api|service)\b/gi;
+  const concepts = signal.split(/\s*[,;]\s*|\s+and\s+/i)
+    .map((part) => normalizedBriefItem(part.replace(platformWords, " ")))
+    .filter((part) => part.length >= 3)
+    .slice(0, 12);
+  if (!concepts.length) return discovery;
+
+  const canonical = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const merge = (authoritative: string[], proposed: string[]) => Array.from(new Map(
+    [...authoritative, ...proposed].filter(Boolean).map((item) => [canonical(item), item]),
+  ).values());
+  const mainFeatures = merge(concepts, discovery.mainFeatures.filter((item) => !/^(?:home\/?dashboard screen|primary workflow(?: with offline-first state)?|core workflow|main workflow)$/i.test(item.trim())));
+  const dataModel = merge(concepts.map(singularEntity).filter(Boolean), discovery.dataModel.filter((item) => !/^(?:item\/?record|activity\/?event|resource|record|entity)$/i.test(item.trim())));
+  const architecture = canonical(discovery.architecture).includes(canonical(signal))
+    ? discovery.architecture
+    : `${signal} built with ${discovery.recommendedStack}, organized around ${concepts.join(", ")}. ${discovery.architecture}`.trim();
+  const decisions = discovery.decisions.map((item) => {
+    if (item.dimension === "domain") return { ...item, hypothesis: signal, confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The product scope comes directly from the user's selected subtype.", question: undefined };
+    if (item.dimension === "features") return { ...item, hypothesis: mainFeatures.join(", "), confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The leading capabilities preserve the user's selected product concepts.", question: undefined };
+    if (item.dimension === "data-shape") return { ...item, hypothesis: dataModel.join(", "), confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The primary entities are derived from the user's selected product concepts.", question: undefined };
+    if (item.dimension === "architecture") return { ...item, hypothesis: architecture, confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The architecture is anchored to the selected product scope and starter stack.", question: undefined };
+    return item;
+  });
+  const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
+  const keyFacts = merge([`User-selected product scope: ${signal}`], discovery.keyFacts.filter((fact) => !/^user-selected product scope:/i.test(fact)));
+  return {
+    ...discovery,
+    prompt: [signal, starterTitle, discovery.prompt].filter(Boolean).join(". "),
+    projectType: signal,
+    architecture,
+    mainFeatures,
+    dataModel,
+    decisions,
+    questions,
+    assumptions,
+    keyFacts,
+  };
+}
+
 type SignalProfile = {
   id: string;
   label: string;
@@ -323,7 +506,16 @@ export function discoverProject(prompt: string): ProjectDiscoveryResult {
   const normalized = prompt.trim();
   const profile = chooseProfile(normalized);
   const ambiguity = ambiguityScore(normalized, profile);
-  const baseConfidence = profile ? Math.max(42, 92 - ambiguity) : Math.max(25, 48 - ambiguity);
+  const words = normalized.split(/\s+/).filter(Boolean).length;
+  const explicitSignals = [
+    explicitStackFromPrompt(normalized),
+    explicitPlatformFromPrompt(normalized),
+    /\b(?:include|including|must|needs?|features?|requirements?)\b/i.test(normalized) ? "requirements" : undefined,
+    /\b(?:database|prisma|sqlite|postgres|mysql|auth|login|api|localstorage|local storage)\b/i.test(normalized) ? "data" : undefined,
+  ].filter(Boolean).length;
+  const measuredSpecificity = Math.floor(words / 3) + explicitSignals * 9;
+  const customSpecificity = Math.min(46, explicitStackFromPrompt(normalized) && words >= 14 ? Math.max(40, measuredSpecificity) : measuredSpecificity);
+  const baseConfidence = profile ? Math.max(42, 92 - ambiguity) : Math.max(25, Math.min(94, 48 + customSpecificity - ambiguity));
   const fallback = defaultProfile(normalized);
   const selected = profile ?? fallback;
 
@@ -342,7 +534,7 @@ export function discoverProject(prompt: string): ProjectDiscoveryResult {
 
   const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
 
-  return {
+  return reconcileDiscoveryWithExplicitBrief({
     prompt: normalized,
     projectType: selected.label,
     recommendedStack: selected.stack,
@@ -355,7 +547,7 @@ export function discoverProject(prompt: string): ProjectDiscoveryResult {
     decisions,
     keyFacts: keyFactsFor(selected, normalized),
     futureCapabilities: selected.growth,
-  };
+  }, normalized);
 }
 
 function chooseProfile(prompt: string) {
@@ -381,20 +573,47 @@ function chooseProfile(prompt: string) {
 
 function defaultProfile(prompt: string): SignalProfile {
   const label = deriveTarget(prompt);
+  const explicitStack = explicitStackFromPrompt(prompt);
+  const explicitPlatform = explicitPlatformFromPrompt(prompt);
+  const featureClauses = prompt
+    .replace(/\r/g, "")
+    .split(/(?:\n\s*[-*\u2022]?\s*|[.;]\s*|,\s*)/i)
+    .map((clause) => clause.replace(/^.*?\b(?:include|including|features?|must|needs?|should)\b\s*:?[ ]*/i, "").trim())
+    .filter((clause) => clause.length >= 5 && clause.length <= 120)
+    .filter((clause) => /\b(?:add|allow|calendar|create|dashboard|delete|edit|filter|form|import|manage|pin|report|search|show|support|track|update|workflow)\b/i.test(clause))
+    .slice(0, 10)
+    .map((clause) => clause.charAt(0).toUpperCase() + clause.slice(1).replace(/[.,;:]$/, ""));
+  const meaningfulFeatureClauses = featureClauses.length > 1
+    ? featureClauses.filter((clause) => !/^create\b[^.]{0,80}\b(?:app|application|website|service|project)\b/i.test(clause))
+    : featureClauses;
+  const features = meaningfulFeatureClauses.length
+    ? Array.from(new Set(meaningfulFeatureClauses))
+    : ["Primary workspace", "Core create/edit workflow", "List/detail view", "Settings or configuration area"];
+  const platform = explicitPlatform ?? (/\b(?:fastapi|express|asp\.?net|api)\b/i.test(explicitStack ?? "") ? "Backend service" : "Web app");
+  const architecture = explicitStack
+    ? `${explicitStack} project organized around the requested workflows, with typed domain boundaries where the stack supports them and a runnable build, test, and preview path.`
+    : "Application with an editable first version, explicit domain boundaries, and a runnable verification path; persistence and integrations remain clean seams until the brief requires them.";
+  const actionEntities = Array.from(prompt.matchAll(/\b(?:add|create|delete|edit|filter|find|manage|pin|schedule|search|show|track|update|cancel)(?:\s*\/\s*(?:add|create|delete|edit|filter|find|manage|pin|schedule|search|show|track|update|cancel))*\s+(?:a|an|new|the|their)?\s*([a-z][a-z-]{2,})/gi)).map((match) => match[1]);
+  const surfaceEntities = Array.from(prompt.matchAll(/\b([a-z][a-z-]{2,})\s+(?:table|detail|records?|flows?|catalog|directory|history|search|filters?)\b/gi)).map((match) => match[1]);
+  const entityCandidates = [...actionEntities, ...surfaceEntities]
+    .map((entity) => entity.replace(/ies$/i, "y").replace(/s$/i, ""))
+    .filter((entity) => !/^(?:and|app|application|business|data|detail|favorite|filter|logic|medium-complexity|new|project|state|statu|status|with|workflow)$/i.test(entity))
+    .map((entity) => entity.charAt(0).toUpperCase() + entity.slice(1).toLowerCase());
+  const entities = Array.from(new Set(entityCandidates)).slice(0, 8);
   return {
     id: "custom",
     label,
     patterns: [],
-    stack: "Next.js",
-    architecture: "Web app with a simple, editable first version and room to add backend/persistence once the workflow is clear.",
-    architectureRationale: "Starting simple and leaving the persistence layer as a clean seam avoids locking in a database decision before the real workflow is clear.",
+    stack: explicitStack ?? "Next.js + TypeScript",
+    architecture,
+    architectureRationale: explicitStack ? "The user named the implementation stack, so discovery preserves it and plans verification around its native toolchain." : "A runnable, testable boundary avoids locking in technology the user did not request.",
     style: "Clean, practical product UI until a stronger brand or audience signal is provided.",
     styleRationale: "Without a stronger signal on brand or audience, a clean neutral baseline is safer to build on than guessing at a specific aesthetic.",
-    features: ["Primary workspace", "Core create/edit workflow", "List/detail view", "Settings or configuration area"],
-    entities: ["Item", "User", "Record"],
+    features,
+    entities: entities.length ? entities : ["Item", "User", "Record"],
     users: "The target users are not specific yet.",
-    platform: "Web app",
-    complexity: "Ambiguous tool/product",
+    platform,
+    complexity: features.length >= 6 || /\b(?:production-ready|multi-tenant|roles?|permissions?|audit|integration|prisma|database)\b/i.test(prompt) ? "Feature-rich production application" : "Focused custom application",
     growth: ["A real database once the data model stabilizes", "User accounts and permissions", "Usage analytics", "Integrations with other tools you rely on"],
   };
 }
@@ -455,11 +674,12 @@ function ambiguityScore(prompt: string, profile?: SignalProfile) {
   const words = prompt.toLowerCase().split(/\s+/).filter(Boolean);
   const vague = /\b(tool|app|thing|system|platform|software|project)\b/i.test(prompt) && words.length <= 6;
   const veryShort = words.length <= 4;
-  return 24 + (vague ? 28 : 0) + (veryShort ? 14 : 0);
+  const detailed = words.length >= 18 || Boolean(explicitStackFromPrompt(prompt)) || /\b(?:include|including|must|needs?|requirements?|features?)\b/i.test(prompt);
+  return (detailed ? 0 : 24) + (vague ? 28 : 0) + (veryShort ? 14 : 0);
 }
 
 function authConfidence(prompt: string, profile: SignalProfile) {
-  if (/\b(login|auth|account|user accounts?|database|db|api|backend|server|persist|save data|payments?|checkout)\b/i.test(prompt)) return 92;
+  if (/\b(login|auth|account|user accounts?|database|db|api|backend|server|persist|save data|local\s*storage|localstorage|payments?|checkout|prisma|postgres(?:ql)?|mysql|sqlite|mongodb)\b/i.test(prompt)) return 92;
   // A recognized domain profile is enough for Foundry to commit to a sensible default
   // without asking — only a genuinely unmatched (custom) domain stays uncertain here.
   if (profile.id === "custom") return 58;
@@ -467,13 +687,15 @@ function authConfidence(prompt: string, profile: SignalProfile) {
 }
 
 function authSource(prompt: string): DiscoverySource {
-  return /\b(login|auth|account|database|api|backend|server|persist|save data)\b/i.test(prompt) ? "observed" : "defaulted";
+  return /\b(login|auth|account|database|api|backend|server|persist|save data|local\s*storage|localstorage|prisma|postgres(?:ql)?|mysql|sqlite|mongodb)\b/i.test(prompt) ? "observed" : "defaulted";
 }
 
 function authDataApiFor(prompt: string, profile: SignalProfile) {
   if (profile.id === "auth-page") return "Email/password plus Google and GitHub OAuth, JWT sessions in httpOnly cookies, and a password-reset flow with expiring tokens.";
+  if (/\b(?:pax|poslink|payment terminal|licensed sdk|sandbox transaction|do not simulate (?:hardware|payments?))\b/i.test(prompt)) return "Durable local catalog/cart state plus a real licensed terminal-SDK boundary; payment, device discovery, and transaction outcomes must be verified rather than mocked.";
   if (/\b(login|auth|account)\b/i.test(prompt)) return "Account/auth-ready UI wired to a real session model, not just a static form.";
-  if (/\b(database|db|persist|save data)\b/i.test(prompt)) return "A persistent data boundary (typed models, migration-ready) rather than local-only state.";
+  if (/\b(?:local\s*storage|localstorage)\b/i.test(prompt)) return "Browser-local persistence for the first version, with serialization isolated from the UI so it can be replaced by a service later.";
+  if (/\b(database|db|persist|save data|prisma|postgres(?:ql)?|mysql|sqlite|mongodb)\b/i.test(prompt)) return "A persistent data boundary (typed models, migration-ready) rather than local-only state.";
   if (/\b(api|backend|server)\b/i.test(prompt)) return "An explicit API/backend boundary with validated request/response contracts.";
   if (profile.id === "inventory" || profile.id === "commerce" || profile.id === "dashboard") return "Start with local/mock data and keep the database/auth/API seams explicit so they're easy to wire in later.";
   return "Local state/mock data for the first version, with clear seams for a real database or auth once needed.";
@@ -487,8 +709,21 @@ function navigationFor(profile: SignalProfile) {
   return "Dashboard/home, list/table, detail/edit, settings.";
 }
 
+export function explicitProjectNameFromPrompt(prompt: string): string | undefined {
+  const named = prompt.match(/\b(?:called|named)\s+["']?([A-Za-z0-9][A-Za-z0-9 _-]{1,79}?)["']?(?=[.,;]|\s+(?:using|with|that|which)\b|$)/i)?.[1];
+  const buildAs = prompt.match(/^\s*(?:build|create|make|develop)\s+(?:me\s+)?["']?(.{2,80}?)["']?\s+(?:as|using|with)\b/i)?.[1];
+  const value = (named || buildAs)?.replace(/\s+/g, " ").trim();
+  if (!value || value.split(/\s+/).length > 8) return undefined;
+  return value;
+}
+
 function deriveTarget(prompt: string) {
-  const target = prompt
+  const explicitName = explicitProjectNameFromPrompt(prompt);
+  if (explicitName) return explicitName;
+  const primary = prompt
+    .split(/(?:\n|[.!?]\s+|\b(?:using|built with|in)\s+(?:plain |static |vanilla )?(?:html|react|next\.?js|vue|svelte|astro|node|python|\.net)|\b(?:include|including|features?|must|needs?|with support for)\b)/i, 1)[0]
+    ?.slice(0, 100) ?? prompt;
+  const target = primary
     .replace(/\b(build|create|make|me|please|a|an|the|new|project|app|software)\b/gi, " ")
     .replace(/[^\w\s/-]/g, " ")
     .replace(/\s+/g, " ")

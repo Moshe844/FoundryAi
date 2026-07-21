@@ -1,10 +1,14 @@
 import { NextResponse } from "next/server";
-import { getPreviewStatus, launchDesktopPreview, refreshPreviewForProject, stopPreviewForProject } from "@/lib/factory/runtime";
+import { getPreviewStatus, launchAndroidPreview, launchDesktopPreview, refreshPreviewForProject, stopPreviewForProject } from "@/lib/factory/runtime";
+import { captureAndroidEmulatorFrame, sendAndroidEmulatorTap } from "@/lib/factory/android-emulator";
 
 type PreviewRequest = {
   projectId?: string;
   projectPath?: string;
-  action?: "status" | "stop" | "launch-desktop" | "refresh";
+  action?: "status" | "stop" | "launch-desktop" | "launch-android" | "android-frame" | "android-tap" | "refresh";
+  serial?: string;
+  x?: number;
+  y?: number;
   localConnector?: {
     url?: string;
     token?: string;
@@ -25,6 +29,21 @@ export async function POST(request: Request) {
 
   if (body.action === "launch-desktop") {
     const result = await launchDesktopPreview(body.projectId, body.projectPath);
+    return NextResponse.json(result, { status: result.ok ? 200 : 409 });
+  }
+
+  if (body.action === "launch-android") {
+    const result = await launchAndroidPreview(body.projectId, body.projectPath);
+    return NextResponse.json(result, { status: result.ok ? 200 : 409 });
+  }
+
+  if (body.action === "android-frame") {
+    const result = captureAndroidEmulatorFrame(body.serial);
+    return NextResponse.json(result, { status: result.ok ? 200 : 409 });
+  }
+
+  if (body.action === "android-tap") {
+    const result = sendAndroidEmulatorTap(Number(body.x), Number(body.y), body.serial);
     return NextResponse.json(result, { status: result.ok ? 200 : 409 });
   }
 

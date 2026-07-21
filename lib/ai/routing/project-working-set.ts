@@ -33,8 +33,12 @@ export async function discoverProjectWorkingSet(access: ProjectAccess, task: str
         return found;
       }))).flat()
     : [];
-  const sourceHits = hits.filter((hit) => !GENERATED_PATH_PATTERN.test(hit.path.replace(/\\/g, "/")));
-  const behavioralTask = /\b(?:click|button|form|upload|process|interaction|handler|submit|navigate|open|close|enable|disable)\b/i.test(task);
+  const sourceHits = hits.filter((hit) => {
+    const normalized = hit.path.replace(/\\/g, "/");
+    return !GENERATED_PATH_PATTERN.test(normalized)
+      && !/(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|[^/]+\.tsbuildinfo)$/i.test(normalized);
+  });
+  const behavioralTask = /\b(?:click|button|form|upload|process|interaction|handler|submit|navigate|open|close|enable|disable|search|filter|sort|pagination|toggle)\b/i.test(task);
   const hitCounts = new Map<string, { count: number; first: number }>();
   sourceHits.forEach((hit, index) => {
     const current = hitCounts.get(hit.path);

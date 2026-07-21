@@ -130,6 +130,27 @@ const safeCommandPatterns = [
   /\b(node|python|python3|py|ruby|php|java|go|cargo|dotnet|mvn|gradle|pytest|vitest|jest|tsc|eslint|next|vite|astro|svelte-kit)\b/i,
   /\bgit\s+(?:status|log|diff|show|rev-parse|blame|shortlog|describe|ls-files|remote(?:\s+-v)?)\b/i,
 ];
+const safeAdapterVerificationPatterns = [
+  /^R(?:\.exe)?\s+CMD\s+(?:check|build)\b/i,
+  /^composer(?:\.bat)?\s+validate\b/i,
+  /^bundle(?:\.bat)?\s+exec\s+(?:rubocop|rspec|rails\s+test)\b/i,
+  /^swift\s+(?:build|test)\b/i,
+  /^cmake\s+(?:-S\b|--build\b)/i,
+  /^ctest\s+--test-dir\b/i,
+  /^meson\s+(?:setup|compile|test)\b/i,
+  /^mix\s+(?:format\s+--check-formatted|compile\s+--warnings-as-errors|test)\b/i,
+  /^sbt\s+(?:compile|test)\b/i,
+  /^dart\s+(?:format\s+--output=none|analyze|test)\b/i,
+  /^(?:luacheck|busted)\b/i,
+  /^pwsh(?:\.exe)?\s+-NoProfile\s+-Command\s+Invoke-ScriptAnalyzer\b/i,
+  /^shellcheck\b/i,
+  /^godot(?:\.exe)?\s+--headless\s+--editor\b/i,
+];
+
+function isSafeAdapterVerificationCommand(command) {
+  if (/[&|;<>`$\r\n]/.test(command)) return false;
+  return safeAdapterVerificationPatterns.some((pattern) => pattern.test(command));
+}
 
 function send(res, status, body) {
   res.writeHead(status, {
@@ -391,7 +412,7 @@ function decideCommandPermission(command) {
   }
   const approvalMatch = permissionRequiredCommandPatterns.find((entry) => entry.pattern.test(trimmed));
   if (approvalMatch) return { allowed: false, status: "permission-required", reason: approvalMatch.reason, category: approvalMatch.category };
-  if (safeCommandPatterns.some((pattern) => pattern.test(trimmed)) || isReadOnlyExistenceProbe(trimmed)) return { allowed: true };
+  if (safeCommandPatterns.some((pattern) => pattern.test(trimmed)) || isReadOnlyExistenceProbe(trimmed) || isSafeAdapterVerificationCommand(trimmed)) return { allowed: true };
   return { allowed: false, status: "permission-required", reason: "Foundry needs approval before running an unrecognized local command.", category: "unrecognized" };
 }
 
@@ -693,9 +714,15 @@ async function detectedPreviewCommand(fullPath) {
   try {
     const pkg = JSON.parse(await fsp.readFile(pkgPath, "utf8"));
     const scripts = pkg.scripts || {};
-    if (scripts.dev) return "npm run dev";
-    if (scripts.start) return "npm start";
-    if (scripts.preview) return "npm run preview";
+    if (scripts.dev) return { kind: "npm", script: "dev", display: "npm run dev" };
+    if (scripts.start) return { kind: "npm", script: "start", display: "npm start" };
+    if (scripts.preview) return { kind: "npm", script: "preview", display: "npm run preview" };
+    const declaresNext = Boolean(pkg.dependencies?.next || pkg.devDependencies?.next);
+    const nextCli = path.join(fullPath, "node_modules", "next", "dist", "bin", "next");
+    if (declaresNext && fs.existsSync(nextCli)) {
+      const built = fs.existsSync(path.join(fullPath, ".next", "BUILD_ID"));
+      return { kind: "next-cli", cliPath: nextCli, mode: built ? "start" : "dev", display: `node node_modules/next/dist/bin/next ${built ? "start" : "dev"}` };
+    }
     return undefined;
   } catch {
     return undefined;
@@ -712,16 +739,87 @@ function processIsRunning(pid) {
   }
 }
 
-function findEntryHtmlFile(fullPath) {
-  try {
-    const entries = fs.readdirSync(fullPath);
-    return entries.find((name) => name.toLowerCase() === "index.html") || entries.find((name) => name.toLowerCase().endsWith(".html"));
-  } catch {
-    return undefined;
+function findEntryHtmlFile(fullPath, preferredEntries = []) {
+  const ignored = /^(?:node_modules|\.git|\.next|\.foundry-artifacts|\.foundry-data|coverage|dist|build|out|vendor|bin|obj)$/i;
+  const queue = [{ absolute: fullPath, relative: "", depth: 0 }];
+  const candidates = [];
+  let visited = 0;
+  while (queue.length && visited < 2_000) {
+    const current = queue.shift();
+    visited += 1;
+    let entries = [];
+    try { entries = fs.readdirSync(current.absolute, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const relative = current.relative ? `${current.relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory() && current.depth < 20 && !ignored.test(entry.name)) {
+        queue.push({ absolute: path.join(current.absolute, entry.name), relative, depth: current.depth + 1 });
+      } else if (entry.isFile() && /\.html?$/i.test(entry.name)) {
+        candidates.push({ path: relative.replace(/\\/g, "/"), score: current.depth * 10 + (/^index\.html?$/i.test(entry.name) ? 0 : 1) });
+      }
+    }
   }
+  const byNormalizedPath = new Map(candidates.map((candidate) => [candidate.path.toLowerCase(), candidate.path]));
+  for (const preferred of preferredEntries) {
+    const normalized = String(preferred).replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+    const exact = byNormalizedPath.get(normalized);
+    if (exact) return exact;
+  }
+  return candidates.sort((left, right) => left.score - right.score || left.path.localeCompare(right.path))[0]?.path;
 }
 
-async function startPreview(root, relativePath, command) {
+function safeInjectedEnvironment(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(key) || typeof item !== "string" || item.length > 32768) continue;
+    result[key] = item;
+  }
+  return result;
+}
+
+async function testIntegrationProbe(probe) {
+  try {
+    const url = new URL(String(probe?.url || ""));
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(url.hostname))) {
+      return { ok: false, status: "failed", message: "The Local Agent refused a non-TLS remote integration probe." };
+    }
+    const method = String(probe?.method || "GET").toUpperCase();
+    if (!["GET", "POST", "PUT", "DELETE", "HEAD"].includes(method)) return { ok: false, status: "failed", message: "The integration probe method is not allowed." };
+    const headers = {};
+    for (const [key, value] of Object.entries(probe?.headers || {})) if (/^[a-z0-9-]{1,80}$/i.test(key) && typeof value === "string" && value.length <= 32768) headers[key] = value;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch(url, { method, headers, body: ["GET", "HEAD"].includes(method) ? undefined : String(probe?.body || ""), signal: controller.signal });
+      return response.ok
+        ? { ok: true, status: "configured", message: "Authentication succeeded from the Local Agent network." }
+        : { ok: false, status: response.status === 401 ? "revoked" : "failed", message: `The provider rejected the Local Agent probe (HTTP ${response.status}).` };
+    } finally { clearTimeout(timer); }
+  } catch { return { ok: false, status: "failed", message: "The Local Agent could not reach the provider. Check network, TLS, and proxy settings." }; }
+}
+
+function discoverPaymentDevices() {
+  try {
+    if (process.platform === "win32") {
+      const script = "Get-PnpDevice -PresentOnly | Where-Object { $_.Class -in @('USB','Ports','Bluetooth','SmartCardReader') } | Select-Object FriendlyName,InstanceId,Status | ConvertTo-Json -Compress";
+      const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true, timeout: 10000 });
+      const parsed = JSON.parse(result.stdout || "[]");
+      return (Array.isArray(parsed) ? parsed : [parsed]).map(item => ({ name: String(item.FriendlyName || "Unknown device"), id: String(item.InstanceId || ""), status: String(item.Status || "Unknown") })).slice(0, 200);
+    }
+    if (process.platform === "darwin") {
+      const result = spawnSync("system_profiler", ["SPUSBDataType", "-json"], { encoding: "utf8", timeout: 10000 });
+      const data = JSON.parse(result.stdout || "{}");
+      const output = [];
+      const walk = value => { if (!value || typeof value !== "object") return; if (value._name) output.push({ name: String(value._name), id: String(value.vendor_id || value.serial_num || ""), status: "Present" }); for (const child of Object.values(value)) if (typeof child === "object") walk(child); };
+      walk(data); return output.slice(0, 200);
+    }
+    const root = "/sys/bus/usb/devices";
+    if (!fs.existsSync(root)) return [];
+    return fs.readdirSync(root).flatMap(entry => { try { const base = path.join(root, entry); const name = fs.readFileSync(path.join(base, "product"), "utf8").trim(); const vendor = fs.readFileSync(path.join(base, "idVendor"), "utf8").trim(); const product = fs.readFileSync(path.join(base, "idProduct"), "utf8").trim(); return [{ name, id: `VID_${vendor}&PID_${product}`, status: "Present" }]; } catch { return []; } }).slice(0, 200);
+  } catch { return []; }
+}
+
+async function startPreview(root, relativePath, command, preferredEntries = [], environment = {}) {
   const fullPath = resolveContained(root, relativePath || "");
   if (!fullPath || !fs.existsSync(fullPath)) return { state: "error", reason: "Preview path does not exist on this machine." };
   const key = fullPath;
@@ -739,9 +837,9 @@ async function startPreview(root, relativePath, command) {
     }
   }
 
-  const detectedCommand = command || await detectedPreviewCommand(fullPath);
+  const detectedCommand = command ? { kind: "shell", command, display: command } : await detectedPreviewCommand(fullPath);
   if (!detectedCommand) {
-    const entryFile = findEntryHtmlFile(fullPath);
+    const entryFile = findEntryHtmlFile(fullPath, preferredEntries);
     if (!entryFile) return { state: "error", reason: "No dev script and no HTML entry file were found, so there is nothing to preview yet." };
     const port = await findPreviewPort();
     const ownershipToken = crypto.randomBytes(16).toString("hex");
@@ -754,7 +852,8 @@ async function startPreview(root, relativePath, command) {
     });
     child.unref();
     if (!child.pid) return { state: "error", reason: "Could not start the owned static preview server." };
-    const previewUrl = `http://127.0.0.1:${port}`;
+    const encodedEntryPath = entryFile.split("/").map(encodeURIComponent).join("/");
+    const previewUrl = `http://127.0.0.1:${port}/${encodedEntryPath}`;
     previewProcesses.set(key, { port, pid: child.pid, ownershipToken, kind: "static", previewUrl });
     persistPreviewRecord(key, { port, pid: child.pid, ownershipToken, kind: "static", previewUrl });
     const ready = await probeHttpReady(port, 6, 250);
@@ -765,13 +864,31 @@ async function startPreview(root, relativePath, command) {
   }
 
   const port = await findPreviewPort();
-  const devCommand = detectedCommand;
   let spawnFailed = false;
-  const previewExecutable = process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : devCommand;
-  const previewArguments = process.platform === "win32"
-    ? ["/d", "/s", "/c", `${devCommand} -- -p ${port}`]
-    : ["--", "-p", String(port)];
-  const child = spawn(previewExecutable, previewArguments, { cwd: fullPath, shell: false, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, PORT: String(port) } });
+  let previewExecutable;
+  let previewArguments;
+  if (detectedCommand.kind === "next-cli") {
+    previewExecutable = process.execPath;
+    previewArguments = [detectedCommand.cliPath, detectedCommand.mode, "-p", String(port)];
+  } else if (detectedCommand.kind === "npm" && process.platform !== "win32") {
+    previewExecutable = "npm";
+    previewArguments = ["run", detectedCommand.script, "--", "-p", String(port)];
+  } else if (process.platform === "win32") {
+    const devCommand = detectedCommand.kind === "npm" ? detectedCommand.display : detectedCommand.command;
+    previewExecutable = process.env.ComSpec || "cmd.exe";
+    previewArguments = ["/d", "/s", "/c", `${devCommand} -- -p ${port}`];
+  } else {
+    previewExecutable = "/bin/sh";
+    previewArguments = ["-lc", `${detectedCommand.command} -- -p ${port}`];
+  }
+  const child = spawn(previewExecutable, previewArguments, {
+    cwd: fullPath,
+    shell: false,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    env: { ...process.env, ...safeInjectedEnvironment(environment), PORT: String(port) },
+  });
   child.once("error", () => {
     spawnFailed = true;
   });
@@ -962,6 +1079,31 @@ async function searchFiles(root, query, maxResults = 20) {
   }
   await visit(resolvedRoot);
   return hits;
+}
+
+async function discoverSdkArtifacts(root, terms, maxResults = 80) {
+  const resolvedRoot = normalizeRoot(root);
+  const needles = (Array.isArray(terms) ? terms : []).map((term) => String(term).trim().toLowerCase()).filter((term) => term.length >= 2).slice(0, 20);
+  const sdkExtension = /\.(?:zip|aar|jar|dll|so|dylib|framework|xcframework|pdf|docx?|txt|md|html?|xml|json|ya?ml)$/i;
+  const ignored = /(?:^|[\\/])(?:node_modules|\.git|\.gradle|build|dist|coverage|\.next)(?:[\\/]|$)/i;
+  const hits = [];
+  async function visit(directory, depth) {
+    if (depth > 8 || hits.length >= maxResults) return;
+    const entries = await fs.promises.readdir(directory, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (hits.length >= maxResults) break;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(resolvedRoot, absolute).replace(/\\/g, "/");
+      if (ignored.test(relative)) continue;
+      if (entry.isDirectory()) { await visit(absolute, depth + 1); continue; }
+      const lower = relative.toLowerCase();
+      if (!sdkExtension.test(entry.name) || (needles.length && !needles.some((needle) => lower.includes(needle)))) continue;
+      const details = await fs.promises.stat(absolute).catch(() => undefined);
+      hits.push({ path: relative, name: entry.name, size: details?.size ?? 0, extension: path.extname(entry.name).toLowerCase() });
+    }
+  }
+  await visit(resolvedRoot, 0);
+  return { root: path.basename(resolvedRoot), artifacts: hits, searchedTerms: needles, truncated: hits.length >= maxResults };
 }
 
 function normalizeCommandText(command) {
@@ -1474,7 +1616,23 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/preview/start") {
       if (!requireApprovedRoot(res, body.root)) return;
-      return send(res, 200, await startPreview(body.root, String(body.path || ""), body.command ? String(body.command) : undefined));
+      return send(res, 200, await startPreview(
+        body.root,
+        String(body.path || ""),
+        body.command ? String(body.command) : undefined,
+        Array.isArray(body.entryFiles) ? body.entryFiles.map(String) : [],
+        body.environment,
+      ));
+    }
+    if (url.pathname === "/integrations/probe") {
+      return send(res, 200, await testIntegrationProbe(body.probe));
+    }
+    if (url.pathname === "/hardware/discover") {
+      return send(res, 200, { devices: discoverPaymentDevices(), permissions: { deviceEnumeration: "completed", usbAccess: "not-tested", bluetoothAccess: "not-tested", serialAccess: "not-tested" }, hardwareValidated: false });
+    }
+    if (url.pathname === "/sdk/discover") {
+      if (!requireApprovedRoot(res, body.root)) return;
+      return send(res, 200, await discoverSdkArtifacts(body.root, body.terms, body.maxResults || 80));
     }
     if (url.pathname === "/preview/stop") {
       if (!requireApprovedRoot(res, body.root)) return;

@@ -11,7 +11,7 @@ import type { MissionState } from "@/lib/mission-engine";
 import { deriveMissionDisplayStatus, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
 import { answerTaskFor, buildMissionVM } from "@/lib/canvas/adapter";
 import type { CanvasDotState, CanvasMissionVM } from "@/lib/canvas/model";
-import { dotStateOf, latestLiveEvent, needsRepairAction } from "@/lib/canvas/model";
+import { dotStateOf, hasVerificationConflict, latestLiveEvent, needsRepairAction } from "@/lib/canvas/model";
 import type { BlockedCommandAction } from "@/components/execution/ApprovalPrompt";
 import { CanvasComposer } from "@/components/canvas/CanvasComposer";
 import { CollapsedMissionRow } from "@/components/canvas/CollapsedMissionRow";
@@ -126,6 +126,7 @@ export function MissionCanvas({
     ? (activeExecution.source_requirements[0] || activeExecution.title || "").trim() || null
     : null;
   const retryWillRepair = Boolean(activeExecution && needsRepairAction(activeExecution));
+  const retryWillRecheck = Boolean(activeExecution && hasVerificationConflict(activeExecution));
 
   const silenceMs = useElapsedSince(liveEvent?.timestamp, missionStatus.isBusy);
   const stalled = missionStatus.isBusy && isStalled(silenceMs);
@@ -156,7 +157,9 @@ export function MissionCanvas({
   } : null;
   const applicableRecoveredPreview = recoveredPreview?.projectId === connectedProjectId ? recoveredPreview : null;
   const effectiveExecution = applicableRecoveredPreview && recoveredExecutionBase
-    ? { ...recoveredExecutionBase, ...execution, ...applicableRecoveredPreview }
+    ? missionStatus.isBusy
+      ? { ...recoveredExecutionBase, ...applicableRecoveredPreview, ...execution }
+      : { ...recoveredExecutionBase, ...execution, ...applicableRecoveredPreview }
     : execution;
   const previewAvailable = effectiveExecution?.previewState === "ready"
     && Boolean(effectiveExecution.previewUrl || effectiveExecution.artifact || effectiveExecution.previewPlatform === "desktop");
@@ -190,8 +193,11 @@ export function MissionCanvas({
       return;
     }
     if (!connectedProjectId) return;
+    // Preview is an always-available engineering workspace, not a reward for a successful build.
+    // Open the dock immediately so the user can watch starting/error/readiness state while the
+    // background refresh attaches the best currently runnable surface.
+    setPreviewOpen(true);
     if (effectiveExecution?.previewState === "ready" && (effectiveExecution.artifact || effectiveExecution.previewPlatform === "desktop")) {
-      setPreviewOpen(true);
       return;
     }
     setPreviewLoading(true);
@@ -209,9 +215,8 @@ export function MissionCanvas({
         setRecoveredPreview({ ...reconciled, projectId: connectedProjectId });
         if (status.previewState && status.previewState !== execution?.previewState) onPreviewStateChangeRef.current?.(status);
       }
-      setPreviewOpen(ready);
     } catch {
-      setPreviewOpen(false);
+      setRecoveredPreview({ projectId: connectedProjectId, previewState: "error", previewReason: "Foundry could not reach the preview service. The workspace remains open so the next readiness update can attach without another click." });
     } finally {
       setPreviewLoading(false);
     }
@@ -250,7 +255,6 @@ export function MissionCanvas({
       autoOpenedForRef.current = previewIdentity;
       setPreviewOpen(true);
     }
-    if (!previewAvailable && !missionStatus.isBusy) setPreviewOpen(false);
   }, [connectedProjectId, effectiveExecution?.previewState, effectiveExecution?.previewUrl, effectiveExecution?.artifact?.downloadUrl, effectiveExecution?.previewPlatform, activeExecution?.id, previewAvailable, missionStatus.isBusy]);
 
   // §6.1 auto-follow: stay pinned while the user is at the live edge; any real upward
@@ -368,17 +372,54 @@ export function MissionCanvas({
   function handleApprove(event: FactoryExecutionEvent, action: BlockedCommandAction) {
     const command = event.command ?? event.title;
     const category = event.details?.category as CommandPermissionCategory | undefined;
+    const actionKind = event.details?.approvalActionKind === "delete" || event.details?.approvalActionKind === "write"
+      ? event.details.approvalActionKind
+      : "command";
+    const target = typeof event.details?.approvalTarget === "string" ? event.details.approvalTarget : undefined;
     if (action === "skip") {
       onExecute(
         `Denied approval to run "${command}" - mark the checklist item that needed it as skipped (not blocked) and continue with every other item that can still be verified safely.`,
-        { requestedCommand: command, decision: "deny" },
+        { requestedCommand: command, decision: "deny", actionKind, target },
       );
       return;
     }
     if (action === "approve-category" && category) onApproveCategory?.(category);
     if (action === "approve-command") onApproveCommand?.(command);
     const decision = action === "approve-once" ? "approve-once" : action === "approve-category" ? "approve-category" : "approve-command";
-    onExecute(`Approved: run ${command}`, { requestedCommand: command, decision, category: decision === "approve-category" ? category : undefined });
+    onExecute(`Approved: ${actionKind === "command" ? "run" : actionKind} ${target ?? command}`, { requestedCommand: command, decision, category: decision === "approve-category" ? category : undefined, actionKind, target });
+  }
+
+  function handleSdkUpload(files: File[]) {
+    if (!files.length) return;
+    if (!activeVM?.blocking || activeVM.blocking.kind !== "question") return;
+    const supplied = files.map((file) => file.name).join(", ");
+    // Treat the upload as the answer to the active prerequisite, not as a new read-only chat
+    // question. This preserves the blocked build plan and carries the binary evidence into its
+    // resumed execution instead of launching an unrelated inspection mission.
+    onExecute(answerTaskFor(activeVM.blocking, [{
+      question: activeVM.blocking.question,
+      answer: `SDK/specification files uploaded: ${supplied}. Inspect their actual contents, derive only evidenced integration modes and processor/middleware routes, then resume the blocked build.`,
+    }], mission.pendingClarification), undefined, files);
+  }
+
+  async function handleLocateSdk() {
+    if (!localConnector || !activeVM?.blocking || activeVM.blocking.kind !== "question") return;
+    const namedSdk = activeVM.blocking.question.match(/licensed\s+(.+?)\s+(?:Android\s+)?SDK/i)?.[1]?.trim() || "sdk";
+    try {
+      const response = await fetch(`${localConnector.url.replace(/\/$/, "")}/sdk/discover`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(localConnector.token ? { authorization: `Bearer ${localConnector.token}` } : {}) },
+        body: JSON.stringify({ root: localConnector.rootLabel, terms: [namedSdk], maxResults: 80 }),
+      });
+      const result = await response.json() as { artifacts?: Array<{ path: string; name: string; size: number }>; error?: string };
+      if (!response.ok) throw new Error(result.error || "SDK discovery failed.");
+      const artifacts = result.artifacts ?? [];
+      onExecute(artifacts.length
+        ? `Local Agent found these candidate ${namedSdk} SDK/specification artifacts in the approved folder. Inspect only these paths, identify versions and supported integration routes from their actual contents, and continue without guessing:\n${artifacts.map((item) => `- ${item.path} (${item.size} bytes)`).join("\n")}`
+        : `Local Agent searched the approved folder for ${namedSdk} SDK/specification artifacts and found none. Keep the prerequisite open and offer folder selection or upload.`, undefined);
+    } catch (error) {
+      onExecute(`Local Agent SDK discovery could not complete: ${error instanceof Error ? error.message : "unknown error"}. Keep the prerequisite open and offer folder selection or upload.`, undefined);
+    }
   }
 
   function handleEvidenceClick(eventIds: string[]) {
@@ -427,7 +468,7 @@ export function MissionCanvas({
     && Boolean(event.filePath),
   ));
   const showStatusStrip = Boolean(activeExecution) && !liveEdgeVisible && (missionStatus.isBusy || missionStatus.isPausedForApproval || missionStatus.isPausedForUser);
-  const dockOpen = previewAvailable && previewOpen;
+  const dockOpen = previewOpen && Boolean(effectiveExecution || recoveredExecutionBase);
   const visibleFileCount = workspaceFiles.length || execution?.files.length || 0;
 
   return (
@@ -452,9 +493,8 @@ export function MissionCanvas({
             <button
               type="button"
               onClick={() => void togglePreview()}
-              disabled={previewLoading}
               aria-pressed={dockOpen}
-              className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-bold text-foundry-subtle transition hover:bg-overlay/[0.05] hover:text-foundry-ink disabled:cursor-wait disabled:opacity-70"
+              className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-bold text-foundry-subtle transition hover:bg-overlay/[0.05] hover:text-foundry-ink"
               title={previewLoading ? "Starting the project preview" : previewFailureReason ? `Preview failed: ${previewFailureReason}` : dockOpen ? "Close the preview" : "Open the preview"}
             >
               {dockOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
@@ -534,6 +574,8 @@ export function MissionCanvas({
                   suggestions={recommendations}
                   onAnswer={handleAnswer}
                   onApprove={handleApprove}
+                  onUpload={handleSdkUpload}
+                  onLocateSdk={localConnector ? handleLocateSdk : undefined}
                   onEvidenceClick={handleEvidenceClick}
                   onSuggestion={handleSuggestion}
                 />
@@ -602,8 +644,10 @@ export function MissionCanvas({
             <span className="text-[12px] text-foundry-muted">
               {activeExecution?.state === "cancelled"
                 ? "The last run was interrupted before it finished."
+                : retryWillRecheck
+                  ? "The same verifier result repeated on unchanged source. Foundry stopped duplicate paid repair calls; recheck runs the exact gate first."
                 : retryWillRepair
-                  ? "The implementation is on disk, but verification found issues that still need repair."
+                  ? "Foundry preserved the implementation after the same source and verification evidence stopped changing. Continue resumes from that exact gate."
                   : "The last run didn't finish."}
             </span>
             <button
@@ -611,7 +655,7 @@ export function MissionCanvas({
               className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-2.5 py-1 text-[12px] font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
               onClick={() => activeExecution && (onRetry ? onRetry(retryableTask, activeExecution.id) : onExecute(retryableTask))}
             >
-              {retryWillRepair ? "Fix verified issues" : "Retry this task"}
+              {retryWillRecheck ? "Recheck verification" : retryWillRepair ? "Continue autonomous repair" : "Retry this task"}
             </button>
           </div>
         ) : null}

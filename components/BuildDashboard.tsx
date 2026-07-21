@@ -39,7 +39,7 @@ import { runDiscoveryEngine } from "@/lib/discovery/engine";
 import { FALLBACK_STACK_OPTIONS, type StackOption } from "@/lib/ai/project-discovery-llm";
 import { platformStackOptionsForProject, reconcilePlatformStackOptions } from "@/lib/discovery/platform-stack-policy";
 import { genericHistoryRecommendation, type HistoryRecommendation } from "@/lib/discovery/history-recommendations";
-import { deriveQuestionsAndAssumptions, discoverProject } from "@/lib/ai/project-discovery";
+import { deriveQuestionsAndAssumptions, discoverProject, explicitProjectNameFromPrompt } from "@/lib/ai/project-discovery";
 import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
 import { generatedWorkspaceForMission } from "@/lib/factory/live-project";
@@ -49,6 +49,7 @@ import type { FactoryExistingProjectRequest, FactoryFileReadResult, FactoryJourn
 import { MissionCanvas } from "@/components/canvas/MissionCanvas";
 import { humanizeKey } from "@/components/execution/timelineUtils";
 import { ModelModeSelector, ModelSelectionChip } from "@/components/ModelModeSelector";
+import { CredentialsSettings } from "@/components/integrations/CredentialsSettings";
 import { useModelMode } from "@/lib/ai/model-mode";
 import type { TierResolution } from "@/lib/ai/model-router";
 
@@ -113,7 +114,7 @@ type ProjectStart = {
   instructions: string;
   instructionFiles: File[];
   discovery: ProjectDiscoveryResult | null;
-  discoveryProvenance: "pending" | "model" | "rough";
+  discoveryProvenance: "pending" | "model" | "brief" | "rough";
   discoveryAnswers: Record<string, string>;
   /** Dynamically-authored stack choices from the Discovery Engine's LLM pass — empty until UnderstandingStep resolves, seeded with a small universal fallback until then. Replaces the old static per-category stackRecommendations table. */
   stackOptions: StackOption[];
@@ -1031,6 +1032,13 @@ function FactorySettingsView({
 
         <ModelModeSelector />
 
+        <CredentialsSettings
+          projectId={execution?.projectId || mission?.missionId || "unassigned-project"}
+          workspaceId={mission?.missionId || "local-workspace"}
+          files={(execution?.files || []).map((file) => ({ path: file.path, content: file.content }))}
+          localAgentOffline={Boolean(selectedProjectBrief.match(/^Local connector root:/im) && !execution)}
+        />
+
         <section className="grid gap-3 sm:grid-cols-2">
           <button
             className="min-h-24 rounded-md border border-overlay/10 bg-overlay/[0.035] p-4 text-left transition hover:border-foundry-teal/35 hover:bg-foundry-teal/[0.08]"
@@ -1662,7 +1670,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
     // A real gpt-5 analysis has been observed taking 60-80+ seconds; 110s is the hard ceiling. This is a
     // Promise.race that resolves to a heuristic fallback rather than aborting the shared request, so a
     // remount's own timer can never tear down an in-flight discovery the cache is serving.
-    const hardTimeoutMs = 20_000;
+    const hardTimeoutMs = 60_000;
     const startedAt = Date.now();
 
     async function refine() {
@@ -1678,7 +1686,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
       // as the fallback memo content if the LLM call fails, so the user never lands on a blank summary
       // step just because OPENAI_API_KEY is unset or the network hiccups.
       const heuristic = discoverProject(seedText);
-      const cacheKey = JSON.stringify(["fast-discovery-v4-platform-contract", seedText, start.template.id, start.subtype, start.customSubtype, start.projectLocation, start.uploadNames]);
+      const cacheKey = JSON.stringify(["fast-discovery-v5-explicit-contract", attempt, seedText, start.template.id, start.subtype, start.customSubtype, start.projectLocation, start.uploadNames]);
       let completed = false;
       try {
         const inspection = start.uploadNames.length ? inspectExistingSourceNames(start.uploadNames) : null;
@@ -1709,7 +1717,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           cachedRequest.promise,
           wait(hardTimeoutMs).then((): DiscoveryEngineOutcome => {
             cachedRequest.abort();
-            return { ok: false, error: "Discovery analysis exceeded the 20-second time budget and was cancelled." };
+            return { ok: false, error: "Discovery analysis exceeded the 60-second time budget and was cancelled." };
           }),
         ]);
         if (!cancelledRef.current) {
@@ -1718,7 +1726,12 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
             return;
           }
           const rawDiscovery = result.discovery;
-          const resolvedDiscovery = reconcileKnownStarterDiscovery(rawDiscovery, start);
+          const resolvedDiscovery = {
+            ...reconcileKnownStarterDiscovery(rawDiscovery, start),
+            // Reconcile against the typed brief, not a model-authored prompt echo. This keeps an
+            // Android vendor SDK requirement authoritative when the model proposes a web bridge.
+            prompt: start.projectDescription.trim() || rawDiscovery.prompt,
+          };
           const proposedStackOptions = Array.isArray(result.stackOptions) && result.stackOptions.length ? result.stackOptions : fallbackStackOptionsFor(resolvedDiscovery, start);
           const platformContract = reconcilePlatformStackOptions(start.template.id, resolvedDiscovery, proposedStackOptions);
           const resolvedStackOptions = platformContract.stackOptions;
@@ -1727,7 +1740,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           const authoritativeDiscovery = alignDiscoveryWithSelectionAndConstraints(resolvedDiscovery, start, resolvedStack);
           onUpdate({
             discovery: authoritativeDiscovery,
-            discoveryProvenance: "model",
+            discoveryProvenance: result.provenance === "brief" ? "brief" : "model",
             // The recommendation and the selected value are one decision. Keeping the old
             // seed stack here made the sidebar/build brief claim Next.js while the cards
             // correctly recommended WPF (or another domain-specific stack).
@@ -2372,10 +2385,15 @@ function ProjectStartFlow({
           {step === "understanding" ? <UnderstandingStep start={start} onUpdate={onUpdate} onAdvance={() => onStepChange("stack")} /> : null}
 
           {step === "stack" ? (
-            <FlowSection eyebrow="Foundry recommends, doesn't force" title="Pick a stack — or trust the recommendation." body="Foundry proposed these as different-language ways to build the exact same plan, honest capability level attached. Pick one, or type anything else below.">
+            <FlowSection eyebrow="Foundry recommends, doesn't force" title="Pick a complete delivery stack — or trust the recommendation." body="Each option covers framework, runtime, persistence, security, required integrations, testing, and deployment for this project. Foundry build support is reported separately from architectural fit.">
               {start.discoveryProvenance === "rough" ? (
                 <div role="status" className="mb-4 rounded-lg border border-foundry-amber/25 bg-foundry-amber/[0.06] px-3 py-2 text-xs leading-5 text-foundry-muted">
                   Rough local pass — the AI discovery call did not complete. These choices are provisional and are not presented as a verified model recommendation.
+                </div>
+              ) : null}
+              {start.discoveryProvenance === "brief" ? (
+                <div role="status" className="mb-4 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.06] px-3 py-2 text-xs leading-5 text-foundry-muted">
+                  Brief-derived decision: your explicit platform, stack, workflows, and constraints were preserved because the optional model refinement returned an incomplete payload.
                 </div>
               ) : null}
               <div className="grid gap-2.5 sm:grid-cols-2">
@@ -3497,7 +3515,7 @@ function CapabilityBadge({ level }: { level: number }) {
     2: "border-overlay/15 text-foundry-muted",
     1: "border-red-300/40 text-red-300",
   };
-  return <span className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[9.5px] tracking-wide ${styles[level] ?? styles[2]}`}>{level}/4</span>;
+  return <span title="Foundry build and verification support" aria-label={`Foundry build support ${level} of 4`} className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[9.5px] tracking-wide ${styles[level] ?? styles[2]}`}>build support {level}/4</span>;
 }
 
 function StackCard({ recommendation, active, onClick }: { recommendation: StackRecommendation; active: boolean; onClick: () => void }) {
@@ -4206,6 +4224,7 @@ function reconcileKnownStarterDiscovery(discovery: ProjectDiscoveryResult, start
 
 function alignDiscoveryWithSelectionAndConstraints(discovery: ProjectDiscoveryResult, start: ProjectStart, selectedStack: string): ProjectDiscoveryResult {
   const brief = `${start.projectDescription} ${discovery.prompt}`;
+  const explicitProjectName = explicitProjectNameFromPrompt(start.projectDescription);
   const stackChanged = selectedStack.trim() !== "" && !sameStackChoice(selectedStack, discovery.recommendedStack);
   const architecture = stackChanged
     ? genericArchitectureFor(selectedStack, discovery.dataModel, discovery.projectType, discovery.mainFeatures)
@@ -4248,6 +4267,7 @@ function alignDiscoveryWithSelectionAndConstraints(discovery: ProjectDiscoveryRe
     : discovery.keyFacts;
   return {
     ...discovery,
+    projectType: explicitProjectName || discovery.projectType,
     recommendedStack: selectedStack || discovery.recommendedStack,
     architecture,
     mainFeatures,
@@ -4362,6 +4382,8 @@ function recommendationForStart(start: ProjectStart): StackRecommendation {
 }
 
 function cleanProjectName(value: string) {
+  const explicitName = explicitProjectNameFromPrompt(value);
+  if (explicitName) return explicitName.trim();
   const cleaned = titleCase(
     value
       .replace(/\b(build|create|make|me|an?|the|with|for)\b/gi, " ")

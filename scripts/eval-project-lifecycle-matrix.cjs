@@ -89,6 +89,11 @@ function createFixtures() {
     write(`${directory}/MainWindow.xaml`, `<Window x:Class="${assembly}.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Foundry Matrix" Width="360" Height="180"><Grid><TextBlock Text="Ready" HorizontalAlignment="Center" VerticalAlignment="Center" /></Grid></Window>\n`);
     write(`${directory}/MainWindow.xaml.cs`, `using System.Windows; namespace ${assembly}; public partial class MainWindow : Window { public MainWindow() { InitializeComponent(); } }\n`);
   }
+
+  write("11-java-gradle/settings.gradle", "rootProject.name = 'matrix-java'\n");
+  write("11-java-gradle/build.gradle", "plugins { id 'java' }\n");
+  write("11-java-gradle/src/main/java/matrix/Ready.java", "package matrix; public final class Ready { public static boolean value() { return true; } }\n");
+
 }
 
 async function run() {
@@ -118,6 +123,7 @@ async function run() {
       ["07-dotnet-console", 'dotnet build "MatrixConsole.csproj"'],
       ["08-dotnet-library", 'dotnet build "MatrixLibrary.csproj"'],
       ["09-dotnet-wpf", 'dotnet build "MatrixWpf.csproj"'],
+      ["11-java-gradle", "gradle --no-daemon clean build"],
     ];
 
     for (const [name, command] of matrix) {
@@ -148,9 +154,9 @@ async function run() {
     assert.ok(Date.now() - lockedBuildStarted < 30_000, "Owned runtime recovery took too long and likely fell through to compiler retries.");
     results.push({ name: "10-running-wpf", command: 'launch + dotnet build "MatrixLock.csproj" --no-restore', durationMs: lockedBuild.durationMs });
 
-    assert.equal(results.length, 10);
+    assert.equal(results.length, 11);
     for (const result of results) console.log(`PASS ${result.name} (${result.durationMs}ms) — ${result.command}`);
-    console.log("PASS project lifecycle matrix: 10/10 real projects connected, opened, and verified with zero provider calls.");
+    console.log("PASS project lifecycle matrix: 11/11 real projects connected, opened, and verified with zero provider calls across the locally installed static web, Node.js, TypeScript, Python, .NET, and Java/Gradle toolchains.");
   } finally {
     if (process.platform === "win32") spawnSync("taskkill.exe", ["/im", "MatrixLock.exe", "/t", "/f"], { stdio: "ignore", windowsHide: true });
     if (connector.pid) spawnSync("taskkill.exe", ["/pid", String(connector.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });

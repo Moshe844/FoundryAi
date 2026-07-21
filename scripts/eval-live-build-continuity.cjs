@@ -75,8 +75,11 @@ async function run() {
   assert.match(runtime, /noProgressBoundaryAfterVerifiedEdit/);
   assert.match(runtime, /advancedFromNoProgressBoundaryVerification/);
   assert.match(runtime, /uiChangeNeedsBrowserVerification/);
-  assert.match(runtime, /async function detectNextPreviewScript/);
+  assert.match(runtime, /async function detectNextPreviewCommand/);
   assert.match(runtime, /verifiedBuildExists[\s\S]+scripts\.start/);
+  assert.match(runtime, /declaresNext && existsSync\(cliPath\)/);
+  assert.match(runtime, /previewCommand\.kind === "direct"/);
+  assert.match(runtime, /path\.join\(projectPath, "out", "index\.html"\)/);
   assert.match(runtime, /startScript === "start" \? 50 : 90/);
   assert.match(runtime, /Preview failed to start: \$\{trimOutput\(runtimeLog\)\}/);
 

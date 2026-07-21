@@ -689,7 +689,7 @@ function detectBrowserProject(files: FactoryUploadedFile[]): BrowserProjectDetec
     if (filePath.endsWith(".dart")) languages.add("Dart");
     if (filePath.endsWith(".gd")) languages.add("GDScript");
   }
-  const entryFiles = paths.filter((filePath) => /(^|\/)(index|main|app)\.html$/i.test(filePath) || /\.html$/i.test(filePath)).slice(0, 8);
+  const entryFiles = paths.filter((filePath) => /\.html?$/i.test(filePath)).slice(0, 8);
   const packageManager = lower.some((filePath) => filePath.endsWith("pnpm-lock.yaml"))
     ? "pnpm"
     : lower.some((filePath) => filePath.endsWith("yarn.lock"))

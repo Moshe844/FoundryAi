@@ -160,6 +160,13 @@ const newDependencyPattern =
   /\b(npm|pip|pypi|nuget|composer|cargo|gem)\s+(?:i|install|add)\b|\b(?:use|add|install|bring in|pull in)\b[^.?!\n]{0,40}\b(?:npm |python |pip )?(?:package|library|module|dependency|gem|crate)\b/i;
 const smallTweakPattern =
   /\b(typo|rename|color|colour|gray|grey|background|button|label|title|padding|margin|font|border|border-radius|shadow|size|width|height|position|align|spacing|one line|tweak|swap|toggle|hover|disabled state)\b/i;
+// Moving an existing element is one of the most common trivial layout edits, and the vocabulary above
+// already covers its siblings ("position", "align", "spacing") — its absence was an oversight that
+// escalated one-line moves to the architect tier and cost ~$0.89 for a single reposition. Both a
+// reposition verb *and* a positional target are required, so "move the database to Postgres" (a real
+// migration with no positional word) is still treated as full-scope work.
+const repositionPattern =
+  /\b(?:move|reposition|reorder|relocate|place|put|shift|drag)\b[^.?!\n]{0,60}\b(?:above|below|under|underneath|beneath|over|on top|top|bottom|left|right|center|centre|before|after|next to|beside|alongside|inside|within|first|last|header|footer|sidebar|navbar|nav bar|toolbar)\b/i;
 const recognizedFileExtensions = new Set([
   "js", "jsx", "ts", "tsx", "mjs", "cjs", "css", "scss", "sass", "less", "html", "htm", "json", "py", "rb", "php",
   "java", "kt", "kts", "swift", "c", "h", "cpp", "hpp", "cc", "cs", "go", "rs", "vue", "svelte", "md", "mdx", "yml",
@@ -179,7 +186,22 @@ export function isLikelySmallSingleFileRequest(task: string): boolean {
   );
   if (filePaths.size > 1) return false;
   if ((text.toLowerCase().match(/\b(and|then)\b/g) ?? []).length >= 2) return false;
-  return filePaths.size === 1 || smallTweakPattern.test(text);
+  return filePaths.size === 1 || smallTweakPattern.test(text) || repositionPattern.test(text);
+}
+
+/**
+ * Relocating existing markup is small in *scope* but not small in *difficulty*: it requires removing a
+ * block from one parent and reinserting it under another, and a half-applied move silently deletes
+ * working UI. Observed on the weakest tier — asked to move a total above the filter bar, the model
+ * deleted the total and never re-added it, while typecheck, build and preview all stayed green.
+ *
+ * Callers should keep these on the bounded small-edit budget but refuse to run them on the cheapest
+ * model. Budget reflects how much work there is; tier reflects how easy it is to get wrong.
+ */
+export function isStructuralRelocationRequest(task: string): boolean {
+  const text = task.trim();
+  if (!text || text.length > 200) return false;
+  return repositionPattern.test(text);
 }
 
 // "Start my server", "run the build", "run the tests" name one concrete operational action with an

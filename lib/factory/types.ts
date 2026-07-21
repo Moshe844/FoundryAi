@@ -125,6 +125,69 @@ export type FactoryArtifact = {
   downloadUrl: string;
 };
 
+export type FactoryLifecyclePhaseId =
+  | "understand"
+  | "plan"
+  | "analyze"
+  | "implement"
+  | "verify"
+  | "build"
+  | "test"
+  | "launch"
+  | "browser-validate"
+  | "repair"
+  | "publish"
+  | "monitor"
+  | "report";
+
+export type FactoryLifecyclePhase = {
+  id: FactoryLifecyclePhaseId;
+  label: string;
+  status: "completed" | "failed" | "blocked" | "skipped";
+  evidence: string[];
+  eventIds: string[];
+  reason?: string;
+};
+
+export type FactoryCompletionMilestones = {
+  highest: "not-saved" | "saved" | "built" | "tested" | "verified" | "browser-validated" | "production-ready";
+  saved: boolean;
+  built: boolean;
+  tested: boolean;
+  verified: boolean;
+  browserValidated: boolean;
+  productionReady: boolean;
+};
+
+export type FactoryOperationalEvidence = {
+  requested: boolean;
+  status: "not-requested" | "waiting-approval" | "verified" | "failed" | "unverified";
+  evidence: string[];
+};
+
+/**
+ * Evidence-backed terminal handoff shared by every stack and project source. It is derived from the
+ * same files, commands, timeline, checklist, and verification records used by the completion gate;
+ * report wording never upgrades the underlying mission status.
+ */
+export type FactoryEngineeringReport = {
+  request: string;
+  outcome: string;
+  issue?: string;
+  rootCause?: string;
+  actionsTaken: string[];
+  filesChanged: string[];
+  commandsExecuted: Array<{ command: string; exitCode: number | null; durationMs?: number }>;
+  verification: ExecutionMissionVerification[];
+  browserValidation: FactoryOperationalEvidence & { previewUrl?: string };
+  publication: FactoryOperationalEvidence;
+  monitoring: FactoryOperationalEvidence;
+  remainingIssues: string[];
+  recommendations: string[];
+  completion: FactoryCompletionMilestones;
+  generatedAt: string;
+};
+
 /** A single piece of real evidence backing (or refuting) mission completion. Built server-side from the same evidence the executor's completion gate inspects — never independently re-derived by the client. */
 export type ExecutionMissionVerification = {
   check_type: "file-read" | "build" | "test" | "lint" | "typecheck" | "preview" | "manual-evidence" | "checklist" | "command";
@@ -162,6 +225,9 @@ export type FactoryProjectResult = {
   previewState?: FactoryPreviewState;
   previewPlatform?: FactoryPreviewPlatform;
   previewReason?: string;
+  /** Set when the built app can be launched on a native emulator/simulator instead of a browser
+   * (currently "android" — a real Android Virtual Device). Drives the "Launch on emulator" action. */
+  previewEmulator?: "android";
   /** Server-derived metadata for an artifact that exists on disk. Never synthesize this client-side. */
   artifact?: FactoryArtifact;
   /** True only when a separately approved atomic action verified that the connected project root no longer exists. */
@@ -186,6 +252,10 @@ export type FactoryProjectResult = {
   executionTurns?: number;
   /** Real local toolchain readiness plus trusted one-click setup recipes for this stack. */
   environment?: EnvironmentReadiness;
+  /** Canonical lifecycle reconstructed only from actions that actually occurred. */
+  lifecycle?: FactoryLifecyclePhase[];
+  /** Complete evidence-backed mission handoff. */
+  engineeringReport?: FactoryEngineeringReport;
 };
 
 /**
@@ -291,6 +361,9 @@ export type FactoryExistingProjectRequest = {
     requestedCommand: string;
     decision: "approve-once" | "approve-command" | "approve-category" | "deny";
     category?: CommandPermissionCategory;
+    /** Distinguishes shell commands from approval-aware file operations. */
+    actionKind?: "command" | "delete" | "write";
+    target?: string;
   };
   /** Defaults to "standard" — how much planning/review/verification depth this mission gets. Independent of Model Mode (which model handles a call); see lib/ai/mission/quality-level.ts. */
   quality?: MissionQualityLevel;

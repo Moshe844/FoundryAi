@@ -2,6 +2,7 @@
 
 import { Download, ExternalLink, Gamepad2, Maximize2, Minimize2, Monitor, PanelRightClose, Play, RefreshCw, Smartphone, Tablet } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import Image from "next/image";
 import type { FactoryProjectResult } from "@/lib/factory/types";
 
 /**
@@ -87,23 +88,26 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
 export function PreviewCompletionCard({ execution }: { execution: FactoryProjectResult }) {
   const [launchState, setLaunchState] = useState<"idle" | "launching" | "launched" | "error">("idle");
   const [launchError, setLaunchError] = useState("");
+  const [emulatorSerial, setEmulatorSerial] = useState("");
   const platform = execution.previewPlatform ?? "web";
   const ready = execution.previewState === "ready" || execution.previewState === "starting";
   const label = previewActionLabel(platform);
-  async function launchDesktop() {
+  const emulatorAvailable = execution.previewEmulator === "android";
+  async function launch(action: "launch-desktop" | "launch-android") {
     setLaunchState("launching");
     setLaunchError("");
     try {
-      const response = await fetch("/api/factory/preview", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: execution.projectId, projectPath: execution.projectPath, action: "launch-desktop" }) });
-      const result = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      const response = await fetch("/api/factory/preview", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: execution.projectId, projectPath: execution.projectPath, action }) });
+      const result = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string; serial?: string };
       if (response.ok && result.ok) {
+        if (result.serial) setEmulatorSerial(result.serial);
         setLaunchState("launched");
       } else {
-        setLaunchError(result.error || "Windows did not accept the desktop launch request.");
+        setLaunchError(result.error || "The launch request was not accepted.");
         setLaunchState("error");
       }
     } catch (error) {
-      setLaunchError(error instanceof Error ? error.message : "Foundry could not reach its desktop launcher.");
+      setLaunchError(error instanceof Error ? error.message : "Foundry could not reach its launcher.");
       setLaunchState("error");
     }
   }
@@ -114,9 +118,10 @@ export function PreviewCompletionCard({ execution }: { execution: FactoryProject
           <p className="flex items-center gap-2 text-xs font-extrabold text-foundry-ink">{platform === "game" ? <Gamepad2 size={14} className="text-foundry-teal" /> : <Play size={14} className="text-foundry-teal" />}{ready ? previewReadyTitle(platform) : "Preview availability"}</p>
           <p className="mt-1 break-all text-xs leading-5 text-foundry-subtle">{execution.previewUrl ? `Running at ${execution.previewUrl}` : execution.previewReason || "No interactive preview is available for this build yet."}</p>
         </div>
-        {execution.previewUrl ? <a href={execution.previewUrl} target="_blank" rel="noreferrer" className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22]"><ExternalLink size={14} />{label}</a> : platform === "desktop" && ready ? <button type="button" onClick={launchDesktop} disabled={launchState === "launching"} className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:opacity-60"><Play size={14} />{launchState === "launching" ? "Launching..." : launchState === "launched" ? "App launched" : "Launch desktop app"}</button> : null}
+        {execution.previewUrl ? <a href={execution.previewUrl} target="_blank" rel="noreferrer" className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22]"><ExternalLink size={14} />{label}</a> : platform === "desktop" && ready ? <button type="button" onClick={() => launch("launch-desktop")} disabled={launchState === "launching"} className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:opacity-60"><Play size={14} />{launchState === "launching" ? "Launching..." : launchState === "launched" ? "App launched" : "Launch desktop app"}</button> : (platform === "android" || platform === "mobile") && emulatorAvailable && ready ? <button type="button" onClick={() => launch("launch-android")} disabled={launchState === "launching"} className="inline-flex min-h-9 shrink-0 items-center gap-2 rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-3 text-xs font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.22] disabled:opacity-60"><Play size={14} />{launchState === "launching" ? "Starting emulator…" : launchState === "launched" ? "Running on emulator" : "Launch on emulator"}</button> : null}
       </div>
-      {launchState === "error" ? <p className="mt-2 text-xs text-foundry-amber">Desktop launch failed: {launchError}</p> : null}
+      {launchState === "error" ? <p className="mt-2 text-xs text-foundry-amber">Launch failed: {launchError}</p> : null}
+      {launchState === "launched" && emulatorAvailable ? <AndroidEmulatorSurface projectId={execution.projectId} projectPath={execution.projectPath} serial={emulatorSerial} /> : null}
       {execution.artifact ? (
         <div className="mt-3 border-t border-foundry-teal/20 pt-3">
           <div className="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
@@ -133,8 +138,57 @@ export function PreviewCompletionCard({ execution }: { execution: FactoryProject
           </a>
         </div>
       ) : null}
+      {execution.engineeringReport?.recommendations?.length ? (
+        <div className="mt-3 border-t border-foundry-teal/20 pt-3">
+          <p className="font-mono text-[10px] uppercase tracking-[0.06em] text-foundry-subtle">Remaining real-world testing</p>
+          <ol className="mt-2 grid gap-1.5 text-xs leading-5 text-foundry-ink">
+            {execution.engineeringReport.recommendations.map((instruction, index) => <li key={`${index}-${instruction}`}><span className="mr-2 font-mono text-foundry-teal">{index + 1}.</span>{instruction}</li>)}
+          </ol>
+        </div>
+      ) : null}
     </section>
   );
+}
+
+function AndroidEmulatorSurface({ projectId, projectPath, serial }: { projectId: string; projectPath: string; serial: string }) {
+  const [frame, setFrame] = useState("");
+  const [error, setError] = useState("");
+  const imageRef = useRef<HTMLImageElement>(null);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = async () => {
+      try {
+        const response = await fetch("/api/factory/preview", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId, projectPath, action: "android-frame", serial }) });
+        const result = (await response.json()) as { ok?: boolean; imageBase64?: string; error?: string };
+        if (!active) return;
+        if (response.ok && result.imageBase64) { setFrame(`data:image/png;base64,${result.imageBase64}`); setError(""); }
+        else setError(result.error || "The emulator frame is unavailable.");
+      } catch (cause) {
+        if (active) setError(cause instanceof Error ? cause.message : "The emulator frame is unavailable.");
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, 1000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [projectId, projectPath, serial]);
+
+  async function tap(event: React.MouseEvent<HTMLImageElement>) {
+    const image = imageRef.current;
+    if (!image?.naturalWidth || !image.naturalHeight) return;
+    const rect = image.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * image.naturalWidth;
+    const y = ((event.clientY - rect.top) / rect.height) * image.naturalHeight;
+    await fetch("/api/factory/preview", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId, projectPath, action: "android-tap", serial, x, y }) });
+  }
+
+  return <div className="mt-3 border-t border-foundry-teal/20 pt-3">
+    <div className="mb-2 flex items-center justify-between"><p className="font-mono text-[10px] uppercase tracking-[0.06em] text-foundry-subtle">Live Android emulator</p><span className="h-2 w-2 rounded-full bg-foundry-teal" title="Connected" /></div>
+    <div className="mx-auto max-w-[390px] overflow-hidden rounded-[1.6rem] border-4 border-slate-800 bg-black shadow-xl">
+      {frame ? <Image ref={imageRef} src={frame} alt="Live Android emulator" onClick={tap} className="block h-auto w-full cursor-crosshair select-none" draggable={false} width={1080} height={2274} unoptimized /> : <div className="grid aspect-[9/19.5] place-items-center p-6 text-center text-xs text-foundry-subtle">Connecting to the emulator display…</div>}
+    </div>
+    {error ? <p className="mt-2 text-center text-xs text-foundry-amber">{error}</p> : null}
+  </div>;
 }
 
 function ArtifactField({ label, value }: { label: string; value: string }) {

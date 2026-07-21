@@ -2,9 +2,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const workspace = fs.readFileSync(path.join(root, "components/WorkspaceShell.tsx"), "utf8");
-const missionBlock = fs.readFileSync(path.join(root, "components/canvas/MissionBlock.tsx"), "utf8");
-const provider = fs.readFileSync(path.join(root, "lib/ai/provider.ts"), "utf8");
+const readSource = (relativePath) => fs.readFileSync(path.join(root, relativePath), "utf8").replace(/\r\n/g, "\n");
+const workspace = readSource("components/WorkspaceShell.tsx");
+const missionBlock = readSource("components/canvas/MissionBlock.tsx");
+const provider = readSource("lib/ai/provider.ts");
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);

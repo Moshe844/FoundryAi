@@ -1,0 +1,7 @@
+import { describe, expect, it } from "vitest";
+import { refreshOAuth, revokeOAuth, verifyOAuthState } from "@/lib/integrations/oauth";
+import { integrationById } from "@/lib/integrations/catalog";
+import { afterEach, vi } from "vitest";
+afterEach(()=>vi.restoreAllMocks());
+describe("OAuth recovery",()=>{it("rejects interrupted OAuth without state",()=>expect(()=>verifyOAuthState("")).toThrow("interrupted"));it("rejects tampered OAuth state",()=>expect(()=>verifyOAuthState("payload.signature")).toThrow("verification failed"));});
+describe("OAuth lifecycle",()=>{it("renews an access token while retaining a rotated or existing refresh token",async()=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({access_token:"new-access",expires_in:3600}),{status:200,headers:{"content-type":"application/json"}})));expect(await refreshOAuth(integrationById("gmail")!,"refresh-token")).toMatchObject({accessToken:"new-access",refreshToken:"refresh-token"});});it("requires confirmation before provider revocation",async()=>{await expect(revokeOAuth(integrationById("github")!,"token",false)).rejects.toThrow("explicit confirmation");});it("handles provider revocation without returning the token",async()=>{const request=vi.fn().mockResolvedValue(new Response(null,{status:204}));vi.stubGlobal("fetch",request);expect(await revokeOAuth(integrationById("github")!,"sensitive-token",true)).toBe(true);expect(JSON.stringify(await request.mock.results[0].value)).not.toContain("sensitive-token");});});

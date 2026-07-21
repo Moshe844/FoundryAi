@@ -1,4 +1,4 @@
-import type { FactoryExecutionEvent, FactoryExecutionEventKind, FactoryObjectiveChecklistItem, MissionClarification } from "@/lib/factory/types";
+import type { FactoryEngineeringReport, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryLifecyclePhase, FactoryObjectiveChecklistItem, MissionClarification } from "@/lib/factory/types";
 import type { DeliveredProjectFile, ExecutionMission, ExecutionMissionState, ExecutionMissionVerificationStatus } from "@/lib/mission/model";
 import type { WorkspaceAttachment } from "@/lib/files";
 import { stripTerminalFormatting } from "@/lib/text/terminal";
@@ -79,7 +79,7 @@ export type CanvasSummaryLine = {
 
 /** Terminal block. Rendered only after the real final event. */
 export type CanvasSummary = {
-  heading: "Done" | "Failed" | "Stopped" | "Blocked" | "Needs repair";
+  heading: "Done" | "Failed" | "Stopped" | "Blocked" | "Verification blocked" | "Ready to continue";
   verificationStatus: ExecutionMissionVerificationStatus;
   /** Product-specific final handoff, preserved from the executor rather than replaced by a status word. */
   outcome?: string;
@@ -91,6 +91,8 @@ export type CanvasSummary = {
   /** Present only if real uncertainty exists (blocked reason, warnings, flags). */
   watchFor: string[];
   elapsedMs?: number;
+  engineeringReport?: FactoryEngineeringReport;
+  lifecycle?: FactoryLifecyclePhase[];
 };
 
 export type CanvasTier = "tiny" | "medium" | "large" | "huge";
@@ -120,11 +122,20 @@ export type CanvasMissionVM = {
 
 export type CanvasDotState = "idle" | "working" | "waiting" | "failed";
 
+/** A repeated finding on byte-identical source is a verifier conflict, not unfinished project work. */
+export function hasVerificationConflict(mission: ExecutionMission): boolean {
+  return mission.state === "failed" && mission.blocked_reason?.includes("[FOUNDRY_VERIFICATION_CONFLICT]") === true;
+}
+
 /** A verified product/build defect is actionable work, not an unexplained execution crash. */
 export function needsRepairAction(mission: ExecutionMission): boolean {
-  if (mission.state !== "failed") return false;
+  if (mission.state !== "failed" || hasVerificationConflict(mission)) return false;
   const actionableChecks = new Set(["preview", "build", "test", "lint", "typecheck", "command"]);
-  return mission.verification.some((item) => item.result === "fail" && actionableChecks.has(item.check_type));
+  if (mission.verification.some((item) => item.result === "fail" && actionableChecks.has(item.check_type))) return true;
+  // Missions persisted before structured verification was mandatory stored the exact gate in the
+  // terminal blocker. Preserve their repair semantics after an upgrade instead of demoting them to
+  // an unexplained generic retry.
+  return /\b(?:browser (?:preview )?verification|real browser gate|production build|typecheck|lint|test(?:s|ing)?|command)\b[^\n]{0,160}\b(?:fail(?:ed|ure|ing)?|unresolved|did not pass|still needs repair)\b/i.test(mission.blocked_reason ?? "");
 }
 
 const voiceKinds: FactoryExecutionEventKind[] = ["reasoning", "planning", "summary"];

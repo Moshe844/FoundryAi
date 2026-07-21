@@ -26,6 +26,7 @@ import {
   isAcceptedInterpretationReply,
   isApprovalReplyMessage,
   normalizeFollowUpResolution,
+  projectBehaviorDiagnosisIntent,
   standaloneMutationIntent,
   LatestFollowUpQueue,
 } from "@/lib/mission/classifyFollowUp";
@@ -446,13 +447,16 @@ function normalizeExecutionMissions(mission: MissionState): ExecutionMission[] {
         : undefined;
       const migratedFailureReason = migratedProviderReason ?? migratedNoActionReason;
       const timeline = item.timeline ?? [];
-      const migratedTimeline = migratedFailureReason
+      const recoverableInternalBoundary = /FOUNDRY_VERIFICATION_CONFLICT|NO_PROGRESS_(?:BEFORE|AFTER)_MUTATION|Checklist item\(s\) not completed|production build (?:failed|not verified)|command or file write failed/i.test(item.blocked_reason ?? "");
+      const migratedTimeline = migratedFailureReason || recoverableInternalBoundary
         ? timeline.map((event) => event.title === "Mission blocked" && event.status === "error" ? {
             ...event,
-            kind: "summary" as const,
-            title: legacyNoActionFailure ? "No executable edit was produced" : "AI providers unavailable",
-            output: migratedFailureReason,
-            details: { ...(event.details ?? {}), reason: migratedFailureReason, retryable: true },
+            kind: recoverableInternalBoundary ? "planning" as const : "summary" as const,
+            status: recoverableInternalBoundary ? "warning" as const : event.status,
+            title: recoverableInternalBoundary ? "Repair evidence preserved" : legacyNoActionFailure ? "No executable edit was produced" : "AI providers unavailable",
+            output: recoverableInternalBoundary ? undefined : migratedFailureReason,
+            internal: recoverableInternalBoundary || event.internal,
+            details: { ...(event.details ?? {}), reason: migratedFailureReason ?? item.blocked_reason, retryable: true, recoverable: recoverableInternalBoundary },
           } : event)
         : timeline;
       return {
@@ -966,8 +970,13 @@ export function WorkspaceShell() {
           result: failed ? "fail" as const : verified ? "pass" as const : "skipped" as const,
           evidence: failed || !verified ? failureReason : `Live preview responded successfully at ${preview.previewUrl || "its verified local URL"}.`,
         };
+        // Stable id: preview readiness is reconciled repeatedly (a cold dev server can report "not
+        // ready" and then come up moments later). A per-run id meant the filter below never matched,
+        // so every reconciliation appended another line and the timeline ended up showing "Preview
+        // failed its live readiness check" directly above "Preview readiness verified" for the same
+        // preview. Only the latest reconciliation is true, so it must replace the previous one.
         const timelineEvent: FactoryExecutionEvent = {
-          id: `preview-reconciliation-${Date.now()}`,
+          id: "preview-reconciliation",
           timestamp: now,
           tier: failed ? "flag" : "finding",
           kind: "preview",
@@ -987,7 +996,7 @@ export function WorkspaceShell() {
             blocked_reason: undefined,
           } : {}),
           verification: [...active.verification.filter((entry) => entry.check_type !== "preview"), previewEvidence],
-          timeline: [...active.timeline.filter((event) => event.id !== timelineEvent.id), timelineEvent],
+          timeline: [...active.timeline.filter((event) => event.id !== timelineEvent.id && !event.id.startsWith("preview-reconciliation-")), timelineEvent],
           updated_at: now,
         };
         const nextArtifact: CreatedArtifact = { ...artifact, body: JSON.stringify(nextResult, null, 2), description: `Factory execution ${nextResult.status}.` };
@@ -1115,7 +1124,7 @@ export function WorkspaceShell() {
               attachments: mergeAttachments(item.attachments, evidenceAttachments),
               executionMissions: [
                 ...item.executionMissions,
-                createPendingExecutionMission(item, confirmedInterpretationTask || task, requestNote.id),
+                createPendingExecutionMission(item, confirmedInterpretationTask || task, requestNote.id, approvalResponse ? getActiveExecutionMission(item) : undefined),
               ],
               activeExecutionMissionId: pendingExecutionId,
               // Any new turn supersedes a still-open clarify prompt — whether this turn IS the answer
@@ -1196,6 +1205,22 @@ export function WorkspaceShell() {
       : approvalResponse
       ? { ...fallbackFollowUpResolution(task, context), currentIntent: "edit" as const, continuity: "carry_forward_plan" as const, referenceConfidence: 1, plannedAction: `Resolve the recorded approval decision for ${approvalResponse.requestedCommand}.` }
       : await resolveProjectMessageIntent(targetMission, task);
+    if (!exactMissionRetry && !approvalResponse && projectBehaviorDiagnosisIntent(task)) {
+      resolvedIntent = {
+        ...resolvedIntent,
+        currentIntent: "diagnose",
+        referencedPriorAction: null,
+        relevantFiles: [],
+        expectedScope: "Inspect the active project and its recorded/runtime evidence to explain the reported behavior without changing source.",
+        destructive: false,
+        referenceConfidence: 1,
+        plannedAction: task,
+        continuity: "fresh_plan",
+        rationale: "The message combines a current application failure with a request for explanation, so project evidence must be inspected before answering.",
+        clarifyingQuestion: "",
+        clarifyingOptions: [],
+      };
+    }
     const currentStandaloneMutation = standaloneMutationIntent(task);
     if (!exactMissionRetry && !approvalResponse && currentStandaloneMutation && !isMutatingProjectIntent(resolvedIntent.currentIntent)) {
       resolvedIntent = {
@@ -1348,28 +1373,28 @@ export function WorkspaceShell() {
     await runFactoryExecutionForMission(missionId, brief);
   }
 
-  function createPendingExecutionMission(mission: MissionState, task: string, requestMessageId?: string): ExecutionMission {
+  function createPendingExecutionMission(mission: MissionState, task: string, requestMessageId?: string, continuation?: ExecutionMission): ExecutionMission {
     const now = new Date().toISOString();
     const previous = mission.executionMissions.at(-1);
     return {
       id: `execution-${requestMessageId ?? Date.now()}`,
       title: taskTitle(task),
-      source_requirements: [task],
+      source_requirements: continuation?.source_requirements ?? [task],
       state: "understanding",
       verification_status: "none",
-      plan: [],
-      files_touched: [],
-      commands_run: [],
-      verification: [],
-      summary: "",
-      parent_mission_id: previous?.id,
+      plan: continuation?.plan ?? [],
+      files_touched: continuation?.files_touched ?? [],
+      commands_run: continuation?.commands_run ?? [],
+      verification: continuation?.verification ?? [],
+      summary: continuation?.summary ?? "",
+      parent_mission_id: continuation?.id ?? previous?.id,
       request_message_id: requestMessageId,
-      timeline: [{
+      timeline: [...(continuation?.timeline ?? []), {
         id: `request-read-${requestMessageId ?? Date.now()}`,
         timestamp: now,
         kind: "planning",
         status: "running",
-        title: "Reading your request",
+        title: continuation ? "Resuming after your approval" : "Reading your request",
       }],
       created_at: now,
       updated_at: now,
@@ -2468,7 +2493,7 @@ function taskFromAcceptedInterpretation(pending: PendingClarification) {
     .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}.!?]+$/gu, "");
   if (quoteAgnosticInterpretation) return quoteAgnosticInterpretation;
   // interpretation question has one quoted executable restatement followed by "Is that correct?".
-  const interpreted = pending.question.match(/(?:current interpretation is:|understood your request as:)\s*[â€œ"]([\s\S]+?)[â€"]\s*Is that correct\??/i)?.[1]?.trim();
+  const interpreted = pending.question.match(/(?:current interpretation is:|understood your request as:)\s*[\u201c"]([\s\S]+?)[\u201d"]\s*Is that correct\??/i)?.[1]?.trim();
   return interpreted || pending.originalTask.trim();
 }
 
@@ -2620,7 +2645,7 @@ function factoryResultMessage(result: FactoryProjectResult) {
   const changed = result.files.filter((file) => file.status === "created" || file.status === "edited");
   const summary = result.sessionSummary;
   const lines = [
-    summary?.outcome ? `Outcome: ${summary.outcome}` : result.objective ? `Objective: ${result.objective}` : `Factory execution ${result.status}.`,
+    `Outcome: ${preciseFactoryOutcome(result)}`,
     "",
     `Project path: ${result.projectPath}`,
     result.sourceMode ? `Source mode: ${result.sourceMode}` : "",
@@ -2636,6 +2661,20 @@ function factoryResultMessage(result: FactoryProjectResult) {
   ];
 
   return lines.filter(Boolean).join("\n");
+}
+
+function preciseFactoryOutcome(result: FactoryProjectResult) {
+  const recorded = result.sessionSummary?.outcome?.trim() ?? "";
+  const generic = /^(?:implemented|completed|updated|fixed|repaired)\s+(?:the\s+)?(?:requested|project)\b|^the (?:requested|verified) (?:project )?change/i.test(recorded);
+  if (recorded && !generic) return recorded;
+  const behavior = (result.sessionSummary?.changes ?? []).map((item) => item.trim()).filter(Boolean);
+  const files = result.files.filter((file) => file.status === "created" || file.status === "edited").map((file) => file.path);
+  const passed = [...new Set((result.verification ?? []).filter((item) => item.result === "pass").map((item) => item.check_type))];
+  return [
+    behavior.length ? `Behavior: ${behavior.join("; ")}` : "",
+    files.length ? `Changed ${files.length} file${files.length === 1 ? "" : "s"}: ${files.join(", ")}.` : "No project files changed.",
+    passed.length ? `Verified by: ${passed.join(", ")}.` : "No successful verification gate was recorded.",
+  ].filter(Boolean).join(" ");
 }
 
 function executionMissionFromResult(mission: MissionState, result: FactoryProjectResult, task: string, existing?: ExecutionMission): ExecutionMission {
@@ -2661,7 +2700,7 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
       };
     });
   const blockedReason = result.blocker || completionContradiction || (state === "complete" ? undefined : result.checklist?.find((item) => item.status === "blocked")?.evidence);
-  const humanSummary = completionContradiction ? "" : result.sessionSummary?.outcome || (state === "complete" && verification.length ? factoryResultMessage(result) : "");
+  const humanSummary = completionContradiction ? "" : state === "complete" && verification.length ? preciseFactoryOutcome(result) : result.sessionSummary?.outcome || "";
   const pendingMockReview =
     result.status === "awaiting-mock-approval"
       ? { message: result.blocker || "The first working mock is ready for review.", preview_url: result.previewUrl }
@@ -2704,6 +2743,8 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
     preview_url: result.previewState === "ready" ? result.previewUrl : undefined,
     undo_snapshot: existing?.undo_snapshot,
     summary: humanSummary,
+    engineering_report: result.engineeringReport,
+    lifecycle: result.lifecycle,
     parent_mission_id: existing?.parent_mission_id,
     follow_up_resolution: existing?.follow_up_resolution,
     request_message_id: existing?.request_message_id,

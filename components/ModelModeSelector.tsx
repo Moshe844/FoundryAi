@@ -89,7 +89,7 @@ export function ModelModeSelector() {
       {dailySpend ? (
         <div className={`rounded-md border px-3 py-2 text-xs ${dailySpend.blocked ? "border-amber-400/35 bg-amber-400/[0.08] text-amber-100" : "border-overlay/10 bg-overlay/[0.03] text-foundry-muted"}`}>
           <span className="font-extrabold">Foundry recorded today: ${dailySpend.actualCostUsd.toFixed(2)} of ${dailySpend.limitUsd.toFixed(2)}</span>
-          <span className="ml-2">${dailySpend.remainingUsd.toFixed(2)} available{dailySpend.reservedCostUsd ? ` Â· $${dailySpend.reservedCostUsd.toFixed(2)} currently reserved` : ""}</span>
+          <span className="ml-2">${dailySpend.remainingUsd.toFixed(2)} available{dailySpend.reservedCostUsd ? ` · $${dailySpend.reservedCostUsd.toFixed(2)} currently reserved` : ""}</span>
           {dailySpend.blocked ? <span className="mt-1 block">Paid model calls are stopped. Raise FOUNDRY_DAILY_MODEL_BUDGET_USD only when you explicitly authorize more spend.</span> : null}
         </div>
       ) : null}

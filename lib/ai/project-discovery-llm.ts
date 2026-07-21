@@ -108,11 +108,47 @@ export const DISCOVERY_REFINEMENT_SYSTEM_PROMPT = [
   "alternative_stacks should list 1-3 other reasonable stack choices distinct from recommended_stack.",
   "deployment_note should be one or two sentences about how this specific project would ship.",
   "stack_options: propose 3-5 concrete stacks that could ALL build the exact same architecture/features/data-model you just decided — i.e. variants of one plan, not independent guesses at different products. The set must be right-sized to the project (see the right-sizing rule above): for a genuinely simple/static/client-only project, the recommended option AND the alternatives should be lightweight (e.g. 'HTML/CSS/JS (vanilla)', 'HTML + Alpine.js', 'Astro static', 'SvelteKit') — do NOT pad the list with heavyweight framework/database stacks just to show variety, and do NOT force a JS+Python+JVM spread onto something that has no backend. Only for projects that genuinely need a backend should you span different backend languages (e.g. 'Next.js (TypeScript)', 'Python/FastAPI', 'Java/Spring Boot'), each named specifically — not just 'JavaScript'. Exactly one entry has recommended:true — your actual best pick, matching recommended_stack. Each 'why' is one short sentence on why that specific stack fits THIS project, not a generic language pitch.",
+  "A stack option must be DELIVERY-COMPLETE for the stated requirements, not merely a framework name. When applicable, name the UI/runtime, API framework, datastore, ORM/migrations, authentication/session mechanism, email/jobs/cache/realtime providers or adapter seams, test framework, and deployment shape. Verify that every option covers every architecture-changing feature before recommending it. Never say a choice aligns with an existing architecture when the user is creating a new workspace with no inspected project evidence.",
   "Always call refine_project_discovery. Do not answer in prose.",
 ].join("\n");
 
 export function discoveryRefinementUserText(context: DiscoveryRefinementContext, heuristic: ProjectDiscoveryResult): string {
   return JSON.stringify({ context, heuristic }, null, 2);
+}
+
+export type DiscoveryRefinementDepth = "starter-stack" | "compact-custom" | "full";
+
+/**
+ * Decides how much of the understanding the model regenerates.
+ *
+ * `starter-stack` only re-picks the stack and keeps the generic category template for features,
+ * entities, and architecture. That is correct ONLY when the user picked a starter card and typed no
+ * real description — then the template is genuinely all we know.
+ *
+ * The bug this fixes: selecting a starter forced `starter-stack` even when the user *also* described a
+ * specific product, so a habit tracker and a delivery-driver app produced byte-identical boilerplate —
+ * only the stack ever differed. When a substantive description exists, regenerate the full
+ * understanding from it. The route's platform-contract reconciliation still pins the starter's stack
+ * family (mobile stays React Native), so this changes the *understanding*, not the platform.
+ */
+export function discoveryRefinementDepth(input: {
+  knownStarter: boolean;
+  descriptionWordCount: number;
+  /** Words of meaningful, non-generic subtype/category the user picked (0 for a placeholder subtype). */
+  subtypeWordCount: number;
+  highConfidenceCustom: boolean;
+}): DiscoveryRefinementDepth {
+  // Product signal can arrive two ways: a typed description, OR a specific subtype/category the user
+  // selected. The first version of this fix only counted the typed description, so picking "Mobile App"
+  // + a subtype like "Workout Trackers, Calorie Counters, Meditation Timers" with no typed sentence
+  // still fell through to the generic template. A chosen subtype is real signal and must count — a
+  // couple of meaningful words is enough, since a subtype is already a product category, not prose.
+  const hasProductSignal = input.descriptionWordCount >= 8 || input.subtypeWordCount >= 2;
+  if (input.knownStarter && !hasProductSignal) return "starter-stack";
+  if (input.highConfidenceCustom) return "compact-custom";
+  // A starter card plus real product signal, or an ambiguous custom brief, both get the full
+  // description-driven refinement.
+  return "full";
 }
 
 export type DiscoveryRefinementResult = {

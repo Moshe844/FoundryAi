@@ -20,7 +20,7 @@ export function detectVerificationProfile(evidence: ProjectEvidence): Verificati
 }
 
 function isProjectMarker(entry: string) {
-  return /^(package\.json|.+-lock\.(?:json|ya?ml)|yarn\.lock|bun\.lockb?|next\.config\..+|pom\.xml|mvnw(?:\.cmd)?|gradlew(?:\.bat)?|settings\.gradle(?:\.kts)?|build\.gradle(?:\.kts)?|pyproject\.toml|requirements\.txt|manage\.py|composer\.json|go\.mod|cargo\.toml|pubspec\.yaml|dockerfile|docker-compose\.ya?ml|project\.godot|chart\.yaml|.+\.(?:sln|csproj|tf|sql)|.+\.html?)$/i.test(entry);
+  return /^(package\.json|.+-lock\.(?:json|ya?ml)|yarn\.lock|bun\.lockb?|next\.config\..+|pom\.xml|mvnw(?:\.cmd)?|gradlew(?:\.bat)?|settings\.gradle(?:\.kts)?|build\.gradle(?:\.kts)?|angular\.json|pyproject\.toml|requirements\.txt|manage\.py|composer\.json|go\.mod|cargo\.toml|pubspec\.yaml|\.metadata|gemfile|package\.swift|cmakelists\.txt|meson\.build|makefile|mix\.exs|build\.sbt|description|namespace|.+\.rockspec|.+\.(?:psd1|psm1|sh)|dockerfile|docker-compose\.ya?ml|project\.godot|assets|projectsettings|k8s|kubernetes|helm|chart\.yaml|migrations|.+\.(?:sln|csproj|tf|sql)|.+\.html?)$/i.test(entry);
 }
 
 export function formatVerificationProfile(profile: VerificationProfile): string {

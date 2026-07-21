@@ -83,6 +83,10 @@ export function SummaryBlock({
         </div>
       ) : null}
 
+      {summary.engineeringReport ? (
+        <EngineeringReport report={summary.engineeringReport} lifecycle={summary.lifecycle ?? []} />
+      ) : null}
+
       {suggestions.length ? (
         <div className="mt-1 grid" role="list" aria-label="Suggested next steps">
           {suggestions.slice(0, 3).map((recommendation) => (
@@ -102,4 +106,52 @@ export function SummaryBlock({
       ) : null}
     </div>
   );
+}
+
+function EngineeringReport({ report, lifecycle }: { report: NonNullable<CanvasSummary["engineeringReport"]>; lifecycle: NonNullable<CanvasSummary["lifecycle"]> }) {
+  const publication = operationalLine("Publication", report.publication);
+  const monitoring = operationalLine("Monitoring", report.monitoring);
+  return (
+    <details className="max-w-3xl rounded-lg border border-foundry-line/70 bg-overlay/[0.015] px-3 py-2 text-[13px] text-foundry-muted">
+      <summary className="cursor-pointer select-none font-medium text-foundry-ink">
+        Engineering report · {report.completion.highest.replace(/-/g, " ")}
+      </summary>
+      <div className="mt-3 grid gap-3 leading-6">
+        <ReportSection label="Lifecycle" items={lifecycle.map((phase) => `${phase.label}: ${phase.status}${phase.reason ? ` — ${phase.reason}` : ""}`)} />
+        {report.issue ? <ReportSection label="Issue" items={[report.issue]} /> : null}
+        {report.rootCause ? <ReportSection label="Root cause" items={[report.rootCause]} /> : null}
+        <ReportSection label="Actions taken" items={report.actionsTaken} empty="No mutating action was recorded." />
+        <ReportSection label="Files changed" items={report.filesChanged} empty="No project files changed." mono />
+        <ReportSection
+          label="Commands executed"
+          items={report.commandsExecuted.map((command) => `${command.command} → exit ${command.exitCode ?? "unknown"}`)}
+          empty="No shell commands were required."
+          mono
+        />
+        <ReportSection label="Browser validation" items={[operationalLine("Browser", report.browserValidation)]} />
+        <ReportSection label="Operations" items={[publication, monitoring]} />
+        <ReportSection label="Remaining issues" items={report.remainingIssues} empty="None recorded." />
+        <ReportSection label="Recommendations" items={report.recommendations} empty="No follow-up recommendation." />
+      </div>
+    </details>
+  );
+}
+
+function ReportSection({ label, items, empty, mono = false }: { label: string; items: string[]; empty?: string; mono?: boolean }) {
+  const visible = items.filter(Boolean);
+  return (
+    <section>
+      <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-foundry-subtle">{label}</p>
+      {visible.length ? (
+        <ul className={`mt-0.5 grid gap-0.5 ${mono ? "font-mono text-[12px]" : ""}`}>
+          {visible.map((item, index) => <li key={`${label}-${index}`} className="break-words">{item}</li>)}
+        </ul>
+      ) : empty ? <p className="mt-0.5 text-foundry-subtle">{empty}</p> : null}
+    </section>
+  );
+}
+
+function operationalLine(label: string, value: NonNullable<CanvasSummary["engineeringReport"]>["publication"]): string {
+  const evidence = value.evidence.length ? ` — ${value.evidence.join("; ")}` : "";
+  return `${label}: ${value.status.replace(/-/g, " ")}${evidence}`;
 }

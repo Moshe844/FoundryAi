@@ -104,6 +104,8 @@ export type RoutingBudget = {
   premiumCallLimit?: number;
   maximumTier?: ModelTier;
   maximumParallelCalls?: number;
+  /** Prevent later stages from widening this request's explicitly bounded allowance. */
+  hardCeiling?: boolean;
 };
 
 export type RoutingDecision = {

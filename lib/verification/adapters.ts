@@ -101,10 +101,11 @@ const adapters: EcosystemAdapter[] = [
   },
   {
     id: "android-gradle", label: "Android/Gradle",
-    detect: (evidence) => (has(evidence, "gradlew") || has(evidence, "gradlew.bat")) && (has(evidence, "settings.gradle") || has(evidence, "settings.gradle.kts")) && (has(evidence, "app") || has(evidence, "androidmanifest.xml")) ? 95 : 0,
+    detect: (evidence) => (has(evidence, "settings.gradle") || has(evidence, "settings.gradle.kts")) && (has(evidence, "app") || has(evidence, "androidmanifest.xml")) ? 95 : 0,
     buildProfile: (evidence) => {
-      const wrapper = evidence.platform === "win32" && has(evidence, "gradlew.bat") ? "gradlew.bat" : "./gradlew";
-      return { commands: [command("android-compile", "compile", `${wrapper} compileDebug`, "Gradle wrapper"), command("android-lint", "lint", `${wrapper} lintDebug`, "Gradle wrapper"), command("android-unit", "unit-test", `${wrapper} testDebugUnitTest`, "Gradle wrapper"), command("android-build", "build", `${wrapper} assembleDebug`, "Gradle wrapper")], limitations: ["Instrumentation tests require an available emulator or connected device."] };
+      const wrapper = evidence.platform === "win32" && has(evidence, "gradlew.bat") ? "gradlew.bat" : has(evidence, "gradlew") ? "./gradlew" : "gradle";
+      const source = has(evidence, "gradlew") || has(evidence, "gradlew.bat") ? "Gradle wrapper" : "system Gradle";
+      return { commands: [command("android-compile", "compile", `${wrapper} compileDebug`, source), command("android-lint", "lint", `${wrapper} lintDebug`, source), command("android-unit", "unit-test", `${wrapper} testDebugUnitTest`, source), command("android-build", "build", `${wrapper} assembleDebug`, source)], limitations: ["Instrumentation tests require an available emulator or connected device."] };
     },
   },
   {
@@ -146,7 +147,16 @@ const adapters: EcosystemAdapter[] = [
   },
   { id: "go", label: "Go", detect: (evidence) => has(evidence, "go.mod") ? 85 : 0, buildProfile: () => ({ commands: [command("go-vet", "lint", "go vet ./...", "go.mod"), command("go-test", "unit-test", "go test ./...", "go.mod"), command("go-build", "build", "go build ./...", "go.mod")], limitations: [] }) },
   { id: "rust", label: "Rust", detect: (evidence) => has(evidence, "cargo.toml") ? 85 : 0, buildProfile: () => ({ commands: [command("cargo-format", "format", "cargo fmt --check", "Cargo.toml"), command("cargo-check", "compile", "cargo check", "Cargo.toml"), command("cargo-clippy", "lint", "cargo clippy -- -D warnings", "Cargo.toml"), command("cargo-test", "unit-test", "cargo test", "Cargo.toml"), command("cargo-build", "build", "cargo build", "Cargo.toml")], limitations: [] }) },
-  { id: "flutter", label: "Flutter", detect: (evidence) => has(evidence, "pubspec.yaml") ? 85 : 0, buildProfile: () => ({ commands: [command("flutter-analyze", "lint", "flutter analyze", "pubspec.yaml"), command("flutter-test", "unit-test", "flutter test", "pubspec.yaml")], limitations: ["Device launch and platform builds depend on locally installed SDK targets."] }) },
+  {
+    id: "flutter",
+    label: "Flutter",
+    detect: (evidence) => {
+      if (!has(evidence, "pubspec.yaml")) return 0;
+      const pubspec = evidence.files["pubspec.yaml"] || "";
+      return has(evidence, ".metadata") || /(?:^|\n)\s*flutter\s*:|sdk\s*:\s*flutter\b/i.test(pubspec) ? 85 : 0;
+    },
+    buildProfile: () => ({ commands: [command("flutter-analyze", "lint", "flutter analyze", "pubspec.yaml"), command("flutter-test", "unit-test", "flutter test", "pubspec.yaml")], limitations: ["Device launch and platform builds depend on locally installed SDK targets."] }),
+  },
   { id: "svelte", label: "Svelte/SvelteKit", detect: (evidence) => dependency(evidence, "@sveltejs/kit") || dependency(evidence, "svelte") ? 96 : 0, buildProfile: (evidence) => nodeAdapter().buildProfile(evidence) },
   { id: "nuxt", label: "Nuxt", detect: (evidence) => dependency(evidence, "nuxt") ? 96 : 0, buildProfile: (evidence) => nodeAdapter().buildProfile(evidence) },
   { id: "vue", label: "Vue", detect: (evidence) => dependency(evidence, "vue") ? 92 : 0, buildProfile: (evidence) => nodeAdapter().buildProfile(evidence) },
@@ -161,7 +171,7 @@ const adapters: EcosystemAdapter[] = [
   { id: "elixir", label: "Elixir", detect: (evidence) => has(evidence, "mix.exs") ? 85 : 0, buildProfile: () => ({ commands: [command("mix-format", "format", "mix format --check-formatted", "mix.exs"), command("mix-compile", "compile", "mix compile --warnings-as-errors", "mix.exs"), command("mix-test", "unit-test", "mix test", "mix.exs")], limitations: [] }) },
   { id: "scala-sbt", label: "Scala/sbt", detect: (evidence) => has(evidence, "build.sbt") ? 85 : 0, buildProfile: () => ({ commands: [command("sbt-compile", "compile", "sbt compile", "build.sbt"), command("sbt-test", "unit-test", "sbt test", "build.sbt")], limitations: [] }) },
   { id: "dart", label: "Dart", detect: (evidence) => has(evidence, "pubspec.yaml") ? 75 : 0, buildProfile: () => ({ commands: [command("dart-format", "format", "dart format --output=none --set-exit-if-changed .", "pubspec.yaml"), command("dart-analyze", "lint", "dart analyze", "pubspec.yaml"), command("dart-test", "unit-test", "dart test", "pubspec.yaml", false)], limitations: [] }) },
-  { id: "r-package", label: "R Package", detect: (evidence) => has(evidence, "description") && has(evidence, "namespace") ? 85 : 0, buildProfile: () => ({ commands: [command("r-check", "build", "R CMD check .", "DESCRIPTION")], limitations: [] }) },
+  { id: "r-package", label: "R Package", detect: (evidence) => has(evidence, "description") && has(evidence, "namespace") ? 85 : 0, buildProfile: (evidence) => ({ commands: [command("r-check", "build", `${evidence.platform === "win32" ? "R.exe" : "R"} CMD check .`, "DESCRIPTION")], limitations: [] }) },
   { id: "lua", label: "Lua", detect: (evidence) => has(evidence, ".luacheckrc") || has(evidence, "rockspec") || endsWith(evidence, ".rockspec") ? 75 : 0, buildProfile: (evidence) => ({ commands: [...(has(evidence, ".luacheckrc") ? [command("lua-lint", "lint", "luacheck .", ".luacheckrc")] : []), command("lua-test", "unit-test", "busted", "Lua project", false)], limitations: [] }) },
   { id: "powershell", label: "PowerShell", detect: (evidence) => endsWith(evidence, ".psd1") || endsWith(evidence, ".psm1") ? 75 : 0, buildProfile: () => ({ commands: [command("powershell-analyze", "lint", "pwsh -NoProfile -Command Invoke-ScriptAnalyzer -Path . -Recurse", "PowerShell module")], limitations: ["PSScriptAnalyzer must be installed in the local PowerShell environment."] }) },
   { id: "shell", label: "Shell", detect: (evidence) => endsWith(evidence, ".sh") ? 55 : 0, buildProfile: () => ({ commands: [command("shellcheck", "lint", "shellcheck **/*.sh", "shell scripts")], limitations: ["shellcheck and shell glob support must be available locally."] }) },

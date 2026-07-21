@@ -260,6 +260,10 @@ export async function POST(request: Request) {
     // the project, so pausing it because the classifier polished or restated its wording only adds
     // cost and produces a nonsensical approval-looking card.
     const conversationGroundedMutation = parsed?.mutation_authorized === true && parsed?.interpretation_source === "recent_conversation";
+    const actionableProjectDefect =
+      isConnectedProjectContext(body.context) &&
+      looksLikeExecutableBugReport(policyMessage) &&
+      !explicitlyReadOnlyDiagnostic(policyMessage);
     const semanticUndo = parsed?.mutation_authorized === true && parsed?.mutation_kind === "undo_recorded_change";
     const semanticApplyChange = parsed?.mutation_authorized === true && parsed?.mutation_kind === "apply_change";
     const effectiveIntent = semanticUndo
@@ -270,7 +274,12 @@ export async function POST(request: Request) {
           ? "edit"
           : intent;
     const mutatingIntent = effectiveIntent === "edit" || effectiveIntent === "debug" || effectiveIntent === "undo" || effectiveIntent === "continue";
-    const meaningCorrectionNeedsApproval = !enforcedReadOnlyIntent && mutatingIntent && !conversationGroundedMutation;
+    // A concrete observed defect already supplies the executable outcome: restore the behavior that
+    // the connected project exposes. Minor wording cleanup, a misspelled control label, and not yet
+    // knowing the owning file are investigation details, not user decisions. Let the debug mission
+    // inspect first; genuine conflicts discovered from project evidence can still pause later.
+    const meaningCorrectionNeedsApproval =
+      !enforcedReadOnlyIntent && mutatingIntent && !conversationGroundedMutation && !actionableProjectDefect;
     const interpretation = acceptedInterpretation || !meaningCorrectionNeedsApproval
       ? null
       : interpretationConfirmation({
@@ -413,6 +422,17 @@ function executionModeForIntent(intent: ProjectTurnIntent) {
 }
 
 function applyProjectIntentPolicy(intent: ProjectTurnIntent, message: string, context: ProjectIntentContext | undefined): ProjectTurnIntent {
+  // An observed failure in a connected project is executable scope by itself. This precedes the
+  // generic clarification policy deliberately: choosing the file/component and tracing the broken
+  // event flow are Foundry's engineering responsibilities, never clarification questions for users.
+  if (
+    isConnectedProjectContext(context) &&
+    looksLikeExecutableBugReport(message) &&
+    !explicitlyReadOnlyDiagnostic(message)
+  ) {
+    return "debug";
+  }
+
   // Misroute guard: a concrete imperative change request must start an edit mission — even when it bundles
   // conflicting requirements. Contradictions are a *plan conflict* the mission resolves with its own
   // one-at-a-time decision prompt (which pauses and resumes the same run), NOT a reason to dead-end the turn
@@ -488,9 +508,12 @@ function looksLikeExecutableBugReport(message: string) {
   const text = message.toLowerCase();
   const hasFailureSignal =
     /\b(upload failed|json\.?parse|unexpected character|syntaxerror|typeerror|referenceerror|uncaught|exception|stack trace|traceback|500|404|403|401)\b/i.test(text) ||
-    /\b(error|failed|fails|failing|broken|crash|crashes|crashing|bug|issue|problem)\b/i.test(text);
+    /\b(error|failed|fails|failing|broken|broke|crash|crashes|crashing|bug|issue|problem|unresponsive|stuck|frozen|hangs?|glitch(?:es|ing)?)\b/i.test(text) ||
+    /\b(?:is|are|was|were|has|have|had|seems?|keeps?|started|stopped)\b[^.?!\n]{0,80}\b(?:not working|not opening|not responding|not loading|not saving|not updating|not showing|not closing|not navigating|not doing anything|doing nothing|no longer works?)\b/i.test(text) ||
+    /\b(?:does|do|did)\s+(?:not|nothing)\b/i.test(text) ||
+    /\b(?:won't|will not|can't|cannot|couldn't|doesn't|does not)\s+(?:open|close|submit|save|load|update|show|render|navigate|respond|work|run|start|stop|copy|delete|create|add|remove)\b/i.test(text);
   const hasWorkflowSignal = /\b(when|while|trying to|on upload|during|after|before|click|submit|save|load|parse|upload|download|import|export)\b/i.test(text);
-  const hasProjectArtifactSignal = /\b(file|sheet|excel|csv|json|api|server|client|browser|frontend|backend|route|endpoint|form|upload|request|response)\b/i.test(text);
+  const hasProjectArtifactSignal = /\b(file|sheet|excel|csv|json|api|server|client|browser|frontend|backend|route|endpoint|form|upload|request|response|app|page|screen|view|modal|dialog|menu|button|link|control|field|input|feature|login|checkout|report|dashboard|navigation|preview)\b/i.test(text);
   return hasFailureSignal && (hasWorkflowSignal || hasProjectArtifactSignal);
 }
 

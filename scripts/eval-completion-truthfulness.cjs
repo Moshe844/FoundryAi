@@ -58,6 +58,8 @@ assert(followUpPolicy.standaloneMutationIntent(repeatedImplementationRequest) ==
 assert(followUpPolicy.standaloneMutationIntent("When clicking on Settings the app closes.") === "debug", "A plain-language current desktop failure is not routed as repair work.");
 assert(debugIntentPolicy.isConcreteDebugRequest("When clicking on Settings the app closes."), "The planner does not recognize the Settings exit as a concrete debug request.");
 assert(followUpPolicy.standaloneMutationIntent("What changed in the last mission?") === null, "A genuine status question was incorrectly converted into an edit.");
+assert(followUpPolicy.explicitReadOnlyProjectIntent("Where is this value stored, and why can I not find it after saving?") === "inspection", "A project-behavior evidence question can still mutate the product instead of inspecting and answering.");
+assert(followUpPolicy.explicitReadOnlyProjectIntent("Fix the storage flow so saved records appear after reload.") === null, "An explicit persistence repair request was incorrectly made read-only.");
 const uiRequests = [
   "Make the checkout easier and more pleasant for customers to use.",
   "Could this workflow feel clearer and less confusing?",
@@ -149,19 +151,23 @@ assert(executor.includes("input.hasBuildTooling !== false"), "Existing static pr
 assert(projectAccess.includes("(?:serve|http-server)"), "Common static preview commands are not recognized as long-running servers.");
 assert(factoryRuntime.includes("semanticStaticMutation") && factoryRuntime.includes("strategyComplexity = boundedStaticFollowUp"), "Conversation-grounded static follow-ups can still expand into architecture-scale ceremony.");
 assert(factoryRuntime.includes("browserEvidence.acceptanceVerified") && factoryRuntime.includes("Requirement-directed browser acceptance"), "A failed implementation can still be reconciled by generic browser health instead of request-specific acceptance.");
-assert(factoryRuntime.includes("Boolean(preModelBrowserEvidence) || boundedStaticFollowUp || explicitCommandOnlyRequest"), "A bounded static edit can still expand into a multi-phase planning mission.");
+assert(factoryRuntime.includes("Boolean(preModelBrowserEvidence) || boundedStaticFollowUp || boundedSmallEdit || explicitCommandOnlyRequest"), "A bounded static or named-control edit can still expand into a multi-phase planning mission.");
 assert(factoryRuntime.includes("Implemented the requested project change and verified the changed interface"), "A successful browser-reconciled edit can still expose an internal model-budget blocker as its outcome.");
 assert(factoryRuntime.includes("findUnreachableVerifiedUiFiles"), "Fingerprint reuse does not check whether changed UI components are reachable from the application.");
 assert(factoryRuntime.includes("their UI is not connected to the application"), "Disconnected UI can still be reported as an already-completed implementation.");
 assert(workspaceShell.includes("currentStandaloneMutation && !isMutatingProjectIntent(resolvedIntent.currentIntent)"), "A standalone implementation request can still be rendered as a status evidence packet after semantic misclassification.");
 assert(workspaceShell.includes("if (reportsCurrentBehaviorFailure(task)) return undefined"), "The client can still attach stale completion evidence to a fresh defect report.");
 assert(intentRoute.includes('intent === "status" || intent === "retrospective"'), "The server policy does not correct imperative mutations misclassified as status or retrospective requests.");
+assert(intentRoute.includes("actionableProjectDefect") && intentRoute.includes("!actionableProjectDefect"), "Actionable defect reports can still be diverted into wording-confirmation clarification.");
+assert(intentRoute.includes('return "debug";') && intentRoute.includes("choosing the file/component"), "Connected-project defect reports can still ask users to identify implementation files instead of starting diagnosis.");
+assert(intentRoute.includes("not working|not opening|not responding") && intentRoute.includes("not doing anything|doing nothing|no longer works"), "Ordinary broken-behavior wording is not covered by deterministic debug routing.");
 assert(intentClassifier.includes("shuts?\\s+down") && intentClassifier.includes("clos(?:e|es|ed|ing)"), "Plain-language unexpected app exits are missing from deterministic debug routing.");
 assert(factoryRuntime.includes("observableBrowserContractForTask") && factoryRuntime.includes("validateObservableBrowserContract"), "The browser gate does not derive and exercise observable capabilities from the user's atomic requirements.");
 assert(factoryRuntime.includes("acceptanceScreenshotUrl") && factoryRuntime.includes("strongest matching surface"), "Browser evidence can still screenshot an arbitrary last route instead of the strongest requested surface.");
 assert(factoryRuntime.includes("hasDisposableFrameworkAssetFailure(problems)"), "A stale generated chunk mixed with downstream DOM failures can still be routed into paid product repair.");
 assert(factoryRuntime.includes("browserAcceptanceTask") && factoryRuntime.includes("previewTarget && verificationProfile.commands.some"), "Required builds can still invalidate a live preview or validate internal planning prose instead of the user request.");
 assert(factoryRuntime.includes('page.waitForLoadState("networkidle"'), "Client-rendered controls can still be judged missing before route data and hydration settle.");
+assert(factoryRuntime.includes("Paused the existing preview before project mutation and verification") && factoryRuntime.includes("preventsMixedBuildArtifacts"), "A framework build can still run beside its owned dev preview and leave browser acceptance on mixed generated artifacts.");
 assert(factoryRuntime.includes("Matching files alone were insufficient; executing the unverified requirements"), "Idempotency reuse can still accept matching fingerprints without rendered requirement acceptance.");
 assert(factoryRuntime.includes("currentDefectReport") && factoryRuntime.includes("priorCompletionCanBeReused"), "A fresh defect report can still reuse an older completed mission.");
 assert(factoryRuntime.includes("File fingerprints and a build cannot prove the requested") && factoryRuntime.includes("executing normally"), "Non-web behavior can still be marked complete from hashes and compilation alone.");

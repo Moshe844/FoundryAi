@@ -31,6 +31,16 @@ export function upsertExecutionEvent(timeline: FactoryExecutionEvent[], event: F
   else timeline.splice(index, 1, event);
 }
 
+/**
+ * Folds a sub-execution's timeline (a repair pass, a recovery batch) into its parent while keeping one
+ * identity per event. A plain push would append the child's records verbatim, so a stable-identity event
+ * such as the execution verdict could appear twice — an intermediate "finished with blocker" left sitting
+ * beside the real successful outcome. Upserting keeps the newest record for each identity.
+ */
+export function mergeExecutionTimeline(target: FactoryExecutionEvent[], incoming: readonly FactoryExecutionEvent[]): void {
+  for (const event of incoming) upsertExecutionEvent(target, event);
+}
+
 /** Reconciles streamed state with persisted state using the same identity contract. */
 export function mergeExecutionTimelines(existing: FactoryExecutionEvent[], incoming: FactoryExecutionEvent[]): FactoryExecutionEvent[] {
   const merged = [...existing];
