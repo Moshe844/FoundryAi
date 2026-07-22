@@ -27,6 +27,7 @@ export async function POST(request: Request) {
   const runtimeController = new AbortController();
   const unregisterExecution = registerExecution(body.controlId, runtimeController);
   let cancelled = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
   const stream = new ReadableStream({
     async start(controller) {
       const sentEvents = new Set<string>();
@@ -34,6 +35,11 @@ export async function POST(request: Request) {
         if (cancelled) return;
         controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
       };
+
+      // Keep the client's 150s inactivity watchdog from killing a mission during a long model call,
+      // install, or build that emits no events. Signals only that the server is alive and working;
+      // genuine hangs stay bounded by per-operation server timeouts. The client ignores unknown types.
+      heartbeat = setInterval(() => send({ type: "heartbeat", at: Date.now() }), 30_000);
 
       try {
         const result = await executeExistingProjectTask(body.brief, body.task, body.files ?? [], body.localPath, (event: FactoryExecutionEvent) => {
@@ -50,12 +56,14 @@ export async function POST(request: Request) {
         failExecution(body.controlId, message);
         send({ type: "error", error: message });
       } finally {
+        if (heartbeat) clearInterval(heartbeat);
         unregisterExecution();
         if (!cancelled) controller.close();
       }
     },
     cancel() {
       cancelled = true;
+      if (heartbeat) clearInterval(heartbeat);
       // A browser reload only disconnects this subscriber. The server execution
       // remains active and can be recovered through its durable control snapshot.
     },

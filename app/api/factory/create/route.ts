@@ -16,12 +16,21 @@ export async function POST(request: Request) {
       const runtimeController = new AbortController();
       const unregisterExecution = registerExecution(body.controlId, runtimeController);
       let disconnected = false;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
       const stream = new ReadableStream({
         start(controller) {
           const sentEvents = new Set<string>();
           const send = (payload: unknown) => {
             if (!disconnected) controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
           };
+
+          // A single model call generating the first batch — or a long install/build — can legitimately
+          // emit no events for minutes. Without a keepalive the client's 150s inactivity watchdog kills
+          // the mission mid-work (observed: "Generating the first runnable source batch" → stopped at
+          // 150s). This heartbeat only signals the server is still alive and working; genuine hangs stay
+          // bounded by the per-operation server timeouts, and if the server process dies the heartbeat
+          // stops so the client watchdog still fires correctly. The client ignores unknown message types.
+          heartbeat = setInterval(() => send({ type: "heartbeat", at: Date.now() }), 30_000);
 
           void createFactoryProject(
             body.brief ?? "",
@@ -50,11 +59,13 @@ export async function POST(request: Request) {
               if (!disconnected) controller.close();
             })
             .finally(() => {
+              if (heartbeat) clearInterval(heartbeat);
               unregisterExecution();
             });
         },
         cancel() {
           disconnected = true;
+          if (heartbeat) clearInterval(heartbeat);
           // Reload/navigation disconnects only this stream subscriber. The
           // build remains active until completion or an explicit Stop request.
         },

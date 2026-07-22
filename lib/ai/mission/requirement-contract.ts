@@ -198,10 +198,17 @@ export function requiresPresentationLayerChange(task: string, visualNeed?: numbe
 /** Advanced/full-featured product language raises the rendered acceptance floor across domains. */
 export function requiresSubstantialUiAcceptance(task: string): boolean {
   const quality = "advanced|comprehensive|full[- ]featured|feature[- ]rich|production[- ]ready|enterprise[- ]grade";
-  const surface = "app|application|website|site|dashboard|tool|planner|tracker|list|workspace|portal|console|interface";
-  if (new RegExp(`\\b(?:${quality})\\b[^.\\n]{0,70}\\b(?:${surface})\\b|\\b(?:${surface})\\b[^.\\n]{0,70}\\b(?:${quality})\\b`, "i").test(task)) return true;
+  // App surfaces imply interactive, feature-rich behavior (forms, many controls). Content surfaces
+  // (site/page/website/landing) are frequently — and legitimately — small and formless: a profile card,
+  // a portfolio, a landing page. Only an explicit quality word makes a content surface "substantial".
+  const appSurface = "app|application|dashboard|tool|planner|tracker|workspace|portal|console|admin|editor|crm|spreadsheet|kanban|board";
+  const anySurface = `${appSurface}|website|site|landing|interface|platform`;
+  if (new RegExp(`\\b(?:${quality})\\b[^.\\n]{0,70}\\b(?:${anySurface})\\b|\\b(?:${anySurface})\\b[^.\\n]{0,70}\\b(?:${quality})\\b`, "i").test(task)) return true;
 
+  // A long feature list implies substantial UI only for an app surface. A static content page can list
+  // five small features (heading, bio, tags, a hover effect) without ever needing forms or ten controls,
+  // and demanding them turned a complete profile card into a permanent "thin shell" repair loop.
   const featureLine = task.match(/^Main features:\s*(.+)$/im)?.[1] ?? "";
   const namedFeatures = featureLine.split(/\s*;\s*/).map((item) => item.trim()).filter(Boolean);
-  return namedFeatures.length >= 5 && new RegExp(`\\b(?:${surface})\\b`, "i").test(task);
+  return namedFeatures.length >= 5 && new RegExp(`\\b(?:${appSurface})\\b`, "i").test(task);
 }

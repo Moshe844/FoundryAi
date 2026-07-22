@@ -18,9 +18,11 @@ export function CollapsedMissionRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
-  const glyph = vm.state === "complete" ? "✓" : vm.state === "cancelled" ? "⊘" : vm.state === "failed" || vm.state === "blocked" ? "✕" : "○";
-  const glyphColor =
-    vm.state === "complete" ? "text-foundry-teal" : vm.state === "cancelled" ? "text-foundry-subtle" : vm.state === "failed" || vm.state === "blocked" ? "text-red-300" : "text-foundry-subtle";
+  const failed = vm.state === "failed" || vm.state === "blocked";
+  const cancelled = vm.state === "cancelled";
+  const glyph = vm.state === "complete" ? "✓" : cancelled ? "⊘" : failed ? "✕" : "○";
+  const glyphColor = vm.state === "complete" ? "text-foundry-teal" : failed ? "text-red-300" : "text-foundry-subtle";
+  const statusLabel = vm.state === "complete" ? "Completed" : cancelled ? "Stopped" : failed ? "Failed" : "In progress";
 
   return (
     <div>
@@ -28,15 +30,18 @@ export function CollapsedMissionRow({
         type="button"
         aria-expanded={expanded}
         onClick={onToggle}
-        className="group/row flex h-10 w-full items-center gap-2.5 rounded px-1.5 text-left transition hover:bg-overlay/[0.03]"
+        className={`group/row flex h-11 w-full items-center gap-3 rounded-lg px-2.5 text-left transition ${expanded ? "bg-overlay/[0.04]" : "hover:bg-overlay/[0.03]"}`}
       >
-        <span className={`shrink-0 font-mono text-[12px] ${glyphColor}`} aria-hidden="true">{glyph}</span>
-        <span className="min-w-0 flex-1 truncate text-[14px] leading-6 text-foundry-muted">
+        <span className={`grid h-6 w-6 shrink-0 place-items-center rounded-md border border-overlay/10 bg-overlay/[0.03] font-mono text-[11px] ${glyphColor}`} aria-hidden="true">{glyph}</span>
+        <span className="min-w-0 flex-1 truncate text-[13.5px] leading-6 text-foundry-muted">
           {firstLine(vm.request)}
           {vm.outcome ? <span className="text-foundry-subtle"> — {vm.outcome}</span> : null}
         </span>
-        <span className="shrink-0 text-[11px] text-foundry-subtle opacity-0 transition-opacity duration-150 group-hover/row:opacity-100">
+        <span className="shrink-0 text-[10px] text-foundry-subtle opacity-0 transition-opacity duration-150 group-hover/row:opacity-100">
           {relativeTime(vm.updatedAt)}
+        </span>
+        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[9.5px] font-bold uppercase tracking-[0.08em] ${vm.state === "complete" ? "bg-foundry-teal/10 text-foundry-teal" : failed ? "bg-red-400/10 text-red-300" : "bg-overlay/[0.06] text-foundry-subtle"}`}>
+          {statusLabel}
         </span>
       </button>
       {expanded ? (

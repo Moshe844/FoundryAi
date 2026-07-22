@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronDown, Code2, FolderTree, History, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { ChevronDown, Code2, FolderTree, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { MissionRecommendation } from "@/lib/ai/mission/recommendations";
@@ -11,7 +11,7 @@ import type { MissionState } from "@/lib/mission-engine";
 import { deriveMissionDisplayStatus, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
 import { answerTaskFor, buildMissionVM } from "@/lib/canvas/adapter";
 import type { CanvasDotState, CanvasMissionVM } from "@/lib/canvas/model";
-import { dotStateOf, hasVerificationConflict, latestLiveEvent, needsRepairAction } from "@/lib/canvas/model";
+import { currentFocusOf, dotStateOf, hasVerificationConflict, latestLiveEvent, needsRepairAction } from "@/lib/canvas/model";
 import type { BlockedCommandAction } from "@/components/execution/ApprovalPrompt";
 import { CanvasComposer } from "@/components/canvas/CanvasComposer";
 import { CollapsedMissionRow } from "@/components/canvas/CollapsedMissionRow";
@@ -556,37 +556,51 @@ export function MissionCanvas({
               </div>
             ) : null}
             <div className="mx-auto max-w-[760px]">
+              {activeVM?.isBusy && activeExecution ? (
+                <div className="canvas-enter mb-5 flex items-center gap-3 rounded-xl border border-foundry-teal/20 bg-foundry-teal/[0.05] px-4 py-3 shadow-[0_1px_0_rgba(0,0,0,0.02)]">
+                  <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foundry-teal/50" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-foundry-teal" />
+                  </span>
+                  <p className="min-w-0 flex-1 truncate text-[13px] leading-5 text-foundry-ink">
+                    <span className="font-bold text-foundry-teal">Current focus: </span>
+                    <span className="font-semibold">{currentFocusOf(activeExecution)}</span>
+                  </p>
+                  <span className="hidden shrink-0 text-[11px] text-foundry-subtle sm:block">Older progress collapses automatically</span>
+                </div>
+              ) : null}
               {mission.compaction ? (
                 <p className="mb-3 text-[11px] leading-5 text-foundry-subtle">Earlier project activity compacted into project memory.</p>
               ) : null}
               {priorVMs.length ? (
-                <section className="mb-8 overflow-hidden rounded-lg border border-overlay/8 bg-overlay/[0.018]" aria-label="Previous messages">
-                  <button
-                    type="button"
-                    aria-expanded={historyOpen}
-                    onClick={() => {
-                      setHistoryOpen((current) => !current);
-                      if (historyOpen) setExpandedPriorId(null);
-                    }}
-                    className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-foundry-muted transition hover:bg-overlay/[0.035] hover:text-foundry-ink"
-                  >
-                    <History size={14} className="text-foundry-subtle" aria-hidden="true" />
-                    <span>Previous messages</span>
-                    <span className="rounded-full bg-overlay/[0.055] px-2 py-0.5 font-mono text-[10px] text-foundry-subtle">{priorVMs.length}</span>
-                    <ChevronDown size={14} className={`ml-auto text-foundry-subtle transition-transform ${historyOpen ? "rotate-180" : ""}`} aria-hidden="true" />
-                  </button>
-                  {historyOpen ? (
-                    <div className="canvas-enter border-t border-overlay/8 px-1.5 py-1.5">
-                      {priorVMs.map((vm) => (
-                        <CollapsedMissionRow
-                          key={vm.id}
-                          vm={vm}
-                          expanded={expandedPriorId === vm.id}
-                          onToggle={() => setExpandedPriorId((current) => (current === vm.id ? null : vm.id))}
-                        />
-                      ))}
-                    </div>
-                  ) : null}
+                <section className="mb-8" aria-label="Previous progress">
+                  <div className="mb-3 flex items-center gap-3">
+                    <span className="h-px flex-1 bg-overlay/10" aria-hidden="true" />
+                    <span className="whitespace-nowrap text-[10px] font-bold uppercase tracking-[0.14em] text-foundry-subtle">
+                      Previous progress <span className="text-foundry-subtle/60">· click any item to reopen</span>
+                    </span>
+                    <span className="h-px flex-1 bg-overlay/10" aria-hidden="true" />
+                  </div>
+                  <div className="grid gap-0.5 rounded-xl border border-overlay/8 bg-overlay/[0.012] p-1.5">
+                    {(historyOpen ? priorVMs : priorVMs.slice(-5)).map((vm) => (
+                      <CollapsedMissionRow
+                        key={vm.id}
+                        vm={vm}
+                        expanded={expandedPriorId === vm.id}
+                        onToggle={() => setExpandedPriorId((current) => (current === vm.id ? null : vm.id))}
+                      />
+                    ))}
+                    {!historyOpen && priorVMs.length > 5 ? (
+                      <button
+                        type="button"
+                        onClick={() => setHistoryOpen(true)}
+                        className="mt-0.5 flex items-center gap-1.5 rounded px-2 py-1.5 text-left text-[12px] text-foundry-subtle transition hover:text-foundry-muted"
+                      >
+                        <ChevronDown size={13} aria-hidden="true" />
+                        Show {priorVMs.length - 5} earlier {priorVMs.length - 5 === 1 ? "item" : "items"}
+                      </button>
+                    ) : null}
+                  </div>
                 </section>
               ) : null}
 

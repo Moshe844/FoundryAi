@@ -1,4 +1,4 @@
-import type { FactoryEngineeringReport, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryLifecyclePhase, FactoryObjectiveChecklistItem, MissionClarification } from "@/lib/factory/types";
+import type { ExecutionMissionVerification, FactoryEngineeringReport, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryLifecyclePhase, FactoryObjectiveChecklistItem, MissionClarification } from "@/lib/factory/types";
 import type { DeliveredProjectFile, ExecutionMission, ExecutionMissionState, ExecutionMissionVerificationStatus } from "@/lib/mission/model";
 import type { WorkspaceAttachment } from "@/lib/files";
 import { stripTerminalFormatting } from "@/lib/text/terminal";
@@ -113,6 +113,10 @@ export type CanvasMissionVM = {
   tier: CanvasTier;
   groups: CanvasVoiceGroup[];
   deliveredFiles: DeliveredProjectFile[];
+  /** Live compact verification checklist — real gates only, latest result each. */
+  verification: CanvasVerificationCheck[];
+  /** Live browser-validation steps from the real preview timeline. */
+  browserSteps: CanvasBrowserStep[];
   phases: CanvasPhase[];
   blocking?: CanvasBlocking;
   summary?: CanvasSummary;
@@ -123,6 +127,61 @@ export type CanvasMissionVM = {
 };
 
 export type CanvasDotState = "idle" | "working" | "waiting" | "failed";
+
+/** One row of the compact verification summary — a real gate that ran, never a placeholder. */
+export type CanvasVerificationCheck = { label: string; status: "pass" | "fail" | "skipped" };
+
+/** One real browser-validation step, in order (e.g. "Signup page opened", "Form submitted"). */
+export type CanvasBrowserStep = { label: string; status: "running" | "done" | "failed" };
+
+/**
+ * The live browser-validation steps, from the real preview timeline. An auth flow yields granular steps
+ * (page opened → form submitted → email created → verification link); a static page yields the coarser
+ * preview lifecycle. Real events only — the latest state per distinct step, most recent last.
+ */
+export function browserStepsOf(timeline: FactoryExecutionEvent[]): CanvasBrowserStep[] {
+  const byLabel = new Map<string, CanvasBrowserStep["status"]>();
+  for (const event of timeline) {
+    if (event.kind !== "preview" || isInternalExecutionEvent(event)) continue;
+    const label = stripTerminalFormatting(event.title || "").replace(/\s+/g, " ").trim();
+    if (!label) continue;
+    byLabel.set(label, event.status === "error" ? "failed" : event.status === "running" ? "running" : "done");
+  }
+  return [...byLabel.entries()].slice(-6).map(([label, status]) => ({ label, status }));
+}
+
+const VERIFICATION_LABELS: Partial<Record<ExecutionMissionVerification["check_type"], string>> = {
+  typecheck: "Type-check",
+  lint: "Lint",
+  build: "Build",
+  test: "Tests",
+  preview: "Browser flow",
+  command: "Command",
+};
+const VERIFICATION_ORDER: ExecutionMissionVerification["check_type"][] = ["typecheck", "lint", "build", "test", "preview", "command"];
+
+/**
+ * VerificationSummary source — collapses the real verification records into one compact live checklist,
+ * latest result per gate. Only gates a person recognizes (type-check, build, tests, browser flow) render;
+ * bookkeeping records (file-read, checklist, manual-evidence) never appear. Nothing is faked: a row exists
+ * only because that gate actually ran.
+ */
+export function verificationChecksOf(verification: ExecutionMissionVerification[]): CanvasVerificationCheck[] {
+  const latest = new Map<ExecutionMissionVerification["check_type"], ExecutionMissionVerification>();
+  for (const item of verification) {
+    if (!VERIFICATION_LABELS[item.check_type]) continue;
+    latest.set(item.check_type, item);
+  }
+  return VERIFICATION_ORDER.filter((type) => latest.has(type)).map((type) => {
+    const item = latest.get(type)!;
+    let label = VERIFICATION_LABELS[type]!;
+    if (type === "test") {
+      const count = item.evidence.match(/(\d+)\s*(?:tests?|passed|specs?|examples?)/i);
+      if (count) label = `${count[1]} tests`;
+    }
+    return { label, status: item.result };
+  });
+}
 
 /** A repeated finding on byte-identical source is a verifier conflict, not unfinished project work. */
 export function hasVerificationConflict(mission: ExecutionMission): boolean {
@@ -441,6 +500,21 @@ export function currentActivityOf(mission: ExecutionMission): { state: CanvasExe
     return { state: "running", label: commandLabel(last.command ?? last.title) };
   }
   return { state: "thinking", label: "Thinking" };
+}
+
+/**
+ * A concise "current focus" phrase for the banner — the most recent thing Foundry actually said it is
+ * doing (its latest voice line, first sentence), falling back to the short activity label. Real content
+ * only: it never invents a focus the timeline doesn't support.
+ */
+export function currentFocusOf(mission: ExecutionMission): string {
+  const voice = [...mission.timeline].reverse().find((event) => isVoiceEvent(event) && voiceTextOf(event));
+  if (voice) {
+    const text = voiceTextOf(voice);
+    const first = text.split(/(?<=[.!?])\s+/)[0]?.trim() || text;
+    return first.length > 120 ? `${first.slice(0, 117)}…` : first;
+  }
+  return currentActivityOf(mission).label;
 }
 
 /** The raw payload behind a row (stdout/stderr/diff), preserved verbatim for expansion. */

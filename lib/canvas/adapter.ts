@@ -2,7 +2,7 @@ import type { FactoryExecutionEvent, FactoryProjectResult, MissionClarification 
 import type { ExecutionMission, MissionState, PendingClarification } from "@/lib/mission-engine";
 import { missionStateLabel, pendingApprovalOf, busyMissionStates } from "@/lib/mission/model";
 import type { CanvasBlocking, CanvasMissionVM, CanvasSummary, CanvasSummaryLine } from "@/lib/canvas/model";
-import { groupTimeline, hasVerificationConflict, needsRepairAction, outcomeOf, phasesOf, tierOf } from "@/lib/canvas/model";
+import { browserStepsOf, groupTimeline, hasVerificationConflict, needsRepairAction, outcomeOf, phasesOf, tierOf, verificationChecksOf } from "@/lib/canvas/model";
 import { stripTerminalFormatting } from "@/lib/text/terminal";
 import { customInstructionsFromProjectBrief } from "@/lib/factory/project-brief";
 import { compactEvidenceText } from "@/lib/factory/event-contract";
@@ -47,6 +47,8 @@ export function buildMissionVM(
     tier: tierOf(execution),
     groups,
     deliveredFiles: execution.delivered_files ?? [],
+    verification: verificationChecksOf(execution.verification ?? []),
+    browserSteps: browserStepsOf(execution.timeline),
     phases: phasesOf(execution.plan ?? []),
     blocking: isActive ? blockingOf(execution, mission, factoryResult) : undefined,
     summary: terminal && !isPlainAnswer ? summaryOf(execution) : undefined,

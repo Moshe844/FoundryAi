@@ -14,7 +14,7 @@ Module._extensions[".ts"] = (m, f) => m._compile(ts.transpileModule(fs.readFileS
 const orig = Module._resolveFilename;
 Module._resolveFilename = function (r, ...a) { const t = r.startsWith("@/") ? path.join(root, r.slice(2)) : r; try { return orig.call(this, t, ...a); } catch (e) { for (const x of [".ts", ".tsx"]) if (fs.existsSync(`${t}${x}`)) return `${t}${x}`; throw e; } };
 
-const { groupExecutionUnits, currentActivityOf, normalizeLineRange } = require(path.join(root, "lib/canvas/model.ts"));
+const { groupExecutionUnits, currentActivityOf, normalizeLineRange, verificationChecksOf, currentFocusOf, browserStepsOf } = require(path.join(root, "lib/canvas/model.ts"));
 
 let failures = 0;
 const ok = (label, cond) => { if (!cond) failures++; console.log(`${cond ? "PASS" : "FAIL"}  ${label}`); };
@@ -65,6 +65,41 @@ ok("editing a file => 'Editing x.ts'", currentActivityOf(mission("running", [{ k
 ok("running a test command => 'Running tests'", currentActivityOf(mission("running", [{ kind: "command", command: "npm test -- upload", status: "running", title: "" }])).state === "testing");
 ok("a decision event => deciding", currentActivityOf(mission("running", [{ kind: "reasoning", tier: "decision", status: "completed", title: "" }])).state === "deciding");
 ok("complete => completed", currentActivityOf(mission("complete", [])).state === "completed");
+
+console.log("\n=== VerificationSummary: real gates only, latest result each, in canonical order ===");
+let checks = verificationChecksOf([
+  { check_type: "file-read", result: "pass", evidence: "read back" },
+  { check_type: "typecheck", result: "pass", evidence: "tsc clean" },
+  { check_type: "build", result: "fail", evidence: "first build failed" },
+  { check_type: "build", result: "pass", evidence: "The production build completed with exit code 0." },
+  { check_type: "test", result: "pass", evidence: "18 tests passed" },
+  { check_type: "checklist", result: "pass", evidence: "rows settled" },
+]);
+ok("bookkeeping records (file-read, checklist) are excluded", checks.every((c) => c.label !== "file-read" && c.label !== "checklist"));
+ok("latest build result wins (fail→pass shows pass)", checks.find((c) => c.label === "Build").status === "pass");
+ok("test count is extracted from evidence", checks.some((c) => c.label === "18 tests"));
+ok("canonical order: Type-check before Build before Tests", checks.map((c) => c.label).join(",") === "Type-check,Build,18 tests");
+ok("empty verification => no checks", verificationChecksOf([]).length === 0);
+
+console.log("\n=== currentFocusOf: the latest thing Foundry said it's doing (banner text) ===");
+ok("uses the latest voice line, first sentence", currentFocusOf({ state: "running", timeline: [
+  { id: "1", kind: "reasoning", status: "completed", title: "", rationale: "The build passes. I'm now running the real signup flow in the browser." },
+] }) === "The build passes.");
+ok("falls back to the activity label when there is no voice", currentFocusOf({ state: "running", timeline: [
+  { id: "1", kind: "command", command: "npm test", status: "running", title: "" },
+] }) === "Running tests");
+
+console.log("\n=== browserStepsOf: real preview steps only, latest state each, in order ===");
+const steps = browserStepsOf([
+  { id: "1", kind: "reasoning", status: "completed", title: "thinking" },
+  { id: "2", kind: "preview", status: "completed", title: "Signup page opened" },
+  { id: "3", kind: "preview", status: "completed", title: "Form submitted" },
+  { id: "4", kind: "preview", status: "running", title: "Opening verification link" },
+]);
+ok("non-preview events are excluded", steps.every((s) => s.label !== "thinking"));
+ok("preview steps are surfaced in order", steps.map((s) => s.label).join(" | ") === "Signup page opened | Form submitted | Opening verification link");
+ok("a running preview step reports running", steps.find((s) => s.label === "Opening verification link").status === "running");
+ok("empty timeline => no steps", browserStepsOf([]).length === 0);
 
 console.log(`\n${failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`}`);
 process.exit(failures ? 1 : 0);
