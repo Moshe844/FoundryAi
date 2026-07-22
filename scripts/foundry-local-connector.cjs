@@ -158,6 +158,8 @@ function send(res, status, body) {
     "access-control-allow-origin": "*",
     "access-control-allow-headers": "content-type, authorization",
     "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-private-network": "true",
+    "access-control-max-age": "600",
   });
   res.end(JSON.stringify(body));
 }
@@ -1106,6 +1108,34 @@ async function discoverSdkArtifacts(root, terms, maxResults = 80) {
   return { root: path.basename(resolvedRoot), artifacts: hits, searchedTerms: needles, truncated: hits.length >= maxResults };
 }
 
+async function importSdkArtifacts(sourceRoot, destinationRoot, artifactPaths) {
+  const source = normalizeRoot(sourceRoot);
+  const destination = normalizeRoot(destinationRoot);
+  if (!source || !destination || !approvedRoots.has(source) || !approvedRoots.has(destination)) {
+    return { ok: false, error: "Both the SDK folder and project folder must be explicitly approved." };
+  }
+  const requested = Array.isArray(artifactPaths) ? artifactPaths.map(String).slice(0, 80) : [];
+  const allowed = /\.(?:zip|aar|jar|dll|so|dylib|framework|xcframework|pdf|docx?|txt|md|html?|xml|json|ya?ml)$/i;
+  const imported = [];
+  let totalBytes = 0;
+  for (const relative of requested) {
+    const sourceFile = resolveContained(source, relative);
+    if (!sourceFile || !allowed.test(relative)) continue;
+    const stats = await fsp.stat(sourceFile).catch(() => null);
+    if (!stats?.isFile()) continue;
+    totalBytes += stats.size;
+    if (totalBytes > 512 * 1024 * 1024) return { ok: false, error: "Selected SDK evidence exceeds the 512 MB safe import limit." };
+    const safeRelative = relative.replace(/\\/g, "/").split("/").filter((part) => part && part !== "." && part !== "..").join("/");
+    const projectRelative = `.foundry-input/sdk/${safeRelative}`;
+    const destinationFile = resolveContained(destination, projectRelative);
+    if (!destinationFile) continue;
+    await fsp.mkdir(path.dirname(destinationFile), { recursive: true });
+    await fsp.copyFile(sourceFile, destinationFile);
+    imported.push({ source: relative, path: projectRelative, name: path.basename(relative), size: stats.size });
+  }
+  return { ok: true, imported, totalBytes };
+}
+
 function normalizeCommandText(command) {
   return String(command || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
@@ -1633,6 +1663,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/sdk/discover") {
       if (!requireApprovedRoot(res, body.root)) return;
       return send(res, 200, await discoverSdkArtifacts(body.root, body.terms, body.maxResults || 80));
+    }
+    if (url.pathname === "/sdk/import") {
+      if (!requireApprovedRoot(res, body.sourceRoot) || !requireApprovedRoot(res, body.destinationRoot)) return;
+      return send(res, 200, await importSdkArtifacts(body.sourceRoot, body.destinationRoot, body.paths));
     }
     if (url.pathname === "/preview/stop") {
       if (!requireApprovedRoot(res, body.root)) return;

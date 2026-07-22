@@ -120,8 +120,64 @@ export type MissionExecutorResult = {
   alreadySatisfied?: boolean;
 };
 
-const IMPLEMENTATION_SCAN_EXCLUDED_DIRS = new Set(["node_modules", ".git", ".next", ".next-build", ".svelte-kit", ".turbo", ".cache", "dist", "build", "out", "coverage", "target", "bin", "obj"]);
+const IMPLEMENTATION_SCAN_EXCLUDED_DIRS = new Set(["node_modules", ".git", ".next", ".next-build", ".svelte-kit", ".turbo", ".cache", ".foundry-artifacts", ".foundry-data", "dist", "build", "out", "coverage", "target", "bin", "obj"]);
 const EXECUTABLE_SOURCE_PATH = /\.(?:[cm]?[jt]sx?|vue|svelte|astro|html?|css|scss|sass|less|py|rb|php|java|kt|kts|swift|go|rs|cs|fs|fsx|vb|dart|scala|lua|r|sql|graphql|proto|xaml)$/i;
+
+export function generatedProcessTheaterPath(files: Array<{ path?: unknown; content?: unknown }>): string | undefined {
+  return files.find((file) => {
+    const filePath = String(file.path ?? "").replace(/\\/g, "/");
+    const content = String(file.content ?? "");
+    if (!EXECUTABLE_SOURCE_PATH.test(filePath) || !content) return false;
+    const internalClaims = [
+      /\b(?:operation-only request|operational compliance artifact|mission resumed|mission decision)\b/i,
+      /\b(?:provider decision|selected provider|excluded providers?|decision (?:applied|locked))\b/i,
+      /\bsettings\s*(?:->|→)\s*credentials\s*&\s*integrations\b/i,
+      /\b(?:local agent requested|verified\s*=\s*true)\b/i,
+    ].filter((pattern) => pattern.test(content)).length;
+    const theaterName = /(?:^|\/)(?:immediate)?(?:operation|decision)(?:record|runner|note|state|checkpoint|verifier)(?:test)?\.(?:kt|java|swift|[cm]?[jt]sx?|py|rb|cs|go)$/i.test(filePath);
+    // These are Foundry execution assertions disguised as customer source. Real provider adapters
+    // prove readiness by invoking an SDK/API and interpreting its response; they do not persist a
+    // boolean claiming that an internal selection or mission step was verified.
+    return internalClaims >= 2 || (theaterName && internalClaims >= 1);
+  })?.path as string | undefined;
+}
+
+export function jvmTopLevelDeclarations(content: string) {
+  const packageName = content.match(/^\s*package\s+([\w.]+)/m)?.[1] ?? "";
+  const declarations = [...content.matchAll(/^\s*(?:(?:public|private|internal|protected|sealed|abstract|open|data|enum|annotation|value)\s+)*(?:class|interface|object)\s+([A-Za-z_]\w*)/gm)]
+    .map((match) => packageName ? `${packageName}.${match[1]}` : match[1]);
+  return [...new Set(declarations)];
+}
+
+export async function duplicateJvmDeclarationIssue(access: ProjectAccess, files: Array<{ path?: unknown; content?: unknown }>) {
+  const proposed = files.flatMap((file) => {
+    const filePath = String(file.path ?? "").replace(/\\/g, "/");
+    if (!/\.(?:kt|java)$/i.test(filePath)) return [];
+    return jvmTopLevelDeclarations(String(file.content ?? "")).map((name) => ({ name, filePath }));
+  });
+  const proposedOwner = new Map<string, string>();
+  for (const declaration of proposed) {
+    const existingOwner = proposedOwner.get(declaration.name);
+    if (existingOwner && existingOwner.toLowerCase() !== declaration.filePath.toLowerCase()) {
+      return `${declaration.name} is declared by both ${existingOwner} and ${declaration.filePath} in the same generated batch.`;
+    }
+    proposedOwner.set(declaration.name, declaration.filePath);
+  }
+  if (!access.searchFiles) return undefined;
+  for (const declaration of proposed) {
+    const simpleName = declaration.name.split(".").at(-1)!;
+    const hits = await access.searchFiles(simpleName, { maxResults: 40 }).catch(() => []);
+    for (const hit of hits) {
+      const hitPath = hit.path.replace(/\\/g, "/");
+      if (hitPath.toLowerCase() === declaration.filePath.toLowerCase() || !/\.(?:kt|java)$/i.test(hitPath)) continue;
+      const existing = await access.readFile(hitPath, { limitBytes: 100_000 }).catch(() => null);
+      if (existing?.exists && jvmTopLevelDeclarations(existing.content).includes(declaration.name)) {
+        return `${declaration.name} already exists in ${hitPath}; writing ${declaration.filePath} would create a duplicate JVM declaration.`;
+      }
+    }
+  }
+  return undefined;
+}
 
 export async function hasRunnableProjectEntry(access: ProjectAccess): Promise<boolean> {
   const entryPatterns = [
@@ -132,7 +188,7 @@ export async function hasRunnableProjectEntry(access: ProjectAccess): Promise<bo
     /(?:^|\/)(?:program\.cs|app\.xaml|mainwindow\.xaml|mainactivity\.(?:java|kt)|__main__\.py|main\.(?:rs|go|dart|swift|c|cc|cpp|cxx)|application\.java)$/i,
   ];
   async function visit(relativePath: string, depth: number): Promise<boolean> {
-    if (depth > 3) return false;
+    if (depth > 10) return false;
     const entries = await access.listDir(relativePath).catch(() => []);
     for (const entry of entries) {
       const childPath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
@@ -141,7 +197,7 @@ export async function hasRunnableProjectEntry(access: ProjectAccess): Promise<bo
       } else if (entryPatterns.some((pattern) => pattern.test(childPath))) {
         const entry = await access.readFile(childPath, { limitBytes: 4_000 }).catch(() => null);
         const content = entry?.content?.trim() ?? "";
-        const obviousStub = /continuing implementation|coming soon|todo|placeholder|hello world/i.test(content);
+        const obviousStub = content.length < 400 && /continuing implementation|coming soon|todo|placeholder|hello world/i.test(content);
         // A filename alone is not a runnable experience. Generated recovery previously accepted a
         // seven-line "Continuing implementation" page as complete and moved straight to build.
         const conventionalCompiledEntry = /(?:^|\/)(?:program\.cs|app\.xaml|mainwindow\.xaml|mainactivity\.(?:java|kt)|__main__\.py|main\.(?:rs|go|dart|swift|c|cc|cpp|cxx)|application\.java)$/i.test(childPath);
@@ -239,7 +295,7 @@ function toolSchemas(canRunCommands: boolean, canBrowserValidate = false): Neutr
         properties: {
           files: {
             type: "array",
-            minItems: 1,
+            minItems: 3,
             maxItems: 24,
             items: {
               type: "object",
@@ -516,7 +572,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       .map((candidate) => candidate.replace(/\\/g, "/").trim())
       .filter(Boolean),
   ));
-  const readOnlyFollowUp = Boolean(
+  const readOnlyFollowUp = !input.newProject && !input.requireFirstMutation && Boolean(
     input.followUpResolution
     && ["question", "inspection", "diagnose", "status", "retrospective"].includes(input.followUpResolution.currentIntent),
   );
@@ -562,7 +618,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             required: ["path", "offset_bytes", "limit_bytes"],
           },
         } : tool)
-    : input.commandOnly
+    : input.commandOnly && !input.newProject && !input.requireFirstMutation
     ? availableTools.filter((tool) => !["write_file", "write_files", "replace_in_file", "delete_file"].includes(tool.name))
     : input.staticProject && (input.newProject || input.staticRewrite)
     ? availableTools.filter((tool) => tool.name === "write_file").map((tool) => ({
@@ -577,7 +633,35 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         },
       }))
     : input.newProject
-      ? availableTools.filter((tool) => tool.name !== "report_blocked")
+      ? availableTools.filter((tool) => tool.name !== "report_blocked").map((tool) => input.verificationProfile?.adapterId === "android-gradle" && tool.name === "write_files" ? {
+          ...tool,
+          description: `${tool.description} For this Android project, every path must be real Kotlin/Java source, Android resource XML, test source, or the existing Gradle configuration. Temp, ops, log, marker, note, and generic text files are invalid.`,
+          parameters: {
+            ...tool.parameters,
+            properties: {
+              files: {
+                type: "array",
+                minItems: 3,
+                maxItems: 24,
+                contains: {
+                  type: "object",
+                  properties: { path: { type: "string", pattern: "^app/src/(?:main|test|androidTest)/(?:java|kotlin)/.+\\.(?:kt|java)$" } },
+                  required: ["path"],
+                },
+                minContains: 2,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    path: { type: "string", pattern: "^(?:settings\\.gradle(?:\\.kts)?|build\\.gradle(?:\\.kts)?|gradle\\.properties|app/build\\.gradle(?:\\.kts)?|app/src/(?:main|test|androidTest)/(?:java|kotlin|res)/.+\\.(?:kt|java|xml))$" },
+                    content: { type: "string", minLength: 80 },
+                  },
+                  required: ["path", "content"],
+                },
+              },
+            },
+          },
+        } : tool)
       : availableTools;
   const provider: ProviderId = input.provider ?? "openai";
   const needsGeneratedEntryRecovery = input.newProject
@@ -598,6 +682,16 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const { model, effort } = resolveModelForTier(effectiveTier, { provider });
 
   async function emit(kind: FactoryExecutionEventKind, status: FactoryExecutionEventStatus, title: string, extra: Partial<FactoryExecutionEvent> = {}) {
+    // Suppress a near-duplicate user-facing narrative line before it ever reaches the canvas — this is
+    // what stops a generic lifecycle template from being emitted identically every batch. Findings and
+    // decisions carry distinct rationale, so this only ever collapses true repeats. Never applied to the
+    // live "running" placeholder (it updates in place) or to internal/orchestration events.
+    if (kind === "reasoning" && status === "completed" && !extra.internal && !extra.tier && title.trim().length >= 12) {
+      const normalized = normalizeForSimilarity(title.trim());
+      if (recentReasoningNormalized.some((prior) => textSimilarity(normalized, prior) > 0.72)) return;
+      recentReasoningNormalized.push(normalized);
+      if (recentReasoningNormalized.length > 8) recentReasoningNormalized.shift();
+    }
     const id = extra.id
       ?? (status !== "running" ? matchingRunningEventId(timeline, { kind, command: extra.command, filePath: extra.filePath }) : undefined)
       ?? `mission-event-${timeline.length}-${Math.random().toString(16).slice(2)}`;
@@ -670,7 +764,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               : "",
             "write_file always takes one complete new file, while write_files writes a coordinated verified set in one operation. For a new project or multi-file feature, prefer one write_files call over one model turn per file. For a localized change in an existing file, prefer replace_in_file with an exact old_text match so a small repair never requires a risky whole-file rewrite.",
             input.newProject && !input.staticProject
-              ? "For a multi-file greenfield build, keep each write_files response to 3–4 complete coordinated files and at most roughly 36,000 characters of file content. Finish the executable foundation over multiple verified batches. Do not attempt the entire repository in one oversized tool call: a truncated JSON action writes nothing and wastes the model call."
+              ? "For an unfinished multi-file generated build, each write_files response must be a substantial executable product slice: normally 8–12 complete coordinated files and no more than roughly 100,000 characters total. Include the user-visible screen or workflow, its state/domain logic, persistence or real integration boundary, and meaningful automated tests in the SAME batch. Tiny utility-only batches, one-class-per-call work, markers, constants-only batches, and build-process artifacts are invalid. A passing compiler proves only that the current slice compiles; it is never evidence that the saved product brief is implemented. Do not edit Gradle files unless a concrete compiler diagnostic requires it. Prefer three substantial verified product slices over dozens of tiny batches."
+              : "",
+            input.newProject
+              ? "Foundry's process is never part of the customer's product. Do not create operation, decision, checkpoint, readiness, compliance, or status classes/tests that merely record a selected provider, credentials screen, Local Agent action, mission state, or `verified = true`. Those are execution notes disguised as code. Implement named customer workflows from the saved brief. A provider integration must call APIs proven by supplied SDK/API evidence, interpret real responses and errors, and expose that behavior to the product."
               : "",
             "Never create an empty placeholder source file and plan to fill it in on a later turn. Write complete meaningful content on the first write_file call. Empty HTML, CSS, JavaScript, TypeScript, component, config, or data files are not implementation progress.",
             "The first working version must actually IMPLEMENT the requested features — not a shell that announces them. A screen whose entire content is a title plus text like \"coming soon\", \"preparing…\", \"under construction\", \"first workflow\", or \"feature will be added\" is NOT a working version; it is a placeholder that fails the request. If the user asked for a workout logger, a calorie tracker, and a meditation timer with a dashboard, the first build must contain a real workout logging UI with input and a list, a real calorie entry UI, a real timer, and a dashboard that reads from them — with local state wired up — not a landing screen describing them. Build the real screens and their interactions in the first pass; a scaffold that only renders a heading is an incomplete build, not a milestone.",
@@ -816,6 +913,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   let generatedWriteCalls = 0;
   let hadUnresolvedToolFailure = false;
   let lastReasoningNormalized = "";
+  // Every user-facing reasoning line, whatever its source, is checked against the recent ones so a
+  // hard-coded lifecycle template ("The complete source set is ready…") can never repeat verbatim the way
+  // it did across continuation batches. The model's own specific reasoning is what should dominate.
+  const recentReasoningNormalized: string[] = [];
   let silentExplorationTurns = 0;
   // Runtime-supplied working-set evidence is a completed inspection. Do not pay the model to list or
   // reread files whose exact current contents are already present in its authoritative context.
@@ -823,6 +924,13 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   let consecutiveExplorationTurns = 0;
   const completedEvidenceRepairReads = new Set<string>();
   let modelCallsSinceDurableProgress = 0;
+  let consecutiveRejectedGeneratedWrites = 0;
+  let paidModelCallsThisBatch = 0;
+  // A healthy implementation batch coordinates files and then hands verification to deterministic
+  // tools. It must not consume the entire mission allowance by turning every tiny file into another
+  // paid turn. Complex work can be resumed explicitly from verified state; silent 24-call spirals are
+  // never an acceptable default.
+  const maximumPaidModelCallsThisBatch = Math.max(3, Math.min(12, Number(process.env.FOUNDRY_MAX_MODEL_CALLS_PER_EXECUTION_BATCH) || 8));
   const successfulCommandSignatures = new Set<string>();
   const coordinatedEvidencePaths = Array.from(input.initialProjectEvidence?.matchAll(/^--- (.+?) ---$/gm) ?? [], (match) => match[1].replace(/\\/g, "/"));
   const coordinatedMutationCounts = new Map<string, number>();
@@ -851,6 +959,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     ? configuredNoProgressCalls
     : Math.max(1, Math.min(2, configuredNoProgressCalls));
   let forcedMutationRecovery: "replace_in_file" | "write_file" | undefined = input.requireFirstMutation ? mutationToolForExistingProject() : undefined;
+  const initialGeneratedRootEntries = input.newProject ? await input.access.listDir("").catch(() => []) : [];
+  const initialGeneratedManifestPresent = initialGeneratedRootEntries.some((entry) => entry.kind === "file" && /^(?:package\.json|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|pom\.xml|cargo\.toml|go\.mod|pubspec\.yaml|[^/]+\.(?:csproj|sln))$/i.test(entry.name));
+  const coordinatedGeneratedFoundationNeeded = input.newProject
+    && (!initialGeneratedManifestPresent || !(await hasRunnableProjectEntry(input.access)) || input.executionStrategy?.workflow === "autonomous-mission");
   let mutationRecoveryUsed = false;
   let alreadySatisfied = false;
   const explicitlyRequiredPaths = input.newProject ? explicitRequiredProjectPaths(input.task) : [];
@@ -895,6 +1007,11 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
 
   for (let turn = 1; turn <= maxTurns; turn += 1) {
     if (input.signal?.aborted) return stoppedByUser(turn);
+    if (paidModelCallsThisBatch >= maximumPaidModelCallsThisBatch) {
+      const reason = `Model-call limit reached (${maximumPaidModelCallsThisBatch}) for this execution batch. Foundry stopped before spending the remaining mission allowance; preserve verified files and require deterministic verification or an explicit user resume.`;
+      await emit("planning", "warning", "Execution batch stopped at its paid-call safety boundary", { details: { reason, paidCallPrevented: true, recoverable: true } });
+      return finalize("failed", reason, Math.max(0, turn - 1));
+    }
     // Existing-project missions may need a small amount of inspection, but inspection is not the
     // requested outcome. Once two model turns have only read/listed/searched, require the next
     // call to mutate the project. This applies to every detected stack and keeps a weak Fast model
@@ -1018,6 +1135,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           : forcedMutationRecovery
             ? "Applying the required source change"
             : "Preparing the next verified project action";
+    // Greenfield recovery must buy coordinated implementation, not one tiny file per provider call.
+    const coordinatedNewProjectFoundation = coordinatedGeneratedFoundationNeeded && !input.staticProject && generatedWriteCalls < 10;
     await emit("reasoning", "running", activeProviderStage, {
       // One provider-wait lifecycle replaces itself across turns and continuation batches. Without
       // a stable identity the canvas rendered the same "Continuing from …" state once per model call.
@@ -1040,6 +1159,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           ? turnTools.filter((tool) => tool.name === "write_file")
           : needsGeneratedEntryRecovery && generatedWriteCalls < generatedWriteFloor
           ? turnTools.filter((tool) => tool.name === (input.staticProject ? "write_file" : "write_files"))
+          : coordinatedNewProjectFoundation
+          ? turnTools.filter((tool) => tool.name === "write_files")
           : input.staticProject && input.fastLane && !input.newProject && inspectedExistingProject
           ? turnTools.filter((tool) => !explorationToolNames.has(tool.name))
           : turnTools,
@@ -1065,6 +1186,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           ? { name: "write_file" }
           : needsGeneratedEntryRecovery && generatedWriteCalls < generatedWriteFloor
           ? { name: input.staticProject ? "write_file" : "write_files" }
+          : coordinatedNewProjectFoundation
+          ? { name: "write_files" }
           : coordinatedAlternatePaths.length
           ? { name: "replace_in_file" }
           : "auto",
@@ -1084,7 +1207,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       },
       { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 1, signal: input.signal, timeoutMs: input.staticProject && (input.newProject || input.staticRewrite || (input.fastLane && input.tier && input.tier !== "fast")) ? 120_000 : input.staticProject ? 90_000 : input.fastLane ? 60_000 : 160_000 },
     );
-    if (result.usage.requestCount > 0) modelCallsSinceDurableProgress += 1;
+    if (result.usage.requestCount > 0) {
+      modelCallsSinceDurableProgress += 1;
+      paidModelCallsThisBatch += result.usage.requestCount;
+    }
     usage.push(result.usage);
     if (turn === 1) {
       await emit("planning", "completed", `Model · ${result.usage.provider}/${result.usage.model}`, {
@@ -1221,7 +1347,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           role: "user",
           content: [{
             type: "text",
-            text: "Your previous response returned without the required project write. Call write_files now. Write one compact executable batch of 3–4 complete coordinated files with no more than roughly 36,000 characters of file content: begin with the framework configuration, application entry/layout, primary usable screen, and its shared state or style module. Use compatible pinned dependency ranges, no placeholder or marker files, no documentation, and no explanation before the tool call. Later verified batches will extend the foundation; do not attempt the entire repository in one JSON action.",
+            text: "Your previous response returned without the required project write. Call write_files now with one substantial executable product slice of 8–12 coordinated files and at most roughly 100,000 characters total. The same batch must include the primary usable screen/workflow, state and domain logic, persistence or real integration boundary, and meaningful tests. Do not write markers, constants-only utilities, placeholders, documentation, or explanations before the tool call.",
           }],
         });
       }
@@ -1384,6 +1510,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         ? args.files.map((file) => file && typeof file === "object" ? String((file as Record<string, unknown>).path ?? "").replace(/\\/g, "/") : "")
         : [];
       const generatedMutationPaths = coordinatedWritePaths.length ? coordinatedWritePaths : [writePath];
+      const proposedGeneratedFiles = call.name === "write_files" && Array.isArray(args.files)
+        ? args.files.filter((file): file is Record<string, unknown> => Boolean(file && typeof file === "object"))
+        : [args];
       const wrongForcedRequiredPath = forceRequiredFile && call.name === "write_file" && writePath.toLowerCase() !== forcedRequiredPath?.toLowerCase()
         ? `This recovery action must create the exact missing user-required path ${forcedRequiredPath}; ${writePath || "a blank path"} is not an accepted substitute.`
         : undefined;
@@ -1422,11 +1551,63 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       const protectedBatchPath = input.newProject ? generatedMutationPaths.find((path) => /(?:^|\/)foundry-brief\.md$/i.test(path)) : undefined;
       const generatedBatchDocumentationPath = input.newProject && !runnableEntryExistsNow ? generatedMutationPaths.find((path) => /(?:^|\/)(?:readme(?:\.[^/]+)?|changelog(?:\.[^/]+)?|notes?(?:\.[^/]+)?|scratch(?:\.[^/]+)?|temp(?:\.[^/]+)?|todo(?:\.[^/]+)?|\.init-stamp)$/i.test(path)) : undefined;
       const generatedBatchMarkerPath = input.newProject ? generatedMutationPaths.find((path) => /(?:^|\/)(?:\.(?:bootstrap|handoff|stamp|keep|touch|placeholder)(?:\.[^/]*)?|fix\.txt|[^/]*(?:touchpoint|status|progress|handoff|bootstrap|inspect|probe|noop|marker|fix[-_ ]?(?:note|placeholder|stub|temp)|repair[-_ ]?note|debug[-_ ]?note|verification[-_ ]?note)[^/]*)(?:\.[^/]*)?$|\.(?:tmp|log)$/i.test(path)) : undefined;
-      const generatedOrchestrationArtifactPath = input.newProject ? generatedMutationPaths.find((candidate) => {
+      const generatedPlainPlaceholderPath = input.newProject ? generatedMutationPaths.find((candidate) =>
+        /(?:^|\/)(?:placeholder\d*(?:\.[^/]*)?|boot\.txt|init\.txt|[^/]*(?:scaffoldnote|kickoff|missioncontinuation|featurescaffold|batch\d*anchor|batch\d*[a-z]?|init(?:one|two|three|\d+)|keep\d+)[^/]*\.[^/]*)$/i.test(candidate)
+        || /(?:^|\/)(?:temp|placeholder)(?:\/|$)/i.test(candidate)) : undefined;
+      let invalidAndroidNamespacePath: string | undefined;
+      if (input.newProject && input.verificationProfile?.adapterId === "android-gradle") {
+        const appGradle = await input.access.readFile("app/build.gradle.kts", { limitBytes: 120_000 }).catch(() => ({ exists: false, content: "" }));
+        const fallbackGradle = appGradle.exists ? appGradle : await input.access.readFile("app/build.gradle", { limitBytes: 120_000 }).catch(() => ({ exists: false, content: "" }));
+        const namespace = fallbackGradle.content.match(/\bnamespace\s*(?:=\s*)?["']([^"']+)["']/)?.[1]
+          ?? fallbackGradle.content.match(/\bapplicationId\s*(?:=\s*)?["']([^"']+)["']/)?.[1];
+        if (namespace) {
+          const namespacePath = namespace.replace(/\./g, "/").toLowerCase();
+          invalidAndroidNamespacePath = generatedMutationPaths.find((candidate) => {
+            const normalized = candidate.replace(/\\/g, "/").toLowerCase();
+            const source = normalized.match(/^app\/src\/(?:main|test|androidtest)\/(?:java|kotlin)\/(.+)\.(?:kt|java)$/i)?.[1];
+            return Boolean(source && source !== namespacePath && !source.startsWith(`${namespacePath}/`));
+          });
+        }
+      }
+      const invalidAndroidProductPath = input.newProject && input.verificationProfile?.adapterId === "android-gradle"
+        ? generatedMutationPaths.find((candidate) => !/^(?:settings\.gradle(?:\.kts)?|build\.gradle(?:\.kts)?|gradle\.properties|app\/build\.gradle(?:\.kts)?|app\/src\/(?:main|test|androidTest)\/(?:java|kotlin|res)\/.+\.(?:kt|java|xml))$/i.test(candidate))
+        : undefined;
+      const androidSourceFiles = proposedGeneratedFiles.filter((file) => /^app\/src\/(?:main|test|androidTest)\/(?:java|kotlin)\/.+\.(?:kt|java)$/i.test(String(file.path ?? "").replace(/\\/g, "/")));
+      const androidProductLayers = new Set(androidSourceFiles.flatMap((file) => {
+        const candidatePath = String(file.path ?? "").replace(/\\/g, "/").toLowerCase();
+        const content = String(file.content ?? "");
+        const layers: string[] = [];
+        if (/\/(?:ui|screen|presentation)\/|(?:activity|screen|viewmodel)\.(?:kt|java)$/.test(candidatePath)
+          || /\b(?:@Composable|Activity|ViewModel)\b/.test(content)) layers.push("experience");
+        if (/\/(?:domain|usecase|workflow|feature)\/|\b(?:use\s*case|workflow|checkout|cart|sale|refund|inventory)\b/i.test(`${candidatePath} ${content}`)) layers.push("behavior");
+        if (/\/(?:data|repository|database|dao|integration|gateway|terminal)\/|\b(?:@Entity|@Dao|RoomDatabase|Repository|Gateway|POSLink|Terminal)\b/.test(`${candidatePath} ${content}`)) layers.push("persistence-or-integration");
+        if (/^app\/src\/(?:test|androidtest)\//.test(candidatePath) || /\b@Test\b/.test(content)) layers.push("test");
+        return layers;
+      }));
+      const coordinatedAndroidProductSlice = androidSourceFiles.length >= 3
+        && androidProductLayers.has("experience")
+        && androidProductLayers.has("behavior")
+        && (androidProductLayers.has("persistence-or-integration") || androidProductLayers.has("test"));
+      const insufficientAndroidSourceBatch = input.newProject && input.verificationProfile?.adapterId === "android-gradle" && call.name === "write_files"
+        && androidSourceFiles.length < (runnableEntryExistsNow ? 6 : 2)
+        && !coordinatedAndroidProductSlice;
+      const generatedPlaceholderContentPath = input.newProject
+        ? proposedGeneratedFiles.find((file) => proposedFileIsPlaceholderOnly(String(file.path ?? ""), String(file.content ?? "")))?.path as string | undefined
+        : undefined;
+      const undersizedCoordinatedFoundation = coordinatedNewProjectFoundation
+        && call.name === "write_files"
+        && proposedGeneratedFiles.length < 3
+        ? `A coordinated greenfield foundation requires at least 3 complete related files; this call supplied ${proposedGeneratedFiles.length}. The batch was rejected before disk write.`
+        : undefined;
+      const generatedOrchestrationArtifactPath = generatedMutationPaths.find((candidate) => {
         const normalized = candidate.replace(/\\/g, "/");
         return /(?:^|\/)[^/]*(?:build[-_ ]?lock|verification[-_ ]?repair|compiler[-_ ]?repair|provider[-_ ]?fallback|scaffold[-_ ]?repair)[^/]*\.[^/]+$/i.test(normalized)
-          || /(?:^|\/)[^/]*marker[^/]*\.(?:txt|md|json|log)$/i.test(normalized);
-      }) : undefined;
+          || /(?:^|\/)[^/]*marker[^/]*\.(?:txt|md|json|log)$/i.test(normalized)
+          // Provider/SDK prerequisites belong in Foundry's execution state, never as fake
+          // customer-domain classes whose only behavior is documenting that work is blocked.
+          || /(?:^|\/)[^/]*(?:continuation(?:note)?|sdk(?:evidence|readiness)|evidence(?:gate|record|checklist)|hardwarevalidationnotice|validationnotice)[^/]*\.[^/]+$/i.test(normalized);
+      });
+      const generatedProcessTheater = input.newProject ? generatedProcessTheaterPath(proposedGeneratedFiles) : undefined;
       const competingProjectManifestPath = input.newProject && !explicitProjectExpansion
         ? generatedMutationPaths.find((candidate) => {
             const family = projectManifestFamily(candidate);
@@ -1485,17 +1666,30 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         && (writePath.toLowerCase() !== "index.html" || !isCompleteSelfContainedStaticEntry(writePath, String(args.content ?? "")))
         ? "The first static-project write must be the finished index.html, not a skeleton or initialization placeholder. Write at least 2,500 characters with the complete requested content, embedded responsive CSS, embedded interactive JavaScript, realistic seed data, accessible controls, and closing </script>, </body>, and </html> tags. This one coherent artifact lets Foundry verify the browser without buying several follow-up model turns."
         : undefined;
-      const coordinatedGeneratedWriteIssue = protectedBatchPath
+      const coordinatedGeneratedWriteIssue = undersizedCoordinatedFoundation
+        ?? (insufficientAndroidSourceBatch
+        ? `${runnableEntryExistsNow ? "An Android continuation batch must implement a substantial product slice with at least six coordinated Kotlin/Java application and test files" : "An unfinished Android foundation must include at least two real Kotlin/Java application or test files"}. Tiny utility batches and XML resources alone do not implement the saved product brief.`
+        : invalidAndroidProductPath
+        ? `${invalidAndroidProductPath} is not Android application source, test source, resource XML, or verified Gradle configuration. Generated Android batches may not create temp, log, marker, or generic text files.`
+        : invalidAndroidNamespacePath
+        ? `${invalidAndroidNamespacePath} is outside the Android application's established namespace. Extend the existing application package declared in app/build.gradle instead of creating a disconnected parallel source tree.`
+        : protectedBatchPath
         ? "foundry-brief.md is the authoritative saved requirement and cannot be overwritten as generated application output."
         : competingProjectManifestPath
           ? `${competingProjectManifestPath} would create a competing project root beside the established ${establishedProjectManifests.join(", ")}. Repair the existing project in place; do not scaffold a replacement unless the user explicitly requests another project or module.`
         : generatedOrchestrationArtifactPath
           ? `${generatedOrchestrationArtifactPath} describes Foundry's own build, verification, provider, scaffold, or progress machinery. Internal orchestration artifacts are never customer application source and cannot be written into a generated project.`
+        : generatedProcessTheater
+          ? `${generatedProcessTheater} turns Foundry's internal provider/mission state into customer source and claims success without a real SDK/API action. Implement an actual user workflow or provider adapter and verify its response; execution notes and hard-coded verified booleans are rejected.`
+        : generatedPlainPlaceholderPath
+          ? `${generatedPlainPlaceholderPath} is a placeholder/bootstrap artifact, not customer application source. This entire batch was rejected before disk write.`
+        : generatedPlaceholderContentPath
+          ? `${generatedPlaceholderContentPath} contains placeholder-only implementation rather than requested product behavior. This entire batch was rejected before disk write.`
         : generatedBatchDocumentationPath
           ? `${generatedBatchDocumentationPath} is documentation, not the unfinished customer application. Write the coordinated application source first.`
           : generatedBatchMarkerPath
             ? `${generatedBatchMarkerPath} is an internal marker/progress artifact, not customer application source.`
-            : undefined;
+            : undefined);
       // Structural-drift guard: a write whose relative imports point at files that do not exist is not
       // an implementation — it is an invented parallel structure. Observed live: a repair wrote screens
       // importing ../src/state/MoodContext while the real module lived at src/context/JournalContext;
@@ -1505,7 +1699,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       const unresolvedImportIssue = ["write_file", "write_files", "replace_in_file"].includes(call.name ?? "")
         ? await unresolvedRelativeImportIssue(input.access, call.name ?? "", args, generatedMutationPaths).catch(() => undefined)
         : undefined;
-      const staticWriteIssue = wrongForcedRequiredPath ?? unresolvedImportIssue ?? repeatedGeneratedWriteIssue ?? generatedApplicationRootIssue ?? generatedManifestIssue ?? coordinatedGeneratedWriteIssue ?? protectedGeneratedBriefIssue ?? generatedDocumentationIssue ?? generatedMarkerIssue ?? generatedRecoveryWriteIssue ?? firstStaticArtifactIssue ?? (input.staticProject && call.name === "write_file"
+      const duplicateJvmIssue = input.newProject && ["write_file", "write_files"].includes(call.name ?? "")
+        ? await duplicateJvmDeclarationIssue(input.access, proposedGeneratedFiles).catch(() => undefined)
+        : undefined;
+      const staticWriteIssue = wrongForcedRequiredPath ?? unresolvedImportIssue ?? duplicateJvmIssue ?? repeatedGeneratedWriteIssue ?? generatedApplicationRootIssue ?? generatedManifestIssue ?? coordinatedGeneratedWriteIssue ?? protectedGeneratedBriefIssue ?? generatedDocumentationIssue ?? generatedMarkerIssue ?? generatedRecoveryWriteIssue ?? firstStaticArtifactIssue ?? (input.staticProject && call.name === "write_file"
         ? invalidStaticEntryWrite(writePath, String(args.content ?? ""))
         : undefined);
       const evidenceRepairReplacement = typeof args.new_text === "string" ? args.new_text : "";
@@ -1529,6 +1726,17 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           details: { reason: rejectedWriteReason },
         });
         toolResult = { verified: false, reason: rejectedWriteReason };
+        if (input.newProject && ["write_file", "write_files", "replace_in_file"].includes(call.name ?? "")) {
+          consecutiveRejectedGeneratedWrites += 1;
+          if (consecutiveRejectedGeneratedWrites >= 2) {
+            const reason = `Generated source was rejected twice without a durable mutation. Foundry stopped before buying another provider call. Latest rejection: ${rejectedWriteReason}`;
+            await emit("planning", "warning", "Rejected generation stopped before another paid call", {
+              internal: true,
+              details: { reason, paidCallPrevented: true, recoverable: true },
+            });
+            return finalize("failed", reason, turn);
+          }
+        }
       } else {
         toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions).catch((error) => ({
           error: error instanceof Error ? error.message : "Tool call failed unexpectedly.",
@@ -1544,6 +1752,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       if (["write_file", "write_files", "replace_in_file"].includes(call.name ?? "")) {
         const writeResult = toolResult as { verified?: boolean; contentChanged?: boolean; written?: number };
         if (writeResult.verified && (writeResult.contentChanged || Number(writeResult.written ?? 0) > 0)) {
+          consecutiveRejectedGeneratedWrites = 0;
           modelCallsSinceDurableProgress = 0;
           consecutiveExplorationTurns = 0;
           const mutationPaths = coordinatedWritePaths.length ? coordinatedWritePaths : [writePath];
@@ -1670,6 +1879,14 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               const key = filePath.toLowerCase();
               generatedWriteCounts.set(key, (generatedWriteCounts.get(key) ?? 0) + 1);
             });
+            if (input.newProject && call.name === "write_files") {
+              const reason = "SOURCE_BATCH_READY_FOR_DETERMINISTIC_VERIFICATION: The coordinated source batch is on disk. Run the stack's required compile, lint, tests, and build before requesting another generated batch.";
+              await emit("planning", "completed", "Source batch ready for deterministic verification", {
+                internal: true,
+                details: { reason, changedFiles: generatedMutationPaths, paidModelCallsBeforeVerification: paidModelCallsThisBatch },
+              });
+              return finalize("failed", reason, turn);
+            }
           }
           lastFailedWriteSignature = "";
           repeatedWriteFailures = 0;
@@ -1831,7 +2048,11 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           item.evidence = `The complete static source set was written and read back from disk (${Array.from(changedFiles).join(", ")}); deterministic browser verification follows in the runtime gate.`;
         }
       });
-      await emit("reasoning", "completed", "The complete source set is ready. I’m opening it in a real browser now and checking the rendered experience.");
+      const writtenFiles = Array.from(changedFiles);
+      const fileSummary = writtenFiles.length <= 3
+        ? writtenFiles.join(", ")
+        : `${writtenFiles.slice(0, 3).join(", ")} and ${writtenFiles.length - 3} more`;
+      await emit("reasoning", "completed", `The source is written${fileSummary ? ` (${fileSummary})` : ""}. I’m opening it in a real browser now to verify the rendered result.`);
       return finalize("passed", undefined, turn);
     }
   }
@@ -2157,6 +2378,64 @@ function hasCompleteStaticArtifactSet(changedFiles: Set<string>) {
     && paths.some((file) => /\.(?:js|mjs|cjs|ts)$/.test(file));
 }
 
+/**
+ * True when a proposed generated file is a placeholder/stub rather than real product source — used to
+ * reject it before disk write. This must NOT catch legitimate real content, or a whole build produces
+ * zero files. The bug it fixes: a bare `\bplaceholder\b` matched the HTML `placeholder="…"` attribute,
+ * so a real portfolio's contact form (`<input placeholder="Your email">`) was rejected as
+ * "placeholder-only" twice and the mission failed with nothing written.
+ */
+/**
+ * A browser serves an `.html` file literally. When a mission picks a Markdown/Astro-flavored stack but
+ * the file is served as raw static HTML, the model prepends YAML/TOML frontmatter (`---\ntitle: …\n---`)
+ * that renders as visible garbage and fails the browser gate on every attempt. That is not valid HTML
+ * content, so strip a leading frontmatter block from HTML entry files before writing. Conservative: only
+ * acts when a real HTML document (`<!doctype`/`<html`/`<…>`) follows the block, so legitimate files are
+ * never mangled. Exported for testing.
+ */
+export function htmlEntryWithoutFrontmatter(rawPath: string, content: string): string {
+  if (!/\.html?$/i.test(rawPath.replace(/\\/g, "/"))) return content;
+  const match = content.match(/^﻿?\s*(---|\+\+\+)[ \t]*\r?\n[\s\S]*?\r?\n\1[ \t]*\r?\n?/);
+  if (!match) return content;
+  const remainder = content.slice(match[0].length);
+  return /^\s*<(?:!doctype\b|!--|html\b|[a-z])/i.test(remainder) ? remainder.replace(/^\s*\n/, "") : content;
+}
+
+export function proposedFileIsPlaceholderOnly(rawPath: string, rawContent: string): boolean {
+  const candidatePath = rawPath.replace(/\\/g, "/");
+  const content = rawContent.trim();
+  if (!candidatePath || !content) return false;
+
+  // Foundry-internal stub/handoff phrases — these are never legitimate customer content.
+  if (/\b(?:touch to satisfy tool-call requirement|no-op anchor|satisfy (?:the )?tool contract|not referenced by (?:the )?application runtime|operation-only mission|initialization artifact|continuation batch|coordinated source write|stable state wiring|companion initialization|batch\d+)\b/i.test(content)) return true;
+
+  // "Coming soon", "under construction", placeholder prose, and lone TODO/FIXME stubs are placeholder
+  // signals — but ONLY when they dominate a small file. A substantial real page (a portfolio is
+  // thousands of chars of real markup) that merely *mentions* "coming soon" in one section, or uses the
+  // HTML placeholder attribute in a form, is real product. Gate the prose signals on small content.
+  const withoutTags = content.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  const looksSubstantial = content.length >= 1_200 || withoutTags.length >= 400;
+  if (!looksSubstantial) {
+    if (/\b(?:build in progress|coming soon|under construction|starting coordinated)\b|\/\/\s*(?:TODO|FIXME)\b/i.test(content)) return true;
+    // Placeholder as PROSE ("this is a placeholder", "placeholder content"), never the HTML
+    // placeholder="…" attribute, CSS ::placeholder, or an object key `placeholder:`.
+    const placeholderAt = content.toLowerCase().indexOf("placeholder");
+    if (placeholderAt >= 0) {
+      const before = content[placeholderAt - 1] ?? "";
+      const after = content.slice(placeholderAt + "placeholder".length);
+      const attachedToIdentifier = /[a-z0-9_:-]/i.test(before) || /^[a-z0-9_:-]/i.test(after);
+      const usedAsAttributeOrKey = /^\s*[=:]/.test(after);
+      if (!attachedToIdentifier && !usedAsAttributeOrKey) return true;
+    }
+  }
+
+  // A tiny non-web source file that declares a type/const but no real behavior is a stub regardless.
+  return /\.(?:kt|java|swift|ts|tsx|js|jsx)$/i.test(candidatePath)
+    && content.length < 300
+    && /\b(?:object|class)\s+\w+[\s\S]*\bconst\s+val\b/i.test(content)
+    && !/\bfun\s+\w+\s*\(|\b(?:Activity|ViewModel|Composable)\b/.test(content);
+}
+
 function isCompleteSelfContainedStaticEntry(filePath: string, content: string) {
   return /\.html?$/i.test(filePath)
     && content.length >= 2_500
@@ -2377,7 +2656,7 @@ async function executeTool(
       return { verified: true, written: normalized.length, results };
     }
     case "write_file": {
-      const content = typeof args.content === "string" ? args.content : "";
+      const content = htmlEntryWithoutFrontmatter(pathArg, typeof args.content === "string" ? args.content : "");
       if (/^(?:\.checklist|checklist(?:\.[a-z0-9_-]+)?|progress(?:\.[a-z0-9_-]+)?|evidence(?:\.[a-z0-9_-]+)?|notes?\.txt)$/i.test(pathArg.replace(/\\/g, "/").split("/").pop() ?? "")) {
         const reason = `${basename} is an internal progress/evidence artifact, not application source. Create the actual requested project file instead.`;
         await emit("edit", "error", `Refused internal progress file: ${basename}`, { tier: "trace", fileName: basename, filePath: pathArg, details: { reason } });
@@ -2824,7 +3103,7 @@ function explicitlyRequestsCommand(task: string, command: string) {
 
 const HEDGE_PREFIX_PATTERN = /^(i think|i believe|i suspect|my hunch is|my guess is|it looks like|it seems like|it seems that)\b[,:]?\s*/i;
 
-function normalizeForSimilarity(text: string) {
+export function normalizeForSimilarity(text: string) {
   return text
     .toLowerCase()
     .replace(HEDGE_PREFIX_PATTERN, "")
@@ -2832,7 +3111,7 @@ function normalizeForSimilarity(text: string) {
     .trim();
 }
 
-function textSimilarity(a: string, b: string) {
+export function textSimilarity(a: string, b: string) {
   const aTokens = new Set(a.split(/\s+/).filter(Boolean));
   const bTokens = new Set(b.split(/\s+/).filter(Boolean));
   if (!aTokens.size || !bTokens.size) return 0;

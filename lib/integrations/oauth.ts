@@ -1,8 +1,33 @@
 import "server-only";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import type { IntegrationDefinition } from "@/lib/integrations/types";
 const configs={google:{authorize:"https://accounts.google.com/o/oauth2/v2/auth",token:"https://oauth2.googleapis.com/token",scope:"https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly",client:"GOOGLE_CLIENT_ID",secret:"GOOGLE_CLIENT_SECRET"},microsoft:{authorize:"https://login.microsoftonline.com/common/oauth2/v2.0/authorize",token:"https://login.microsoftonline.com/common/oauth2/v2.0/token",scope:"offline_access User.Read Mail.Send",client:"MICROSOFT_CLIENT_ID",secret:"MICROSOFT_CLIENT_SECRET"},github:{authorize:"https://github.com/login/oauth/authorize",token:"https://github.com/login/oauth/access_token",scope:"read:user repo",client:"GITHUB_CLIENT_ID",secret:"GITHUB_CLIENT_SECRET"},slack:{authorize:"https://slack.com/oauth/v2/authorize",token:"https://slack.com/api/oauth.v2.access",scope:"chat:write,users:read",client:"SLACK_CLIENT_ID",secret:"SLACK_CLIENT_SECRET"}} as const;
-function signingKey(){return process.env.FOUNDRY_OAUTH_STATE_KEY||process.env.FOUNDRY_LOCAL_SECRET_KEY||"foundry-development-oauth-state";}
+// The OAuth state HMAC key is the ONLY thing stopping a forged callback (CSRF). A hardcoded default
+// like "foundry-development-oauth-state" is public in the source, so anyone could sign a valid state
+// and defeat that protection. Prefer an explicitly configured key; otherwise persist a random 32-byte
+// key per instance (0600, gitignored under .foundry-data) so the signature is unforgeable and stable
+// across restarts — never a shared constant.
+let cachedFallbackKey: string | undefined;
+function fallbackSigningKey(): string {
+  if (cachedFallbackKey) return cachedFallbackKey;
+  const dir = path.join(process.cwd(), ".foundry-data", "credentials");
+  const keyFile = path.join(dir, ".oauth-state-key");
+  try {
+    if (existsSync(keyFile)) { cachedFallbackKey = readFileSync(keyFile, "utf8").trim(); if (cachedFallbackKey) return cachedFallbackKey; }
+    mkdirSync(dir, { recursive: true });
+    cachedFallbackKey = randomBytes(32).toString("base64");
+    writeFileSync(keyFile, cachedFallbackKey, { encoding: "utf8", mode: 0o600 });
+    return cachedFallbackKey;
+  } catch {
+    // Only if the data dir is unwritable: a per-process random key. States won't survive a restart,
+    // but they are still unforgeable — strictly better than a public constant.
+    cachedFallbackKey = randomBytes(32).toString("base64");
+    return cachedFallbackKey;
+  }
+}
+function signingKey(){return process.env.FOUNDRY_OAUTH_STATE_KEY||process.env.FOUNDRY_LOCAL_SECRET_KEY||fallbackSigningKey();}
 export function oauthStart(def:IntegrationDefinition,scope:string,redirectUri:string){if(!def.oauthProvider)throw new Error("Integration does not support OAuth.");const c=configs[def.oauthProvider];const clientId=process.env[c.client];if(!clientId)throw new Error(`${c.client} is not configured for Foundry.`);const payload=Buffer.from(JSON.stringify({scope,provider:def.id,nonce:randomBytes(12).toString("hex"),expires:Date.now()+600000})).toString("base64url");const sig=createHmac("sha256",signingKey()).update(payload).digest("base64url");const state=`${payload}.${sig}`;const url=new URL(c.authorize);url.searchParams.set("client_id",clientId);url.searchParams.set("redirect_uri",redirectUri);url.searchParams.set("response_type","code");url.searchParams.set(def.oauthProvider==="slack"?"scope":"scope",c.scope);url.searchParams.set("state",state);if(def.oauthProvider==="google")url.searchParams.set("access_type","offline");return {url:url.toString(),state};}
 export function verifyOAuthState(state:string){const [payload,sig]=state.split(".");if(!payload||!sig)throw new Error("OAuth was interrupted or returned invalid state.");const expected=createHmac("sha256",signingKey()).update(payload).digest();const supplied=Buffer.from(sig,"base64url");if(supplied.length!==expected.length||!timingSafeEqual(supplied,expected))throw new Error("OAuth state verification failed.");const data=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as {scope:string;provider:string;expires:number};if(data.expires<Date.now())throw new Error("OAuth setup expired. Start the connection again.");return data;}
 export async function exchangeOAuth(def:IntegrationDefinition,code:string,redirectUri:string){if(!def.oauthProvider)throw new Error("Integration does not support OAuth.");const c=configs[def.oauthProvider];const params=new URLSearchParams({client_id:process.env[c.client]||"",client_secret:process.env[c.secret]||"",code,redirect_uri:redirectUri,grant_type:"authorization_code"});const response=await fetch(c.token,{method:"POST",headers:{accept:"application/json","content-type":"application/x-www-form-urlencoded"},body:params});const data=await response.json() as Record<string,unknown>;if(!response.ok||data.error)throw new Error("OAuth authorization was denied or interrupted.");return {accessToken:String(data.access_token||""),refreshToken:String(data.refresh_token||""),expiresAt:data.expires_in?new Date(Date.now()+Number(data.expires_in)*1000).toISOString():""};}

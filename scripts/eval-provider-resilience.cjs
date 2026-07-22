@@ -37,7 +37,7 @@ assert(
   factoryRuntime.includes("const boundedSmallEdit = !approvalResponse")
     && factoryRuntime.includes("namedControlDefect || looksUnambiguouslyLikeSmallEdit")
     && factoryRuntime.includes("maximumModelCalls: 6, premiumCallLimit: 1, estimatedCostUsd: 0.15, hardCeiling: true")
-    && factoryRuntime.includes('boundedSmallEdit\n    ? "fast"')
+    && factoryRuntime.includes('isStructuralRelocationRequest(requestedTask) ? "builder" : "fast"')
     && factoryRuntime.includes("maximumBrowserRepairStages = boundedSmallEdit ? 1")
     && factoryRuntime.includes("shouldRunVerify(quality) && !boundedStaticFollowUp && !boundedSmallEdit"),
   "A small explicit UI edit can still expand into an expensive multi-stage mission.",
@@ -138,7 +138,7 @@ assert(
   openaiRuntime.includes("request.tools?.length")
     && foundryRuntime.includes("billable: Boolean(lastData.usage)")
     && foundryRuntime.includes("requestCount: input.billable ? 1 : 0")
-    && executor.includes("if (result.usage.requestCount > 0) modelCallsSinceDurableProgress += 1")
+    && executor.includes("if (result.usage.requestCount > 0) {") && executor.includes("modelCallsSinceDurableProgress += 1")
     && costGuard.includes("ledger.calls = Math.max(0, ledger.calls - 1)"),
   "Rejected zero-usage provider requests can still be reported as billed or consume the task call allowance.",
 );

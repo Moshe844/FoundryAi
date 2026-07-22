@@ -3,10 +3,11 @@
 import { useState } from "react";
 import type { MissionRecommendation } from "@/lib/ai/mission/recommendations";
 import type { FactoryExecutionEvent } from "@/lib/factory/types";
-import type { CanvasMissionVM, CanvasPhase, CanvasVoiceGroup, CanvasWorkEvent } from "@/lib/canvas/model";
-import { formatDuration } from "@/lib/canvas/model";
+import type { CanvasMissionVM, CanvasPhase, CanvasVoiceGroup } from "@/lib/canvas/model";
+import { formatDuration, groupExecutionUnits } from "@/lib/canvas/model";
 import type { BlockedCommandAction } from "@/components/execution/ApprovalPrompt";
 import { BlockingCard } from "@/components/canvas/BlockingCard";
+import { ExecutionRail } from "@/components/canvas/ExecutionRail";
 import { LiveActivityRow } from "@/components/canvas/LiveActivityRow";
 import { SummaryBlock } from "@/components/canvas/SummaryBlock";
 import { CanvasMarkdown } from "@/components/canvas/CanvasMarkdown";
@@ -250,11 +251,7 @@ function VoiceTrail({ groups, recorded, busy, revealEventIds }: { groups: Canvas
             ) : null}
             {group.events.length ? (
               expanded ? (
-                <ul className="mt-2 grid gap-1.5 pl-5">
-                  {group.events.map((event) => (
-                    <EventRow key={event.id} event={event} />
-                  ))}
-                </ul>
+                <ExecutionRail units={groupExecutionUnits(group.events)} />
               ) : (
                 <button
                   type="button"
@@ -281,37 +278,6 @@ function VoiceTrail({ groups, recorded, busy, revealEventIds }: { groups: Canvas
         );
       })}
     </div>
-  );
-}
-
-function EventRow({ event }: { event: CanvasWorkEvent }) {
-  const [open, setOpen] = useState(false);
-  const failed = event.status === "error";
-  const hasPayload = Boolean(event.output);
-
-  return (
-    <li id={`canvas-evt-${event.id}`} className="group/row rounded transition-colors">
-      <div className="flex items-baseline gap-2">
-        {hasPayload ? (
-          <button
-            type="button"
-            aria-expanded={open}
-            onClick={() => setOpen((value) => !value)}
-            className={`min-w-0 flex-1 text-left font-mono text-[13px] leading-6 ${failed ? "text-red-300" : "text-foundry-muted"} transition hover:text-foundry-ink`}
-          >
-            {event.text}
-          </button>
-        ) : (
-          <span className={`min-w-0 flex-1 font-mono text-[13px] leading-6 ${failed ? "text-red-300" : "text-foundry-muted"}`}>{event.text}</span>
-        )}
-        <span className="shrink-0 text-[11px] text-foundry-subtle opacity-0 transition-opacity duration-150 group-hover/row:opacity-100">
-          {new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-        </span>
-      </div>
-      {open && event.output ? (
-        <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded border border-overlay/8 bg-shade/30 p-2.5 font-mono text-[12px] leading-5 text-foundry-muted">{event.output}</pre>
-      ) : null}
-    </li>
   );
 }
 

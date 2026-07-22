@@ -39,7 +39,7 @@ import { runDiscoveryEngine } from "@/lib/discovery/engine";
 import { FALLBACK_STACK_OPTIONS, type StackOption } from "@/lib/ai/project-discovery-llm";
 import { platformStackOptionsForProject, reconcilePlatformStackOptions } from "@/lib/discovery/platform-stack-policy";
 import { genericHistoryRecommendation, type HistoryRecommendation } from "@/lib/discovery/history-recommendations";
-import { deriveQuestionsAndAssumptions, discoverProject, explicitProjectNameFromPrompt } from "@/lib/ai/project-discovery";
+import { deriveQuestionsAndAssumptions, discoverProject, explicitPlatformFromPrompt, explicitProjectNameFromPrompt, explicitStackFromPrompt, reconcileDiscoveryWithExplicitBrief } from "@/lib/ai/project-discovery";
 import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
 import { generatedWorkspaceForMission } from "@/lib/factory/live-project";
@@ -114,7 +114,7 @@ type ProjectStart = {
   instructions: string;
   instructionFiles: File[];
   discovery: ProjectDiscoveryResult | null;
-  discoveryProvenance: "pending" | "model" | "brief" | "rough";
+  discoveryProvenance: "pending" | "model" | "deterministic" | "brief" | "rough";
   discoveryAnswers: Record<string, string>;
   /** Dynamically-authored stack choices from the Discovery Engine's LLM pass — empty until UnderstandingStep resolves, seeded with a small universal fallback until then. Replaces the old static per-category stackRecommendations table. */
   stackOptions: StackOption[];
@@ -484,7 +484,10 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
     // When the caller already captured a description (dashboard prompt, history recommendation), mirror
     // the seed the "What do you want to build?" step would apply, then skip straight past that step so
     // the same question isn't asked twice.
-    const subtype = firstSubtypeFor(template.id);
+    // A freeform project has no platform until the user's brief supplies one. Seeding the
+    // first custom chip ("Web app") here made that UI default look user-confirmed and also
+    // sent it to the discovery engine, biasing Android, iOS, desktop, CLI, and backend briefs.
+    const subtype = template.id === "custom" ? "" : firstSubtypeFor(template.id);
     const appKind = initialDescription || appKindFor(template, subtype, "");
     const projectName = template.id === "custom"
       ? (described ? cleanProjectName(initialDescription) : "")
@@ -1573,7 +1576,9 @@ function CustomBuildStep({ start, onUpdate }: { start: ProjectStart; onUpdate: (
     onUpdate({
       projectDescription: value,
       appKind: value,
-      subtype: firstSubtypeFor("custom"),
+      // Keep freeform discovery unclassified until the brief is analyzed. The old Web-app
+      // seed survived every edit and was presented as "Your choice" even for Android apps.
+      subtype: "",
       customSubtype: "",
       projectName: start.projectNameTouched ? start.projectName : cleanProjectName(value),
       discoveryAnswers: {},
@@ -1617,6 +1622,15 @@ function discoverySeedText(start: ProjectStart) {
     return `${defaultKindFor(start.template.id)}. Subtype: ${start.customSubtype.trim() || start.appKind || start.subtype}`;
   }
   return start.projectDescription.trim() || start.appKind;
+}
+
+function deterministicDiscoveryIsSufficient(brief: string) {
+  const words = brief.trim().split(/\s+/).filter(Boolean).length;
+  if (explicitStackFromPrompt(brief)) return words >= 5;
+  // Require more than a bare "Android app"-style label: platform plus a concrete product/workflow
+  // is enough for the local policy, while genuinely underspecified requests still get refinement.
+  return Boolean(explicitPlatformFromPrompt(brief)) && words >= 8
+    && /\b(?:allow|build|checkout|create|display|integrate|let|manage|scan|send|support|track|using|with)\b/i.test(brief);
 }
 
 function cachedRunDiscoveryEngine(key: string, run: (signal: AbortSignal) => Promise<DiscoveryEngineOutcome>): CachedDiscoveryRequest {
@@ -1686,6 +1700,39 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
       // as the fallback memo content if the LLM call fails, so the user never lands on a blank summary
       // step just because OPENAI_API_KEY is unset or the network hiccups.
       const heuristic = discoverProject(seedText);
+      // An explicit platform or stack is already an authoritative architecture constraint. Waiting
+      // for a remote model to rediscover "Android" (or iOS, WPF, FastAPI, etc.) adds latency and cost
+      // without resolving an unknown. Reconcile it through the same universal stack policy locally.
+      if (start.template.id === "custom" && deterministicDiscoveryIsSufficient(seedText)) {
+        const resolvedDiscovery = reconcileDiscoveryWithExplicitBrief({
+          ...reconcileKnownStarterDiscovery(heuristic, start),
+          // A broad commerce keyword such as "checkout" must not rename a specifically described
+          // PAX/Android product to the generic catalog profile "E-commerce store".
+          projectType: cleanProjectName(seedText) || heuristic.projectType,
+          prompt: seedText,
+        }, seedText);
+        const platformContract = reconcilePlatformStackOptions(start.template.id, resolvedDiscovery, fallbackStackOptionsFor(resolvedDiscovery, start));
+        const resolvedStackOptions = platformContract.stackOptions;
+        const resolvedStack = resolvedStackOptions.find((option) => option.recommended)?.name || platformContract.recommendedStack || resolvedDiscovery.recommendedStack;
+        const authoritativeDiscovery = alignDiscoveryWithSelectionAndConstraints(resolvedDiscovery, start, resolvedStack);
+        onUpdate({
+          discovery: authoritativeDiscovery,
+          discoveryProvenance: "deterministic",
+          stack: resolvedStack,
+          customStack: "",
+          projectName: start.projectNameTouched ? start.projectName : cleanProjectName(authoritativeDiscovery.projectType),
+          alternativeStacks: resolvedStackOptions.filter((option) => option.name !== resolvedStack).map((option) => option.name),
+          deploymentNote: "Deployment will follow the selected platform's native packaging and runtime requirements.",
+          lede: "Foundry used the explicit platform and product requirements in your brief.",
+          stackOptions: resolvedStackOptions,
+          modelSelection: null,
+        });
+        window.clearTimeout(escapeTimer);
+        const remaining = minVisibleMs - (Date.now() - startedAt);
+        if (remaining > 0) await wait(remaining);
+        if (!cancelledRef.current) onAdvance();
+        return;
+      }
       const cacheKey = JSON.stringify(["fast-discovery-v5-explicit-contract", attempt, seedText, start.template.id, start.subtype, start.customSubtype, start.projectLocation, start.uploadNames]);
       let completed = false;
       try {
@@ -1835,7 +1882,9 @@ function DiscoveryRail({ start, stepIndex, steps }: { start: ProjectStart; stepI
   const idx = (target: FlowStep) => steps.indexOf(target);
   const starterLabel = start.template.id === "custom" ? "Custom project" : start.template.title.replace(/^Build\s+/i, "");
   const styleValue = start.customStyle.trim() || start.styleChoice;
-  const exactProjectChoice = start.customSubtype.trim() || (start.subtype === "Other / Custom" ? "" : start.subtype.trim());
+  const exactProjectChoice = start.template.id === "custom"
+    ? explicitSurfaceFromBrief(start.projectDescription, start.discovery)
+    : start.customSubtype.trim() || (start.subtype === "Other / Custom" ? "" : start.subtype.trim());
 
   const rows: Array<{ key: string; label: string; value: string; show: boolean; pending?: boolean }> = [
     { key: "starter", label: "Starter", value: starterLabel, show: true },
@@ -2394,6 +2443,11 @@ function ProjectStartFlow({
               {start.discoveryProvenance === "brief" ? (
                 <div role="status" className="mb-4 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.06] px-3 py-2 text-xs leading-5 text-foundry-muted">
                   Brief-derived decision: your explicit platform, stack, workflows, and constraints were preserved because the optional model refinement returned an incomplete payload.
+                </div>
+              ) : null}
+              {start.discoveryProvenance === "deterministic" ? (
+                <div role="status" className="mb-4 rounded-lg border border-foundry-teal/25 bg-foundry-teal/[0.06] px-3 py-2 text-xs leading-5 text-foundry-muted">
+                  Brief-derived decision: your explicit platform and requirements were sufficient to select compatible delivery stacks locally. No discovery model call was needed.
                 </div>
               ) : null}
               <div className="grid gap-2.5 sm:grid-cols-2">
@@ -4226,6 +4280,11 @@ function alignDiscoveryWithSelectionAndConstraints(discovery: ProjectDiscoveryRe
   const brief = `${start.projectDescription} ${discovery.prompt}`;
   const explicitProjectName = explicitProjectNameFromPrompt(start.projectDescription);
   const stackChanged = selectedStack.trim() !== "" && !sameStackChoice(selectedStack, discovery.recommendedStack);
+  const platformHypothesis = explicitSurfaceFromBrief(start.projectDescription, discovery) || explicitPlatformFromPrompt(brief);
+  const nativeMobilePlatform = /^(?:android|ios|mobile) app$/i.test(platformHypothesis || "");
+  const reconciledStyleDirection = nativeMobilePlatform
+    ? "Native touch-first operations interface with platform navigation, large tap targets, resilient offline states, and device-appropriate accessibility."
+    : discovery.styleDirection;
   const architecture = stackChanged
     ? genericArchitectureFor(selectedStack, discovery.dataModel, discovery.projectType, discovery.mainFeatures)
     : discovery.architecture;
@@ -4233,8 +4292,25 @@ function alignDiscoveryWithSelectionAndConstraints(discovery: ProjectDiscoveryRe
   const excludesDatabase = /\b(?:no|without)\s+(?:a\s+)?(?:database|db|backend|server)\b/i.test(brief)
     || /\bno\s+(?:login|auth|database|backend)(?:\s+or\s+(?:a\s+)?(?:login|auth|database|backend))+\b/i.test(brief);
   const decisions = discovery.decisions.map((decision) => {
+    if (decision.dimension === "platform" && platformHypothesis && decision.hypothesis !== platformHypothesis) {
+      return {
+        ...decision,
+        hypothesis: platformHypothesis,
+        rationale: "The platform is explicitly stated in the current project brief and determines the native runtime, preview, packaging, and verification path.",
+        confidence: 100,
+        source: "user-confirmed" as const,
+        action: "silent-infer" as const,
+        question: undefined,
+      };
+    }
+    if (nativeMobilePlatform && decision.dimension === "style") {
+      return { ...decision, hypothesis: reconciledStyleDirection, rationale: "The explicit mobile platform requires native touch, accessibility, density, and device-state conventions rather than web/SaaS presentation assumptions.", confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined };
+    }
+    if (nativeMobilePlatform && decision.dimension === "navigation") {
+      return { ...decision, hypothesis: "Native screen hierarchy with platform back behavior, task-focused tabs or destinations, and preserved cart/workflow state.", rationale: "Navigation follows the selected native mobile runtime and the requested operational workflow.", confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined };
+    }
     if (decision.dimension === "architecture" && stackChanged) {
-      return { ...decision, hypothesis: architecture, confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined };
+      return { ...decision, hypothesis: architecture, rationale: `The selected ${selectedStack} delivery stack replaces assumptions tied to the previous architecture.`, confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined };
     }
     if (decision.dimension === "auth-database-api" && (excludesAuth || excludesDatabase)) {
       const excluded = [excludesAuth ? "authentication or user accounts" : "", excludesDatabase ? "a database or backend" : ""].filter(Boolean).join(" and ");
@@ -4262,14 +4338,24 @@ function alignDiscoveryWithSelectionAndConstraints(discovery: ProjectDiscoveryRe
   const mainFeatures = Array.from(new Map([...explicitFeatures, ...discovery.mainFeatures].map((feature) => [feature.toLowerCase(), feature])).values());
   const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
   const constraintFact = `First version excludes ${[excludesAuth ? "authentication/user accounts" : "", excludesDatabase ? "database/backend" : ""].filter(Boolean).join(" and ")}.`;
-  const keyFacts = (excludesAuth || excludesDatabase)
+  let keyFacts = (excludesAuth || excludesDatabase)
     ? [...discovery.keyFacts.filter((fact) => !/\b(auth|login|account|database|backend|persistence)\b/i.test(fact)), constraintFact]
     : discovery.keyFacts;
+  if (platformHypothesis) {
+    const previousPlatform = discovery.decisions.find((decision) => decision.dimension === "platform")?.hypothesis;
+    keyFacts = keyFacts.map((fact) => fact === previousPlatform || (/^(?:web|mobile|desktop|android|ios) app$/i.test(fact) && fact !== platformHypothesis) ? platformHypothesis : fact);
+    keyFacts = keyFacts.filter((fact, index) => keyFacts.indexOf(fact) === index);
+  }
+  if (nativeMobilePlatform) {
+    keyFacts = keyFacts.map((fact) => /\bsaas\b|web interface|browser interface/i.test(fact) ? "Native touch-first operations interface" : fact);
+    keyFacts = keyFacts.filter((fact, index) => keyFacts.indexOf(fact) === index);
+  }
   return {
     ...discovery,
     projectType: explicitProjectName || discovery.projectType,
     recommendedStack: selectedStack || discovery.recommendedStack,
     architecture,
+    styleDirection: reconciledStyleDirection,
     mainFeatures,
     decisions,
     questions,
@@ -4393,6 +4479,19 @@ function cleanProjectName(value: string) {
   );
   const words = cleaned.split(/\s+/).filter(Boolean);
   return words.slice(0, 7).join(" ");
+}
+
+/** A customer-facing surface label derived only from current evidence, never a starter default. */
+function explicitSurfaceFromBrief(brief: string, discovery?: ProjectDiscoveryResult | null) {
+  if (/\bandroid\b/i.test(brief)) return "Android app";
+  if (/\b(?:ios|iphone|ipad)\b/i.test(brief)) return "iOS app";
+  if (/\bmobile\s+(?:app|application)\b/i.test(brief)) return "Mobile app";
+  if (/\b(?:desktop|windows|macos)\s+(?:app|application)\b/i.test(brief)) return "Desktop app";
+  if (/\b(?:command[- ]line|cli)\b/i.test(brief)) return "Command-line app";
+  if (/\b(?:backend|server-only|microservice|rest\s+api|web\s+api|api\s+(?:service|server))\b/i.test(brief)) return "Backend service";
+  if (/\b(?:web|browser)\s+(?:app|application|site|website|dashboard)\b/i.test(brief)) return "Web app";
+  const platformDecision = discovery?.decisions.find((decision) => decision.dimension === "platform")?.hypothesis?.trim();
+  return platformDecision || "";
 }
 
 function customSubtypesForDetectedType(detectedType: string) {
@@ -4642,7 +4741,12 @@ function projectBriefFor(start: ProjectStart) {
   const recommendation = recommendationForStart(start);
   const selectedStack = start.discovery?.recommendedStack || selectedStackFor(start);
   const defaults = recommendation.defaults;
-  const projectName = start.projectName || cleanProjectName(start.discovery?.projectType || start.appKind);
+  // For a freeform build the current brief/discovery is the source of truth. Reusing the
+  // mutable projectName seed here allowed an older dashboard prompt (for example Inventory
+  // Management System) to determine the new mission title and folder after the brief changed.
+  const projectName = start.template.id === "custom" && !start.projectNameTouched
+    ? cleanProjectName(start.discovery?.projectType || start.projectDescription || start.appKind)
+    : start.projectName || cleanProjectName(start.discovery?.projectType || start.appKind);
   const discovery = start.discovery;
   const answeredQuestions = Object.entries(start.discoveryAnswers)
     .filter(([, answer]) => answer.trim())

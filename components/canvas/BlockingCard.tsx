@@ -99,7 +99,15 @@ function QuestionCard({
               type="button"
               role="radio"
               aria-checked="false"
-              onClick={() => submit(option)}
+              onClick={() => {
+                // This is an executable prerequisite, not a prose answer. Treating it like
+                // ordinary text resumed generation without ever invoking the Local Agent.
+                if (/^Locate SDK files with Local Agent$/i.test(option) && onLocateSdk) {
+                  onLocateSdk();
+                  return;
+                }
+                submit(option);
+              }}
               className="min-h-[44px] w-full rounded-md border border-overlay/10 bg-overlay/[0.02] px-3.5 py-2 text-left text-sm font-medium leading-5 text-foundry-ink transition hover:border-foundry-teal/40 hover:bg-foundry-teal/[0.06]"
             >
               {option}
@@ -112,7 +120,7 @@ function QuestionCard({
           <button type="button" onClick={() => sdkInputRef.current?.click()} className="min-h-[44px] rounded-md border border-foundry-teal/30 bg-foundry-teal/[0.08] px-3.5 py-2 text-left text-sm font-semibold text-foundry-ink hover:bg-foundry-teal/[0.14]">
             Upload SDK or specification files
           </button>
-          {onLocateSdk ? <button type="button" onClick={onLocateSdk} className="min-h-[44px] rounded-md border border-foundry-teal/30 bg-foundry-teal/[0.08] px-3.5 py-2 text-left text-sm font-semibold text-foundry-ink hover:bg-foundry-teal/[0.14]">Search the connected Local Agent folder</button> : null}
+          {onLocateSdk ? <button type="button" onClick={onLocateSdk} className="min-h-[44px] rounded-md border border-foundry-teal/30 bg-foundry-teal/[0.08] px-3.5 py-2 text-left text-sm font-semibold text-foundry-ink hover:bg-foundry-teal/[0.14]">Choose and search an SDK folder with Local Agent</button> : null}
           <button type="button" onClick={() => { sdkInputRef.current?.setAttribute("webkitdirectory", ""); sdkInputRef.current?.click(); }} className="min-h-[44px] rounded-md border border-overlay/12 bg-overlay/[0.025] px-3.5 py-2 text-left text-sm font-semibold text-foundry-ink hover:border-foundry-teal/35">
             Select an existing SDK folder
           </button>

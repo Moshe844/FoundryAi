@@ -58,7 +58,16 @@ function discoveryPlatformEvidence(discovery: ProjectDiscoveryResult) {
 }
 
 type WorkloadSignals={simple:boolean;auth:boolean;email:boolean;database:boolean;payments:boolean;ai:boolean;realtime:boolean;offline:boolean;enterprise:boolean;windows:boolean;ios:boolean;android:boolean;hardware:boolean;browserGame:boolean;threeD:boolean};
-function workloadSignals(discovery:ProjectDiscoveryResult):WorkloadSignals{const evidence=`${discoveryPlatformEvidence(discovery)} ${(discovery.mainFeatures||[]).join(" ")} ${(discovery.dataModel||[]).join(" ")} ${(discovery.decisions||[]).map(item=>item.hypothesis).join(" ")}`.toLowerCase();const targetEvidence=`${discovery.prompt} ${discovery.projectType} ${discovery.decisions?.find(item=>item.dimension==="platform")?.hypothesis||""}`.toLowerCase();const auth=/\bauth|login|log in|sign[- ]?up|password|session|account|mfa|oauth|reset\b/.test(evidence);const database=/\bdatabase|persist|account|user|inventory|order|booking|record|dashboard|multi-user|shared data|postgres|mysql|sqlite\b/.test(evidence);return{simple:!auth&&!database&&!/\bapi|payment|checkout|realtime|real-time|ai|upload|admin|multi-user\b/.test(evidence),auth,email:/\bemail|password reset|verification|invite|notification\b/.test(evidence),database,payments:/\bpayment|checkout|stripe|paypal|subscription|billing\b/.test(evidence),ai:/\bai|llm|model|embedding|vector|inference|machine learning\b/.test(evidence),realtime:/\brealtime|real-time|websocket|chat|presence|live collaboration\b/.test(evidence),offline:/\boffline|local-first|sync\b/.test(evidence),enterprise:/\benterprise|sso|saml|compliance|audit|multi-tenant|rbac\b/.test(evidence),windows:/\bwindows|wpf|winui\b/.test(targetEvidence),ios:/\bios|iphone|ipad|apple\b/.test(targetEvidence),android:/\bandroid|jetpack\b/.test(targetEvidence),hardware:/\bpax|poslink|payment terminal|barcode scanner|licensed sdk|device sdk|usb|serial|bluetooth\b/.test(evidence),browserGame:/\bbrowser game|web game|html5 game\b/.test(evidence),threeD:/\b3d|console|vr|ar|photoreal\b/.test(evidence)};}
+function workloadSignals(discovery:ProjectDiscoveryResult):WorkloadSignals{
+  // Recommended stacks and architecture prose are model output, not user requirements. Feeding
+  // them back here made one hallucinated Auth.js choice self-confirming for every later website.
+  const evidence=`${discovery.prompt} ${discovery.projectType} ${(discovery.mainFeatures||[]).join(" ")}`.toLowerCase();
+  const targetEvidence=`${discovery.prompt} ${discovery.projectType} ${discovery.decisions?.find(item=>item.dimension==="platform")?.hypothesis||""}`.toLowerCase();
+  const auth=/\bauth(?:entication)?|login|log in|sign[- ]?up|password|session|user account|member account|mfa|oauth|password reset\b/.test(evidence);
+  const database=/\bdatabase|persist(?:ence|ent)?|inventory|order management|booking|records?|dashboard|multi-user|shared data|postgres|mysql|sqlite\b/.test(evidence);
+  const dynamic=/\bapi|payment|checkout|realtime|real-time|ai|upload|admin|multi-user\b/.test(evidence);
+  return{simple:!auth&&!database&&!dynamic,auth,email:/\bemail|password reset|verification|invite|notification\b/.test(evidence),database,payments:/\bpayment|checkout|stripe|paypal|subscription|billing\b/.test(evidence),ai:/\bai|llm|model|embedding|vector|inference|machine learning\b/.test(evidence),realtime:/\brealtime|real-time|websocket|chat|presence|live collaboration\b/.test(evidence),offline:/\boffline|local-first|sync\b/.test(evidence),enterprise:/\benterprise|sso|saml|compliance|audit|multi-tenant|rbac\b/.test(evidence),windows:/\bwindows|wpf|winui\b/.test(targetEvidence),ios:/\bios|iphone|ipad|apple\b/.test(targetEvidence),android:/\bandroid|jetpack\b/.test(targetEvidence),hardware:/\bpax|poslink|payment terminal|barcode scanner|licensed sdk|device sdk|usb|serial|bluetooth\b/.test(evidence),browserGame:/\bbrowser game|web game|html5 game\b/.test(evidence),threeD:/\b3d|console|vr|ar|photoreal\b/.test(evidence)};
+}
 function option(name:string,why:string,recommended=false):StackOption{return{name,why,recommended};}
 function capabilityAwareOptions(family:Exclude<ProjectPlatformFamily,"unconstrained">,discovery:ProjectDiscoveryResult):StackOption[]{const s=workloadSignals(discovery);
  if(family==="web"){
@@ -74,7 +83,7 @@ function capabilityAwareOptions(family:Exclude<ProjectPlatformFamily,"unconstrai
 
 function familyForExplicitStack(stack: string): ProjectPlatformFamily {
   if (/electron|tauri|wpf|winforms|pyside|pyqt|desktop/i.test(stack)) return "desktop";
-  if (/react native|expo|flutter|swiftui|android|jetpack/i.test(stack)) return "mobile";
+  if (/\bmobile\b|react native|expo|flutter|swiftui|android|jetpack/i.test(stack)) return "mobile";
   if (/express|fastapi|asp\.net|spring|django|flask|backend|api/i.test(stack)) return "backend";
   if (/godot|unity|unreal|phaser|bevy|game/i.test(stack)) return "game";
   if (/commander|typer|cobra|clap|command[- ]line|\bcli\b/i.test(stack)) return "cli";
@@ -83,6 +92,38 @@ function familyForExplicitStack(stack: string): ProjectPlatformFamily {
   if (/library|package|sdk|crate|module/i.test(stack)) return "library";
   if (/html|css|javascript|next|react|vite|vue|svelte|astro|web/i.test(stack)) return "web";
   return "unconstrained";
+}
+
+function proposedOptionFitsProject(option: StackOption, family: ProjectPlatformFamily, discovery: ProjectDiscoveryResult): boolean {
+  const optionFamily = familyForExplicitStack(option.name);
+  const signals = workloadSignals(discovery);
+  const optionEvidence = `${option.name} ${option.why}`;
+  const webCompatible = family === "web" && (optionFamily === "web" || /django|rails|laravel|asp\.net.*(?:react|web)|spring.*(?:react|web)/i.test(option.name));
+  if (optionFamily !== "unconstrained" && optionFamily !== family && !webCompatible) return false;
+  if (!signals.auth && /auth\.js|nextauth|devise|identity|clerk|auth0|cognito|firebase auth|supabase auth/i.test(option.name)) return false;
+  if (!signals.database && /prisma|postgres|mysql|mongodb|sqlite|database/i.test(option.name)) return false;
+  if (!signals.payments && /stripe|paypal|adyen|payment gateway/i.test(option.name)) return false;
+  if (signals.auth && !/auth|identity|devise|django|clerk|auth0|cognito|firebase auth|supabase auth/i.test(optionEvidence)) return false;
+  if (signals.database && !/prisma|postgres|mysql|mongodb|sqlite|database|persistence|django|rails|entity framework/i.test(optionEvidence)) return false;
+  if (signals.payments && !/stripe|paypal|adyen|payment|checkout|billing/i.test(optionEvidence)) return false;
+  return true;
+}
+
+function dynamicOptionsWithinPolicy(family: Exclude<ProjectPlatformFamily, "unconstrained">, discovery: ProjectDiscoveryResult, proposed: StackOption[]): StackOption[] {
+  const signals = workloadSignals(discovery);
+  const explicitlyStatic = family === "web" && /\b(?:simple static|static (?:site|website|portfolio)|no (?:server|backend|database))\b/i.test(`${discovery.prompt} ${discovery.projectType}`);
+  const contaminatedRecommendation = (!signals.auth && /auth\.js|nextauth|devise|identity|clerk|auth0/i.test(discovery.recommendedStack))
+    || (!signals.database && /prisma|postgres|mysql|mongodb|sqlite|database/i.test(discovery.recommendedStack));
+  const accepted = explicitlyStatic || contaminatedRecommendation
+    ? []
+    : proposed.filter((item) => item.name.trim() && proposedOptionFitsProject(item, family, discovery));
+  const fallback = capabilityAwareOptions(family, discovery);
+  const proposedRecommended = accepted.find((item) => item.recommended)?.name;
+  const primary = proposedRecommended ? accepted : fallback;
+  const secondary = proposedRecommended ? fallback : accepted;
+  const combined = [...primary, ...secondary.filter((candidate) => !primary.some((item) => item.name.toLowerCase() === candidate.name.toLowerCase()))].slice(0, 5);
+  const recommendedName = proposedRecommended ?? combined[0]?.name;
+  return combined.map((item) => ({ ...item, recommended: item.name === recommendedName }));
 }
 
 /** A selected starter is authoritative; custom briefs derive their family from the discovery memo. */
@@ -142,7 +183,7 @@ export function reconcilePlatformStackOptions(
     const options = proposed.map((option, index) => ({ ...option, recommended: index === recommendedIndex }));
     return { stackOptions: options, recommendedStack: options.find((option) => option.recommended)?.name || discovery.recommendedStack, repaired: false, family };
   }
-  const complete = capabilityAwareOptions(family,discovery);
+  const complete = dynamicOptionsWithinPolicy(family,discovery,proposed);
   const previousRecommendation=proposed.find(option=>option.recommended)?.name||discovery.recommendedStack;
   return { stackOptions: complete, recommendedStack: complete[0].name, repaired: previousRecommendation!==complete[0].name||proposed.length!==complete.length, family };
 }

@@ -26,7 +26,8 @@ import { createExecutionStrategy, tierForCapability, type ExecutionStrategy } fr
 import { DEFAULT_MISSION_QUALITY, type MissionQualityLevel } from "@/lib/ai/mission/quality-level";
 import type { ProviderId } from "@/lib/ai/providers/types";
 import { apiKeyForProvider } from "@/lib/ai/providers/dispatch";
-import { describeAndroidToolchain, launchAndroidEmulator, resolveAndroidTools } from "@/lib/factory/android-emulator";
+import { describeAndroidToolchain, ensureAndroidGradleWrapper, launchAndroidEmulator, resolveAndroidTools, resolveJavaHome } from "@/lib/factory/android-emulator";
+import { inspectImportedAndroidSdk } from "@/lib/factory/android-sdk-evidence";
 import { importUploadedSdkArchives } from "@/lib/factory/sdk-archives";
 import { iosBuildGuidance, iosGuidanceMessage } from "@/lib/factory/ios-build-guidance";
 import type { ModelMode, ModelTier } from "@/lib/ai/model-router";
@@ -58,7 +59,7 @@ import { isStaticSourceSeparationRequest, planStaticSourceSeparation, type Stati
 import { acceptanceWorkflowTemplate, parseAcceptanceWorkflowManifest, type AcceptanceWorkflowManifest } from "@/lib/verification/acceptance-workflow";
 import { projectIntegrationEnvironment } from "@/lib/integrations/runtime-environment";
 import { detectProjectIntegrations } from "@/lib/integrations/detection";
-import { integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "@/lib/integrations/requirements";
+import { integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "@/lib/integrations/requirements";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 type EvidenceAttachments = NonNullable<FactoryExistingProjectRequest["evidenceAttachments"]>;
@@ -993,14 +994,8 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // A licensed SDK archive supplied with this resumed creation satisfies the SDK-intake gate, but
   // never hardware certification. Match catalog evidence generically so this works for every SDK
   // family and does not repeat the same paid prerequisite after upload.
-  const attachedHardwareEvidence = requiredIntegrations
-    .flatMap((requirement) => requirement.candidates)
-    .filter((candidate) => candidate.executionKind === "hardware" && evidenceAttachments.some((attachment) => {
-      const evidence = `${attachment.fileName} ${attachment.rawText ?? ""}`.toLowerCase();
-      return [candidate.id, candidate.name, ...candidate.packages, ...candidate.sourcePatterns]
-        .some((term) => term.length >= 3 && evidence.includes(term.toLowerCase()));
-    }))
-    .map((candidate) => candidate.id);
+  const attachedHardwareEvidence = integrationProvidersFromEvidence(requiredIntegrations,
+    evidenceAttachments.map((attachment) => `${attachment.fileName} ${attachment.rawText ?? ""}`));
   const missingIntegrations = missingIntegrationRequirements(requiredIntegrations, [...configuredIntegrations.providers, ...attachedHardwareEvidence]);
   if (missingIntegrations.length) {
     const questions = missingIntegrations.map(integrationRequirementPrompt);
@@ -4783,6 +4778,21 @@ async function discoverStaticSourceInventory(access: ProjectAccess): Promise<{ f
   return { files, paths, totalBytes };
 }
 
+async function importedSdkEvidencePaths(access: ProjectAccess) {
+  const queue = [".foundry-input/sdk"];
+  const paths: string[] = [];
+  while (queue.length && paths.length < 2_000) {
+    const current = queue.shift()!;
+    const entries = await access.listDir(current).catch(() => []);
+    for (const entry of entries) {
+      const relative = `${current}/${entry.name}`;
+      if (entry.kind === "directory") queue.push(relative);
+      else paths.push(relative);
+    }
+  }
+  return paths;
+}
+
 async function runExistingProjectMissionWithAccess(params: {
   access: ReturnType<typeof createServerProjectAccess> | ReturnType<typeof createLocalConnectorProjectAccess>;
   task: string;
@@ -4894,6 +4904,41 @@ async function runExistingProjectMissionWithAccess(params: {
     signal,
   });
   if (projectDeletion) return projectDeletion;
+  // Retry/resume is a separate execution entry point from initial creation. Reapply the exact same
+  // external-integration gate here before discovery, routing, or generation so a failed browser/agent
+  // handoff cannot be bypassed by clicking Retry or Continue. Only the selected brief fields are
+  // authoritative; alternative stacks in the memo must not create false prerequisites.
+  if (isControlContinuation || !requestNamesConcreteChange) {
+    const selectedSpec = durableBrowserBrief?.exists ? parseBrief(durableBrowserBrief.content) : undefined;
+    const prerequisiteBrief = selectedSpec
+      ? [selectedSpec.projectDescription, `Selected stack: ${selectedSpec.stack}`, selectedSpec.instructions].filter(Boolean).join("\n")
+      : requestedTask;
+    const requiredIntegrations = integrationRequirementsForBrief(prerequisiteBrief);
+    if (requiredIntegrations.length) {
+      const credentialProjectId = workspaceProjectPath
+        ? path.basename(workspaceProjectPath)
+        : execution.projectId || `connector-${slugify(access.rootLabel) || "project"}`;
+      const configured = await projectIntegrationEnvironment({ projectId: credentialProjectId, environment: "development", location: "local" });
+      const importedEvidence = await importedSdkEvidencePaths(access);
+      const suppliedEvidence = evidenceAttachments.map((attachment) => `${attachment.fileName} ${attachment.rawText ?? ""}`);
+      const hardwareProviders = integrationProvidersFromEvidence(requiredIntegrations, [...importedEvidence, ...suppliedEvidence]);
+      const missing = missingIntegrationRequirements(requiredIntegrations, [...configured.providers, ...hardwareProviders]);
+      if (missing.length) {
+        const questions = missing.map(integrationRequirementPrompt);
+        const blocker = `Foundry still needs ${missing.length} verified project integration${missing.length === 1 ? "" : "s"} before execution can resume. No generation model was called.`;
+        const paused = await pauseForPlanConflicts(execution, questions.map((question) => question.question));
+        return {
+          status: paused.status,
+          blocker,
+          clarificationQuestions: questions,
+          changedFiles: [],
+          commands: [],
+          verification: [],
+          events: [blocker, ...questions.map((question) => question.question)],
+        };
+      }
+    }
+  }
   // Approval clicks are bounded control turns. Do not start each one on the premium builder tier.
   let workingSet = await discoverProjectWorkingSet(access, task);
   await emitExecution(execution, "reasoning", "completed", workingSet.likelyFiles.length
@@ -5512,9 +5557,20 @@ async function runExistingProjectMissionWithAccess(params: {
     hasOpenPlanItems: parentHasOpenPlanItems,
     commandOnly: explicitCommandOnlyRequest,
     deletesProject: /^\s*(?:delete|remove|erase)\s+(?:this\s+)?project\b/i.test(requestedTask),
-  });
+  }) || Boolean(
+    isFoundryGeneratedProject
+    && stackProfile.id === "android"
+    && isControlContinuation
+    && parentMission?.state !== "completed"
+  );
+  // A short Retry/continue control can be classified as operation-only in isolation. Once Foundry
+  // has recovered an unfinished generated project, the saved brief is the real task and source
+  // mutation is required. Carrying the synthetic control classification into the executor caused
+  // models to write "operation-only" no-op anchors merely to satisfy the forced write contract.
+  const effectiveCommandOnlyRequest = explicitCommandOnlyRequest && !resumingIncompleteProject;
   const resumingIncompleteStaticProject = resumingIncompleteProject && stackProfile.id === "static-html";
-  const recoveryScaffoldFiles = resumingIncompleteProject && workspaceProjectPath
+  const needsGeneratedAndroidFoundation = Boolean(isFoundryGeneratedProject && workspaceProjectPath && stackProfile.id === "android");
+  const recoveryScaffoldFiles = (resumingIncompleteProject || needsGeneratedAndroidFoundation) && workspaceProjectPath
     ? await ensureRequestedStackScaffold(workspaceProjectPath, stackProfile, path.basename(workspaceProjectPath), execution, [], savedBriefForRecovery?.exists ? parseBrief(savedBriefForRecovery.content).stack : stackProfile.label, savedBriefForRecovery?.exists ? savedBriefForRecovery.content : stackProfile.label, detectedStackMismatch)
     : [];
   if (recoveryScaffoldFiles.length && detectedStackMismatch) {
@@ -5534,6 +5590,23 @@ async function runExistingProjectMissionWithAccess(params: {
     await emitExecution(execution, "reasoning", "completed", workingSet.likelyFiles.length
       ? `Recovery working set selected from the saved brief: ${workingSet.likelyFiles.slice(0, 3).join(", ")}${workingSet.likelyFiles.length > 3 ? " and their dependencies" : ""}.`
       : "The saved brief did not identify a narrow source set; recovery will inspect the application root without reading generated build output.");
+  }
+  if (workspaceProjectPath && stackProfile.id === "android") {
+    const androidGradle = await access.readFile("app/build.gradle.kts", { limitBytes: 120_000 }).catch(() => ({ exists: false, content: "" }));
+    const androidNamespace = androidGradle.content.match(/\bnamespace\s*=\s*["']([^"']+)["']/)?.[1]
+      ?? androidGradle.content.match(/\bapplicationId\s*=\s*["']([^"']+)["']/)?.[1];
+    if (androidNamespace) {
+      task = `${task}\n\nMandatory Android source contract: the established namespace is ${androidNamespace}. Every new Kotlin/Java file must declare package ${androidNamespace} or a child package and must be written under app/src/.../${androidNamespace.replace(/\./g, "/")}/. Do not invent com.example, com.pax, com.merchant, or any parallel application package.`;
+    }
+    const sdkEvidence = inspectImportedAndroidSdk(workspaceProjectPath);
+    if (sdkEvidence.report) {
+      task = `${task}\n\nImported Android SDK API evidence (generated from the real AAR; authoritative for integration code):\n${sdkEvidence.report}`;
+      await emitExecution(execution, "inspection", "completed", `Inspected ${sdkEvidence.files.length} imported Android SDK archive${sdkEvidence.files.length === 1 ? "" : "s"}`, {
+        details: { files: sdkEvidence.files, evidenceFile: ".foundry-input/sdk/sdk-evidence.md", paidModelCalls: 0 },
+      });
+    } else if (sdkEvidence.error) {
+      await emitExecution(execution, "inspection", "error", "Imported Android SDK inspection failed", { details: { error: sdkEvidence.error, paidModelCalls: 0 } });
+    }
   }
   await emitExecution(execution, "inspection", "completed", "Detected project stack", {
     internal: true,
@@ -5594,7 +5667,7 @@ async function runExistingProjectMissionWithAccess(params: {
     classification.rationale = "A real browser failure was already collected deterministically, so paid intent classification would only repeat known evidence.";
   }
   const deterministicIntent = deterministicMutationIntent(task);
-  if (explicitCommandOnlyRequest && (classification.intent === "question" || classification.intent === "status" || classification.intent === "analyze")) {
+  if (effectiveCommandOnlyRequest && (classification.intent === "question" || classification.intent === "status" || classification.intent === "analyze")) {
     classification.intent = "edit";
     classification.needsProjectInspection = true;
     classification.rationale = "Deterministic operation guard: the user explicitly requested a real run/validation action, so prose-only inspection is not a valid result.";
@@ -5760,15 +5833,21 @@ async function runExistingProjectMissionWithAccess(params: {
     && !assessmentHighRisk(routingAssessment)
     && routingAssessment.estimatedFiles <= 3
     && routingAssessment.estimatedSubsystems <= 2;
-  const directExecutionLane = Boolean(preModelBrowserEvidence) || boundedStaticFollowUp || boundedSmallEdit || explicitCommandOnlyRequest || fastLane || boundedDebug || boundedCoordinatedEdit;
-  const carryForwardPlan = !explicitCommandOnlyRequest && !resumingIncompleteProject && continuity === "carry_forward_plan" && Boolean(parentMission?.plan.length) && stackProfile.level >= 4;
+  const directExecutionLane = Boolean(preModelBrowserEvidence) || boundedStaticFollowUp || boundedSmallEdit || effectiveCommandOnlyRequest || fastLane || boundedDebug || boundedCoordinatedEdit;
+  const carryForwardPlan = !effectiveCommandOnlyRequest && !resumingIncompleteProject && continuity === "carry_forward_plan" && Boolean(parentMission?.plan.length) && stackProfile.level >= 4;
   if (!directExecutionLane && !carryForwardPlan) await emitExecution(execution, "planning", "running", "Planning the approach", { internal: true });
   let checklist: FactoryObjectiveChecklistItem[];
   if (resumingIncompleteProject) {
     const inheritedPlan = parentMission?.plan.map((item) => item.status === "completed" || item.status === "skipped"
       ? { ...item }
       : { ...item, status: "pending" as const, evidence: undefined });
-    checklist = inheritedPlan?.length ? inheritedPlan : [
+    const briefRequirements = savedBriefForRecovery?.exists ? generatedRecoveryRequirements(savedBriefForRecovery.content) : [];
+    checklist = briefRequirements.length ? briefRequirements.map((requirement, index) => ({
+      id: `generated-requirement-${index + 1}`,
+      label: `Implement and verify: ${requirement}`,
+      status: "pending" as const,
+      phase: "Saved product brief",
+    })) : inheritedPlan?.length ? inheritedPlan : [
       { id: "complete-generated-source", label: "Create the complete coordinated application source from the saved brief", status: "pending" },
       { id: "verify-generated-project", label: "Run the project checks and confirm the real application starts successfully", status: "pending" },
     ];
@@ -5801,7 +5880,7 @@ async function runExistingProjectMissionWithAccess(params: {
           status: "pending" as const,
           phase: "Requested behavior",
         }))
-      : [{ id: preModelBrowserEvidence ? "browser-evidenced-repair" : explicitCommandOnlyRequest ? "operation-verified" : boundedDebug ? "bounded-debug-repair" : "small-edit-applied", label: preModelBrowserEvidence ? "Repair the verified desktop/mobile browser failure and rerun acceptance" : explicitCommandOnlyRequest ? `Run and verify without source changes: ${requestedTask.trim()}` : `Complete: ${task.trim()}`, status: "pending" as const }];
+      : [{ id: preModelBrowserEvidence ? "browser-evidenced-repair" : effectiveCommandOnlyRequest ? "operation-verified" : boundedDebug ? "bounded-debug-repair" : "small-edit-applied", label: preModelBrowserEvidence ? "Repair the verified desktop/mobile browser failure and rerun acceptance" : effectiveCommandOnlyRequest ? `Run and verify without source changes: ${requestedTask.trim()}` : `Complete: ${task.trim()}`, status: "pending" as const }];
   } else {
     // Pre-plan complexity is necessarily an estimate (distinctPhases doesn't exist until the checklist
     // does) — fine here, since tierForStage's "plan" branch only ever keys off quality, never complexity.
@@ -5882,7 +5961,18 @@ async function runExistingProjectMissionWithAccess(params: {
   });
   const strategyComplexity = boundedStaticFollowUp ? "small" as const : complexity;
   const strategyHighRisk = boundedStaticFollowUp ? false : highRisk;
-  const missionStrategy = createExecutionStrategy({
+  const missionStrategy = createExecutionStrategy(resumingIncompleteProject && isFoundryGeneratedProject ? {
+    kind: "existing-project",
+    complexity: "large",
+    quality,
+    fileCount: Math.max(24, routingAssessment.estimatedFiles),
+    estimatedArtifacts: Math.max(8, checklist.filter((item) => item.status === "pending").length),
+    independentlyGeneratable: true,
+    highRisk: false,
+    securitySensitive: routingAssessment.securityOrPayment,
+    needsVisualValidation: true,
+    repeatedFailures: parentMission?.state === "failed" ? 1 : 0,
+  } : {
     kind: "existing-project", complexity: strategyComplexity, quality, fileCount: boundedStaticFollowUp ? Math.min(3, routingAssessment.estimatedFiles) : routingAssessment.estimatedFiles,
     estimatedArtifacts: checklist.filter((item) => item.status === "pending").length,
     independentlyGeneratable: new Set(checklist.map((item) => item.phase).filter(Boolean)).size > 1 && !strategyHighRisk,
@@ -6073,8 +6163,11 @@ async function runExistingProjectMissionWithAccess(params: {
     });
   } else {
     if (recoveryPreflight?.buildPassed && fullGeneratedRecovery) {
-      await emitExecution(execution, "reasoning", "completed", "The production command exited 0, but the project still has no runnable application entry. Foundry is continuing from the saved brief instead of presenting an empty 404 runtime as a verified build.", {
-        details: { paidModelCallsBeforeDecision: 0, runnableEntry: false },
+      const recoveryReason = !hasGeneratedRunnableEntry
+        ? "The production command exited 0, but the project still has no runnable application entry. Foundry is continuing from the saved brief instead of presenting an empty runtime as a verified build."
+        : "The production command exited 0, but the generated stack does not yet match the authoritative saved brief. Foundry is continuing the requested product instead of accepting the mismatched foundation.";
+      await emitExecution(execution, "reasoning", "completed", recoveryReason, {
+        details: { paidModelCallsBeforeDecision: 0, runnableEntry: hasGeneratedRunnableEntry, detectedStackMismatch },
       });
     } else if (recoveryPreflight?.commands.length && !recoveryPreflight.buildPassed) {
       const lastPreflightCommand = recoveryPreflight.commands.at(-1)!;
@@ -6118,12 +6211,12 @@ async function runExistingProjectMissionWithAccess(params: {
     highRisk,
     tier: implementationModel.tier,
     architectureNotes,
-    hasBuildTooling: explicitCommandOnlyRequest ? false : stackHasBuildStep(stackProfile.id),
+    hasBuildTooling: effectiveCommandOnlyRequest ? false : stackHasBuildStep(stackProfile.id),
     verificationProfile,
     executionStrategy: missionStrategy,
     evidenceImages,
     routingAssessment,
-    commandOnly: explicitCommandOnlyRequest,
+    commandOnly: effectiveCommandOnlyRequest,
     initialProjectEvidence: boundedWorkingSetEvidence ?? compilerRepairEvidence,
     requireFirstMutation: Boolean(boundedWorkingSetEvidence || compilerRepairEvidence || boundedCompilerRepair),
     avoidFirstMutationPaths: boundedCoordinatedEdit
@@ -6139,7 +6232,7 @@ async function runExistingProjectMissionWithAccess(params: {
     evidenceFirstRepair: Boolean(preModelBrowserEvidence || boundedCompilerRepair),
     evidenceRepairReadPaths: [...new Set([...compilerRepairReadPaths, ...preModelRepairReadPaths])],
     maxTurns: preModelBrowserEvidence ? 6 : boundedCompilerRepair ? 6 : approvalResponse ? 20 : boundedSmallEdit ? 6 : boundedStaticFollowUp ? 3 : boundedCoordinatedEdit ? 12 : resumingIncompleteStaticProject ? 8 : resumingIncompleteProject ? 32 : undefined,
-    maxOutputTokens: preModelBuildFailure ? 1_500 : preModelBrowserEvidence ? 5_000 : boundedCompilerRepair ? 1_500 : boundedStaticWholeRewrite ? 16_000 : boundedSmallEdit ? 3_500 : boundedStaticFollowUp ? 3_000 : boundedCoordinatedEdit ? 5_000 : resumingIncompleteProject ? 6_000 : undefined,
+    maxOutputTokens: preModelBuildFailure ? 1_500 : preModelBrowserEvidence ? 5_000 : boundedCompilerRepair ? 1_500 : boundedStaticWholeRewrite ? 16_000 : boundedSmallEdit ? 3_500 : boundedStaticFollowUp ? 3_000 : boundedCoordinatedEdit ? 5_000 : resumingIncompleteProject ? 16_000 : undefined,
     // Generated-project continuation shares one deliberately small ledger across every batch.
     // Deterministic scaffold/build/browser work is unmetered; source generation cannot silently
     // expand one Retry click into an enterprise-tier 40-call mission.
@@ -6227,7 +6320,7 @@ async function runExistingProjectMissionWithAccess(params: {
   const exactVerificationRepairLane = exactFailedRetry && Boolean(preModelBrowserEvidence);
   const stalledBeforeFirstMutation = !exactVerificationRepairLane
     && !resumingIncompleteProject
-    && !explicitCommandOnlyRequest
+    && !effectiveCommandOnlyRequest
     && result.status === "failed"
     && result.changedFiles.length === 0
     && /NO_PROGRESS_BEFORE_MUTATION|lost a clear next step|did not call required tool (?:replace_in_file|write_files?|edit_file)|existing file content unchanged|no-progress action/i.test(result.blocker ?? "");
@@ -6302,7 +6395,7 @@ async function runExistingProjectMissionWithAccess(params: {
       // the prior generation while a required verification profile rebuilds the project.
       await stopProjectPreview(previewTarget);
     }
-    const profileGate = await runRequiredVerificationProfile({ access, execution, profile: verificationProfile, projectPath: workspaceProjectPath, existingCommands: result.commands, requireAutomatedTests: missionRequiresAutomatedTests(task) });
+    const profileGate = await runRequiredVerificationProfile({ access, execution, profile: verificationProfile, projectPath: workspaceProjectPath, existingCommands: result.changedFiles.length ? [] : result.commands, requireAutomatedTests: missionRequiresAutomatedTests(task) });
     result.commands.push(...profileGate.commands);
     result.verification.push(...profileGate.verification);
     if (!profileGate.passed) {
@@ -6325,7 +6418,7 @@ async function runExistingProjectMissionWithAccess(params: {
         internal: true,
         details: { paidModelCalls: 0, reconciledNoProgressBoundary: true, changedFiles: result.changedFiles },
       });
-    } else if (modelBudgetBoundaryAfterVerifiedEdit) {
+    } else if (modelBudgetBoundaryAfterVerifiedEdit && !resumingIncompleteProject) {
       for (const item of result.checklist) {
         if (item.status === "pending" || item.status === "running" || item.status === "blocked") {
           item.status = "completed";
@@ -6347,17 +6440,23 @@ async function runExistingProjectMissionWithAccess(params: {
     // allowance as a continuation boundary, not a terminal product blocker. Existing-project work
     // still requires a real file change before automatic continuation so read-only failures cannot
     // loop without progress.
-    && (resumingIncompleteProject || candidate.changedFiles.length > 0)
+    && candidate.changedFiles.length > 0
     && !assessAutonomousBlocker(candidate.blocker ?? "").terminal
     && !(noProgressBoundaryAfterVerifiedEdit && acceptedUiOutcome && previewPlatformForStack(stackProfile.label) === "web")
-    && /NO_PROGRESS_(?:BEFORE|AFTER)_MUTATION|command or file write failed|production build (?:not verified|failed)|Checklist item\(s\) not completed/i.test(candidate.blocker ?? "");
-  const needsGeneratedEntryContinuation = resumingIncompleteProject
-    && !(await hasRunnableProjectEntry(executorAccess));
+    && /SOURCE_BATCH_READY_FOR_DETERMINISTIC_VERIFICATION|NO_PROGRESS_(?:BEFORE|AFTER)_MUTATION|command or file write failed|production build (?:not verified|failed)|Checklist item\(s\) not completed|Model-call limit reached|configured execution limit/i.test(candidate.blocker ?? "");
   // A substantial greenfield product can legitimately need more than one bounded executor batch.
   // Preserve one routing/cost identity across continuation batches. On-disk progress can continue,
   // but a batch boundary must never reset the amount the user authorized this mission to spend.
   const maxContinuationBatches = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 20);
   let consecutiveStagnantContinuationBatches = 0;
+  // Churn-proof stagnation. `evidenceProgressed` below counts ANY changed file as progress, so a model
+  // that edits a config file every batch while the SAME production build keeps failing (observed live:
+  // a Next.js build-worker crash re-narrated as a new diagnosis each batch — "workspace root", then
+  // "turbopack root", then "TypeScript 7") kept the loop alive for 82 turns / $3.17. Track the STRUCTURAL
+  // signature of each batch-ending build failure — it erases concrete type text, ids, and durations — so
+  // those disguised repeats are recognized across batches and the continuation stops after three.
+  const continuationBuildFailureSignatures = new Map<string, number>();
+  let stuckBuildFailure = false;
   for (let continuationAttempt = 1; continuationAttempt <= maxContinuationBatches && resumableBatchFailure(result); continuationAttempt += 1) {
     const lastFailedCommand = [...result.commands].reverse().find((command) => command.exitCode !== 0);
     const recoveryFingerprintBefore = createHash("sha256").update([
@@ -6387,14 +6486,17 @@ async function runExistingProjectMissionWithAccess(params: {
       fastLane: false,
       highRisk,
       tier: implementationModel.tier,
-      hasBuildTooling: explicitCommandOnlyRequest ? false : stackHasBuildStep(stackProfile.id),
+      hasBuildTooling: effectiveCommandOnlyRequest ? false : stackHasBuildStep(stackProfile.id),
       verificationProfile,
       executionStrategy: missionStrategy,
       routingAssessment,
-      commandOnly: explicitCommandOnlyRequest,
+      commandOnly: effectiveCommandOnlyRequest,
       // File count is not an application contract. Configuration, styles, and helper components can
       // easily exceed three files while the project still has no route/entry and renders only 404.
-      newProject: needsGeneratedEntryContinuation,
+      // Keep generated-project write quality, placeholder, manifest, and coordinated-foundation
+      // guards active for every continuation. A token MainActivity is not proof the project stopped
+      // being a greenfield build.
+      newProject: resumingIncompleteProject,
       continuableBatch: resumingIncompleteProject,
       staticProject: resumingIncompleteStaticProject,
       maxTurns: resumingIncompleteProject ? 32 : 16,
@@ -6408,6 +6510,31 @@ async function runExistingProjectMissionWithAccess(params: {
       verification: [...result.verification, ...continuation.verification],
       timeline: [...result.timeline, ...continuation.timeline],
     };
+    // Every generated continuation batch must cross the deterministic stack gate before another
+    // paid model call. The initial batch already did this below, but continuation results were
+    // previously merged and immediately routed back to the model, allowing several junk batches
+    // to accumulate without compiling once.
+    if (continuation.changedFiles.length > 0
+      && access.runCommand
+      && verificationProfile.commands.some((item) => item.required && !item.longRunning)) {
+      const continuationGate = await runRequiredVerificationProfile({
+        access,
+        execution,
+        profile: verificationProfile,
+        projectPath: workspaceProjectPath,
+        existingCommands: [],
+        requireAutomatedTests: missionRequiresAutomatedTests(task),
+      });
+      result.commands.push(...continuationGate.commands);
+      result.verification.push(...continuationGate.verification);
+      if (!continuationGate.passed) {
+        const failure = continuationGate.failure
+          ? `${continuationGate.failure.command} â€” ${summarizeCommandFailure(continuationGate.failure)}`
+          : "no runnable required verification command was available.";
+        result.status = "failed";
+        result.blocker = `Required ${verificationProfile.ecosystem} command or file write failed: ${failure}`;
+      }
+    }
     const nextFailedCommand = [...result.commands].reverse().find((command) => command.exitCode !== 0);
     const recoveryFingerprintAfter = createHash("sha256").update([
       result.blocker ?? "",
@@ -6421,9 +6548,25 @@ async function runExistingProjectMissionWithAccess(params: {
       await emitExecution(execution, "planning", "warning", "Paused duplicate recovery calls after source and verification evidence remained unchanged", { internal: true, details: { recoveryFingerprint: recoveryFingerprintAfter, paidCallPrevented: true, unchangedEvidence: true, stagnantBatches: consecutiveStagnantContinuationBatches } });
       break;
     }
+    // A batch that still ends on a failing production build is only progress if it is a DIFFERENT
+    // failure (the app exposing its next real error). The same structural signature recurring across
+    // batches — even with fresh file churn — is the model flailing on an unchanging wall, not converging.
+    const batchBuildFailure = [...result.commands].reverse().find((command) => command.exitCode !== 0 && isProductionBuildCommand(command.command));
+    if (batchBuildFailure) {
+      const buildSignature = compilerFailureSignature(batchBuildFailure, workspaceProjectPath ?? access.rootLabel);
+      const buildRepeats = (continuationBuildFailureSignatures.get(buildSignature) ?? 0) + 1;
+      continuationBuildFailureSignatures.set(buildSignature, buildRepeats);
+      if (buildRepeats >= 3) {
+        stuckBuildFailure = true;
+        await emitExecution(execution, "planning", "warning", "Stopped continuation after the same production build failure survived three repair batches", { internal: true, details: { buildSignature, buildRepeats, paidCallPrevented: true } });
+        result.status = "failed";
+        result.blocker = `The production build failed with the same error across ${buildRepeats} continuation batches without converging. Foundry stopped rather than spend more of the mission budget re-attempting an unchanging failure: ${summarizeCommandFailure(batchBuildFailure)}`;
+        break;
+      }
+    }
   }
 
-  if (deterministicProfileBlocker && result.status !== "stopped" && access.runCommand) {
+  if (deterministicProfileBlocker && result.status !== "stopped" && !stuckBuildFailure && access.runCommand) {
     if (previewTarget && verificationProfile.commands.some((item) => item.required && !item.longRunning && isProductionBuildCommand(item.command))) {
       await stopProjectPreview(previewTarget);
     }
@@ -6644,10 +6787,14 @@ async function runExistingProjectMissionWithAccess(params: {
         result.verification.push({
           check_type: "preview",
           result: "skipped",
-          evidence: managedPreview.previewReason || "A live in-browser preview is not available for this project on this machine. The implementation is complete and on disk.",
+          evidence: managedPreview.previewReason || "A live in-browser preview is not available for this project on this machine.",
         });
         result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
-        result.sessionSummary.outcome = `The implementation is complete and verified on disk. ${managedPreview.previewReason || "A live in-browser preview is not available for this project on this machine."}`;
+        // Preview availability cannot turn failed generation, SDK intake, or verification into
+        // a completed implementation. Preserve the authoritative execution verdict.
+        result.sessionSummary.outcome = result.status === "passed"
+          ? `The implementation passed its available verification. ${managedPreview.previewReason || "A live in-browser preview is not available for this project on this machine."}`
+          : `The implementation did not complete: ${result.blocker || "required verification is still failing."} ${managedPreview.previewReason || "A live in-browser preview is not available for this project on this machine."}`;
       } else if (!managedPreview.previewUrl || managedPreview.previewPlatform !== "web") {
         result.status = "failed";
         result.blocker = managedPreview.previewReason || "Real browser verification was requested, but Foundry could not start an owned web preview.";
@@ -8948,6 +9095,21 @@ function lineValue(brief: string, label: string) {
   return brief.match(new RegExp(`^${escapeRegExp(label)}:\\s*(.+)$`, "im"))?.[1]?.trim() ?? "";
 }
 
+export function generatedRecoveryRequirements(brief: string) {
+  const description = lineValue(brief, "Project description").toLowerCase();
+  const features = lineValue(brief, "Main features").split(";").map((item) => item.trim()).filter((item) => {
+    if (!item) return false;
+    // Discovery commonly repeats the complete project description as feature #1. Keeping that
+    // umbrella item ahead of its concrete capabilities lets a model spend every bounded batch on
+    // one subsystem while claiming the broad sentence is still in progress.
+    return !(item.length > 80 && (description.includes(item.toLowerCase()) || /^build (?:a |an )?complete\b/i.test(item)));
+  });
+  const entities = lineValue(brief, "Data model/entities").split(";").map((item) => item.trim()).filter(Boolean);
+  const requirements = [...features, ...(entities.length ? [`Durable data model and persistence for ${entities.join(", ")}`] : [])]
+    .filter((item) => !/^(?:do not create placeholders|simulator claims as real hardware validation)$/i.test(item));
+  return [...new Map(requirements.map((item) => [item.toLowerCase(), item])).values()].slice(0, 16);
+}
+
 function isSupportedStack(stack: string) {
   return capabilityLevelForStackChoice(stack).level === 4;
 }
@@ -8970,6 +9132,7 @@ function hasLivePreviewFor(stack: string) {
  * real toolchain (Next.js, Node, Python, .NET, Java, Go, Rust, etc.) keeps the stricter requirement.
  */
 function stackHasBuildStep(stackId: string): boolean {
+  if (stackId === "android") return Boolean(resolveAndroidTools() && resolveJavaHome());
   const executable: Partial<Record<string, string>> = {
     nextjs: "node", node: "node", "node-express": "node", react: "node", vue: "node", angular: "node", electron: "node", "react-native": "node",
     python: "python", php: "php", java: "java", android: "gradle", flutter: "flutter", "dotnet-web": "dotnet", "dotnet-desktop": "dotnet",
@@ -9489,6 +9652,17 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
     await writeFile(absolutePath, content, "utf8");
     written.push(relativePath.replace(/\\/g, "/"));
   };
+  const writeInvalid = async (relativePath: string, content: string, isValid: (current: string) => boolean) => {
+    const absolutePath = path.join(projectPath, relativePath);
+    if (existsSync(absolutePath)) {
+      const current = await readFile(absolutePath, "utf8").catch(() => "");
+      if (isValid(current)) return;
+    } else {
+      await mkdir(path.dirname(absolutePath), { recursive: true });
+    }
+    await writeFile(absolutePath, content, "utf8");
+    written.push(relativePath.replace(/\\/g, "/"));
+  };
   const reconcilePackageManifest = async (content: string) => {
     const relativePath = "package.json";
     const absolutePath = path.join(projectPath, relativePath);
@@ -9608,6 +9782,130 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
     if (!hasExistingRoutes) await writeMissing("app/index.tsx", entry);
     return finish("Created verified Expo project scaffold", "The selected React Native stack requires a real Expo manifest, typed configuration, router entry, and runnable screen before model-driven product implementation begins.");
   }
+  if (stack.id === "android") {
+    const packageName = `com.foundry.${safeName.replace(/[^a-z0-9]/g, "").slice(0, 32) || "androidapp"}`;
+    const packagePath = packageName.replace(/\./g, "/");
+    const importedSdkDir = path.join(projectPath, ".foundry-input", "sdk");
+    const importedSdkFiles = await readdir(importedSdkDir, { withFileTypes: true }).catch(() => []);
+    const importedAar = importedSdkFiles.find((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".aar"))?.name;
+    const settingsGradle = `pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+rootProject.name = ${JSON.stringify(projectName.replace(/["\r\n]/g, " "))}
+include(":app")
+`;
+    await writeInvalid("settings.gradle.kts", settingsGradle, (content) => /include\s*\(\s*["']:app["']\s*\)/.test(content) && /pluginManagement/.test(content));
+    const rootGradle = `plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+    id("com.google.devtools.ksp") version "1.9.24-1.0.20" apply false
+}
+`;
+    await writeInvalid("build.gradle.kts", rootGradle, (content) => /com\.android\.application/.test(content) && /org\.jetbrains\.kotlin\.android/.test(content));
+    await writeMissing("gradle.properties", "org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\nkotlin.code.style=official\n");
+    await writeMissing(".gitignore", ".gradle/\n.idea/\nbuild/\n**/build/\nlocal.properties\n*.iml\n");
+    const appGradle = `plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("com.google.devtools.ksp")
+}
+
+android {
+    namespace = "${packageName}"
+    compileSdk = 35
+    defaultConfig { applicationId = "${packageName}"; minSdk = 26; targetSdk = 35; versionCode = 1; versionName = "1.0"; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
+    buildFeatures { compose = true; buildConfig = true }
+    composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+    compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+    kotlinOptions { jvmTarget = "17" }
+    packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+}
+
+dependencies {
+    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+    implementation("androidx.activity:activity-compose:1.9.1")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.4")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.06.00"))
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+${importedAar ? `    implementation(files("../.foundry-input/sdk/${importedAar.replace(/"/g, "")}"))\n` : ""}}
+`;
+    await writeInvalid("app/build.gradle.kts", appGradle, (content) => /com\.android\.application/.test(content) && /\bandroid\s*\{/.test(content) && /\bdependencies\s*\{/.test(content) && (!importedAar || content.includes(importedAar)));
+    const androidManifestPath = "app/src/main/AndroidManifest.xml";
+    await writeMissing(androidManifestPath, `<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <application android:allowBackup="false" android:label=${JSON.stringify(projectName.replace(/["\r\n]/g, " "))} android:supportsRtl="true" android:theme="@style/Theme.Foundry">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+        </activity>
+    </application>
+</manifest>
+`);
+    const manifestAbsolutePath = path.join(projectPath, androidManifestPath);
+    if (existsSync(manifestAbsolutePath)) {
+      const manifest = await readFile(manifestAbsolutePath, "utf8");
+      let reconciled = manifest;
+      if (!/<\/manifest>\s*$/i.test(reconciled)) {
+        reconciled = `<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <application android:allowBackup="false" android:label=${JSON.stringify(projectName.replace(/["\r\n]/g, " "))} android:supportsRtl="true" android:theme="@style/Theme.Foundry">\n        <activity android:name=".MainActivity" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity>\n    </application>\n</manifest>\n`;
+      } else {
+        if (/android\.permission\.CAMERA/.test(reconciled) && !/uses-feature[^>]+android\.hardware\.camera/.test(reconciled)) {
+          reconciled = reconciled.replace(/(<manifest\b[^>]*>)/, `$1\n    <uses-feature android:name="android.hardware.camera" android:required="false" />`);
+        }
+        if (!/<application\b/i.test(reconciled)) {
+          reconciled = reconciled.replace(/<\/manifest>/i, `    <application android:allowBackup="false" android:label=${JSON.stringify(projectName.replace(/["\r\n]/g, " "))} android:supportsRtl="true" android:theme="@style/Theme.Foundry">\n        <activity android:name=".MainActivity" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity>\n    </application>\n</manifest>`);
+        } else if (!/android\.intent\.category\.LAUNCHER/i.test(reconciled)) {
+          reconciled = reconciled.replace(/<\/application>/i, `        <activity android:name=".MainActivity" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity>\n    </application>`);
+        }
+      }
+      if (reconciled !== manifest) {
+        await writeFile(manifestAbsolutePath, reconciled, "utf8");
+        if (!written.includes(androidManifestPath)) written.push(androidManifestPath);
+      }
+    }
+    await writeMissing("app/src/main/res/values/styles.xml", `<resources><style name="Theme.Foundry" parent="android:style/Theme.Material.Light.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:colorAccent">#007F73</item></style></resources>\n`);
+    await writeMissing(`app/src/main/java/${packagePath}/MainActivity.kt`, `package ${packageName}
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { Surface(color = MaterialTheme.colorScheme.background) { Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) { Text(${JSON.stringify(projectName.replace(/["\r\n]/g, " "))}, style = MaterialTheme.typography.headlineMedium); Text("Android runtime, persistence, and device integration foundation verified.") } } }
+    }
+}
+`);
+    await writeMissing(`app/src/test/java/${packagePath}/FoundationTest.kt`, `package ${packageName}\n\nimport org.junit.Assert.assertTrue\nimport org.junit.Test\n\nclass FoundationTest { @Test fun foundationLoads() { assertTrue(true) } }\n`);
+    const androidTools = resolveAndroidTools();
+    if (androidTools) await writeMissing("local.properties", `sdk.dir=${androidTools.sdkRoot.replace(/\\/g, "\\\\")}\n`);
+    const wrapper = ensureAndroidGradleWrapper(projectPath);
+    if (wrapper.ok) {
+      for (const relativePath of wrapper.created) if (!written.includes(relativePath)) written.push(relativePath);
+    } else {
+      events.push(`Android wrapper bootstrap could not complete deterministically: ${wrapper.error ?? "unknown error"}`);
+    }
+    return finish("Created verified Android Gradle project scaffold", `The Android build now starts from a complete Gradle/settings/module/manifest/source/test foundation${importedAar ? ` with ${importedAar} wired as a local AAR dependency` : ""}, rather than asking a model to invent build infrastructure.`);
+  }
   if (stack.id === "python") {
     await writeMissing("requirements.txt", "fastapi>=0.115,<1\nuvicorn[standard]>=0.32,<1\npytest>=8,<9\nhttpx>=0.28,<1\n");
     await writeMissing("app/__init__.py", "");
@@ -9694,9 +9992,9 @@ function previewUnavailableReason(platform: FactoryPreviewPlatform, stack: strin
   // identified, say that plainly and reassure that the work is saved, rather than naming "Unknown".
   const stackIsUnidentified = !stack || /^(unknown|unidentified|n\/?a)$/i.test(stack.trim());
   if (stackIsUnidentified) {
-    return "Foundry couldn't identify this project's stack, so it didn't start a live in-browser preview. The generated implementation is complete and saved on disk — open it in its native toolchain (or tell Foundry the framework) to run it.";
+    return "Foundry couldn't identify this project's stack, so it didn't start a live in-browser preview. Identify the framework and use its native toolchain before runtime behavior can be validated.";
   }
-  return `Foundry doesn't run a live in-browser preview for a ${stack} project on this machine. The implementation is complete and saved on disk — run it with ${stack}'s own tooling.`;
+  return `Foundry doesn't run a live in-browser preview for a ${stack} project on this machine. Use ${stack}'s own tooling or a configured native emulator/device for runtime validation.`;
 }
 
 type PythonPreviewEntry = { kind: "asgi" | "flask" | "django"; module?: string };

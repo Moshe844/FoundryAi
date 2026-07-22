@@ -29,6 +29,8 @@ export type CanvasWorkEvent = {
   /** Raw stdout/stderr/diff payload, expandable in place. Never paraphrased away. */
   output?: string;
   durationMs?: number;
+  /** Changed/read line range from the real event, e.g. "lines 42–67", for the compact rail. */
+  lineRange?: string;
 };
 
 /**
@@ -270,6 +272,7 @@ export function groupTimeline(timeline: FactoryExecutionEvent[]): CanvasVoiceGro
         command: event.command,
         output: rawPayloadOf(event),
         durationMs: event.durationMs,
+        lineRange: normalizeLineRange(typeof event.details?.lineRange === "string" ? event.details.lineRange : undefined),
       };
       const lifecycleKey = `${event.kind}:${event.filePath ?? ""}:${event.command ?? ""}`;
       const previousIndex = current.events.findIndex((candidate) =>
@@ -284,6 +287,160 @@ export function groupTimeline(timeline: FactoryExecutionEvent[]): CanvasVoiceGro
     });
 
   return groups;
+}
+
+/**
+ * ExecutionEventGrouper — collapses the low-level work events inside one voice group into compact
+ * execution units. The raw event trail is the source of truth (kept on each unit's subSteps); this
+ * layer only decides how to *present* it: read → open → edit → save → verify of one file become a single
+ * "Updated auth.ts" unit, and the repeated lifecycle rows of one command become a single command unit.
+ * The rail renders these units inline; each expands in place to its exact low-level steps and payloads.
+ */
+export type CanvasExecutionState =
+  | "thinking" | "investigating" | "deciding" | "editing" | "running"
+  | "testing" | "verifying" | "recovering" | "waiting-approval" | "waiting-user"
+  | "completed" | "blocked";
+
+export type CanvasExecutionSubStep = {
+  id: string;
+  kind: FactoryExecutionEventKind;
+  status: CanvasWorkEvent["status"];
+  text: string;
+  output?: string;
+};
+
+export type CanvasExecutionUnit = {
+  id: string;
+  kind: "file" | "command" | "preview" | "misc";
+  /** Compact rail label — "Updated auth.ts", "npm run build", "Restarting preview". */
+  label: string;
+  /** Secondary detail shown after the label — "lines 42–67", "exit 0". */
+  detail?: string;
+  status: CanvasWorkEvent["status"];
+  durationMs?: number;
+  filePath?: string;
+  command?: string;
+  /** Primary raw payload (diff/stdout/stderr) opened in place. */
+  output?: string;
+  /** The collapsed low-level events behind this unit, in order. */
+  subSteps: CanvasExecutionSubStep[];
+};
+
+/** Normalize an engine line-range string ("Lines 1-658", "Lines 42-67") into a compact rail detail. */
+export function normalizeLineRange(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const match = raw.match(/(\d+)\s*[-–]\s*(\d+)/);
+  if (!match) return undefined;
+  const [from, to] = [Number(match[1]), Number(match[2])];
+  return from === to ? `line ${from}` : `lines ${from}–${to}`;
+}
+
+/**
+ * A unit's status is the latest sub-step's status (last-wins). This is what makes recovery honest: a
+ * failed edit followed by a successful retry, or a running lifecycle row followed by its completion,
+ * resolves to the real final state — while the earlier failure stays visible in the expanded steps and
+ * never leaves the unit falsely marked failed (spec: recovered errors do not remain unresolved).
+ */
+function foldUnitStatus(subSteps: CanvasExecutionSubStep[]): CanvasWorkEvent["status"] {
+  if (!subSteps.length) return "completed";
+  return subSteps[subSteps.length - 1].status;
+}
+
+function commandLabel(command: string): string {
+  return command.replace(/^(?:cmd\.exe\s+\/c\s+|powershell\s+-command\s+)/i, "").replace(/\s+/g, " ").trim();
+}
+
+export function groupExecutionUnits(events: CanvasWorkEvent[]): CanvasExecutionUnit[] {
+  const units: CanvasExecutionUnit[] = [];
+  const fileUnits = new Map<string, CanvasExecutionUnit>();
+  const commandUnits = new Map<string, CanvasExecutionUnit>();
+
+  const addSubStep = (unit: CanvasExecutionUnit, event: CanvasWorkEvent) => {
+    unit.subSteps.push({ id: event.id, kind: event.kind, status: event.status, text: event.text, output: event.output });
+    unit.durationMs = (unit.durationMs ?? 0) + (event.durationMs ?? 0);
+    if (!unit.output && event.output) unit.output = event.output;
+  };
+
+  for (const event of events) {
+    if (event.filePath && (event.kind === "file" || event.kind === "edit" || event.kind === "inspection" || event.kind === "folder")) {
+      let unit = fileUnits.get(event.filePath);
+      if (!unit) {
+        unit = { id: `unit-file-${event.filePath}`, kind: "file", label: "", status: "completed", filePath: event.filePath, durationMs: 0, subSteps: [] };
+        fileUnits.set(event.filePath, unit);
+        units.push(unit);
+      }
+      addSubStep(unit, event);
+      if (event.lineRange && event.kind !== "inspection") unit.detail = event.lineRange;
+      else if (event.lineRange && !unit.detail) unit.detail = event.lineRange;
+      continue;
+    }
+    if (event.kind === "command" || event.kind === "build") {
+      const key = event.command ?? event.text;
+      let unit = commandUnits.get(key);
+      if (!unit) {
+        unit = { id: `unit-cmd-${key}`, kind: "command", label: commandLabel(event.command ?? event.text), status: event.status, command: event.command, durationMs: 0, subSteps: [] };
+        commandUnits.set(key, unit);
+        units.push(unit);
+      }
+      addSubStep(unit, event);
+      continue;
+    }
+    units.push({
+      id: `unit-${event.id}`,
+      kind: event.kind === "preview" ? "preview" : "misc",
+      label: event.text,
+      status: event.status,
+      durationMs: event.durationMs,
+      output: event.output,
+      subSteps: [{ id: event.id, kind: event.kind, status: event.status, text: event.text, output: event.output }],
+    });
+  }
+
+  for (const unit of units) {
+    unit.status = foldUnitStatus(unit.subSteps);
+    if (unit.kind === "file") {
+      const basename = (unit.filePath ?? "").split("/").pop() || unit.filePath || "file";
+      const verb = unit.subSteps.some((step) => step.kind === "edit")
+        ? "Updated"
+        : unit.subSteps.some((step) => step.kind === "file" || step.kind === "folder")
+          ? "Created"
+          : "Read";
+      unit.label = `${verb} ${basename}`;
+    }
+  }
+
+  return units;
+}
+
+/**
+ * CurrentActivityController — the single, unambiguous "what Foundry is doing right now" line. Derived
+ * from the real mission state and the latest non-internal event; never more than one active state.
+ */
+export function currentActivityOf(mission: ExecutionMission): { state: CanvasExecutionState; label: string } {
+  if (mission.state === "waiting_for_approval") return { state: "waiting-approval", label: "Waiting for approval" };
+  if (mission.state === "waiting_for_user") return { state: "waiting-user", label: "Waiting for your reply" };
+  if (mission.state === "complete") return { state: "completed", label: "Completed" };
+  if (mission.state === "failed" || mission.state === "blocked") return { state: "blocked", label: "Blocked" };
+
+  const last = mission.timeline.filter((event) => !isInternalExecutionEvent(event)).at(-1);
+  if (!last) return { state: "thinking", label: "Thinking" };
+  const basename = last.filePath ? last.filePath.split("/").pop() : undefined;
+  const isTest = /\b(test|vitest|jest|spec|playwright)\b/i.test(last.command ?? "");
+  const isBuild = /\b(build|compile|tsc|typecheck)\b/i.test(last.command ?? "") || last.kind === "build";
+
+  if (last.tier === "decision") return { state: "deciding", label: "Deciding on an approach" };
+  if (last.tier === "flag") return { state: "recovering", label: "Handling a blocker" };
+  if (last.tier === "finding") return { state: "investigating", label: "Investigating" };
+  if (last.kind === "fix") return { state: "recovering", label: "Recovering" };
+  if (last.kind === "inspection") return { state: "investigating", label: basename ? `Reading ${basename}` : "Investigating" };
+  if (last.kind === "edit" || last.kind === "file" || last.kind === "folder") return { state: "editing", label: basename ? `Editing ${basename}` : "Editing files" };
+  if (last.kind === "preview") return { state: "testing", label: "Testing in the browser" };
+  if (last.kind === "command" || last.kind === "build") {
+    if (isTest) return { state: "testing", label: "Running tests" };
+    if (isBuild) return { state: "verifying", label: "Building and verifying" };
+    return { state: "running", label: commandLabel(last.command ?? last.title) };
+  }
+  return { state: "thinking", label: "Thinking" };
 }
 
 /** The raw payload behind a row (stdout/stderr/diff), preserved verbatim for expansion. */

@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { toolchainById, toolchainsForStack, type ToolchainDefinition, type ToolchainId } from "./catalog";
+import { resolveAndroidTools } from "@/lib/factory/android-emulator";
 
 export type ToolchainRequirement = {
   id: ToolchainId;
@@ -32,6 +33,10 @@ export async function environmentReadinessForStack(stackId: string): Promise<Env
 }
 
 export function inspectToolchain(definition: ToolchainDefinition): ToolchainRequirement {
+  if (definition.id === "android") {
+    const tools = resolveAndroidTools();
+    if (tools) return { ...base(definition), status: "ready", canInstall: false, detectedVersion: `SDK at ${tools.sdkRoot}` };
+  }
   const version = executableVersion(definition.executable);
   if (version) return { ...base(definition), status: "ready", canInstall: false, detectedVersion: version };
   const recipe = installRecipe(definition);

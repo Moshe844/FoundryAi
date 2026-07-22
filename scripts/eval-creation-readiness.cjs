@@ -16,6 +16,17 @@ const loadTs = (file, customRequire = require) => {
 };
 
 const discovery = loadTs("lib/ai/project-discovery.ts");
+assert.equal(discovery.explicitPlatformFromPrompt("Build a PAX Android point-of-sale application that allows merchants to scan items and checkout."), "Mobile app");
+const dashboardSource = source("components/BuildDashboard.tsx");
+assert.match(dashboardSource, /const subtype = template\.id === "custom" \? "" : firstSubtypeFor\(template\.id\)/, "Freeform projects must not be preclassified as Web apps.");
+assert.match(dashboardSource, /subtype: "",\s*\/\/ Keep freeform discovery unclassified|Keep freeform discovery unclassified[\s\S]{0,180}subtype: ""/, "Editing a custom brief must clear any stale platform subtype.");
+assert.match(dashboardSource, /explicitSurfaceFromBrief\(start\.projectDescription, start\.discovery\)/, "The discovery rail must derive its platform label from the current brief.");
+assert.match(dashboardSource, /start\.template\.id === "custom" && !start\.projectNameTouched[\s\S]{0,180}start\.projectDescription/, "Freeform project creation must derive identity from the current authoritative brief.");
+assert.match(dashboardSource, /deterministicDiscoveryIsSufficient\(seedText\)[\s\S]{0,1600}discoveryProvenance: "deterministic"/, "Explicit platform/stack briefs must bypass unnecessary remote discovery.");
+assert.match(dashboardSource, /No discovery model call was needed\./, "The UI must distinguish zero-call deterministic discovery from a failed model refinement.");
+assert.match(dashboardSource, /decision\.dimension === "platform" && platformHypothesis[\s\S]{0,500}hypothesis: platformHypothesis/, "Selecting a native stack must reconcile the memo's platform decision instead of retaining Web app.");
+assert.match(dashboardSource, /fact === previousPlatform[\s\S]{0,220}platformHypothesis/, "Platform reconciliation must remove stale Web app key facts.");
+assert.match(dashboardSource, /explicitPlatformFromPrompt\(brief\)[\s\S]{0,180}words >= 8/, "The zero-call discovery path must require an explicit platform and a concrete brief.");
 const staticBrief = "Create a small static web app called Orbit Notes. Use plain HTML, CSS, and JavaScript with no external dependencies. Users can add notes, search notes, pin favorites, delete notes, and keep data in localStorage.";
 const staticResult = discovery.discoverProject(staticBrief);
 assert.equal(discovery.explicitStackFromPrompt(staticBrief), "Static HTML + CSS + JavaScript");

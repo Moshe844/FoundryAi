@@ -99,8 +99,13 @@ incompleteCreation.previewState = "stopped";
 incompleteCreation.previewUrl = undefined;
 incompleteCreation.verification = incompleteCreation.verification.filter((item) => item.check_type !== "preview");
 const guardedCreation = reports.finalizeFactoryProjectResult(incompleteCreation, "Create a complete application");
-assert.equal(guardedCreation.status, "failed", "A created project without a ready preview or runnable artifact crossed the public completion boundary.");
+// An incomplete created project must never cross the public completion boundary. It is held in
+// autonomous recovery ("needs-clarification" with a Continue-recovery checkpoint), never reported as
+// passed/production-ready, and carries an honest completion blocker.
+assert.notEqual(guardedCreation.status, "passed", "A created project without a ready preview or runnable artifact crossed the public completion boundary.");
+assert.equal(guardedCreation.status, "needs-clarification", "An incomplete created project was not held in autonomous recovery.");
 assert.match(guardedCreation.blocker, /cannot mark this created project complete/i);
+assert.ok(Array.isArray(guardedCreation.clarificationQuestions) && guardedCreation.clarificationQuestions.length > 0, "The recovery checkpoint offered no way to continue autonomous repair.");
 
 const completeCreation = verifiedResult();
 completeCreation.sourceMode = "new-project";

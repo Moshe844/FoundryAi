@@ -297,7 +297,14 @@ export function isDestructiveRewrite(before: string, after: string): boolean {
   const beforeLines = meaningfulLines(before).length;
   if (beforeLines <= 40) return false;
   const afterLines = meaningfulLines(after).length;
-  return afterLines < beforeLines * 0.5;
+  if (afterLines >= beforeLines * 0.5) return false;
+  // "Destructive" means the real implementation was replaced with a STUB — the defect this guards against
+  // gutted every screen to near-empty bodies so a compile-only gate would pass. Judge that in absolute
+  // terms, not merely "less than half": a compacting rewrite that still yields a real, sizable file is a
+  // legitimate repair. Reverting one restores the broken original and loops forever — exactly what turned a
+  // marketing site's frontmatter-stripping fix into an infinite repair cycle. A genuine stub is small on
+  // its own (few meaningful lines and little text), whatever the original size was.
+  return afterLines < 40 && after.trim().length < 1_500;
 }
 
 export type ComplianceVerdict = {

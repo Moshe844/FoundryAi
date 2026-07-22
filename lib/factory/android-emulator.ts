@@ -1,6 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import tls from "node:tls";
 
 /**
  * Real Android emulator preview. A mobile app is not a web page, so its "preview" is the app running
@@ -162,13 +164,79 @@ export function androidToolchainEnv(): NodeJS.ProcessEnv | undefined {
   const jdk = resolveJavaHome();
   if (!tools || !jdk) return undefined;
   const separator = process.platform === "win32" ? ";" : ":";
+  const trustStore = ensureGradleTrustStore(jdk.javaHome);
   return {
     ...process.env,
     JAVA_HOME: jdk.javaHome,
     ANDROID_HOME: tools.sdkRoot,
     ANDROID_SDK_ROOT: tools.sdkRoot,
     PATH: [path.join(jdk.javaHome, "bin"), path.join(tools.sdkRoot, "platform-tools"), process.env.PATH ?? ""].join(separator),
+    ...(trustStore ? { GRADLE_OPTS: `${process.env.GRADLE_OPTS ?? ""} -Djavax.net.ssl.trustStore=${trustStore.replace(/\\/g, "/")} -Djavax.net.ssl.trustStorePassword=changeit`.trim() } : {}),
   };
+}
+
+function ensureGradleTrustStore(javaHome: string): string | undefined {
+  if (process.platform !== "win32" || typeof tls.getCACertificates !== "function") return undefined;
+  const target = path.join(os.tmpdir(), "foundry-gradle-truststore.p12");
+  if (existsSync(target)) return target;
+  const source = path.join(javaHome, "lib", "security", "cacerts");
+  const keytool = path.join(javaHome, "bin", "keytool.exe");
+  if (!existsSync(source) || !existsSync(keytool)) return undefined;
+  const temporary = mkdtempSync(path.join(os.tmpdir(), "foundry-gradle-trust-"));
+  try {
+    copyFileSync(source, target);
+    for (const [index, certificate] of tls.getCACertificates("system").entries()) {
+      const certificatePath = path.join(temporary, `${index}.pem`);
+      writeFileSync(certificatePath, certificate, "utf8");
+      const imported = spawnSync(keytool, ["-importcert", "-noprompt", "-trustcacerts", "-alias", `foundry-system-${index}`, "-file", certificatePath, "-keystore", target, "-storepass", "changeit"], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+      if (imported.status !== 0) { rmSync(target, { force: true }); return undefined; }
+    }
+    return target;
+  } catch {
+    rmSync(target, { force: true });
+    return undefined;
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+function cachedGradleExecutable(): string | undefined {
+  const home = process.env.USERPROFILE || process.env.HOME;
+  if (!home) return undefined;
+  const root = path.join(home, ".gradle", "wrapper", "dists");
+  const candidates: string[] = [];
+  const walk = (directory: string, depth: number) => {
+    if (depth > 4) return;
+    let entries: import("node:fs").Dirent[];
+    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(directory, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.name.toLowerCase() === (process.platform === "win32" ? "gradle.bat" : "gradle")) candidates.push(full);
+    }
+  };
+  walk(root, 0);
+  return candidates.sort((left, right) => {
+    const preferred = (value: string) => value.includes(`${path.sep}gradle-8.7-`) ? 0 : 1;
+    return preferred(left) - preferred(right) || left.localeCompare(right);
+  })[0];
+}
+
+/** Create the portable Gradle wrapper before model execution, using a locally cached Gradle runtime.
+ * `--no-validate-url` is deliberate: restricted/corporate machines can have a working system network
+ * but a Java trust chain that cannot validate services.gradle.org during wrapper generation. The
+ * wrapper itself retains Gradle's official HTTPS distribution URL for portable future builds. */
+export function ensureAndroidGradleWrapper(projectPath: string): { ok: boolean; created: string[]; error?: string } {
+  const expected = ["gradlew", "gradlew.bat", "gradle/wrapper/gradle-wrapper.jar", "gradle/wrapper/gradle-wrapper.properties"];
+  if (expected.every((relativePath) => existsSync(path.join(projectPath, relativePath)))) return { ok: true, created: [] };
+  const gradle = cachedGradleExecutable();
+  const env = androidToolchainEnv();
+  if (!gradle || !env) return { ok: false, created: [], error: "A cached Gradle runtime and Android JDK 17+ are required to create the project wrapper." };
+  const result = process.platform === "win32"
+    ? spawnSync(gradle, ["-p", projectPath, "wrapper", "--gradle-version", "8.7", "--no-validate-url"], { encoding: "utf8", timeout: 120_000, env, shell: true, windowsHide: true })
+    : spawnSync(gradle, ["-p", projectPath, "wrapper", "--gradle-version", "8.7", "--no-validate-url"], { encoding: "utf8", timeout: 120_000, env });
+  if (result.status !== 0) return { ok: false, created: [], error: `${result.stdout || ""}\n${result.stderr || ""}`.trim() };
+  return { ok: true, created: expected.filter((relativePath) => existsSync(path.join(projectPath, relativePath))) };
 }
 
 /** Honest, actionable description of what the machine can and cannot do for mobile builds. */

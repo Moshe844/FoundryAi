@@ -66,7 +66,7 @@ const SAFE_COMMAND_PATTERNS: RegExp[] = [
   // inherit this allowance (e.g. `dir & del ...` must still require approval).
   /^\s*(?:dir(?:\s+\/[a-z]+)*(?:\s+[^&|;<>]+)?|ls(?:\s+-[a-z]+)*(?:\s+[^&|;<>]+)?|Get-ChildItem(?:\s+[^&|;<>]+)?)\s*$/i,
   /\b(npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:build|test|lint|typecheck|check|dev|start|preview)\b/i,
-  /\b(node|python|python3|py|ruby|php|java|go|cargo|dotnet|mvn|gradle|pytest|vitest|jest|tsc|eslint|next|vite|astro|svelte-kit)\b/i,
+  /\b(node|python|python3|py|ruby|php|java|go|cargo|dotnet|mvnw?|gradlew?|pytest|vitest|jest|tsc|eslint|next|vite|astro|svelte-kit)(?:\.bat|\.cmd)?\b/i,
   /\bgit\s+(?:status|log|diff|show|rev-parse|blame|shortlog|describe|ls-files|remote(?:\s+-v)?)\b/i,
   // Checking that a locally-spawned server responds is a read-only verification step, not a risk — scoped to
   // loopback addresses only (never a blanket curl/wget allow, and the pipe-to-shell destructive pattern above

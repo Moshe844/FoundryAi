@@ -12,7 +12,7 @@ export type ProjectWorkingSet = {
 const TERMS_TO_IGNORE = new Set([
   "this", "that", "with", "from", "into", "after", "make", "change", "update", "build", "fix", "add", "edit", "editing", "implement", "proceed", "project", "require", "user", "not", "the", "and", "for",
 ]);
-const GENERATED_PATH_PATTERN = /(^|\/)(node_modules|\.git|\.next|\.next-build|\.turbo|\.cache|\.pytest_cache|__pycache__|\.mypy_cache|\.ruff_cache|\.tox|\.nox|\.venv|venv|site-packages|dist|build|out|coverage|target|bin|obj)(\/|$)/i;
+const GENERATED_PATH_PATTERN = /(^|\/)(node_modules|\.git|\.next|\.next-build|\.turbo|\.cache|\.foundry-artifacts|\.foundry-data|\.pytest_cache|__pycache__|\.mypy_cache|\.ruff_cache|\.tox|\.nox|\.venv|venv|site-packages|dist|build|out|coverage|target|bin|obj)(\/|$)/i;
 const INDEX_TTL_MS = 60_000;
 const repositoryIndexCache = new Map<string, { expiresAt: number; root: Awaited<ReturnType<ProjectAccess["listDir"]>>; fileCount: number; searches: Map<string, Awaited<ReturnType<NonNullable<ProjectAccess["searchFiles"]>>>> }>();
 

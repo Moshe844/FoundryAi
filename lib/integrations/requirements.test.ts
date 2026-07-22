@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "./requirements";
+import { integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "./requirements";
 
 describe("integration requirements", () => {
   it("requires a real email provider for password reset", () => {
@@ -32,6 +32,13 @@ describe("integration requirements", () => {
     expect(hardware.some((item) => item.id === "payments")).toBe(false);
     expect(integrationRequirementPrompt(hardware.find((item) => item.candidates[0]?.id === "pax")!).options).toContain("Build simulator-only mode");
     expect(integrationRequirementsForBrief("Build a simulator-only PAX Android checkout app without a terminal").some((item) => item.candidates[0]?.id === "pax")).toBe(false);
+    expect(integrationRequirementsForBrief("Build a real PAX Android checkout app. Do not make simulator claims as real hardware validation.").some((item) => item.candidates[0]?.id === "pax")).toBe(true);
+  });
+
+  it("accepts a real imported SDK artifact but not a folder-selection answer", () => {
+    const requirements = integrationRequirementsForBrief("Build a PAX Android checkout app with terminal payments");
+    expect(integrationProvidersFromEvidence(requirements, ["I selected my SDK folder"])).toEqual([]);
+    expect(integrationProvidersFromEvidence(requirements, [".foundry-input/sdk/PAX-POSLink-Android.aar"])).toEqual(["pax"]);
   });
 
   it("infers credentialed capabilities across unrelated application domains", () => {

@@ -64,6 +64,17 @@ assert(/secure cookie sessions/.test(authWeb.stackOptions[0].why)&&/reset tokens
 const staticWeb=policy.reconcilePlatformStackOptions("website",{...baseDiscovery,prompt:"A simple static portfolio with projects and contact links",projectType:"Portfolio website",architecture:"Static site"},webOnly);
 assert(/^HTML \+ CSS/.test(staticWeb.recommendedStack)&&!staticWeb.stackOptions.some(item=>/PostgreSQL|Prisma/.test(item.name)),"Static websites are still being over-engineered.");
 
+const contaminatedPortfolio=policy.reconcilePlatformStackOptions("website",{...baseDiscovery,prompt:"Portfolio",projectType:"Portfolio",recommendedStack:"Next.js App Router + TypeScript + Auth.js + Prisma + SQLite→PostgreSQL",architecture:"Account-enabled application",mainFeatures:["Project gallery","About","Contact"]},webOnly);
+assert(/^HTML \+ CSS/.test(contaminatedPortfolio.recommendedStack),"A model-authored auth stack can still contaminate an ordinary portfolio recommendation.");
+assert(!contaminatedPortfolio.stackOptions.some(item=>/Auth\.js|Prisma|PostgreSQL/.test(item.name)),"An ordinary portfolio still exposes mandatory auth/database stacks without a user requirement.");
+
+const dynamicWebsite=policy.reconcilePlatformStackOptions("website",{...baseDiscovery,prompt:"An interactive museum exhibition website with 3D artifact stories",projectType:"Museum website",mainFeatures:["Interactive exhibits","3D artifact viewer"]},[
+  {name:"Nuxt 4 + Vue 3 + TypeScript",why:"Matches the requested interactive editorial experience.",recommended:true},
+  {name:"SvelteKit + TypeScript",why:"Compact interactive alternative.",recommended:false},
+  {name:"Astro + TypeScript",why:"Content-forward alternative.",recommended:false},
+]);
+assert(/^Nuxt 4/.test(dynamicWebsite.recommendedStack),"Valid model-authored website recommendations are still being replaced by a fixed stack list.");
+
 const aiBackend=policy.reconcilePlatformStackOptions("api",{...baseDiscovery,prompt:"AI document extraction API using embeddings and an LLM",projectType:"AI API",architecture:"Backend API",mainFeatures:["Document inference","Vector embeddings"]},webOnly);
 assert(/FastAPI/.test(aiBackend.recommendedStack),"AI backend did not prefer the Python data/AI toolchain.");
 

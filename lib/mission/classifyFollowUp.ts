@@ -184,7 +184,14 @@ export function looksLikeReadOnlyQuestionForm(message: string): boolean {
   if (!sentences.length) return false;
   if (sentences.some((sentence) => IMPERATIVE_COMMAND.test(sentence))) return false;
 
-  const isQuestion = (sentence: string) => /\?\s*$/.test(sentence) || INTERROGATIVE_OPENER.test(sentence);
+  const isQuestion = (sentence: string) => {
+    if (/\?\s*$/.test(sentence)) return true;
+    // A sentence with no question mark that states a current runtime failure is a bug report, not a
+    // read-only question — even when a temporal "When I click …, it closes." opener makes it look
+    // interrogative. Without this, a crash report was swallowed as inspection instead of repair.
+    if (CURRENT_RUNTIME_FAILURE_PATTERN.test(sentence)) return false;
+    return INTERROGATIVE_OPENER.test(sentence);
+  };
   return sentences.some(isQuestion) && sentences.every((sentence) => isQuestion(sentence) || isNeutralQualifier(sentence));
 }
 

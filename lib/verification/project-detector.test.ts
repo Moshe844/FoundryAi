@@ -11,7 +11,7 @@ describe("Android verification detection", () => {
 
     expect(profile.adapterId).toBe("android-gradle");
     expect(profile.commands.map((item) => item.command)).toEqual([
-      "gradle compileDebug",
+      "gradle compileDebugKotlin",
       "gradle lintDebug",
       "gradle testDebugUnitTest",
       "gradle assembleDebug",
@@ -26,6 +26,6 @@ describe("Android verification detection", () => {
     });
 
     expect(profile.adapterId).toBe("android-gradle");
-    expect(profile.commands[0]?.command).toBe("gradlew.bat compileDebug");
+    expect(profile.commands[0]?.command).toBe("gradlew.bat compileDebugKotlin");
   });
 });

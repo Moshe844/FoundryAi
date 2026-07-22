@@ -1,5 +1,5 @@
 import { execFileSync, execSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { decideCommandPermission, type CommandApprovalScope, type CommandPermissionCategory } from "./command-permissions";
 import { assessWriteVerification } from "./write-verification";
 import { commandProducesBuildArtifacts, resumeOwnedDesktopProcesses, suspendOwnedDesktopProcesses } from "@/lib/factory/owned-desktop-processes";
+import { androidToolchainEnv } from "@/lib/factory/android-emulator";
 
 const LONG_RUNNING_COMMAND_PATTERN =
   /\b(?:next|vite|nodemon|ts-node-dev)\s+dev\b|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:dev|start)\b|\b(?:npx|pnpx|bunx)(?:\.cmd)?\s+(?:--yes\s+)?(?:serve|http-server)\b|\b(?:python|python3|py)(?:\.exe)?\s+-m\s+http\.server\b|\bflask\s+run\b|\brails\s+server\b|\bmanage\.py\s+runserver\b|\buvicorn\b|\bgunicorn\b/i;
@@ -196,6 +197,32 @@ async function projectDependencyInstallAlreadySatisfied(command: string, cwd: st
     reason: "Foundry found package.json and node_modules already present, so it skipped the JavaScript package-manager install instead of asking for approval.",
     category: "dependencies",
   };
+}
+
+// A build/dev/test/local-bin command needs the project's toolchain physically present in node_modules.
+// `astro build`, `next dev`, `vite build`, `tsc`, etc. all resolve a binary out of node_modules/.bin —
+// run one before install and it dies with "'astro' is not recognized" (Windows) / "command not found".
+const TOOLCHAIN_BUILD_COMMAND =
+  /(?:^|[\s&|;(])(?:(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+\S+|build|dev|start|test|preview|serve)\b|npx(?:\.cmd)?\s+\S|(?:astro|next|vite|nuxt|remix|svelte-kit|gatsby|tsc|tsup|rollup|webpack|parcel|esbuild|eslint|jest|vitest|playwright|ng|expo)(?:\.cmd)?\b)/i;
+
+export function commandNeedsInstalledToolchain(command: string): boolean {
+  const normalized = command.trim();
+  if (!TOOLCHAIN_BUILD_COMMAND.test(normalized)) return false;
+  // A dependency install IS the provisioning step; it must never require the toolchain to already exist.
+  if (/\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:install|i|add|ci)\b/i.test(normalized)) return false;
+  return true;
+}
+
+// package.json declares dependencies but node_modules is absent or effectively empty — not installed.
+export function toolchainInstallMissing(cwd: string): boolean {
+  if (!existsSync(path.join(cwd, "package.json"))) return false;
+  const nodeModules = path.join(cwd, "node_modules");
+  if (!existsSync(nodeModules)) return true;
+  try {
+    return readdirSync(nodeModules).filter((entry) => !entry.startsWith(".")).length === 0;
+  } catch {
+    return true;
+  }
 }
 
 async function dependencyEvidence(cwd: string, packageName: string) {
@@ -505,6 +532,7 @@ function spawnCommand(
   keepAliveOnTimeout = false,
   signal?: AbortSignal,
   onSpawn?: (pid: number) => void,
+  environment?: NodeJS.ProcessEnv,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; durationMs: number; timedOut: boolean; aborted: boolean }> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
@@ -514,7 +542,7 @@ function spawnCommand(
     }
     // A dev/server command (keepAliveOnTimeout) must survive past its own grace-period timeout — detached so
     // it isn't tied to this request's process group, and never killed when the grace period elapses below.
-    const child = spawn(cmd, args, { cwd, windowsHide: true, env: childProcessEnv(), detached: keepAliveOnTimeout });
+    const child = spawn(cmd, args, { cwd, windowsHide: true, env: environment ?? childProcessEnv(), detached: keepAliveOnTimeout });
     if (typeof child.pid === "number") onSpawn?.(child.pid);
     let stdout = "";
     let stderr = "";
@@ -586,10 +614,11 @@ async function runCommandWithShellFallback(
   keepAliveOnTimeout = false,
   signal?: AbortSignal,
   onSpawn?: (pid: number) => void,
+  environment?: NodeJS.ProcessEnv,
 ): Promise<ProjectCommandResult> {
   if (/^\s*node(?:\.exe)?\s+-e\s+/i.test(command)) {
     const tokens = tokenizeCommand(command);
-    const direct = await spawnCommand(process.execPath, tokens.slice(1), cwd, timeoutMs, false, signal);
+    const direct = await spawnCommand(process.execPath, tokens.slice(1), cwd, timeoutMs, false, signal, undefined, environment);
     return { ...direct, shellUsed: "direct-node" };
   }
   const order = windowsShellOrder(session.stickyShellId);
@@ -600,7 +629,7 @@ async function runCommandWithShellFallback(
   for (const shellId of order) {
     const invocation = shellInvocation(shellId, command);
     if (!invocation) continue;
-    const result = await spawnCommand(invocation.cmd, invocation.args, cwd, timeoutMs, keepAliveOnTimeout, signal, onSpawn);
+    const result = await spawnCommand(invocation.cmd, invocation.args, cwd, timeoutMs, keepAliveOnTimeout, signal, onSpawn, environment);
     lastResult = result;
     if (result.aborted) {
       return { ...result, shellUsed: shellId, skipped: "aborted", stderr: result.stderr || "Stopped by user." };
@@ -785,8 +814,12 @@ const EXCLUDED_DIR_PATTERN = /(^|\/)(node_modules|\.git|\.next|\.next-build|\.tu
 const MAX_READ_BYTES = 20_000;
 const MAX_SEARCH_FILE_BYTES = 300_000;
 const COMMAND_TIMEOUT_MS = 120_000;
+const TOOLCHAIN_INSTALL_TIMEOUT_MS = 300_000;
 const DEV_SERVER_GRACE_PERIOD_MS = 6_000;
-const MAX_COMMANDS_PER_ROOT = 15;
+// Generated native missions verify compile, lint, tests, and packaging after every bounded source
+// batch. Fifteen commands allowed only three verified batches and then converted the safety counter
+// itself into a false build failure. Permission checks and timeouts still apply per command.
+const MAX_COMMANDS_PER_ROOT = 96;
 
 function normalizeRelativePathForFilter(relativePath: string) {
   return relativePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").toLowerCase();
@@ -1052,6 +1085,25 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
       }
       commandsRun += 1;
       const approvalScope = approvalScopeFor(command, permission, options);
+      // Install-before-build: a generated project's own declared dependencies are required, not optional,
+      // so provision them deterministically the first time a build/dev/test command runs against an
+      // uninstalled node_modules. Without this the model runs `npm run build` on an empty node_modules,
+      // gets "'astro'/'next' is not recognized", and burns paid turns rediscovering it needs to install.
+      let autoInstallNote = "";
+      if (commandNeedsInstalledToolchain(command) && toolchainInstallMissing(requestedCwd)) {
+        const install = await runCommandWithShellFallback(
+          normalizeCommandForExecution("npm install --prefer-offline --no-audit --no-fund"),
+          requestedCwd, shellSession, TOOLCHAIN_INSTALL_TIMEOUT_MS, false, signal, undefined, undefined,
+        );
+        if (install.exitCode !== 0) {
+          return {
+            ...install,
+            approvalScope,
+            stderr: `Foundry installed the project's declared dependencies before "${command}" because node_modules was missing, but that install failed:\n${install.stderr}`.trim(),
+          };
+        }
+        autoInstallNote = "[Foundry installed the project's declared dependencies before this command because node_modules was missing.]";
+      }
       if (portableMkdir) {
         try {
           for (const directory of portableMkdir.directories) {
@@ -1069,8 +1121,14 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
         }
       }
 
+      const commandEnvironment = /(?:^|\s|[\\/])gradle(?:w)?(?:\.bat)?(?:\s|$)/i.test(command)
+        && (existsSync(path.join(requestedCwd, "settings.gradle.kts")) || existsSync(path.join(requestedCwd, "settings.gradle")))
+        ? androidToolchainEnv()
+        : undefined;
+
       if (isLongRunningServerCommand(command)) {
-        const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, DEV_SERVER_GRACE_PERIOD_MS, true, undefined, (pid) => backgroundServerPids.set(requestedCwd, pid));
+        const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, DEV_SERVER_GRACE_PERIOD_MS, true, undefined, (pid) => backgroundServerPids.set(requestedCwd, pid), commandEnvironment);
+        if (autoInstallNote) result.stdout = `${autoInstallNote}\n${result.stdout}`;
         const reportedUrls = Array.from(`${result.stdout}\n${result.stderr}`.matchAll(/https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/gi), (match) => match[0]);
         // Next/Vite commonly print the occupied requested port before the final Local URL. The
         // last loopback URL is the server that actually owns this project's detached process.
@@ -1106,7 +1164,8 @@ export function createServerProjectAccess(root: string, mode: ProjectAccessMode,
           approvalScope,
         };
       }
-      const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, COMMAND_TIMEOUT_MS, false, signal);
+      const result = await runCommandWithShellFallback(command, requestedCwd, shellSession, COMMAND_TIMEOUT_MS, false, signal, undefined, commandEnvironment);
+      if (autoInstallNote) result.stdout = `${autoInstallNote}\n${result.stdout}`;
       const resumed = await resumeOwnedDesktopProcesses(desktopSuspension.suspended);
       const lifecycleNote = desktopSuspension.suspended.length
         ? resumed.failed.length

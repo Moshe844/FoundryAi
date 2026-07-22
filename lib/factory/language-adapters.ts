@@ -130,7 +130,7 @@ export function capabilityLevelForStackChoice(stackName: string): StackProfile {
   if (/react/.test(name)) return { id: "react", label: "React", level: 4 };
   if (/vue/.test(name)) return { id: "vue", label: "Vue", level: 4 };
   if (/angular/.test(name)) return { id: "angular", label: "Angular", level: 4 };
-  if (/android/.test(name)) return { id: "android", label: /kotlin/.test(name) ? "Android (Kotlin)" : "Android (Java)", level: 4 };
+  if (/android|jetpack\s+compose|kotlin[^\n]{0,80}\b(?:room|native vendor sdk|device sdk)\b/.test(name)) return { id: "android", label: /kotlin|jetpack/.test(name) ? "Android (Kotlin)" : "Android (Java)", level: 4 };
   if (/flutter/.test(name)) return { id: "flutter", label: "Flutter", level: 4 };
   if (/web\s*api|asp\.?net/.test(name)) return { id: "dotnet-web", label: ".NET Web API", level: 4 };
   if (/wpf/.test(name)) return { id: "dotnet-desktop", label: ".NET WPF", level: 4 };

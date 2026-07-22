@@ -73,7 +73,7 @@ export function explicitStackFromPrompt(prompt: string): string | undefined {
 export function explicitPlatformFromPrompt(prompt: string): string | undefined {
   if (/\b(?:static|plain|vanilla)\s+(?:web|website|site|html)|\bbrowser(?:-based)?\b|\bweb\s+(?:app|application|site|website|dashboard)\b/i.test(prompt)) return "Web app";
   if (/\bdesktop\s+(?:app|application)|\bwindows\s+(?:app|application)|\bmacos\s+(?:app|application)\b/i.test(prompt)) return "Desktop app";
-  if (/\bmobile\s+(?:app|application)|\bios\s+(?:app|application)|\bandroid\s+(?:app|application)\b/i.test(prompt)) return "Mobile app";
+  if (/\bmobile\s+(?:app|application)|\b(?:ios|iphone|ipad|android)\b[^.\n]{0,60}\b(?:app|application)\b/i.test(prompt)) return "Mobile app";
   if (/\b(?:backend|server-only|microservice|rest\s+api|web\s+api|api\s+(?:service|server))\b/i.test(prompt)) return "Backend service";
   if (/\b(?:browser\s+game|web\s+game|desktop\s+game|mobile\s+game|game)\b/i.test(prompt)) return "Game";
   return undefined;

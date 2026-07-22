@@ -170,6 +170,10 @@ export function MissionCanvas({
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewFullScreen, setPreviewFullScreen] = useState(false);
   const [previewWidthPct, setPreviewWidthPct] = useState(45);
+  // True only while the user is dragging the preview divider. The execution column and the composer
+  // beneath it share a width transition so opening/closing the preview slides them together; during a
+  // live drag that same transition would lag the pointer, so it is suppressed until the drag ends.
+  const [previewResizing, setPreviewResizing] = useState(false);
   const autoOpenedForRef = useRef<string | null>(null);
   const middleRowRef = useRef<HTMLDivElement | null>(null);
   const connectorUrl = localConnector?.url;
@@ -180,6 +184,15 @@ export function MissionCanvas({
     token: connectorToken,
     rootLabel: connectorRootLabel,
   } : undefined, [connectorUrl, connectorToken, connectorRootLabel]);
+  // Foundry-managed projects still live on this machine and can use the installed Local Agent for
+  // SDK intake. Requiring a separately connected project folder made the visible "Locate SDK"
+  // choice silently degrade into prose for managed workspaces.
+  const sdkProjectRoot = connectedPath || execution?.projectPath || "";
+  const sdkConnector = useMemo(() => localConnector ?? (sdkProjectRoot ? {
+    url: "http://127.0.0.1:3917",
+    token: undefined,
+    rootLabel: sdkProjectRoot,
+  } : undefined), [localConnector, sdkProjectRoot]);
   const hasExecution = Boolean(execution);
   const onPreviewStateChangeRef = useRef(onPreviewStateChange);
   useEffect(() => {
@@ -403,22 +416,31 @@ export function MissionCanvas({
   }
 
   async function handleLocateSdk() {
-    if (!localConnector || !activeVM?.blocking || activeVM.blocking.kind !== "question") return;
+    if (!sdkConnector || !activeVM?.blocking || activeVM.blocking.kind !== "question") return;
     const namedSdk = activeVM.blocking.question.match(/licensed\s+(.+?)\s+(?:Android\s+)?SDK/i)?.[1]?.trim() || "sdk";
     try {
-      const response = await fetch(`${localConnector.url.replace(/\/$/, "")}/sdk/discover`, {
+      // Keep browser traffic same-origin. Foundry's server coordinates the Local Agent so browser
+      // private-network policy cannot turn a healthy local connection into an opaque Failed to fetch.
+      const response = await fetch("/api/factory/agent/sdk-intake", {
         method: "POST",
-        headers: { "content-type": "application/json", ...(localConnector.token ? { authorization: `Bearer ${localConnector.token}` } : {}) },
-        body: JSON.stringify({ root: localConnector.rootLabel, terms: [namedSdk], maxResults: 80 }),
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          url: sdkConnector.url,
+          token: sdkConnector.token,
+          destinationRoot: sdkConnector.rootLabel,
+          terms: [namedSdk],
+        }),
       });
-      const result = await response.json() as { artifacts?: Array<{ path: string; name: string; size: number }>; error?: string };
-      if (!response.ok) throw new Error(result.error || "SDK discovery failed.");
-      const artifacts = result.artifacts ?? [];
-      onExecute(artifacts.length
-        ? `Local Agent found these candidate ${namedSdk} SDK/specification artifacts in the approved folder. Inspect only these paths, identify versions and supported integration routes from their actual contents, and continue without guessing:\n${artifacts.map((item) => `- ${item.path} (${item.size} bytes)`).join("\n")}`
-        : `Local Agent searched the approved folder for ${namedSdk} SDK/specification artifacts and found none. Keep the prerequisite open and offer folder selection or upload.`, undefined);
+      const importedResult = await response.json() as { ok?: boolean; cancelled?: boolean; imported?: Array<{ path: string; name: string; size: number }>; error?: string };
+      if (importedResult.cancelled) return;
+      if (!response.ok || !importedResult.ok || !importedResult.imported?.length) throw new Error(importedResult.error || "Found SDK files could not be imported into the project intake area.");
+      const importedEvidence = importedResult.imported.map((item) => `- ${item.path} (${item.size} bytes)`).join("\n");
+      onExecute(answerTaskFor(activeVM.blocking, [{
+        question: activeVM.blocking.question,
+        answer: `Local Agent imported the required ${namedSdk} SDK/specification evidence into the project:\n${importedEvidence}\nUse these actual project-readable artifacts to resolve this prerequisite and resume the same preserved build mission. Do not start a separate inspection response, invent SDK APIs, use stubs, or claim hardware certification without device evidence.`,
+      }], mission.pendingClarification));
     } catch (error) {
-      onExecute(`Local Agent SDK discovery could not complete: ${error instanceof Error ? error.message : "unknown error"}. Keep the prerequisite open and offer folder selection or upload.`, undefined);
+      window.alert(`SDK discovery did not complete. ${error instanceof Error ? error.message : "Unknown error"} The build remains paused; choose another folder or upload the SDK files.`);
     }
   }
 
@@ -448,12 +470,14 @@ export function MissionCanvas({
     const row = middleRowRef.current;
     if (!row) return;
     const rowRect = row.getBoundingClientRect();
+    setPreviewResizing(true);
     function onMove(moveEvent: PointerEvent) {
       const fromRight = rowRect.right - moveEvent.clientX;
       const pct = (fromRight / rowRect.width) * 100;
       setPreviewWidthPct(Math.min(60, Math.max(30, pct)));
     }
     function onUp() {
+      setPreviewResizing(false);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     }
@@ -516,8 +540,8 @@ export function MissionCanvas({
         <div
           ref={scrollRef}
           onScroll={handleScroll}
-          className="relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
-          style={dockOpen ? { flexBasis: `${100 - previewWidthPct}%` } : undefined}
+          className={`relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden ${previewResizing ? "" : "transition-[flex-basis] duration-300 ease-out"}`}
+          style={{ flexBasis: dockOpen ? `${100 - previewWidthPct}%` : "100%" }}
         >
           <div className={`w-full px-6 py-6 ${dockOpen ? "" : "mx-auto max-w-[856px]"}`}>
             {previewFailureReason ? (
@@ -575,7 +599,7 @@ export function MissionCanvas({
                   onAnswer={handleAnswer}
                   onApprove={handleApprove}
                   onUpload={handleSdkUpload}
-                  onLocateSdk={localConnector ? handleLocateSdk : undefined}
+                  onLocateSdk={sdkConnector ? handleLocateSdk : undefined}
                   onEvidenceClick={handleEvidenceClick}
                   onSuggestion={handleSuggestion}
                 />
@@ -638,7 +662,10 @@ export function MissionCanvas({
         ) : null}
       </div>
 
-      <div>
+      <div
+        className={previewResizing ? "" : "transition-[width] duration-300 ease-out"}
+        style={{ width: dockOpen ? `${100 - previewWidthPct}%` : "100%" }}
+      >
         {retryableTask ? (
           <div className="flex flex-wrap items-center gap-2.5 border-t border-overlay/8 bg-shade/20 px-4 py-2 sm:px-6">
             <span className="text-[12px] text-foundry-muted">

@@ -105,7 +105,7 @@ const adapters: EcosystemAdapter[] = [
     buildProfile: (evidence) => {
       const wrapper = evidence.platform === "win32" && has(evidence, "gradlew.bat") ? "gradlew.bat" : has(evidence, "gradlew") ? "./gradlew" : "gradle";
       const source = has(evidence, "gradlew") || has(evidence, "gradlew.bat") ? "Gradle wrapper" : "system Gradle";
-      return { commands: [command("android-compile", "compile", `${wrapper} compileDebug`, source), command("android-lint", "lint", `${wrapper} lintDebug`, source), command("android-unit", "unit-test", `${wrapper} testDebugUnitTest`, source), command("android-build", "build", `${wrapper} assembleDebug`, source)], limitations: ["Instrumentation tests require an available emulator or connected device."] };
+      return { commands: [command("android-compile", "compile", `${wrapper} compileDebugKotlin`, source), command("android-lint", "lint", `${wrapper} lintDebug`, source), command("android-unit", "unit-test", `${wrapper} testDebugUnitTest`, source), command("android-build", "build", `${wrapper} assembleDebug`, source)], limitations: ["Instrumentation tests require an available emulator or connected device."] };
     },
   },
   {

@@ -59,7 +59,7 @@ function candidatesForCategory(category: string, candidateIds?: string[]) {
 export function integrationRequirementsForBrief(text: string): IntegrationRequirement[] {
   const requirements = new Map<string, IntegrationRequirement>();
   for (const definition of integrationCatalog.filter(externallyRequired)) {
-    if (definition.executionKind === "hardware" && /\b(?:simulator|simulated|mock hardware|without (?:a )?(?:terminal|device))\b/i.test(text)) continue;
+    if (definition.executionKind === "hardware" && /\b(?:simulator[- ]only|use (?:a )?simulator instead|build (?:a )?(?:simulated|mock) (?:terminal|device)|mock hardware|without (?:a )?(?:terminal|device))\b/i.test(text)) continue;
     if (!explicitlyExcluded(text, definition) && explicitlyNames(text, definition)) {
       requirements.set(`provider:${definition.id}`, {
         id: `provider:${definition.id}`,
@@ -86,6 +86,20 @@ export function integrationRequirementsForBrief(text: string): IntegrationRequir
 export function missingIntegrationRequirements(requirements: IntegrationRequirement[], verifiedProviders: string[]) {
   const verified = new Set(verifiedProviders);
   return requirements.filter((requirement) => !requirement.candidates.some((candidate) => verified.has(candidate.id)));
+}
+
+/** Finds hardware providers backed by actual imported SDK/specification evidence. A workflow
+ * answer alone is intentionally insufficient; callers pass file paths/names or supplied content. */
+export function integrationProvidersFromEvidence(requirements: IntegrationRequirement[], evidenceItems: string[]) {
+  const evidence = evidenceItems.map(normalize).filter(Boolean);
+  return requirements
+    .flatMap((requirement) => requirement.candidates)
+    .filter((candidate) => candidate.executionKind === "hardware" && evidence.some((item) =>
+      [candidate.id, candidate.name, ...candidate.packages, ...candidate.sourcePatterns]
+        .map(normalize)
+        .some((term) => term.length >= 3 && item.includes(term))))
+    .map((candidate) => candidate.id)
+    .filter((id, index, all) => all.indexOf(id) === index);
 }
 
 export function integrationRequirementPrompt(requirement: IntegrationRequirement) {

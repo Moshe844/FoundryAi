@@ -117,6 +117,14 @@ assert(executor.includes("function concreteEditEvidence") && executor.includes("
 const workspaceShell = fs.readFileSync(path.join(root, "components/WorkspaceShell.tsx"), "utf8");
 const buildDashboard = fs.readFileSync(path.join(root, "components/BuildDashboard.tsx"), "utf8");
 const factoryRuntime = fs.readFileSync(path.join(root, "lib/factory/runtime.ts"), "utf8");
+const blockingCard = fs.readFileSync(path.join(root, "components/canvas/BlockingCard.tsx"), "utf8");
+const missionCanvas = fs.readFileSync(path.join(root, "components/canvas/MissionCanvas.tsx"), "utf8");
+const localConnector = fs.readFileSync(path.join(root, "scripts/foundry-local-connector.cjs"), "utf8");
+const sdkIntake = fs.readFileSync(path.join(root, "app/api/factory/agent/sdk-intake/route.ts"), "utf8");
+assert(blockingCard.includes('^Locate SDK files with Local Agent$') && blockingCard.includes("onLocateSdk();"), "The Local Agent SDK option is still treated as a prose answer instead of an executable action.");
+assert(missionCanvas.includes('/api/factory/agent/sdk-intake') && sdkIntake.includes('/pick-folder') && sdkIntake.includes('/sdk/discover') && sdkIntake.includes('/sdk/import'), "SDK discovery does not use the same-origin server intake flow.");
+assert(localConnector.includes('url.pathname === "/sdk/import"') && localConnector.includes("importSdkArtifacts"), "The Local Agent cannot import discovered SDK evidence into the project intake area.");
+assert(!factoryRuntime.includes("The implementation is complete and verified on disk. ${managedPreview.previewReason"), "Preview unavailability can still overwrite a failed implementation with a false completion claim.");
 const followUpClassifier = fs.readFileSync(path.join(root, "lib/mission/classifyFollowUp.ts"), "utf8");
 const intentRoute = fs.readFileSync(path.join(root, "app/api/factory/intent/route.ts"), "utf8");
 const missionPlanner = fs.readFileSync(path.join(root, "lib/ai/mission/mission-planner.ts"), "utf8");
@@ -151,7 +159,7 @@ assert(executor.includes("input.hasBuildTooling !== false"), "Existing static pr
 assert(projectAccess.includes("(?:serve|http-server)"), "Common static preview commands are not recognized as long-running servers.");
 assert(factoryRuntime.includes("semanticStaticMutation") && factoryRuntime.includes("strategyComplexity = boundedStaticFollowUp"), "Conversation-grounded static follow-ups can still expand into architecture-scale ceremony.");
 assert(factoryRuntime.includes("browserEvidence.acceptanceVerified") && factoryRuntime.includes("Requirement-directed browser acceptance"), "A failed implementation can still be reconciled by generic browser health instead of request-specific acceptance.");
-assert(factoryRuntime.includes("Boolean(preModelBrowserEvidence) || boundedStaticFollowUp || boundedSmallEdit || explicitCommandOnlyRequest"), "A bounded static or named-control edit can still expand into a multi-phase planning mission.");
+assert(factoryRuntime.includes("Boolean(preModelBrowserEvidence) || boundedStaticFollowUp || boundedSmallEdit || effectiveCommandOnlyRequest"), "A bounded static or named-control edit can still expand into a multi-phase planning mission.");
 assert(factoryRuntime.includes("Implemented the requested project change and verified the changed interface"), "A successful browser-reconciled edit can still expose an internal model-budget blocker as its outcome.");
 assert(factoryRuntime.includes("findUnreachableVerifiedUiFiles"), "Fingerprint reuse does not check whether changed UI components are reachable from the application.");
 assert(factoryRuntime.includes("their UI is not connected to the application"), "Disconnected UI can still be reported as an already-completed implementation.");
