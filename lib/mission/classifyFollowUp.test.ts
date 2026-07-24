@@ -49,4 +49,33 @@ describe("normalizeFollowUpResolution", () => {
 
     expect(resolution.currentIntent).toBe("edit");
   });
+
+  it("strips mutation-plan continuity from a read-only project inspection", () => {
+    const resolution = normalizeFollowUpResolution({
+      currentIntent: "inspection",
+      referencedPriorAction: {
+        executionId: "failed-build",
+        description: "Revalidate the exact failed mission cheaply.",
+      },
+      relevantFiles: ["index.html"],
+      expectedScope: "Inspect the current project and explain what it does.",
+      destructive: false,
+      referenceConfidence: 1,
+      plannedAction: "Read the project and answer without changing files.",
+      continuity: "carry_forward_plan",
+      rationale: "The user asked what the project does.",
+      clarifyingQuestion: "",
+      clarifyingOptions: [],
+    }, "what does this project do?", {
+      recentMissionMemory: [{
+        id: "failed-build",
+        task: "Revalidate the exact failed mission cheaply.",
+        status: "failed",
+        filesChanged: [{ path: "index.html" }],
+      }],
+    });
+
+    expect(resolution.currentIntent).toBe("inspection");
+    expect(resolution.continuity).toBe("not_applicable");
+  });
 });

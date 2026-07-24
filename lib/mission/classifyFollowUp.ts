@@ -572,7 +572,11 @@ export function normalizeFollowUpResolution(
     destructive,
     referenceConfidence: confidence,
     plannedAction: String(value.plannedAction || fallback.plannedAction).trim(),
-    continuity: value.continuity === "carry_forward_plan" || value.continuity === "fresh_plan" ? value.continuity : "not_applicable",
+    // Continuity carries executable plan authority. Read-only questions and inspections may use
+    // prior evidence, but they can never resume, revise, or inherit a mutation checklist.
+    continuity: isMutatingIntent(value.currentIntent) && (value.continuity === "carry_forward_plan" || value.continuity === "fresh_plan")
+      ? value.continuity
+      : "not_applicable",
     rationale: String(value.rationale || fallback.rationale).trim(),
     clarifyingQuestion: value.currentIntent === "clarify" ? String(value.clarifyingQuestion || fallback.clarifyingQuestion).trim() : "",
     clarifyingOptions: value.currentIntent === "clarify" && Array.isArray(value.clarifyingOptions) ? value.clarifyingOptions.map(String).map((item) => item.trim()).filter(Boolean).slice(0, 4) : [],

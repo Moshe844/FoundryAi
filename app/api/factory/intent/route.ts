@@ -276,12 +276,18 @@ export async function POST(request: Request) {
     const semanticRuntimeControl = parsed?.runtime_operation === "preview_refresh";
     const semanticUndo = parsed?.mutation_authorized === true && parsed?.mutation_kind === "undo_recorded_change";
     const semanticApplyChange = parsed?.mutation_authorized === true && parsed?.mutation_kind === "apply_change";
+    const modelResolvedReadOnly = intent === "question"
+      || intent === "inspection"
+      || intent === "diagnose"
+      || intent === "status"
+      || intent === "retrospective";
     // Structured model fields occasionally disagree: the resolver can authorize mutation, produce
     // one high-confidence non-destructive interpretation, and still leave mutation_kind as `none`
     // or intent as `clarify` merely because it has not inspected the owning files. File discovery is
     // Foundry's responsibility. Reconcile the semantic contract itself instead of requiring a magic
     // action verb or asking a nontechnical user to name implementation files.
     const confidentDirectMutation = parsed?.mutation_authorized === true
+      && !modelResolvedReadOnly
       && parsed?.interpretation_source === "message"
       && parsed?.destructive !== true
       && normalizeInterpretationKind(parsed?.interpretation_kind) !== "ambiguous"
@@ -290,7 +296,7 @@ export async function POST(request: Request) {
       ? "edit"
       : semanticUndo
       ? "undo"
-      : (semanticApplyChange || confidentDirectMutation) && intent !== "debug" && intent !== "continue"
+      : (semanticApplyChange || confidentDirectMutation) && !modelResolvedReadOnly && intent !== "debug" && intent !== "continue"
         ? "edit"
         : conversationGroundedMutation && intent === "clarify"
           ? "edit"
