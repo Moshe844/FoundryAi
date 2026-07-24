@@ -34,6 +34,10 @@ const POSITIONAL_PREPOSITION =
   /\b(?:above|below|under|underneath|beneath|over|on top of|next to|beside|alongside|to the left of|to the right of|in front of|before|after|inside|within|at the top of|at the bottom of)\b/i;
 const REMOVAL_VERB = /\b(?:remove|delete|drop|get rid of|take out|hide)\b/i;
 const ADDITION_VERB = /\b(?:add|create|insert|introduce|include)\b/i;
+// The start of a NEW clause. A request is often compound — "remove the images, and let me upload my
+// own" — and the subject of one verb ends where the next clause begins. Without this, "remove"
+// slurped the entire sentence (including the "upload" clause) and demanded those words vanish too.
+const CLAUSE_BOUNDARY = /[;,]|\b(?:and|then|plus|also|but|while|so|as well as|after that|followed by)\b/i;
 
 const STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "so", "it", "its", "that", "this", "then", "there", "here", "shows",
@@ -85,21 +89,43 @@ function lineDelta(before: string, after: string): { removed: string[]; added: s
  * The thing being acted on, taken from between the verb and the positional preposition:
  * "move **the total spend number** so it shows above the filter bar" -> ["total", "spend", "number"].
  */
-function subjectTokens(request: string, verb: RegExp): string[] {
+/** The verb's own clause, up to a positional preposition or the start of the next clause. */
+function subjectClause(request: string, verb: RegExp): string | undefined {
   const verbMatch = verb.exec(request);
-  if (!verbMatch) return [];
+  if (!verbMatch) return undefined;
   const afterVerb = request.slice(verbMatch.index + verbMatch[0].length);
-  const boundary = POSITIONAL_PREPOSITION.exec(afterVerb);
-  const subject = boundary ? afterVerb.slice(0, boundary.index) : afterVerb;
+  const positional = POSITIONAL_PREPOSITION.exec(afterVerb);
+  const clause = CLAUSE_BOUNDARY.exec(afterVerb);
+  const cutAt = Math.min(positional ? positional.index : afterVerb.length, clause ? clause.index : afterVerb.length);
+  return afterVerb.slice(0, cutAt);
+}
+
+function subjectTokens(request: string, verb: RegExp): string[] {
+  const subject = subjectClause(request, verb);
+  if (subject === undefined) return [];
   return subject
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter((token) => token.length >= 4 && !STOPWORDS.has(token));
 }
 
-/** Case- and separator-insensitive: "total spend" matches `totalSpend`, `total-spend`, `Total:`. */
+/** Identifier segments of a string: camelCase split, then separated into words. `totalSpend` → total, spend. */
+function identifierSegments(text: string): string[] {
+  return text
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/**
+ * Whether the subject word names a real identifier segment in the source. Matches at a segment BOUNDARY
+ * ("total" matches `totalSpend`, `total-spend`, `Total:`), never as an arbitrary substring — the old
+ * substring test made "able" (from "able to upload") match `available`, `table`, and `disabled`, which
+ * is exactly how a legitimate edit was reported as a failed removal.
+ */
 function mentionsToken(haystack: string, token: string): boolean {
-  return haystack.toLowerCase().replace(/[^a-z0-9]/g, "").includes(token);
+  return identifierSegments(haystack).some((segment) => segment.startsWith(token));
 }
 
 /** Positions of the meaningful lines that mention the subject, indexed among meaningful lines only. */
@@ -207,8 +233,26 @@ function relocationAssertion(request: string, changes: FileChange[]): OutcomeAss
 
 function removalAssertion(request: string, changes: FileChange[]): OutcomeAssertion | undefined {
   if (!REMOVAL_VERB.test(request) || REPOSITION_VERB.test(request)) return undefined;
-  const tokens = subjectTokens(request, REMOVAL_VERB);
-  if (!tokens.length) return undefined;
+  const removalMatch = REMOVAL_VERB.exec(request)!;
+  const allTokens = subjectTokens(request, REMOVAL_VERB);
+  if (!allTokens.length) return undefined;
+  // Compound requests keep words by design. "Remove the pre-added images, and let me upload my own
+  // images" must NOT demand the word "images" disappear — the user asked to keep/add it in the second
+  // clause. A removal target is only a word the user does NOT mention again anywhere after the removal
+  // clause. When every candidate is also wanted elsewhere, removal cannot be judged from source text.
+  const afterRemovalClause = request.slice(removalMatch.index + removalMatch[0].length);
+  const nextClause = CLAUSE_BOUNDARY.exec(afterRemovalClause);
+  const restOfRequest = nextClause ? afterRemovalClause.slice(nextClause.index) : "";
+  const retainedElsewhere = new Set(identifierSegments(restOfRequest));
+  const tokens = allTokens.filter((token) => !retainedElsewhere.has(token));
+  if (!tokens.length) {
+    return {
+      kind: "removal",
+      requirement: `Content matching "${allTokens.join(" ")}" must no longer be present.`,
+      verdict: "indeterminate",
+      evidence: "This is a compound request whose removed subject is also part of what the user asked to keep or add, so removal cannot be confirmed from source text alone.",
+    };
+  }
   const requirement = `Content matching "${tokens.join(" ")}" must no longer be present.`;
   // Anchor on the words that actually occur in the source, not the whole noun phrase. A user names a
   // thing in their own words — "the deprecated retry decorator" — and only some of those words exist as
