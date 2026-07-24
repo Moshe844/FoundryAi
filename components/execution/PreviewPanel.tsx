@@ -16,6 +16,13 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
   const latestReadyEventId = [...(execution.timeline ?? [])].reverse().find((event) => event.kind === "preview" && event.status === "completed" && /preview ready/i.test(event.title))?.id ?? "";
   const previewGeneration = `${execution.previewUrl ?? ""}|${latestReadyEventId}`;
   const previousGenerationRef = useRef(previewGeneration);
+  const lastReadyPreviewRef = useRef<{ url: string; platform: FactoryProjectResult["previewPlatform"] } | null>(null);
+  if (execution.previewState === "ready" && execution.previewUrl) {
+    lastReadyPreviewRef.current = { url: execution.previewUrl, platform: execution.previewPlatform };
+  }
+  const retained = execution.previewState === "starting" ? lastReadyPreviewRef.current : null;
+  const visiblePreviewUrl = execution.previewUrl || retained?.url;
+  const visiblePreviewPlatform = execution.previewPlatform || retained?.platform;
   const wrap = fill ? "" : "mt-4";
 
   useEffect(() => {
@@ -25,7 +32,7 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
     previousGenerationRef.current = previewGeneration;
   }, [execution.previewState, execution.previewUrl, previewGeneration]);
 
-  if (execution.previewState === "starting") {
+  if (execution.previewState === "starting" && !visiblePreviewUrl) {
     return (
       <div className={`${wrap} flex flex-1 flex-col items-center justify-center gap-2 px-4 text-center text-xs leading-5 text-foundry-subtle`}>
         <p>Starting the preview server…</p>
@@ -48,22 +55,27 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
     ) : null;
   }
 
-  if (execution.previewUrl && execution.previewPlatform === "api") {
-    return <ApiPlayground baseUrl={execution.previewUrl} fill={fill} />;
+  if (visiblePreviewUrl && visiblePreviewPlatform === "api") {
+    return (
+      <div className={fill ? "flex min-h-0 flex-1 flex-col" : ""}>
+        <PreviewNotice reason={execution.previewReason} />
+        <ApiPlayground baseUrl={visiblePreviewUrl} fill={fill} />
+      </div>
+    );
   }
 
   if (execution.artifact || execution.previewPlatform === "desktop") {
     return <div className={fill ? "p-3" : ""}><PreviewCompletionCard execution={execution} /></div>;
   }
 
-  if (execution.previewUrl) {
+  if (visiblePreviewUrl) {
     const frameWidth = viewport === "mobile" ? "390px" : viewport === "tablet" ? "768px" : "100%";
     return (
       <div className={`${fill ? "flex min-h-0 flex-1 flex-col" : "mt-4 overflow-hidden rounded-md border border-overlay/10"}`}>
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-overlay/10 bg-shade/20 px-3 py-1.5">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">{execution.previewPlatform === "game" ? "Playable Preview" : "Local Preview"}</span>
-            <a href={execution.previewUrl} target="_blank" rel="noreferrer" title={`Open ${execution.previewUrl}`} className="min-w-0 truncate font-mono text-[10.5px] text-foundry-subtle underline decoration-overlay/20 underline-offset-2 transition hover:text-foundry-ink">{execution.previewUrl}</a>
+            <span className="text-[11px] font-extrabold uppercase tracking-[0.06em] text-foundry-teal">{visiblePreviewPlatform === "game" ? "Playable Preview" : execution.previewState === "starting" ? "Refreshing Preview" : "Local Preview"}</span>
+            <a href={visiblePreviewUrl} target="_blank" rel="noreferrer" title={`Open ${visiblePreviewUrl}`} className="min-w-0 truncate font-mono text-[10.5px] text-foundry-subtle underline decoration-overlay/20 underline-offset-2 transition hover:text-foundry-ink">{visiblePreviewUrl}</a>
           </div>
           <div className="flex items-center gap-1">
             {([['desktop', Monitor], ['tablet', Tablet], ['mobile', Smartphone]] as const).map(([size, Icon]) => (
@@ -72,17 +84,33 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
               </button>
             ))}
             <button type="button" title="Reload preview" onClick={() => setRefreshKey((current) => current + 1)} className="rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"><RefreshCw size={13} /></button>
-            <button type="button" title="Open preview in a new tab" onClick={() => window.open(execution.previewUrl, "_blank", "noopener,noreferrer")} className="rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"><ExternalLink size={13} /></button>
+            <button type="button" title="Open preview in a new tab" onClick={() => window.open(visiblePreviewUrl, "_blank", "noopener,noreferrer")} className="rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink"><ExternalLink size={13} /></button>
           </div>
         </div>
+        <PreviewNotice reason={execution.previewReason} />
         <div className={`${fill ? "min-h-0 flex-1" : "h-72"} overflow-auto bg-foundry-bg p-2`}>
-          <iframe key={refreshKey} src={execution.previewUrl} className="mx-auto h-full max-w-full border-0 bg-white transition-[width] duration-200" style={{ width: frameWidth }} title="Interactive live preview" />
+          <iframe key={refreshKey} src={visiblePreviewUrl} className="mx-auto h-full max-w-full border-0 bg-white transition-[width] duration-200" style={{ width: frameWidth }} title="Interactive live preview" />
         </div>
       </div>
     );
   }
 
   return <p className={`${wrap} rounded-md border border-dashed border-overlay/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>{execution.previewReason || "Open index.html from the project folder to preview this static project."}</p>;
+}
+
+/**
+ * What Foundry resolved about this project's preview, when that needed a decision the user would
+ * otherwise have to reverse-engineer — most often a folder whose server and whose HTML page turn out
+ * to be unrelated. A working preview used to discard this entirely, so the surface on screen was not
+ * the one the user expected and nothing said why.
+ */
+function PreviewNotice({ reason }: { reason?: string }) {
+  if (!reason) return null;
+  return (
+    <p className="shrink-0 border-b border-foundry-amber/25 bg-foundry-amber/[0.07] px-3 py-2 text-xs leading-5 text-foundry-ink">
+      {reason}
+    </p>
+  );
 }
 
 export function PreviewCompletionCard({ execution }: { execution: FactoryProjectResult }) {

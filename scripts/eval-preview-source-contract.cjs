@@ -3,6 +3,8 @@ const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
 const runtime = fs.readFileSync(path.join(root, "lib/factory/runtime.ts"), "utf8");
+const assetPlacement = fs.readFileSync(path.join(root, "lib/factory/asset-placement.ts"), "utf8");
+const staticPreview = fs.readFileSync(path.join(root, "scripts/foundry-static-preview.cjs"), "utf8");
 const recoveryPolicy = fs.readFileSync(path.join(root, "lib/factory/recovery-policy.ts"), "utf8");
 const connector = fs.readFileSync(path.join(root, "scripts/foundry-local-connector.cjs"), "utf8");
 const previewRoute = fs.readFileSync(path.join(root, "app/api/factory/preview/route.ts"), "utf8");
@@ -224,7 +226,9 @@ assert(
   "A retry is not hard-bound to its recorded project root.",
 );
 assert(
-  previewRoute.includes("refreshPreviewForProject(body.projectId, localConnector)")
+  previewRoute.includes("beginPreviewRefreshForProject(body.projectId, localConnector)")
+    && runtime.includes("previewRefreshes.has(projectId)")
+    && runtime.includes('return { previewState: "starting"')
     && runtime.includes("connectorPreviews.set(projectId, localConnector)")
     && runtime.includes("await connectLocalConnectorRoot(connector, connector.rootLabel)")
     && runtime.includes("detectStackProfileAndEntriesForAccess(access)")
@@ -280,10 +284,25 @@ assert(
   runtime.includes("requestsAttachedFilesAsProjectAssets")
     && runtime.includes("materializeAttachedProjectAssets")
     && runtime.includes('materializeAll || attachment.evidenceKind === "photo" || explicitAssetRequest')
-    && runtime.includes("public/foundry-uploads")
+    && runtime.includes("attachedAssetPublicPath(projectPath, placement)")
+    && assetPlacement.includes("public/foundry-uploads")
     && runtime.includes("binary read-back verification failed")
     && runtime.includes("Do not regenerate substitutes."),
   "Attachments requested as real project assets are still only being shown to the model.",
+);
+// An asset's on-disk directory and the URL handed to the model must be decided by the same rule.
+// When they drifted apart, every static project's uploaded logo 404'd and failed the browser gate.
+assert(
+  assetPlacement.includes('rootServedStacks = /^(?:static-html|phaser)/i')
+    && /rootServedStacks\.test\(stackId\)\) return \{ directory: "foundry-uploads", servedFromWebRoot: true \}/.test(assetPlacement)
+    && assetPlacement.includes('placement.servedFromWebRoot ? `/${projectPath.replace(/^public\\//, "")}` : projectPath'),
+  "Root-served static projects can again be handed asset URLs that do not resolve in their own preview.",
+);
+// The static preview must resolve conventional asset roots, or a correct-looking reference 404s.
+assert(
+  staticPreview.includes('const assetRoots = ["", "public", "static", "assets"]')
+    && staticPreview.includes("firstReadable(candidates"),
+  "The static preview server no longer falls back to conventional asset roots.",
 );
 assert(
   projectAccess.includes("writeBinary?(relativePath: string, base64: string)")
@@ -367,7 +386,7 @@ assert(
 );
 assert(
   runtime.includes("verificationFindingFingerprint(browserEvidence.evidence)")
-    && runtime.includes("findingCount > 4")
+    && runtime.includes("findingCount > 1")
     && runtime.includes("Stopped repeated repair on unchanged browser findings"),
   "Repeated identical browser findings can still consume the full autonomous repair budget.",
 );

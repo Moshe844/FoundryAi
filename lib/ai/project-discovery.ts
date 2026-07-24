@@ -1,6 +1,22 @@
 export const discoverySourceValues = ["inferred", "observed", "defaulted", "user-confirmed"] as const;
 export type DiscoverySource = (typeof discoverySourceValues)[number];
 
+/**
+ * Values Foundry invents when the request yields nothing parseable. They exist so a brief is never
+ * empty — but they are Foundry's guesses, not the user's words, and they must never be laundered into
+ * "user-confirmed" facts. A creative-agency site was presented with "Primary workspace / Core
+ * create/edit workflow / List/detail view / Settings" and entities "Item, User, Record" at 100%
+ * confidence, captioned as capabilities the user had selected, while the same screen still asked
+ * "What kind of tool or product is this?".
+ */
+export const GENERIC_FEATURE_PLACEHOLDERS = ["Primary workspace", "Core create/edit workflow", "List/detail view", "Settings or configuration area"];
+export const GENERIC_ENTITY_PLACEHOLDERS = ["Item", "User", "Record"];
+
+export function isGenericPlaceholderValue(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return [...GENERIC_FEATURE_PLACEHOLDERS, ...GENERIC_ENTITY_PLACEHOLDERS].some((placeholder) => placeholder.toLowerCase() === normalized);
+}
+
 export const discoveryStakesValues = ["low", "high"] as const;
 export type DiscoveryStakes = (typeof discoveryStakesValues)[number];
 
@@ -201,15 +217,23 @@ export function reconcileDiscoveryWithUserProductSignal(
   const merge = (authoritative: string[], proposed: string[]) => Array.from(new Map(
     [...authoritative, ...proposed].filter(Boolean).map((item) => [canonical(item), item]),
   ).values());
-  const mainFeatures = merge(concepts, discovery.mainFeatures.filter((item) => !/^(?:home\/?dashboard screen|primary workflow(?: with offline-first state)?|core workflow|main workflow)$/i.test(item.trim())));
-  const dataModel = merge(concepts.map(singularEntity).filter(Boolean), discovery.dataModel.filter((item) => !/^(?:item\/?record|activity\/?event|resource|record|entity)$/i.test(item.trim())));
+  // Foundry's own placeholders must not ride along into a "user-confirmed" list.
+  const mainFeatures = merge(concepts, discovery.mainFeatures.filter((item) => !isGenericPlaceholderValue(item) && !/^(?:home\/?dashboard screen|primary workflow(?: with offline-first state)?|core workflow|main workflow)$/i.test(item.trim())));
+  const dataModel = merge(concepts.map(singularEntity).filter(Boolean), discovery.dataModel.filter((item) => !isGenericPlaceholderValue(item) && !/^(?:item\/?record|activity\/?event|resource|record|entity)$/i.test(item.trim())));
   const architecture = canonical(discovery.architecture).includes(canonical(signal))
     ? discovery.architecture
     : `${signal} built with ${discovery.recommendedStack}, organized around ${concepts.join(", ")}. ${discovery.architecture}`.trim();
   const decisions = discovery.decisions.map((item) => {
     if (item.dimension === "domain") return { ...item, hypothesis: signal, confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The product scope comes directly from the user's selected subtype.", question: undefined };
-    if (item.dimension === "features") return { ...item, hypothesis: mainFeatures.join(", "), confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The leading capabilities preserve the user's selected product concepts.", question: undefined };
-    if (item.dimension === "data-shape") return { ...item, hypothesis: dataModel.join(", "), confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The primary entities are derived from the user's selected product concepts.", question: undefined };
+    // Only claim "user-confirmed" when something the user actually said survives. With no real concepts
+    // the value is Foundry's default, and it must keep its inferred/defaulted provenance and say so —
+    // presenting a guess at 100% confidence as the user's own choice is the dishonest part.
+    if (item.dimension === "features") return mainFeatures.length && !mainFeatures.every(isGenericPlaceholderValue)
+      ? { ...item, hypothesis: mainFeatures.join(", "), confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The leading capabilities preserve the user's selected product concepts.", question: undefined }
+      : { ...item, hypothesis: mainFeatures.join(", "), rationale: "Foundry's default starting features for this category — not taken from your description. Edit them before building." };
+    if (item.dimension === "data-shape") return dataModel.length && !dataModel.every(isGenericPlaceholderValue)
+      ? { ...item, hypothesis: dataModel.join(", "), confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The primary entities are derived from the user's selected product concepts.", question: undefined }
+      : { ...item, hypothesis: dataModel.join(", "), rationale: "Foundry's default entities for this category — not taken from your description. Edit them before building." };
     if (item.dimension === "architecture") return { ...item, hypothesis: architecture, confidence: 100, source: "user-confirmed" as const, action: "silent-infer" as const, rationale: "The architecture is anchored to the selected product scope and starter stack.", question: undefined };
     return item;
   });
@@ -334,6 +358,23 @@ const profiles: SignalProfile[] = [
     growth: ["Hardware barcode and receipt-printer integration", "Multi-register shift reconciliation", "Offline transaction queue", "Role-based approvals", "Payment-provider integration"],
   },
   {
+    id: "project-management",
+    label: "Project management application",
+    patterns: [/\b(project management|project tracker|project planning|kanban|task board|team workload|resource planning|project health)\b/i],
+    stack: "Next.js + TypeScript",
+    architecture:
+      "Next.js App Router application with a typed project/task domain, reusable dashboard and kanban surfaces, local-first persistence for the initial runnable version, and clean service boundaries for later team sync or a database.",
+    architectureRationale: "Project, task, status, assignment, and workload state belong to one coherent domain so board moves and dashboard totals cannot drift apart.",
+    style: "Polished creative-operations workspace with a clear information hierarchy, restrained status color, fast filters, responsive board/list views, and accessible light and dark themes.",
+    styleRationale: "Agency teams switch rapidly between portfolio health, individual tasks, and workload, so the interface must stay scannable without flattening everything into a generic table.",
+    features: ["Project health dashboard", "Searchable and filterable project portfolio", "Kanban task board with status changes", "Team workload and assignment view", "Notifications and activity", "Workspace settings", "Responsive navigation", "Persistent local changes"],
+    entities: ["Project", "Task", "Team member", "Assignment", "Status", "Milestone", "Notification", "Workspace setting"],
+    users: "Creative-agency project managers, team leads, and contributors.",
+    platform: "Web app",
+    complexity: "Multi-screen collaborative business application",
+    growth: ["Real-time team synchronization", "Role-based permissions", "Client portal", "Time tracking and budgets", "Calendar and external integrations"],
+  },
+  {
     id: "dashboard",
     label: "Dashboard",
     // Bare "chart(s)" is too generic (flow chart, org chart) — dropped as a standalone trigger.
@@ -390,7 +431,10 @@ const profiles: SignalProfile[] = [
     label: "Content website",
     // Bare "portfolio" is ambiguous (personal/creative portfolio vs. investment/financial
     // portfolio) — requires "site"/"website" or "personal" to disambiguate toward content.
-    patterns: [/\b(blog|website|portfolio (site|website)|personal portfolio|landing page|marketing site|docs site|content site)\b/i],
+    // Ordinary ways people describe a presentation site. Requiring the literal word "website" sent a
+    // creative-agency brief to the generic CRUD fallback. "Portfolio" alone stays ambiguous
+    // (creative vs. investment portfolio) and still needs site/website/personal to disambiguate.
+    patterns: [/\b(blog|website|web site|portfolio (site|website)|personal portfolio|landing page|marketing site|docs site|content site|agency (?:site|website|portfolio)|studio (?:site|website|portfolio)|brochure|showcase|case stud(y|ies)|our work)\b/i],
     stack: "Next.js",
     architecture:
       "Next.js content site with static generation for pages and posts, MDX-based content authoring, and a component library of reusable sections (hero, feature grid, testimonials, CTA).",
@@ -502,9 +546,29 @@ export function actionForDecision(confidence: number, stakes: DiscoveryStakes): 
   return "default-disclose";
 }
 
-export function discoverProject(prompt: string): ProjectDiscoveryResult {
+/**
+ * The starter the user explicitly picked is authoritative for the domain profile. Profile matching used
+ * to read the prompt alone, so "Northstar for creative agency" matched none of the content profile's
+ * literal keywords (website|blog|landing page|marketing site|portfolio site) and fell through to the
+ * generic custom fallback — a Website starter was handed CRUD-app defaults ("Primary workspace", "Core
+ * create/edit workflow", entities "Item, User, Record"). The user already told us what this is.
+ */
+const STARTER_PROFILE_IDS: Record<string, string> = {
+  website: "content",
+  dashboard: "dashboard",
+  commerce: "commerce",
+  inventory: "inventory",
+  pos: "pos",
+  api: "api",
+  game: "game",
+  mobile: "mobile",
+  desktop: "desktop",
+};
+
+export function discoverProject(prompt: string, starterId?: string): ProjectDiscoveryResult {
   const normalized = prompt.trim();
-  const profile = chooseProfile(normalized);
+  const starterProfile = starterId ? profiles.find((item) => item.id === STARTER_PROFILE_IDS[starterId]) : undefined;
+  const profile = chooseProfile(normalized) ?? starterProfile;
   const ambiguity = ambiguityScore(normalized, profile);
   const words = normalized.split(/\s+/).filter(Boolean).length;
   const explicitSignals = [
@@ -588,7 +652,7 @@ function defaultProfile(prompt: string): SignalProfile {
     : featureClauses;
   const features = meaningfulFeatureClauses.length
     ? Array.from(new Set(meaningfulFeatureClauses))
-    : ["Primary workspace", "Core create/edit workflow", "List/detail view", "Settings or configuration area"];
+    : [...GENERIC_FEATURE_PLACEHOLDERS];
   const platform = explicitPlatform ?? (/\b(?:fastapi|express|asp\.?net|api)\b/i.test(explicitStack ?? "") ? "Backend service" : "Web app");
   const architecture = explicitStack
     ? `${explicitStack} project organized around the requested workflows, with typed domain boundaries where the stack supports them and a runnable build, test, and preview path.`

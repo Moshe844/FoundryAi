@@ -298,8 +298,23 @@ export function phasesOf(plan: FactoryObjectiveChecklistItem[]): CanvasPhase[] {
 }
 
 /**
- * Voice/work grouping: walk the real timeline; each voice event opens a group, work
- * events attach to the most recent group. Dead ends stay — the trail is the actual hunt.
+ * True only for a real narrative beat — something Foundry *said*, in sentences. Status labels
+ * ("Planning project", "Architecture selected", "Model · openai/gpt-5.5", "Build-model usage · …")
+ * are not beats: letting each one open its own entry turned one mission into fifty near-empty boxes
+ * containing two words each. Those fold into the current entry's execution rail instead.
+ */
+export function isNarrativeVoice(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || !/\s/.test(trimmed)) return false;
+  if (/^(?:model|build-model usage|execution strategy|routing|planning project|architecture selected|execution batch|checklist updated)\b/i.test(trimmed)) return false;
+  // A beat is a sentence: it ends in real punctuation, or it is long enough to carry an actual thought.
+  return /[.!?]$/.test(trimmed) ? trimmed.length >= 25 : trimmed.length >= 60;
+}
+
+/**
+ * Voice/work grouping: walk the real timeline; each NARRATIVE voice event opens a group, work
+ * events (and label-like status lines) attach to the most recent group. Dead ends stay — the trail is
+ * the actual hunt.
  */
 export function groupTimeline(timeline: FactoryExecutionEvent[]): CanvasVoiceGroup[] {
   const groups: CanvasVoiceGroup[] = [];
@@ -308,12 +323,16 @@ export function groupTimeline(timeline: FactoryExecutionEvent[]): CanvasVoiceGro
   timeline
     .filter((event) => !isInternalExecutionEvent(event) && event.kind !== "blocked")
     .forEach((event) => {
-      if (isVoiceEvent(event)) {
-        const voice = voiceTextOf(event);
-        if (!voice) return;
+      const voiceText = isVoiceEvent(event) ? voiceTextOf(event) : "";
+      if (voiceText && isNarrativeVoice(voiceText)) {
         const previousGroup = groups.at(-1);
-        if (previousGroup?.voice === voice && previousGroup.events.length === 0) return;
-        current = { id: event.id, voice, voiceTimestamp: event.timestamp, events: [] };
+        // Retries frequently repeat the same narration around their work events. Keep that as one
+        // narrative beat instead of presenting every retry as a new Foundry message.
+        if (previousGroup?.voice === voiceText) {
+          current = previousGroup;
+          return;
+        }
+        current = { id: event.id, voice: voiceText, voiceTimestamp: event.timestamp, events: [] };
         groups.push(current);
         return;
       }
@@ -325,7 +344,9 @@ export function groupTimeline(timeline: FactoryExecutionEvent[]): CanvasVoiceGro
         id: event.id,
         kind: event.kind,
         status: event.status,
-        text: workEventText(event),
+        // A label-like status line keeps its own words as the row text rather than being reformatted
+        // into a file/command phrase it never was.
+        text: voiceText || workEventText(event),
         timestamp: event.timestamp,
         filePath: event.filePath,
         command: event.command,
@@ -413,6 +434,7 @@ export function groupExecutionUnits(events: CanvasWorkEvent[]): CanvasExecutionU
   const units: CanvasExecutionUnit[] = [];
   const fileUnits = new Map<string, CanvasExecutionUnit>();
   const commandUnits = new Map<string, CanvasExecutionUnit>();
+  const miscUnits = new Map<string, CanvasExecutionUnit>();
 
   const addSubStep = (unit: CanvasExecutionUnit, event: CanvasWorkEvent) => {
     unit.subSteps.push({ id: event.id, kind: event.kind, status: event.status, text: event.text, output: event.output });
@@ -444,20 +466,40 @@ export function groupExecutionUnits(events: CanvasWorkEvent[]): CanvasExecutionU
       addSubStep(unit, event);
       continue;
     }
-    units.push({
+    // Preview/misc events carry no path or command, so the lifecycle merge upstream can never pair them
+    // and every repeat rendered as another identical chip ("Checking rendered project in a real
+    // browser · Checking rendered project in a real browser · …"). Fold repeats of the same label into
+    // one unit that keeps the latest status.
+    const miscKey = `misc:${event.text}`;
+    const existing = miscUnits.get(miscKey);
+    if (existing) {
+      addSubStep(existing, event);
+      continue;
+    }
+    const unit: CanvasExecutionUnit = {
       id: `unit-${event.id}`,
       kind: event.kind === "preview" ? "preview" : "misc",
       label: event.text,
       status: event.status,
-      durationMs: event.durationMs,
-      output: event.output,
-      subSteps: [{ id: event.id, kind: event.kind, status: event.status, text: event.text, output: event.output }],
-    });
+      durationMs: 0,
+      subSteps: [],
+    };
+    miscUnits.set(miscKey, unit);
+    units.push(unit);
+    addSubStep(unit, event);
   }
 
   for (const unit of units) {
     unit.status = foldUnitStatus(unit.subSteps);
     if (unit.kind === "file") {
+      const folderOnly = unit.subSteps.every((step) => step.kind === "folder");
+      if (folderOnly) {
+        // A project directory is setup progress, not a delivered file. Keeping it as a file unit
+        // made the rail claim "Created 2 files" when disk contained only foundry-brief.md.
+        unit.kind = "misc";
+        unit.label = unit.subSteps.at(-1)?.text || "Project folder prepared";
+        continue;
+      }
       const basename = (unit.filePath ?? "").split("/").pop() || unit.filePath || "file";
       const verb = unit.subSteps.some((step) => step.kind === "edit")
         ? "Updated"
@@ -508,8 +550,17 @@ export function currentActivityOf(mission: ExecutionMission): { state: CanvasExe
  * only: it never invents a focus the timeline doesn't support.
  */
 export function currentFocusOf(mission: ExecutionMission): string {
+  const newest = mission.timeline.at(-1);
+  // Provider-wait events stay out of the expanded history, but their titles still describe the live
+  // work accurately. Never let an older voice line claim Foundry is reading after work has advanced.
+  if (newest?.status === "running" && isInternalExecutionEvent(newest) && newest.title.trim()) {
+    return newest.title.trim();
+  }
   const voice = [...mission.timeline].reverse().find((event) => isVoiceEvent(event) && voiceTextOf(event));
-  if (voice) {
+  const latest = mission.timeline.filter((event) => !isInternalExecutionEvent(event)).at(-1);
+  // A narrative line owns the focus only until newer concrete work begins. Otherwise an initial
+  // "Reading project request" event can remain visible throughout later edits, commands, and builds.
+  if (voice && (!latest || voice.id === latest.id || new Date(voice.timestamp).getTime() >= new Date(latest.timestamp).getTime())) {
     const text = voiceTextOf(voice);
     const first = text.split(/(?<=[.!?])\s+/)[0]?.trim() || text;
     return first.length > 120 ? `${first.slice(0, 117)}…` : first;
@@ -534,9 +585,12 @@ export function dotStateOf(state: ExecutionMissionState | "idle", isBusy: boolea
 
 /** The most recent real event, rendered verbatim in the live activity row (§7.1). */
 export function latestLiveEvent(timeline: FactoryExecutionEvent[]): { id: string; text: string; timestamp: string } | null {
-  const last = timeline.filter((event) => !isInternalExecutionEvent(event)).at(-1);
+  // A hidden provider/build wait can be newer than the last narrative line. Its concise title is
+  // safe for the live banner and keeps the banner body aligned with Current focus.
+  const last = [...timeline].reverse().find((event) => event.status === "running")
+    ?? timeline.filter((event) => !isInternalExecutionEvent(event)).at(-1);
   if (!last) return null;
-  const text = isVoiceEvent(last) ? voiceTextOf(last) : workEventText(last);
+  const text = isInternalExecutionEvent(last) ? last.title : isVoiceEvent(last) ? voiceTextOf(last) : workEventText(last);
   return text ? { id: last.id, text, timestamp: last.timestamp } : null;
 }
 

@@ -129,9 +129,11 @@ for (const falseCrudCapability of ["toggle-state", "delete-record", "complete-re
 }
 
 const dashboard = source("components/BuildDashboard.tsx");
-assert.match(dashboard, /const hardTimeoutMs = 60_000/);
+assert.match(dashboard, /const hardTimeoutMs = 8_000/);
 assert.match(dashboard, /fast-discovery-v5-explicit-contract", attempt/);
-assert.match(dashboard, /exceeded the 60-second time budget/);
+assert.match(dashboard, /exceeded the 8-second user-facing time budget/);
+assert.match(dashboard, /portfolio\|product page\|landing page/, "Simple content websites do not bypass unnecessary remote discovery.");
+assert.match(dashboard, /if \(!result\.ok \|\| !result\.discovery\) \{[\s\S]{0,120}skipRefinement\(\)/, "Timed-out discovery can still strand the user on an error screen instead of advancing locally.");
 assert.match(dashboard, /result\.provenance === "brief"/);
 assert.match(dashboard, /explicitProjectNameFromPrompt/);
 assert.match(dashboard, /projectType: explicitProjectName \|\| discovery\.projectType/);
@@ -151,6 +153,9 @@ assert.match(discoveryRoute, /const fallbackDiscovery = \{ \.\.\.preserveUserPro
 assert.match(discoveryRoute, /deploymentNoteRespectingExplicitPersistence/);
 
 const runtime = source("lib/factory/runtime.ts");
+const taskProfiler = source("lib/ai/routing/task-profiler.ts");
+const executor = source("lib/ai/mission/executor.ts");
+const executionControl = source("lib/factory/execution-control.ts");
 assert.match(runtime, /const requestedMockReview =/);
 assert.match(runtime, /const offerMockGate = requestedMockReview &&/);
 assert.match(runtime, /const credentialBrief = \[spec\.projectDescription, `Selected stack: \$\{spec\.stack\}`, spec\.instructions\]/);
@@ -184,6 +189,13 @@ assert.match(runtime, /attempt < 8/);
 assert.match(runtime, /const durableBrowserBrief = await access\.readFile\("foundry-brief\.md"/);
 assert.match(runtime, /durableBrowserBrief\?\.exists && !requestNamesConcreteChange \? durableBrowserRequirementsFromBrief\(durableBrowserBrief\.content\)/);
 assert.match(runtime, /Project description:/);
+assert.match(runtime, /requestedTask = durableBrowserRequirementsFromBrief\(requestedTask\)/, "Browser acceptance still treats deferred ideas and alternative stacks as current requirements.");
+assert.doesNotMatch(runtime, /\.\.\.\(uncoveredProse\.length \? \[.*had no automatic browser check/, "Uncheckable descriptive prose still manufactures a browser failure and paid repair.");
+assert.match(runtime, /const verified = missing\.length === 0 && workflow\.problems\.length === 0/, "Browser acceptance does not base its verdict exclusively on observed checks.");
+assert.match(taskProfiler, /const text = activeTaskScope\(input\.message\)\.toLowerCase\(\)/, "Routing still profiles deferred brief content as active work.");
+assert.match(taskProfiler, /Anticipated future capabilities/, "Deferred Foundry brief capabilities are not removed from routing scope.");
+assert.match(executor, /input\.staticProject[\s\S]{0,180}\? 45_000/, "A stalled static-project provider can still freeze generation for two minutes.");
+assert.equal((executionControl.match(/if \(current\.state === "stopped"\) return;/g) || []).length, 2, "Late completion or failure can overwrite an explicit Stop state.");
 assert.equal((runtime.match(/const inheritedBrowserRequest =/g) || []).length, 1, "Every browser branch must share one durable acceptance input.");
 assert.doesNotMatch(runtime, /previewOwnershipToken, requestedTask\)/);
 assert.match(runtime, /Verification-only browser acceptance failed\. Foundry preserved every project file/);

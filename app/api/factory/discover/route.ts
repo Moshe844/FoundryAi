@@ -11,7 +11,8 @@ import type { DiscoveryRefinementContext } from "@/lib/ai/project-discovery-llm"
 import { explicitPersistenceFromPrompt, explicitProjectNameFromPrompt, explicitStackFromPrompt, reconcileDiscoveryWithExplicitBrief, reconcileDiscoveryWithUserProductSignal, type ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import type { ProviderId } from "@/lib/ai/providers/types";
 import type { NeutralTool } from "@/lib/ai/providers/types";
-import { reconcilePlatformStackOptions } from "@/lib/discovery/platform-stack-policy";
+import { discoveryWithSelectedStack, platformFamilyForProject } from "@/lib/discovery/platform-stack-policy";
+import { composeProjectArchitecture, defaultEnvironmentCapabilities, extractProductProfile, recommendStack } from "@/lib/certified-build";
 
 const DEFAULT_MODE: ModelMode = "builder";
 
@@ -183,11 +184,12 @@ export async function POST(request: Request) {
       // 502. This makes discovery reliable across the board: worst case is the generic-but-valid seed,
       // best case is the specific understanding.
       const fallbackDiscovery = { ...preserveUserProductSignal(heuristic), prompt: authoritativeBrief };
-      const platformContract = reconcilePlatformStackOptions(context.starter.id, fallbackDiscovery, []);
+      const certified = certifiedDecision(authoritativeBrief, fallbackDiscovery);
+      const platformContract = certifiedPlatformContract(context.starter.id, certified.discovery, certified.stackOptions);
       return NextResponse.json({
         ok: true,
         provenance: "brief",
-        discovery: { ...fallbackDiscovery, recommendedStack: platformContract.recommendedStack },
+        discovery: { ...certified.discovery, recommendedStack: platformContract.recommendedStack },
         alternativeStacks: platformContract.stackOptions.filter((option) => !option.recommended).map((option) => option.name),
         deploymentNote: deploymentNoteRespectingExplicitPersistence(
           authoritativeBrief,
@@ -197,6 +199,9 @@ export async function POST(request: Request) {
           ? "Foundry preserved the explicit project brief after the optional discovery refinement returned an incomplete payload."
           : "Foundry preserved your selected product scope with deterministic discovery because optional model refinement did not complete; you can still edit any decision before building.",
         stackOptions: platformContract.stackOptions,
+        productProfile: certified.productProfile,
+        stackRecommendation: certified.stackRecommendation,
+        projectArchitecture: certified.projectArchitecture,
         usage: result.usage,
         incompleteRefinement: true,
         modelSelection: {
@@ -221,10 +226,18 @@ export async function POST(request: Request) {
     // `prompt` records user evidence. A model can echo its own proposed stack there, but that must
     // never turn the model's React Native suggestion into an explicit user constraint.
     parsedRefinement.discovery = { ...preserveUserProductSignal(parsedRefinement.discovery), prompt: authoritativeBrief };
-    const platformContract = reconcilePlatformStackOptions(context.starter.id, parsedRefinement.discovery, parsedRefinement.stackOptions);
+    const certified = certifiedDecision(authoritativeBrief, parsedRefinement.discovery);
+    const platformContract = certifiedPlatformContract(context.starter.id, certified.discovery, certified.stackOptions);
     const refined: DiscoveryRefinementResult = {
       ...parsedRefinement,
-      discovery: { ...parsedRefinement.discovery, recommendedStack: platformContract.recommendedStack },
+      // The model wrote its memo for ITS stack pick, and preserveUserProductSignal already copied that
+      // sentence into the decisions and key facts. If policy overrode the pick, EVERY field must follow —
+      // rewriting only `architecture` left the rejected framework on screen and in the build brief.
+      discovery: discoveryWithSelectedStack(
+        { ...parsedRefinement.discovery, recommendedStack: platformContract.recommendedStack },
+        parsedRefinement.discovery.recommendedStack,
+        platformContract.recommendedStack,
+      ),
       stackOptions: platformContract.stackOptions,
       alternativeStacks: platformContract.stackOptions.filter((option) => !option.recommended).map((option) => option.name),
     };
@@ -237,6 +250,9 @@ export async function POST(request: Request) {
       deploymentNote: deploymentNoteRespectingExplicitPersistence(authoritativeBrief, refined.deploymentNote),
       lede: refined.lede,
       stackOptions: refined.stackOptions,
+      productProfile: certified.productProfile,
+      stackRecommendation: certified.stackRecommendation,
+      projectArchitecture: certified.projectArchitecture,
       usage: result.usage,
       modelSelection: {
         tier,
@@ -262,6 +278,23 @@ export async function POST(request: Request) {
       { status: 500 },
     );
   }
+}
+
+/** AI may interpret the brief, but this deterministic gate owns stack eligibility. */
+function certifiedDecision(prompt: string, discovery: ProjectDiscoveryResult) {
+  const productProfile = extractProductProfile(prompt, discovery);
+  const stackRecommendation = recommendStack(productProfile, defaultEnvironmentCapabilities());
+  const selected = stackRecommendation.selectedStack;
+  const selectedName = selected?.displayName ?? discovery.recommendedStack;
+  const nextDiscovery = discoveryWithSelectedStack(discovery, discovery.recommendedStack, selectedName);
+  const stackOptions = selected
+    ? [{ name: selected.displayName, why: stackRecommendation.reasons.join(" "), recommended: true }]
+    : [];
+  return { productProfile, stackRecommendation, projectArchitecture: composeProjectArchitecture(productProfile, stackRecommendation), discovery: nextDiscovery, stackOptions };
+}
+
+function certifiedPlatformContract(starterId: string, discovery: ProjectDiscoveryResult, stackOptions: Array<{ name: string; why: string; recommended: boolean }>) {
+  return { stackOptions, recommendedStack: stackOptions[0]?.name ?? discovery.recommendedStack, repaired: discovery.recommendedStack !== stackOptions[0]?.name, family: platformFamilyForProject(starterId, discovery) };
 }
 
 function compactContext(context: DiscoveryRefinementContext | undefined): DiscoveryRefinementContext {

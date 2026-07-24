@@ -36,5 +36,21 @@ ok("a feature-rich admin tool is substantial", requiresSubstantialUiAcceptance("
 ok("an expense tracker with five features is substantial (app surface + list)", requiresSubstantialUiAcceptance("Project type: Expense tracker\nMain features: add expense; edit expense; categories; monthly totals; charts.") === true);
 ok("a kanban board with five features is substantial", requiresSubstantialUiAcceptance("Project type: Kanban board\nMain features: columns; cards; drag and drop; labels; filters.") === true);
 
+// --- richness must not hinge on form fields (2026-07-22 live regression) ---
+// A product page with 12k characters, 20 semantic regions, 31 controls and 22 styled controls was
+// reported a "thin shell" solely because it had 0 form fields. Forms are not a proxy for richness; when
+// a form is actually requested, requiredDomFeaturesForTask asserts it directly.
+const runtimeSrc = fs.readFileSync(path.join(root, "lib/factory/runtime.ts"), "utf8");
+console.log("\n=== a rich page with no form is not a 'thin shell' ===");
+ok("form fields are no longer part of the thin-shell test",
+  !/requiresSubstantialUiAcceptance\(requestedTask\) && \([^)]*formFields < 2/.test(runtimeSrc));
+ok("substance is still judged on text, structure, controls and styling",
+  /requiresSubstantialUiAcceptance\(requestedTask\) && \(rendered\.textLength < 500 \|\| rendered\.meaningfulElements < 7 \|\| rendered\.interactiveControls < 10 \|\| rendered\.styledControls < 8\)/.test(runtimeSrc));
+
+console.log("\n=== the uncovered-requirements message is readable, not a wall of brief ===");
+ok("the full list is no longer joined verbatim into the summary", !/covers: \$\{uncoveredProse\.join/.test(runtimeSrc));
+ok("it reports a count plus a few examples without failing the build", /requested item\(s\) could not be checked automatically/.test(runtimeSrc)
+  && !/\.\.\.\(uncoveredProse\.length \? \[.*had no automatic browser check/.test(runtimeSrc));
+
 console.log(`\n${failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`}`);
 process.exit(failures ? 1 : 0);

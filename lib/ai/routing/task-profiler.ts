@@ -18,7 +18,7 @@ export type TaskContext = {
 export function profileTask(input: TaskContext): TaskProfile {
   // Classify the new message from scratch. Prior mission text can resolve an ambiguous pronoun,
   // but it must never carry risk, scope, or an expensive tier into the next request.
-  const text = input.message.toLowerCase();
+  const text = activeTaskScope(input.message).toLowerCase();
   const priorContext = [input.activeMission, input.parentMission, ...(input.recentFollowUps ?? [])].filter(Boolean).join(" ").toLowerCase();
   const riskText = stripNegatedRiskClaims(text)
     .replace(/\bauth-database-api\b/g, "")
@@ -156,6 +156,15 @@ function stripNegatedRiskClaims(text: string) {
     /\b(?:no|without|does(?:n't| not) (?:need|use|have)|do not (?:need|use|have))\b(?:(?!\b(?:but|however|although|requires?|including|with)\b)[^.!?\n]){0,160}/g,
     (clause) => clause.replace(/\b(?:backend|database|authentication|auth|payments?|security|login|accounts?|framework|(?:external\s+)?integrations?)\b/g, ""),
   );
+}
+
+/** Planning briefs deliberately mention alternatives and deferred integrations. They are context,
+ * not current execution scope, and must never escalate routing or trigger credential/payment work. */
+function activeTaskScope(text: string) {
+  return text
+    .replace(/^Alternative stacks:.*$/gim, "")
+    .replace(/^Anticipated future capabilities \(not building now[^\n]*$/gim, "")
+    .replace(/^Confidence map:.*$/gim, "");
 }
 
 function clamp(value: number) { return Math.max(0, Math.min(1, value)); }

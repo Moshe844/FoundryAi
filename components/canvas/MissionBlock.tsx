@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
+import { ChevronDown } from "lucide-react";
 import type { MissionRecommendation } from "@/lib/ai/mission/recommendations";
 import type { FactoryExecutionEvent } from "@/lib/factory/types";
 import type { CanvasMissionVM, CanvasPhase, CanvasVoiceGroup } from "@/lib/canvas/model";
@@ -8,7 +9,7 @@ import { formatDuration, groupExecutionUnits } from "@/lib/canvas/model";
 import type { BlockedCommandAction } from "@/components/execution/ApprovalPrompt";
 import { BlockingCard } from "@/components/canvas/BlockingCard";
 import { ExecutionRail } from "@/components/canvas/ExecutionRail";
-import { LiveActivityRow } from "@/components/canvas/LiveActivityRow";
+import { LiveExecutionPanel } from "@/components/canvas/LiveExecutionPanel";
 import { SummaryBlock } from "@/components/canvas/SummaryBlock";
 import { CanvasMarkdown } from "@/components/canvas/CanvasMarkdown";
 
@@ -23,6 +24,10 @@ export function MissionBlock({
   recorded = false,
   revealEventIds,
   liveActivity,
+  currentFocus,
+  currentStateLabel,
+  focusOpen = true,
+  onFocusToggle,
   suggestions = [],
   onAnswer,
   onApprove,
@@ -37,6 +42,12 @@ export function MissionBlock({
   /** Event ids to force-expand and scroll to (evidence links from the summary). */
   revealEventIds?: string[];
   liveActivity?: { id: string; text: string; elapsedMs: number } | null;
+  /** Concise phrase for the focus banner, which sits directly under the request/brief. */
+  currentFocus?: string;
+  /** Short live state word for the current entry ("Editing page.tsx", "Running tests"). */
+  currentStateLabel?: string;
+  focusOpen?: boolean;
+  onFocusToggle?: () => void;
   suggestions?: MissionRecommendation[];
   onAnswer?: (answers: Array<{ question: string; answer: string }>) => void;
   onApprove?: (event: FactoryExecutionEvent, action: BlockedCommandAction) => void;
@@ -59,27 +70,31 @@ export function MissionBlock({
         {vm.requestBrief ? <RequestBrief brief={vm.requestBrief} /> : null}
       </div>
 
+      {!recorded && vm.isBusy && currentFocus ? (
+        <FocusBanner
+          focus={currentFocus}
+          open={focusOpen}
+          onToggle={onFocusToggle}
+          liveActivity={blocked ? null : currentLiveActivity}
+          checks={vm.verification}
+          steps={vm.browserSteps}
+        />
+      ) : null}
+
       {showPhases ? <PhaseList phases={vm.phases} recorded={recorded} /> : null}
 
       <VoiceTrail
         groups={currentLiveActivity ? groupsWithoutLiveEvent(vm.groups, currentLiveActivity.id) : vm.groups}
         recorded={recorded}
         busy={vm.isBusy && !recorded}
+        currentStateLabel={currentStateLabel}
         revealEventIds={revealEventIds}
       />
-
-      {!recorded && vm.isBusy && (vm.verification.length || vm.browserSteps.length) ? (
-        <LiveExecutionPanel checks={vm.verification} steps={vm.browserSteps} />
-      ) : null}
 
       {vm.deliveredFiles.length ? <DeliveredFiles files={vm.deliveredFiles} /> : null}
 
       {!recorded && vm.blocking && onAnswer && onApprove ? (
         <BlockingCard blocking={vm.blocking} onAnswer={onAnswer} onApprove={onApprove} onUpload={onUpload} onLocateSdk={onLocateSdk} />
-      ) : null}
-
-      {!blocked && currentLiveActivity ? (
-        <LiveActivityRow text={currentLiveActivity.text} elapsedMs={currentLiveActivity.elapsedMs} />
       ) : null}
 
       {vm.summary ? (
@@ -235,120 +250,130 @@ function PhaseList({ phases, recorded }: { phases: CanvasPhase[]; recorded: bool
 }
 
 /**
- * Voice lines with their work rows. While live, only the two most recent groups stay
- * expanded — everything older digests to a one-line real count, expandable in place.
- * Recorded traces start fully digested (fully past = fully compressed).
+ * The Current-focus banner: sits directly under the request/brief and owns "what is happening right
+ * now" — the live activity line and the live gates. Nothing here is duplicated further down the page.
  */
-function VoiceTrail({ groups, recorded, busy, revealEventIds }: { groups: CanvasVoiceGroup[]; recorded: boolean; busy: boolean; revealEventIds?: string[] }) {
-  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
-  const autoExpandFrom = recorded ? groups.length : Math.max(0, groups.length - 2);
+function FocusBanner({
+  focus, open, onToggle, liveActivity, checks, steps,
+}: {
+  focus: string;
+  open: boolean;
+  onToggle?: () => void;
+  liveActivity?: { text: string; elapsedMs: number } | null;
+  checks: CanvasMissionVM["verification"];
+  steps: CanvasMissionVM["browserSteps"];
+}) {
+  const hasDetail = Boolean(liveActivity) || checks.length > 0 || steps.length > 0;
+  return (
+    <div className="overflow-hidden rounded-xl border border-foundry-teal/25 bg-foundry-teal/[0.045]">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={onToggle}
+        disabled={!hasDetail}
+        className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition hover:bg-foundry-teal/[0.04] disabled:cursor-default"
+      >
+        <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foundry-teal/50" />
+          <span className="relative inline-flex h-2 w-2 rounded-full bg-foundry-teal" />
+        </span>
+        <p className="min-w-0 flex-1 truncate text-[12.5px] leading-5 text-foundry-ink">
+          <span className="font-bold text-foundry-teal">Current focus: </span>
+          <span className="font-semibold">{focus}</span>
+        </p>
+        <span className="hidden shrink-0 text-[11px] text-foundry-subtle lg:block">Older progress collapses automatically</span>
+        {hasDetail ? <ChevronDown size={14} className={`shrink-0 text-foundry-teal/70 transition-transform ${open ? "rotate-180" : ""}`} aria-hidden="true" /> : null}
+      </button>
+      {open && hasDetail ? (
+        <div className="grid gap-3 border-t border-foundry-teal/15 bg-foundry-surface/60 px-3.5 py-3">
+          {liveActivity ? (
+            <p className="flex items-baseline gap-2 font-mono text-[12px] leading-6">
+              <span className="shrink-0 text-foundry-teal" aria-hidden="true">●</span>
+              <span className="min-w-0 flex-1 text-foundry-muted">{liveActivity.text}</span>
+              <span className="shrink-0 text-foundry-subtle">{formatDuration(liveActivity.elapsedMs)} since last update</span>
+            </p>
+          ) : null}
+          <LiveExecutionPanel checks={checks} steps={steps} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The engineering thread. Every entry except the current one compacts to a single quiet row
+ * ("Foundry · Completed"); only the live entry stays fully open, with a "Previous progress" separator
+ * above it. Clicking any compacted entry reopens it in place and re-compacts the others, so a long
+ * mission stays readable after hundreds of runtime events instead of becoming a flat wall of text.
+ */
+function VoiceTrail({
+  groups, recorded, busy, currentStateLabel, revealEventIds,
+}: {
+  groups: CanvasVoiceGroup[];
+  recorded: boolean;
+  busy: boolean;
+  currentStateLabel?: string;
+  revealEventIds?: string[];
+}) {
+  const [reopenedId, setReopenedId] = useState<string | null>(null);
   const revealed = new Set(revealEventIds ?? []);
+  const currentIndex = groups.length - 1;
 
   return (
-    <div className="grid gap-4">
+    <div className="relative grid gap-2.5 pl-[38px] before:absolute before:bottom-1 before:left-[15px] before:top-3 before:w-px before:bg-overlay/10 before:content-['']">
       {groups.map((group, index) => {
-        const expanded = openGroups[group.id] ?? (index >= autoExpandFrom || group.events.some((event) => revealed.has(event.id)));
+        const isCurrent = !recorded && index === currentIndex;
+        const reopened = reopenedId === group.id || group.events.some((event) => revealed.has(event.id));
+        const open = isCurrent || reopened;
+        const failures = groupFailures(group);
+        const state = isCurrent ? (currentStateLabel || "Working") : failures ? "Attention" : "Completed";
         return (
-          <section key={group.id} className={busy && index === groups.length - 1 ? "canvas-enter" : undefined}>
-            {group.voice ? (
-              <CanvasMarkdown value={group.voice} live={busy && index === groups.length - 1} />
+          <Fragment key={group.id}>
+            {!recorded && index === currentIndex && groups.length > 1 ? (
+              <div className="my-1 flex items-center gap-2.5 text-[9.5px] font-bold uppercase tracking-[0.14em] text-foundry-subtle/70">
+                <span className="h-px flex-1 bg-overlay/10" aria-hidden="true" />
+                <span className="whitespace-nowrap">Previous progress — click any item to reopen</span>
+                <span className="h-px flex-1 bg-overlay/10" aria-hidden="true" />
+              </div>
             ) : null}
-            {group.events.length ? (
-              expanded ? (
-                <ExecutionRail units={groupExecutionUnits(group.events)} />
-              ) : (
+            <section className={`relative ${busy && isCurrent ? "canvas-enter" : ""}`}>
+              <span
+                className={`absolute -left-[38px] top-0 grid h-[26px] w-[26px] place-items-center rounded-lg border text-[11px] font-extrabold ${
+                  open ? "border-foundry-teal/30 bg-foundry-teal/10 text-foundry-teal" : "border-overlay/10 bg-overlay/[0.03] text-foundry-subtle"
+                }`}
+                aria-hidden="true"
+              >
+                F
+              </span>
+              <div className={`rounded-xl transition ${open ? "border border-overlay/10 bg-foundry-surface/70 p-3.5 shadow-[0_6px_18px_rgba(0,0,0,0.03)]" : ""}`}>
                 <button
                   type="button"
-                  aria-expanded={false}
-                  onClick={() => setOpenGroups((current) => ({ ...current, [group.id]: true }))}
-                  className="mt-2 flex items-baseline gap-2 pl-5 text-left text-[13px] leading-6 text-foundry-subtle transition hover:text-foundry-muted"
+                  aria-expanded={open}
+                  onClick={() => setReopenedId(open && !isCurrent ? null : group.id)}
+                  disabled={isCurrent}
+                  className={`flex w-full items-center justify-between gap-3 text-left ${open ? "mb-2" : "rounded-lg px-1 py-1 hover:bg-overlay/[0.03]"} disabled:cursor-default`}
                 >
-                  <span className={groupFailures(group) ? "text-red-300" : "text-foundry-teal"} aria-hidden="true">{groupFailures(group) ? "!" : "✓"}</span>
-                  {digestText(group)}
+                  <span className={`text-[12.5px] font-bold ${open ? "text-foundry-ink" : "text-foundry-subtle"}`}>Foundry</span>
+                  <span className={`inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.1em] ${isCurrent ? "text-foundry-teal" : failures ? "text-red-300" : "text-foundry-subtle"}`}>
+                    <span className={`h-[6px] w-[6px] rounded-full ${isCurrent ? "animate-pulse bg-foundry-teal" : failures ? "bg-red-300" : "bg-foundry-subtle/60"}`} aria-hidden="true" />
+                    {state}
+                  </span>
                 </button>
-              )
-            ) : null}
-            {expanded && index < autoExpandFrom ? (
-              <button
-                type="button"
-                aria-expanded
-                onClick={() => setOpenGroups((current) => ({ ...current, [group.id]: false }))}
-                className="mt-1 pl-5 text-left text-[12px] text-foundry-subtle transition hover:text-foundry-muted"
-              >
-                collapse
-              </button>
-            ) : null}
-          </section>
+                {open ? (
+                  <>
+                    {group.voice ? <CanvasMarkdown value={group.voice} live={busy && isCurrent} /> : null}
+                    {group.events.length ? <ExecutionRail units={groupExecutionUnits(group.events)} /> : null}
+                  </>
+                ) : null}
+              </div>
+            </section>
+          </Fragment>
         );
       })}
     </div>
   );
 }
 
-/**
- * §Compact Verification Activity — the live gates and browser steps as a calm two-column card. Each
- * column renders only when it has real content; nothing is invented. Rows update in place as the mission
- * progresses (a running check shows a pulsing marker, then resolves to ✓ / ✕).
- */
-function LiveExecutionPanel({ checks, steps }: { checks: CanvasMissionVM["verification"]; steps: CanvasMissionVM["browserSteps"] }) {
-  const columns = Number(checks.length > 0) + Number(steps.length > 0);
-  return (
-    <div className={`grid gap-x-8 gap-y-4 rounded-xl border border-overlay/10 bg-overlay/[0.015] p-4 ${columns > 1 ? "sm:grid-cols-2" : ""}`} aria-label="Live execution">
-      {checks.length ? (
-        <section className="grid content-start gap-2">
-          <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-foundry-subtle">Verification</p>
-          <ul className="grid gap-1.5">
-            {checks.map((check) => (
-              <li key={check.label} className="flex items-baseline gap-2 border-b border-dashed border-overlay/8 pb-1.5 text-[13px] leading-6 last:border-0 last:pb-0">
-                <span className={`shrink-0 font-mono text-[11px] ${check.status === "pass" ? "text-foundry-teal" : check.status === "fail" ? "text-red-300" : "text-foundry-subtle"}`} aria-hidden="true">
-                  {check.status === "pass" ? "✓" : check.status === "fail" ? "✕" : "–"}
-                </span>
-                <span className={check.status === "fail" ? "text-red-300" : "text-foundry-muted"}>{check.label}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-      {steps.length ? (
-        <section className="grid content-start gap-2">
-          <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-foundry-subtle">Browser steps</p>
-          <ul className="grid gap-1.5">
-            {steps.map((step) => (
-              <li key={step.label} className="flex items-baseline gap-2 border-b border-dashed border-overlay/8 pb-1.5 text-[13px] leading-6 last:border-0 last:pb-0">
-                {step.status === "running" ? (
-                  <span className="relative flex h-2 w-2 translate-y-[-1px] shrink-0" aria-hidden="true">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foundry-teal/50" />
-                    <span className="relative inline-flex h-2 w-2 rounded-full bg-foundry-teal" />
-                  </span>
-                ) : (
-                  <span className={`shrink-0 font-mono text-[11px] ${step.status === "failed" ? "text-red-300" : "text-foundry-teal"}`} aria-hidden="true">
-                    {step.status === "failed" ? "✕" : "✓"}
-                  </span>
-                )}
-                <span className={step.status === "failed" ? "text-red-300" : "text-foundry-muted"}>{step.label}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-    </div>
-  );
-}
-
 function groupFailures(group: CanvasVoiceGroup): number {
   return group.events.filter((event) => event.status === "error").length;
-}
-
-function digestText(group: CanvasVoiceGroup): string {
-  const files = new Set(group.events.filter((event) => event.kind === "file" || event.kind === "edit").map((event) => event.filePath ?? event.text)).size;
-  const commands = group.events.filter((event) => event.kind === "command" || event.kind === "build").length;
-  const failures = groupFailures(group);
-  const totalMs = group.events.reduce((sum, event) => sum + (event.durationMs ?? 0), 0);
-  const parts: string[] = [];
-  if (files) parts.push(`${files} file${files === 1 ? "" : "s"}`);
-  if (commands) parts.push(`${commands} command${commands === 1 ? "" : "s"}`);
-  if (!parts.length) parts.push(`${group.events.length} event${group.events.length === 1 ? "" : "s"}`);
-  if (failures) parts.push(`${failures} failed`);
-  if (totalMs > 0) parts.push(formatDuration(totalMs));
-  return parts.join(" · ");
 }

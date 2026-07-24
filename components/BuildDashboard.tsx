@@ -37,9 +37,9 @@ import { deriveMissionDisplayStatus, isSoftwareProjectMission, projectBriefFromM
 import { continueOrResumeMission, recentProjects } from "@/lib/discovery/personalization";
 import { runDiscoveryEngine } from "@/lib/discovery/engine";
 import { FALLBACK_STACK_OPTIONS, type StackOption } from "@/lib/ai/project-discovery-llm";
-import { platformStackOptionsForProject, reconcilePlatformStackOptions } from "@/lib/discovery/platform-stack-policy";
+import { platformStackOptionsForProject } from "@/lib/discovery/platform-stack-policy";
 import { genericHistoryRecommendation, type HistoryRecommendation } from "@/lib/discovery/history-recommendations";
-import { deriveQuestionsAndAssumptions, discoverProject, explicitPlatformFromPrompt, explicitProjectNameFromPrompt, explicitStackFromPrompt, reconcileDiscoveryWithExplicitBrief } from "@/lib/ai/project-discovery";
+import { deriveQuestionsAndAssumptions, discoverProject, explicitPlatformFromPrompt, explicitProjectNameFromPrompt, explicitStackFromPrompt, isGenericPlaceholderValue, reconcileDiscoveryWithExplicitBrief } from "@/lib/ai/project-discovery";
 import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
 import { generatedWorkspaceForMission } from "@/lib/factory/live-project";
@@ -52,6 +52,7 @@ import { ModelModeSelector, ModelSelectionChip } from "@/components/ModelModeSel
 import { CredentialsSettings } from "@/components/integrations/CredentialsSettings";
 import { useModelMode } from "@/lib/ai/model-mode";
 import type { TierResolution } from "@/lib/ai/model-router";
+import { buildWorkspaceExecutionPlan, composeProjectArchitecture, defaultEnvironmentCapabilities, extractProductProfile, recommendStack } from "@/lib/certified-build";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 
@@ -159,6 +160,12 @@ type ExistingProjectStart = {
   description: string;
   /** Only meaningful when action is "convert-existing"/"clone-existing" — the stack the project should migrate to. */
   targetStack: string;
+  /**
+   * Workspace copy created the moment an upload is picked, so the preview can show the project
+   * before any mission runs. The first mission reuses this exact folder rather than making a second
+   * copy. Empty for sources that edit a real folder in place (local path / local agent connector).
+   */
+  uploadedWorkspacePath: string;
 };
 
 type FactoryView = "workspace" | "templates" | "settings" | "journal";
@@ -550,6 +557,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
       existingSourceChoice: null,
       description: "",
       targetStack: "",
+      uploadedWorkspacePath: "",
     });
   }
 
@@ -1568,6 +1576,52 @@ function lacksKindStepSignal(start: ProjectStart): boolean {
   return start.template.id === "custom" && !start.projectDescription.trim();
 }
 
+const coreDiscoveryDimensions = new Set<DiscoveryDimension>(["domain", "platform", "features", "data-shape"]);
+
+/** High-stakes product questions must be answered before a title-only prompt can cross into build
+ * instructions. Defaults remain visible and editable, but they are never silently promoted into the
+ * project contract merely because the user clicked Continue. */
+function unansweredCoreDiscoveryDecisions(start: ProjectStart): DiscoveryDecision[] {
+  return (start.discovery?.decisions ?? [])
+    .filter((decision) => decision.action === "ask" && coreDiscoveryDimensions.has(decision.dimension))
+    .filter((decision) => !start.discoveryAnswers[decision.dimension]?.trim())
+    .slice(0, 3);
+}
+
+function memoKnownFactsFor(start: ProjectStart, discovery: ProjectDiscoveryResult): string[] {
+  const projectName = explicitProjectNameFromPrompt(start.projectDescription)
+    ?? (start.projectDescription.trim().split(/\s+/).length <= 8 ? cleanProjectName(start.projectDescription) : "");
+  const confirmed = discovery.decisions
+    .filter((decision) => decision.action !== "ask" && (decision.source === "user-confirmed" || decision.source === "observed"))
+    .map((decision) => decision.hypothesis)
+    .filter((fact) => !fact.split(",").map((item) => item.trim()).every(isGenericPlaceholderValue))
+    .filter((fact) => !/not specific|needs confirmation|generic|placeholder/i.test(fact));
+  return [...new Set([projectName ? `Project name: ${projectName}` : "", ...confirmed].filter(Boolean))].slice(0, 8);
+}
+
+function discoveryUpdateFromConfirmedAnswers(start: ProjectStart): Partial<ProjectStart> | undefined {
+  const answers = Object.entries(start.discoveryAnswers).filter(([, answer]) => answer.trim());
+  if (!answers.length) return undefined;
+  const confirmedContext = answers.map(([dimension, answer]) => `${humanizeKey(dimension)}: ${answer.trim()}`).join(". ");
+  const enrichedBrief = `${start.projectDescription.trim()}. ${confirmedContext}`;
+  let discovery = reconcileDiscoveryWithExplicitBrief(discoverProject(enrichedBrief, start.template.id), enrichedBrief);
+  const selectedStyle = start.customStyle.trim() || (start.styleChoice ? styleDescriptions[start.styleChoice] : "");
+  if (selectedStyle) discovery = applyConfirmedStyle(discovery, selectedStyle);
+  const certified = recommendStack(extractProductProfile(enrichedBrief, discovery), defaultEnvironmentCapabilities());
+  const stackOptions: StackOption[] = certified.selectedStack ? [{ name: certified.selectedStack.displayName, why: certified.reasons.join(" "), recommended: true }] : [];
+  const stack = stackOptions[0]?.name || discovery.recommendedStack;
+  discovery = alignDiscoveryWithSelectionAndConstraints(discovery, start, stack);
+  return {
+    discovery,
+    discoveryProvenance: "deterministic",
+    stack,
+    customStack: "",
+    stackOptions,
+    alternativeStacks: certified.alternatives.map((option) => option.displayName),
+    lede: "Foundry incorporated your confirmed product answers and recalculated the project domain, architecture, data shape, and delivery stack.",
+  };
+}
+
 function CustomBuildStep({ start, onUpdate }: { start: ProjectStart; onUpdate: (update: Partial<ProjectStart>) => void }) {
   // Thin text-capture step — no local inference cluster anymore (inferCustomBuild and its helpers are
   // deleted). A Stage-A seed only enriches naming/subtype chips instantly; the real analysis always
@@ -1626,6 +1680,8 @@ function discoverySeedText(start: ProjectStart) {
 
 function deterministicDiscoveryIsSufficient(brief: string) {
   const words = brief.trim().split(/\s+/).filter(Boolean).length;
+  if (/\b(?:portfolio|product page|landing page|marketing site|brochure site|documentation site|docs site|business website)\b/i.test(brief)
+    && !/\b(?:auth|login|sign[- ]?up|account|checkout|payment|database|admin|dashboard|api)\b/i.test(brief)) return true;
   if (explicitStackFromPrompt(brief)) return words >= 5;
   // Require more than a bare "Android app"-style label: platform plus a concrete product/workflow
   // is enough for the local policy, while genuinely underspecified requests still get refinement.
@@ -1684,7 +1740,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
     // A real gpt-5 analysis has been observed taking 60-80+ seconds; 110s is the hard ceiling. This is a
     // Promise.race that resolves to a heuristic fallback rather than aborting the shared request, so a
     // remount's own timer can never tear down an in-flight discovery the cache is serving.
-    const hardTimeoutMs = 60_000;
+    const hardTimeoutMs = 8_000;
     const startedAt = Date.now();
 
     async function refine() {
@@ -1699,11 +1755,13 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
       // (starter or freeform) goes through the same real analysis, not a cached guess. It also doubles
       // as the fallback memo content if the LLM call fails, so the user never lands on a blank summary
       // step just because OPENAI_API_KEY is unset or the network hiccups.
-      const heuristic = discoverProject(seedText);
+      // The starter the user picked is authoritative for the domain profile — without it a "creative
+      // agency" brief matched no keyword and fell back to CRUD-app defaults on a Website starter.
+      const heuristic = discoverProject(seedText, start.template.id);
       // An explicit platform or stack is already an authoritative architecture constraint. Waiting
       // for a remote model to rediscover "Android" (or iOS, WPF, FastAPI, etc.) adds latency and cost
       // without resolving an unknown. Reconcile it through the same universal stack policy locally.
-      if (start.template.id === "custom" && deterministicDiscoveryIsSufficient(seedText)) {
+      if (deterministicDiscoveryIsSufficient(seedText)) {
         const resolvedDiscovery = reconcileDiscoveryWithExplicitBrief({
           ...reconcileKnownStarterDiscovery(heuristic, start),
           // A broad commerce keyword such as "checkout" must not rename a specifically described
@@ -1711,9 +1769,9 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           projectType: cleanProjectName(seedText) || heuristic.projectType,
           prompt: seedText,
         }, seedText);
-        const platformContract = reconcilePlatformStackOptions(start.template.id, resolvedDiscovery, fallbackStackOptionsFor(resolvedDiscovery, start));
-        const resolvedStackOptions = platformContract.stackOptions;
-        const resolvedStack = resolvedStackOptions.find((option) => option.recommended)?.name || platformContract.recommendedStack || resolvedDiscovery.recommendedStack;
+        const certifiedRecommendation = recommendStack(extractProductProfile(seedText, resolvedDiscovery), defaultEnvironmentCapabilities());
+        const resolvedStackOptions: StackOption[] = certifiedRecommendation.selectedStack ? [{ name: certifiedRecommendation.selectedStack.displayName, why: certifiedRecommendation.reasons.join(" "), recommended: true }] : [];
+        const resolvedStack = resolvedStackOptions[0]?.name || resolvedDiscovery.recommendedStack;
         const authoritativeDiscovery = alignDiscoveryWithSelectionAndConstraints(resolvedDiscovery, start, resolvedStack);
         onUpdate({
           discovery: authoritativeDiscovery,
@@ -1721,7 +1779,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           stack: resolvedStack,
           customStack: "",
           projectName: start.projectNameTouched ? start.projectName : cleanProjectName(authoritativeDiscovery.projectType),
-          alternativeStacks: resolvedStackOptions.filter((option) => option.name !== resolvedStack).map((option) => option.name),
+          alternativeStacks: certifiedRecommendation.alternatives.map((option) => option.displayName),
           deploymentNote: "Deployment will follow the selected platform's native packaging and runtime requirements.",
           lede: "Foundry used the explicit platform and product requirements in your brief.",
           stackOptions: resolvedStackOptions,
@@ -1764,12 +1822,12 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           cachedRequest.promise,
           wait(hardTimeoutMs).then((): DiscoveryEngineOutcome => {
             cachedRequest.abort();
-            return { ok: false, error: "Discovery analysis exceeded the 60-second time budget and was cancelled." };
+            return { ok: false, error: "Discovery analysis exceeded the 8-second user-facing time budget and was cancelled." };
           }),
         ]);
         if (!cancelledRef.current) {
           if (!result.ok || !result.discovery) {
-            setDiscoveryError(result.error || "Discovery could not produce a complete project decision.");
+            skipRefinement();
             return;
           }
           const rawDiscovery = result.discovery;
@@ -1779,9 +1837,7 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
             // Android vendor SDK requirement authoritative when the model proposes a web bridge.
             prompt: start.projectDescription.trim() || rawDiscovery.prompt,
           };
-          const proposedStackOptions = Array.isArray(result.stackOptions) && result.stackOptions.length ? result.stackOptions : fallbackStackOptionsFor(resolvedDiscovery, start);
-          const platformContract = reconcilePlatformStackOptions(start.template.id, resolvedDiscovery, proposedStackOptions);
-          const resolvedStackOptions = platformContract.stackOptions;
+          const resolvedStackOptions = Array.isArray(result.stackOptions) ? result.stackOptions : [];
           const recommendedOption = resolvedStackOptions.find((option) => option.recommended);
           const resolvedStack = recommendedOption?.name || resolvedDiscovery.recommendedStack;
           const authoritativeDiscovery = alignDiscoveryWithSelectionAndConstraints(resolvedDiscovery, start, resolvedStack);
@@ -1802,10 +1858,10 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           });
           completed = true;
         }
-      } catch (error) {
+      } catch {
         // Network error or malformed response — fall back to the heuristic-only memo rather than
         // leaving start.discovery null and the summary step blank.
-        if (!cancelledRef.current) setDiscoveryError(error instanceof Error ? error.message : "Discovery failed before returning a project decision.");
+        if (!cancelledRef.current) skipRefinement();
       } finally {
         window.clearTimeout(escapeTimer);
         const remaining = minVisibleMs - (Date.now() - startedAt);
@@ -1831,8 +1887,10 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
     if (!start.discovery) {
       const seedText = discoverySeedText(start);
       if (seedText.trim()) {
-        const heuristic = discoverProject(seedText);
-        onUpdate({ discovery: heuristic, discoveryProvenance: "rough", projectName: start.projectNameTouched ? start.projectName : cleanProjectName(heuristic.projectType) });
+        const heuristic = discoverProject(seedText, start.template.id);
+        const certified = recommendStack(extractProductProfile(seedText, heuristic), defaultEnvironmentCapabilities());
+        const stackOptions: StackOption[] = certified.selectedStack ? [{ name: certified.selectedStack.displayName, why: certified.reasons.join(" "), recommended: true }] : [];
+        onUpdate({ discovery: { ...heuristic, recommendedStack: stackOptions[0]?.name ?? heuristic.recommendedStack }, discoveryProvenance: "rough", stack: stackOptions[0]?.name ?? heuristic.recommendedStack, customStack: "", stackOptions, alternativeStacks: certified.alternatives.map((option) => option.displayName), projectName: start.projectNameTouched ? start.projectName : cleanProjectName(heuristic.projectType) });
       }
     }
     onAdvance();
@@ -2010,7 +2068,6 @@ function ProjectStartFlow({
 }) {
   const projectUploadInputRef = useRef<HTMLInputElement | null>(null);
   const instructionAttachmentInputRef = useRef<HTMLInputElement | null>(null);
-  const stackOptions = start.stackOptions.length ? start.stackOptions : FALLBACK_STACK_OPTIONS;
   const selectedRecommendation = recommendationForStart(start);
   const canUseFolderPicker = supportsBrowserFolderAccess();
   const hasVisualExperience = projectNeedsVisualStyle(start);
@@ -2040,35 +2097,6 @@ function ProjectStartFlow({
   useEffect(() => {
     if (step === "style" && !hasVisualExperience) onStepChange("summary");
   }, [hasVisualExperience, onStepChange, step]);
-
-  // Keeps discovery.recommendedStack in sync with the user's actual pick — projectBriefFor() and the
-  // memo's "Recommended stack" field both read discovery.recommendedStack, so without this the build
-  // silently used whatever the heuristic/LLM guessed first regardless of what was clicked here.
-  function selectStack(name: string, customStack = "") {
-    const resolved = (customStack || name).trim();
-    if (!start.discovery || !resolved) {
-      onUpdate({ stack: name, customStack });
-      return;
-    }
-    // Switching away from the originally-recommended stack invalidates any framework-specific
-    // architecture language (e.g. "Next.js App Router with Server Actions") — replace it with a
-    // stack-neutral description instead of leaving a wrong, stack-mismatched claim in the memo.
-    const stackChanged = !sameStackChoice(resolved, start.discovery.recommendedStack);
-    const nextArchitecture = stackChanged ? genericArchitectureFor(resolved, start.discovery.dataModel, start.discovery.projectType, start.discovery.mainFeatures) : start.discovery.architecture;
-    onUpdate({
-      stack: name,
-      customStack,
-      discovery: {
-        ...start.discovery,
-        recommendedStack: resolved,
-        architecture: nextArchitecture,
-        decisions: stackChanged
-          ? start.discovery.decisions.map((decision) => (decision.dimension === "architecture" ? { ...decision, hypothesis: nextArchitecture } : decision))
-          : start.discovery.decisions,
-        keyFacts: stackChanged ? refreshArchitectureKeyFact(start.discovery.keyFacts, start.discovery.recommendedStack, resolved) : start.discovery.keyFacts,
-      },
-    });
-  }
 
   const pollAgentStatus = useCallback(async () => {
     const health = await checkAgentHealth(agentUrl, agentToken);
@@ -2180,6 +2208,7 @@ function ProjectStartFlow({
   const activeSourceNames = start.projectLocation === "create-folder" ? connectedFolderEntries : start.projectLocation === "connect-existing" ? start.uploadNames : [];
   const existingSourceRisky = activeSourceNames.length > 0 && inspectExistingSourceNames(activeSourceNames).risky;
   const blockedByExistingSource = existingSourceRisky && !start.existingSourceChoice;
+  const blockedByUnansweredDiscovery = unansweredCoreDiscoveryDecisions(start).length > 0;
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-shade/75 p-4 backdrop-blur-md" role="dialog" aria-modal="true">
@@ -2434,7 +2463,7 @@ function ProjectStartFlow({
           {step === "understanding" ? <UnderstandingStep start={start} onUpdate={onUpdate} onAdvance={() => onStepChange("stack")} /> : null}
 
           {step === "stack" ? (
-            <FlowSection eyebrow="Foundry recommends, doesn't force" title="Pick a complete delivery stack — or trust the recommendation." body="Each option covers framework, runtime, persistence, security, required integrations, testing, and deployment for this project. Foundry build support is reported separately from architectural fit.">
+            <FlowSection eyebrow="Foundry's engineering recommendation" title="The delivery system is selected for you." body="Foundry chooses the smallest complete architecture that satisfies the product and that it can genuinely execute end to end.">
               {start.discoveryProvenance === "rough" ? (
                 <div role="status" className="mb-4 rounded-lg border border-foundry-amber/25 bg-foundry-amber/[0.06] px-3 py-2 text-xs leading-5 text-foundry-muted">
                   Rough local pass — the AI discovery call did not complete. These choices are provisional and are not presented as a verified model recommendation.
@@ -2450,28 +2479,18 @@ function ProjectStartFlow({
                   Brief-derived decision: your explicit platform and requirements were sufficient to select compatible delivery stacks locally. No discovery model call was needed.
                 </div>
               ) : null}
-              <div className="grid gap-2.5 sm:grid-cols-2">
-                {stackOptions.map((option) => (
-                  <StackCard
-                    key={option.name}
-                    recommendation={{ name: option.name, why: option.why, recommended: option.recommended, defaults: [] }}
-                    active={!start.customStack.trim() && start.stack === option.name}
-                    onClick={() => selectStack(option.name)}
-                  />
-                ))}
+              <div className="rounded-lg border border-foundry-teal/30 bg-foundry-teal/[0.07] p-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="section-kicker">Recommended delivery stack</p>
+                    <h3 className="mt-2 text-lg font-extrabold text-foundry-ink">{selectedRecommendation.name}</h3>
+                    <p className="mt-2 text-[13px] leading-relaxed text-foundry-muted">{selectedRecommendation.why}</p>
+                  </div>
+                  <CheckCircle2 className="shrink-0 text-foundry-teal" size={22} />
+                </div>
+                <p className="mt-4 border-t border-foundry-teal/15 pt-3 text-xs leading-5 text-foundry-subtle">{stackCapabilityLine(selectedRecommendation.name)}</p>
               </div>
 
-              <label className="mt-6 flex items-baseline gap-2.5 text-[15px]">
-                <span className="whitespace-nowrap font-serif italic text-foundry-subtle">or, another stack —</span>
-                <input
-                  className="flex-1 border-0 border-b border-overlay/10 bg-transparent p-0 pb-1.5 text-foundry-ink outline-none placeholder:text-foundry-subtle focus:border-foundry-teal/50"
-                  value={start.customStack}
-                  onChange={(event) => selectStack(start.stack, event.target.value)}
-                  placeholder="type any language or framework…"
-                />
-              </label>
-
-              <p className="mt-5 text-[13px] leading-relaxed text-foundry-muted">{selectedRecommendation.why}</p>
             </FlowSection>
           ) : null}
 
@@ -2604,11 +2623,20 @@ function ProjectStartFlow({
                     {step === "project" && blockedByExistingSource ? (
                       <p className="max-w-xs text-right text-xs leading-5 text-foundry-amber">Choose what Foundry should do about the existing files before continuing.</p>
                     ) : null}
+                    {step === "summary" && blockedByUnansweredDiscovery ? (
+                      <p className="max-w-sm text-right text-xs leading-5 text-foundry-amber">Answer the remaining product questions before Foundry finalizes the architecture and build brief.</p>
+                    ) : null}
                     <button
                       className="inline-flex items-center gap-2 rounded-md bg-foundry-teal px-5 py-2.5 text-[13.5px] font-bold text-foundry-bg shadow-[0_6px_20px_-8px_rgba(79,209,189,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
                       type="button"
-                      disabled={(step === "kind" && lacksKindStepSignal(start)) || (step === "project" && blockedByExistingSource)}
-                      onClick={() => onStepChange(nextStep)}
+                      disabled={(step === "kind" && lacksKindStepSignal(start)) || (step === "project" && blockedByExistingSource) || (step === "summary" && blockedByUnansweredDiscovery)}
+                      onClick={() => {
+                        if (step === "summary") {
+                          const confirmedUpdate = discoveryUpdateFromConfirmedAnswers(start);
+                          if (confirmedUpdate) onUpdate(confirmedUpdate);
+                        }
+                        onStepChange(nextStep);
+                      }}
                     >
                       Continue <span aria-hidden="true">→</span>
                     </button>
@@ -2617,7 +2645,7 @@ function ProjectStartFlow({
                   <button
                     className="inline-flex items-center gap-2 rounded-md bg-foundry-amber px-5 py-2.5 text-[13.5px] font-bold text-foundry-bg shadow-[0_6px_20px_-8px_rgba(232,183,92,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
                     type="button"
-                    disabled={blockedByExistingSource}
+                    disabled={blockedByExistingSource || blockedByUnansweredDiscovery}
                     onClick={onCreate}
                   >
                     Looks good — build it <span aria-hidden="true">→</span>
@@ -2694,11 +2722,33 @@ function ExistingProjectFlow({
   const needsTargetStack = start.action === "convert-existing" || start.action === "clone-existing";
   const targetStackMissing = needsTargetStack && !start.targetStack.trim();
 
+  /**
+   * Opening a project is itself a preview trigger. A browser upload has no folder on disk, so the
+   * workspace copy is created here — at pick time — and the mission later reuses that same copy.
+   * Failure is silent by design: this only decides whether the preview can attach early, and must
+   * never block the user from opening the project.
+   */
+  async function materializeUploadForPreview(uploadedFiles: FactoryUploadedFile[]) {
+    if (!uploadedFiles.length) return;
+    try {
+      const response = await fetch("/api/factory/upload-intake", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ files: uploadedFiles, projectName: openedExistingProjectSummary(uploadedFiles.map((file) => file.path)) }),
+      });
+      const result = (await response.json().catch(() => null)) as { ok?: boolean; projectPath?: string } | null;
+      if (response.ok && result?.ok && result.projectPath) onUpdateRef.current({ uploadedWorkspacePath: result.projectPath });
+    } catch {
+      // The project still opens; the preview attaches once the first mission materializes the copy.
+    }
+  }
+
   async function handleExistingUpload(files: FileList | null) {
     setImportingUpload(true);
     try {
       const uploadedFiles = await selectedUploadedFiles(files);
-      onUpdate({ uploadNames: uploadedFiles.map((file) => file.path), uploadedFiles, source: "upload", existingSourceConfirmed: false, existingSourceChoice: null });
+      onUpdate({ uploadNames: uploadedFiles.map((file) => file.path), uploadedFiles, source: "upload", existingSourceConfirmed: false, existingSourceChoice: null, uploadedWorkspacePath: "" });
+      void materializeUploadForPreview(uploadedFiles);
     } finally {
       setImportingUpload(false);
     }
@@ -2724,7 +2774,11 @@ function ExistingProjectFlow({
       localConnectorToken: "",
       existingSourceConfirmed: false,
       existingSourceChoice: null,
+      uploadedWorkspacePath: "",
     });
+    // With a local agent the real folder is edited in place and previews from there, so no copy is
+    // made. Without one this is an uploaded copy like any other, and needs a folder to preview from.
+    if (!agent) void materializeUploadForPreview(files);
   }
 
   const pollAgentStatus = useCallback(async () => {
@@ -3562,37 +3616,6 @@ function ChipButton({ active, label, onClick }: { active: boolean; label: string
   );
 }
 
-function CapabilityBadge({ level }: { level: number }) {
-  const styles: Record<number, string> = {
-    4: "border-foundry-teal/40 text-foundry-teal",
-    3: "border-foundry-amber/45 text-foundry-amber",
-    2: "border-overlay/15 text-foundry-muted",
-    1: "border-red-300/40 text-red-300",
-  };
-  return <span title="Foundry build and verification support" aria-label={`Foundry build support ${level} of 4`} className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[9.5px] tracking-wide ${styles[level] ?? styles[2]}`}>build support {level}/4</span>;
-}
-
-function StackCard({ recommendation, active, onClick }: { recommendation: StackRecommendation; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`rounded-lg border px-4 py-4 text-left transition ${
-        active ? "border-foundry-teal/50 bg-foundry-teal/[0.07] shadow-[inset_0_0_0_1px_rgba(79,209,189,0.3)]" : "border-overlay/10 bg-overlay/[0.03] hover:border-overlay/20"
-      }`}
-    >
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="font-serif text-[19px] text-foundry-ink">{recommendation.name}</span>
-        {recommendation.recommended ? <span className="font-mono text-[9.5px] uppercase tracking-wider text-foundry-amber">★ recommended</span> : null}
-      </div>
-      <p className="m-0 text-[12.5px] leading-relaxed text-foundry-muted">{recommendation.why}</p>
-      <div className="mt-2.5">
-        <CapabilityBadge level={capabilityLevelForStackChoice(recommendation.name).level} />
-      </div>
-    </button>
-  );
-}
-
 function UploadSummary({ names }: { names: string[] }) {
   if (!names.length) {
     return <p className="mt-3 text-xs leading-5 text-foundry-subtle">No files selected yet.</p>;
@@ -3735,24 +3758,14 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
 
   const disclosedDecisions = discovery.decisions.filter((decision) => decision.action !== "silent-infer");
   const questionDecisions = discovery.decisions.filter((decision) => decision.action === "ask").slice(0, 3);
-  const alternativeStacks = alternativeStacksFor(start);
+  const unresolvedCoreDecisions = unansweredCoreDiscoveryDecisions(start);
+  const discoveryIncomplete = unresolvedCoreDecisions.length > 0;
+  const knownFacts = memoKnownFactsFor(start, discovery);
+  const meaningfulFeatures = discovery.mainFeatures.filter((item) => !isGenericPlaceholderValue(item));
+  const meaningfulEntities = discovery.dataModel.filter((item) => !isGenericPlaceholderValue(item));
   const stackCapability = capabilityLevelForStackChoice(selectedStackFor(start));
   const stackCapabilityNote = stackCapabilityNoteFor(stackCapability);
   const memoSections = memoSectionsFor(discovery.decisions);
-
-  function applyAlternativeStack(name: string) {
-    const stackChanged = name !== currentDiscovery.recommendedStack;
-    const nextArchitecture = stackChanged ? genericArchitectureFor(name, currentDiscovery.dataModel, currentDiscovery.projectType, currentDiscovery.mainFeatures) : currentDiscovery.architecture;
-    updateDiscovery({
-      recommendedStack: name,
-      architecture: nextArchitecture,
-      decisions: stackChanged
-        ? currentDiscovery.decisions.map((decision) => (decision.dimension === "architecture" ? { ...decision, hypothesis: nextArchitecture } : decision))
-        : currentDiscovery.decisions,
-      keyFacts: stackChanged ? refreshArchitectureKeyFact(currentDiscovery.keyFacts, currentDiscovery.recommendedStack, name) : currentDiscovery.keyFacts,
-    });
-    onUpdate({ stack: name, customStack: "" });
-  }
 
   return (
     <div className="grid gap-9">
@@ -3761,14 +3774,14 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
           <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Foundry&apos;s Understanding</p>
           <ModelSelectionChip selection={start.modelSelection} showModelNames={showModelNames} />
         </div>
-        <p className="font-serif text-[17px] leading-[1.75] text-foundry-ink">{ledeFor(start)}</p>
+        <p className="font-serif text-[17px] leading-[1.75] text-foundry-ink">{discoveryIncomplete ? "Foundry knows the project name, but the product itself is not defined well enough to finalize its architecture. Answer the remaining product questions below; provisional defaults will not be treated as confirmed requirements." : ledeFor(start)}</p>
       </div>
 
-      {discovery.keyFacts.length ? (
+      {knownFacts.length ? (
         <div>
           <p className="mb-2.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">What Foundry Already Knows</p>
           <ul className="grid gap-2 sm:grid-cols-2">
-            {discovery.keyFacts.map((fact, index) => (
+            {knownFacts.map((fact, index) => (
               <li key={`${fact}-${index}`} className="flex items-baseline gap-2 text-[13.5px] leading-relaxed text-foundry-ink">
                 <CheckCircle2 size={13} className="mt-[3px] shrink-0 text-foundry-teal" />
                 {fact}
@@ -3785,7 +3798,9 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
             {section.items.map((decision) => (
               <li key={decision.dimension}>
                 <div className="flex items-baseline gap-2.5 text-[13.5px] leading-relaxed">
-                  <CheckCircle2 size={13} className="mt-[3px] shrink-0 text-foundry-teal" />
+                  {section.label === "Provisional Defaults"
+                    ? <span className="mt-[1px] w-[13px] shrink-0 text-center font-mono text-[11px] text-foundry-amber">~</span>
+                    : <CheckCircle2 size={13} className="mt-[3px] shrink-0 text-foundry-teal" />}
                   <span className="font-bold text-foundry-ink">{decision.hypothesis}</span>
                 </div>
                 {decision.rationale ? <p className="mt-0.5 pl-[21px] font-serif text-[12.5px] italic leading-relaxed text-foundry-subtle">{decision.rationale}</p> : null}
@@ -3797,29 +3812,21 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
 
       <div className="grid gap-5 sm:grid-cols-2">
         <ReadableField label="Project type" value={discovery.projectType} onChange={(value) => updateDiscovery({ projectType: value })} />
-        <ReadableField label="Recommended stack" value={discovery.recommendedStack} onChange={(value) => updateDiscovery({ recommendedStack: value })} />
+        <div className="grid gap-1.5">
+          <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">{discoveryIncomplete ? "Provisional stack" : "Foundry-selected stack"}</span>
+          <p className="text-[14px] leading-[1.55] text-foundry-ink">{discovery.recommendedStack}</p>
+        </div>
       </div>
 
-      {alternativeStacks.length ? (
-        <div>
-          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Alternative Stacks</p>
-          <div className="border-t border-overlay/[0.07]">
-            {alternativeStacks.map((name) => (
-              <div key={name} className="flex items-center justify-between gap-3 border-b border-overlay/[0.07] py-2.5 text-[13.5px] text-foundry-ink">
-                <span>{name}</span>
-                <button className="font-mono text-[10.5px] text-foundry-subtle transition hover:text-foundry-teal" type="button" onClick={() => applyAlternativeStack(name)}>
-                  use instead →
-                </button>
-              </div>
-            ))}
-          </div>
+      {meaningfulFeatures.length ? <ReadableArea label="Main features" value={meaningfulFeatures.join("\n")} onChange={(value) => updateList("mainFeatures", value)} /> : null}
+      {meaningfulEntities.length ? <ReadableArea label="Data model / entities" value={meaningfulEntities.join("\n")} onChange={(value) => updateList("dataModel", value)} /> : null}
+      {discoveryIncomplete && !meaningfulFeatures.length && !meaningfulEntities.length ? (
+        <div className="rounded-md border border-foundry-amber/25 bg-foundry-amber/[0.06] px-4 py-3 text-[13px] leading-6 text-foundry-muted">
+          Features and data entities are not established yet. Foundry will derive them from your answers instead of building generic Item/User/Record placeholders.
         </div>
       ) : null}
 
-      <ReadableArea label="Main features" value={discovery.mainFeatures.join("\n")} onChange={(value) => updateList("mainFeatures", value)} />
-      <ReadableArea label="Data model / entities" value={discovery.dataModel.join("\n")} onChange={(value) => updateList("dataModel", value)} />
-
-      {discovery.futureCapabilities.length ? (
+      {!discoveryIncomplete && discovery.futureCapabilities.length ? (
         <div>
           <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Growth Strategy</p>
           <p className="mb-2.5 font-serif text-[13.5px] italic leading-relaxed text-foundry-subtle">
@@ -3836,7 +3843,7 @@ function ProjectDiscoveryMemo({ start, onUpdate }: { start: ProjectStart; onUpda
         </div>
       ) : null}
 
-      <ReadableArea label="Deployment" value={deploymentNoteFor(start)} onChange={(value) => onUpdate({ deploymentNote: value })} />
+      {!discoveryIncomplete ? <ReadableArea label="Deployment" value={deploymentNoteFor(start)} onChange={(value) => onUpdate({ deploymentNote: value })} /> : null}
 
       {stackCapabilityNote ? (
         <div className={`flex gap-2.5 border-l-2 py-1 pl-3.5 text-[12.5px] leading-relaxed text-foundry-muted ${stackCapability.level >= 4 ? "border-foundry-teal" : stackCapability.level >= 2 ? "border-foundry-amber" : "border-red-300/60"}`}>
@@ -4233,16 +4240,6 @@ function refreshArchitectureKeyFact(keyFacts: string[], oldStack: string, newSta
   return swapped.filter((fact, index) => swapped.indexOf(fact) === index);
 }
 
-function alternativeStacksFor(start: ProjectStart) {
-  if (start.alternativeStacks.length) return start.alternativeStacks;
-  const selected = selectedStackFor(start);
-  const options = start.stackOptions.length ? start.stackOptions : FALLBACK_STACK_OPTIONS;
-  return options
-    .map((item) => item.name)
-    .filter((name) => name !== selected)
-    .slice(0, 3);
-}
-
 function deploymentNoteFor(start: ProjectStart) {
   if (start.deploymentNote.trim()) return start.deploymentNote;
   const stack = selectedStackFor(start).toLowerCase();
@@ -4269,7 +4266,13 @@ function ledeFor(start: ProjectStart) {
 function reconcileKnownStarterDiscovery(discovery: ProjectDiscoveryResult, start: ProjectStart): ProjectDiscoveryResult {
   if (start.template.id === "custom") return discovery;
   const established = new Set<DiscoveryDimension>(["domain", "platform", "data-shape", "features"]);
-  const decisions = discovery.decisions.map((item) => established.has(item.dimension) && item.action === "ask"
+  // Choosing a starter confirms the DOMAIN and PLATFORM — it does not mean the user picked Foundry's
+  // placeholder features or entities. Stamping those as user-confirmed is how "Primary workspace" and
+  // "Item, User, Record" appeared as capabilities the user had supposedly chosen.
+  const placeholderOnly = (item: { dimension: DiscoveryDimension; hypothesis: string }) =>
+    (item.dimension === "features" || item.dimension === "data-shape")
+    && item.hypothesis.split(",").map((part) => part.trim()).filter(Boolean).every(isGenericPlaceholderValue);
+  const decisions = discovery.decisions.map((item) => established.has(item.dimension) && item.action === "ask" && !placeholderOnly(item)
     ? { ...item, confidence: Math.max(90, item.confidence), source: "user-confirmed" as const, action: "silent-infer" as const, question: undefined }
     : item);
   const { questions, assumptions } = deriveQuestionsAndAssumptions(decisions);
@@ -4377,27 +4380,6 @@ function sameStackChoice(left: string, right: string) {
   return normalize(left) === normalize(right);
 }
 
-function fallbackStackOptionsFor(discovery: ProjectDiscoveryResult, start: ProjectStart): StackOption[] {
-  const platformOptions = platformStackOptionsForProject(start.template.id, discovery);
-  if (platformOptions.length) return platformOptions;
-  const evidence = `${discovery.projectType} ${discovery.prompt} ${discovery.architecture}`.toLowerCase();
-  const contentOnlyWeb = /\b(content|public|marketing|portfolio|club|venue|studio|website)\b/.test(evidence)
-    && /\b(no|without) (?:login|auth|database|backend)\b/.test(evidence);
-  if (contentOnlyWeb) {
-    return [
-      { name: "Astro + TypeScript", why: "Content-first pages, strong accessibility, and minimal client JavaScript fit a public site without a database.", recommended: true },
-      { name: "Next.js + TypeScript", why: "A strong alternative when the site is likely to add server features or richer application behavior later.", recommended: false },
-      { name: "Vite + React + TypeScript", why: "Useful when the experience needs more client-side interaction while remaining a static deployment.", recommended: false },
-      { name: "Static HTML + CSS + JavaScript", why: "The smallest dependency surface for a simple content site with only lightweight form behavior.", recommended: false },
-    ];
-  }
-  const recommended = discovery.recommendedStack.trim() || FALLBACK_STACK_OPTIONS[0].name;
-  return [
-    { name: recommended, why: `Matches the inferred ${discovery.projectType} architecture and first-version requirements.`, recommended: true },
-    ...FALLBACK_STACK_OPTIONS.filter((item) => item.name.toLowerCase() !== recommended.toLowerCase()).map((item) => ({ ...item, recommended: false })),
-  ].slice(0, 5);
-}
-
 function applyConfirmedStyle(discovery: ProjectDiscoveryResult, direction: string): ProjectDiscoveryResult {
   const decisions = discovery.decisions.map((item) => item.dimension === "style"
     ? {
@@ -4424,7 +4406,7 @@ const sectionForDimension: Partial<Record<DiscoveryDimension, string>> = {
   features: "Product Experience",
 };
 
-const sectionOrder = ["Architectural Direction", "Product Experience"];
+const sectionOrder = ["Architectural Direction", "Product Experience", "Provisional Defaults"];
 
 function memoSectionsFor(decisions: DiscoveryDecision[]) {
   const groups = new Map<string, DiscoveryDecision[]>();
@@ -4432,7 +4414,7 @@ function memoSectionsFor(decisions: DiscoveryDecision[]) {
     // Decisions Foundry is asking about live only in "Remaining Unknowns" — showing
     // them here too would repeat the same open question twice on the page.
     if (decision.action === "ask") continue;
-    const label = sectionForDimension[decision.dimension];
+    const label = decision.source === "defaulted" ? "Provisional Defaults" : sectionForDimension[decision.dimension];
     if (!label) continue;
     if (!groups.has(label)) groups.set(label, []);
     groups.get(label)?.push(decision);
@@ -4616,6 +4598,11 @@ function connectedPathForMission(mission: MissionState, execution: FactoryProjec
   const generatedWorkspace = generatedWorkspaceForMission(mission);
   if (generatedWorkspace) return generatedWorkspace.projectPath;
   const brief = projectBriefFromMission(mission);
+  // An upload materialized at pick time already has a real workspace folder. Preferring it over the
+  // browser folder *name* is what lets the preview dock attach before any mission has run — a name
+  // is not a path, and the preview needs a path.
+  const uploadedWorkspacePath = brief.match(/^Foundry workspace copy:\s*(.+)$/im)?.[1]?.trim() ?? "";
+  if (uploadedWorkspacePath) return uploadedWorkspacePath;
   const browserFolderName = brief.match(/^Browser folder name:\s*(.+)$/im)?.[1]?.trim() ?? "";
   if (browserFolderName) return browserFolderName;
   const localPath = brief.match(/^Local project path:\s*(.+)$/im)?.[1]?.trim() ?? "";
@@ -4740,6 +4727,10 @@ function structuredDiscoveryFor(start: ProjectStart): StructuredDiscovery | unde
 function projectBriefFor(start: ProjectStart) {
   const recommendation = recommendationForStart(start);
   const selectedStack = start.discovery?.recommendedStack || selectedStackFor(start);
+  const productProfile = extractProductProfile(discoverySeedText(start), start.discovery ?? undefined);
+  const certifiedRecommendation = recommendStack(productProfile, defaultEnvironmentCapabilities());
+  const projectArchitecture = composeProjectArchitecture(productProfile, certifiedRecommendation);
+  const workspaceExecutionPlan = projectArchitecture ? buildWorkspaceExecutionPlan(projectArchitecture) : null;
   const defaults = recommendation.defaults;
   // For a freeform build the current brief/discovery is the source of truth. Reusing the
   // mutable projectName seed here allowed an older dashboard prompt (for example Inventory
@@ -4753,6 +4744,9 @@ function projectBriefFor(start: ProjectStart) {
     .map(([dimension, answer]) => `${humanizeKey(dimension)}: ${answer.trim()}`);
   const customInstructions = start.instructions.trim() || (answeredQuestions.length ? answeredQuestions.join("; ") : "");
   const customInstructionsSummary = customInstructions.replace(/\s+/g, " ").trim();
+  const establishedFeatures = (discovery?.mainFeatures ?? []).filter((item) => !isGenericPlaceholderValue(item));
+  const establishedEntities = (discovery?.dataModel ?? []).filter((item) => !isGenericPlaceholderValue(item));
+  const establishedFacts = (discovery?.keyFacts ?? []).filter((item) => !isGenericPlaceholderValue(item) && !/not specific|needs confirmation|generic|placeholder/i.test(item));
   const liveFolderMode = start.projectLocation === "connect-existing" && Boolean(start.browserFolderHandleId);
   const uploadedCopyMode = start.projectLocation === "connect-existing" && !start.browserFolderHandleId && start.uploadedFiles.length > 0;
   const connectorMode = start.projectLocation === "create-folder" && Boolean(start.localConnectorRoot);
@@ -4789,12 +4783,16 @@ function projectBriefFor(start: ProjectStart) {
     start.projectDescription ? `Project description: ${start.projectDescription}` : "",
     `Project type: ${discovery?.projectType || start.customSubtype.trim() || start.subtype}`,
     `Selected stack: ${selectedStack}`,
-    alternativeStacksFor(start).length ? `Alternative stacks: ${alternativeStacksFor(start).join("; ")}` : "",
+    `Certified stack id: ${certifiedRecommendation.selectedStackId ?? "none"}`,
+    `Product profile: ${JSON.stringify(productProfile)}`,
+    `Stack decision: ${JSON.stringify({ selectedStackId: certifiedRecommendation.selectedStackId, reasons: certifiedRecommendation.reasons, tradeoffs: certifiedRecommendation.tradeoffs, limitations: certifiedRecommendation.limitations, environmentRequirements: certifiedRecommendation.environmentRequirements, confidence: certifiedRecommendation.confidence })}`,
+    projectArchitecture ? `Project architecture: ${JSON.stringify(projectArchitecture)}` : "",
+    workspaceExecutionPlan ? `Certified workspace execution plan: ${JSON.stringify(workspaceExecutionPlan)}` : "",
     `Architecture: ${discovery?.architecture || recommendation.why}`,
     discovery?.styleDirection ? `Style direction: ${discovery.styleDirection}` : "",
-    discovery?.mainFeatures.length ? `Main features: ${discovery.mainFeatures.join("; ")}` : "",
-    discovery?.dataModel.length ? `Data model/entities: ${discovery.dataModel.join("; ")}` : "",
-    discovery?.keyFacts.length ? `Key facts: ${discovery.keyFacts.join("; ")}` : "",
+    establishedFeatures.length ? `Main features: ${establishedFeatures.join("; ")}` : "",
+    establishedEntities.length ? `Data model/entities: ${establishedEntities.join("; ")}` : "",
+    establishedFacts.length ? `Key facts: ${establishedFacts.join("; ")}` : "",
     discovery?.futureCapabilities.length ? `Anticipated future capabilities (not building now, but leave room for): ${discovery.futureCapabilities.join("; ")}` : "",
     `Deployment: ${deploymentNoteFor(start)}`,
     `Stack capability: ${stackCapabilityLine(selectedStack)}`,
@@ -4875,6 +4873,7 @@ function existingProjectBriefFor(start: ExistingProjectStart) {
     (start.source === "browser-local" || start.source === "connector") && start.localConnectorRoot ? `Local connector root: ${start.localConnectorRoot}` : "",
     (start.source === "browser-local" || start.source === "connector") && start.localConnectorToken ? `Local connector token: ${start.localConnectorToken}` : "",
     start.source === "local" ? `Local project path: ${start.localPath}` : "",
+    start.uploadedWorkspacePath ? `Foundry workspace copy: ${start.uploadedWorkspacePath}` : "",
     `Source status: ${source.status}`,
     `Selected upload files: ${uploadSummaryText(start.uploadNames)}`,
     start.uploadNames.length ? `Selected upload paths: ${start.uploadNames.join("; ")}` : "",

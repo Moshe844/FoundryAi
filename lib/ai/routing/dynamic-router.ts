@@ -62,8 +62,12 @@ export async function routeDynamically(input: TaskContext & {
   const registry = await refreshModelRegistry();
   const profile = profileTask(input);
   if (input.tier) profile.recommendedIntelligenceTier = input.tier;
-  const decision = selectModel(profile, registry, input);
-  if (!decision) throw new Error(`No validated, healthy model satisfies ${profile.recommendedIntelligenceTier} requirements within the current provider and budget constraints.`);
+  // A run of transient provider failures can push every candidate under the availability floor. Refusing
+  // to route then bricks the product before a mission even starts ("Failed 11.7s") even though a usable
+  // model exists. Degrade instead: retry once including models currently marked unhealthy and let the
+  // dispatcher's own fallback handle a genuinely dead provider.
+  const decision = selectModel(profile, registry, input) ?? selectModel(profile, registry, { ...input, includeUnavailable: true });
+  if (!decision) throw new Error(`No model in the registry satisfies ${profile.recommendedIntelligenceTier} requirements within the current provider and budget constraints.`);
   await recordRoutingDecision(decision, profile, input);
   return { profile, decision };
 }
@@ -80,6 +84,10 @@ export function reportModelHealth(provider: ProviderId, modelId: string, success
   if (success) {
     model.status = "valid";
     model.runtimeValidatedAt = new Date().toISOString();
+    // A model that just returned a usable response is healthy again. Without this the availability flag
+    // below was a one-way door: a few transient failures pushed a model under the floor, it was then
+    // excluded from selection, and being excluded it could never succeed to earn its way back.
+    model.available = true;
   }
   if (!success && (suppressForCurrentRegistry || model.providerHealth < 0.35)) model.available = false;
   registry.upsert(model);

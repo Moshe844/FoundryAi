@@ -4,7 +4,7 @@ import { apiKeyForProvider, envVarNameForProvider } from "@/lib/ai/providers/dis
 import { routePayloadDynamically } from "@/lib/ai/routing/dynamic-router";
 import type { ModelMode } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
-import { explicitReadOnlyProjectIntent, interpretationConfirmation, isAcceptedInterpretationReply, normalizeFollowUpResolution } from "@/lib/mission/classifyFollowUp";
+import { explicitReadOnlyConstraint, interpretationConfirmation, isAcceptedInterpretationReply, normalizeFollowUpResolution } from "@/lib/mission/classifyFollowUp";
 import type { FollowUpResolutionRecord, InterpretationKind } from "@/lib/mission/classifyFollowUp";
 
 const projectIntentValues = ["question", "inspection", "diagnose", "status", "debug", "edit", "undo", "continue", "retrospective", "clarify"] as const;
@@ -53,6 +53,11 @@ const RESOLVE_PROJECT_TURN_INTENT_TOOL: NeutralTool = {
       execution_mode: {
         type: "string",
         enum: ["read-only", "mutate", "control", "status"],
+      },
+      runtime_operation: {
+        type: "string",
+        enum: ["none", "preview_refresh"],
+        description: "Semantic Foundry-owned runtime action. Use preview_refresh whenever the user wants the project's site/app/preview/server made reachable or running again, regardless of wording or spelling.",
       },
       confidence: {
         type: "number",
@@ -112,13 +117,14 @@ const RESOLVE_PROJECT_TURN_INTENT_TOOL: NeutralTool = {
       reference_confidence: { type: "number", minimum: 0, maximum: 1 },
       planned_action: { type: "string", description: "The exact next action consistent with the resolved target and scope." },
     },
-    required: ["intent", "execution_mode", "confidence", "interpreted_request", "interpretation_kind", "interpretation_confidence", "interpretation_source", "mutation_authorized", "mutation_kind", "rationale", "continuity", "clarifying_question", "referenced_execution_id", "referenced_action_description", "relevant_files", "expected_scope", "destructive", "reference_confidence", "planned_action"],
+    required: ["intent", "execution_mode", "runtime_operation", "confidence", "interpreted_request", "interpretation_kind", "interpretation_confidence", "interpretation_source", "mutation_authorized", "mutation_kind", "rationale", "continuity", "clarifying_question", "referenced_execution_id", "referenced_action_description", "relevant_files", "expected_scope", "destructive", "reference_confidence", "planned_action"],
   },
 };
 
 type ResolveToolResult = {
   intent?: ProjectTurnIntent;
   execution_mode?: "read-only" | "mutate" | "control" | "status";
+  runtime_operation?: "none" | "preview_refresh";
   confidence?: number;
   interpreted_request?: string;
   interpretation_kind?: InterpretationKind;
@@ -148,6 +154,8 @@ const SYSTEM_PROMPT = [
   "When the user asks Foundry to implement, apply, build, or carry out what Foundry just proposed or described, and there is one clear preceding Foundry proposal, resolve that proposal directly: choose edit, reference its recorded execution, and put the complete proposed scope into planned_action. Never ask the user to repeat Foundry's own immediately preceding list or identify files before the project has been inspected.",
   "Project inspection, file selection, implementation order, prioritization, phasing, and converting outcome-level recommendations into concrete code are Foundry's planning responsibilities. They are not missing user requirements. If the user authorizes the complete preceding proposal, do not ask whether to implement all of it or which part to start with.",
   "Resolve three things semantically: what outcome the user wants, whether they authorize side effects, and which project or recorded mission evidence can answer them.",
+  "Set runtime_operation to preview_refresh when the requested outcome is to make the existing project preview/site/app/server reachable or running. Infer this from meaning across paraphrases, slang, indirect descriptions, and misspellings. This is an operational control action, never a request to edit source or create server instructions.",
+  "Set runtime_operation to none for implementation, debugging, explanation, status, build, test, and every other request. A request that includes both source changes and launching is implementation, not preview_refresh.",
   "Restate the complete request in interpreted_request without dropping clauses or adding features.",
   "Set interpretation_source to recent_conversation when the executable scope is grounded in an actual prior conversation turn. Expanding 'that', 'it', 'the list', 'your recommendations', or any equivalent reference from a stored turn is normal discourse resolution, not a meaning correction that needs confirmation.",
   "Set mutation_authorized independently from intent and execution_mode. It is true whenever the user asks Foundry to make the connected project embody, reflect, contain, apply, or otherwise realize an outcome, including indirect or colloquial wording. Wanting more planning does not make authorization false.",
@@ -255,31 +263,46 @@ export async function POST(request: Request) {
     const policyMessage = acceptedInterpretation
       ? String(parsed?.interpreted_request ?? parsed?.planned_action ?? message).trim()
       : message;
-    const enforcedReadOnlyIntent = explicitReadOnlyProjectIntent(policyMessage);
+    // The model above is the real classifier and understands arbitrary phrasing. The only
+    // deterministic signals allowed to overrule it are hard authority boundaries — an explicit
+    // "don't change anything" or a purely grammatical question — never a change-verb vocabulary,
+    // which can never be complete. This is what keeps "redesign my page", "restyle it", or any
+    // other wording the verb list happens not to contain from being forced to read-only.
+    const enforcedReadOnlyIntent = explicitReadOnlyConstraint(policyMessage);
     // Interpretation confirmation protects executable scope. A read-only question cannot mutate
     // the project, so pausing it because the classifier polished or restated its wording only adds
     // cost and produces a nonsensical approval-looking card.
     const conversationGroundedMutation = parsed?.mutation_authorized === true && parsed?.interpretation_source === "recent_conversation";
-    const actionableProjectDefect =
-      isConnectedProjectContext(body.context) &&
-      looksLikeExecutableBugReport(policyMessage) &&
-      !explicitlyReadOnlyDiagnostic(policyMessage);
+    const semanticRuntimeControl = parsed?.runtime_operation === "preview_refresh";
     const semanticUndo = parsed?.mutation_authorized === true && parsed?.mutation_kind === "undo_recorded_change";
     const semanticApplyChange = parsed?.mutation_authorized === true && parsed?.mutation_kind === "apply_change";
-    const effectiveIntent = semanticUndo
+    // Structured model fields occasionally disagree: the resolver can authorize mutation, produce
+    // one high-confidence non-destructive interpretation, and still leave mutation_kind as `none`
+    // or intent as `clarify` merely because it has not inspected the owning files. File discovery is
+    // Foundry's responsibility. Reconcile the semantic contract itself instead of requiring a magic
+    // action verb or asking a nontechnical user to name implementation files.
+    const confidentDirectMutation = parsed?.mutation_authorized === true
+      && parsed?.interpretation_source === "message"
+      && parsed?.destructive !== true
+      && normalizeInterpretationKind(parsed?.interpretation_kind) !== "ambiguous"
+      && clampConfidence(parsed?.interpretation_confidence) >= 0.8;
+    const effectiveIntent = semanticRuntimeControl
+      ? "edit"
+      : semanticUndo
       ? "undo"
-      : semanticApplyChange && intent !== "debug" && intent !== "continue"
+      : (semanticApplyChange || confidentDirectMutation) && intent !== "debug" && intent !== "continue"
         ? "edit"
         : conversationGroundedMutation && intent === "clarify"
           ? "edit"
           : intent;
+    const actionableProjectDefect = isConnectedProjectContext(body.context) && effectiveIntent === "debug";
     const mutatingIntent = effectiveIntent === "edit" || effectiveIntent === "debug" || effectiveIntent === "undo" || effectiveIntent === "continue";
     // A concrete observed defect already supplies the executable outcome: restore the behavior that
     // the connected project exposes. Minor wording cleanup, a misspelled control label, and not yet
     // knowing the owning file are investigation details, not user decisions. Let the debug mission
     // inspect first; genuine conflicts discovered from project evidence can still pause later.
     const meaningCorrectionNeedsApproval =
-      !enforcedReadOnlyIntent && mutatingIntent && !conversationGroundedMutation && !actionableProjectDefect;
+      !enforcedReadOnlyIntent && mutatingIntent && !semanticRuntimeControl && !conversationGroundedMutation && !actionableProjectDefect;
     const interpretation = acceptedInterpretation || !meaningCorrectionNeedsApproval
       ? null
       : interpretationConfirmation({
@@ -288,7 +311,9 @@ export async function POST(request: Request) {
           kind: normalizeInterpretationKind(parsed?.interpretation_kind),
           confidence: clampConfidence(parsed?.interpretation_confidence),
         });
-    const finalIntent = interpretation ? "clarify" : enforcedReadOnlyIntent ?? applyProjectIntentPolicy(effectiveIntent, policyMessage, body.context);
+    // The structured semantic resolver is authoritative. Product policy may only narrow authority
+    // for an explicit no-mutation constraint; lexical verb/failure lists never promote or demote it.
+    const finalIntent = interpretation ? "clarify" : enforcedReadOnlyIntent ?? effectiveIntent;
     const rationale =
       interpretation
         ? `Foundry must confirm a meaning-bearing interpretation before turning it into executable scope. ${String(parsed?.rationale ?? "")}`.trim()
@@ -315,11 +340,13 @@ export async function POST(request: Request) {
             }
           : null,
         relevantFiles: Array.isArray(parsed?.relevant_files) ? parsed.relevant_files.map(String) : [],
-        expectedScope: String(parsed?.expected_scope ?? ""),
+        expectedScope: semanticRuntimeControl ? "Refresh only Foundry's owned project preview runtime; do not edit source files." : String(parsed?.expected_scope ?? ""),
         destructive: Boolean(parsed?.destructive),
         referenceConfidence: conversationGroundedMemory ? Math.max(0.96, clampConfidence(parsed?.reference_confidence)) : clampConfidence(parsed?.reference_confidence),
-        plannedAction: String(parsed?.planned_action ?? parsed?.interpreted_request ?? message),
-        continuity: conversationGroundedMemory?.status === "complete" && (finalIntent === "edit" || finalIntent === "debug" || finalIntent === "continue")
+        plannedAction: semanticRuntimeControl ? "Refresh the existing project preview runtime without changing project files." : String(parsed?.planned_action ?? parsed?.interpreted_request ?? message),
+        continuity: semanticRuntimeControl
+          ? "not_applicable"
+          : conversationGroundedMemory?.status === "complete" && (finalIntent === "edit" || finalIntent === "debug" || finalIntent === "continue")
           ? "fresh_plan"
           : finalIntent === effectiveIntent
             ? parsed?.continuity ?? "not_applicable"
@@ -327,6 +354,7 @@ export async function POST(request: Request) {
         rationale,
         clarifyingQuestion: interpretation?.question ?? (finalIntent === "clarify" ? String(parsed?.clarifying_question ?? "").trim() : ""),
         clarifyingOptions: interpretation?.options ?? (finalIntent === "clarify" && Array.isArray(parsed?.clarify_options) ? parsed.clarify_options.map(String) : []),
+        runtimeOperation: parsed?.runtime_operation === "preview_refresh" ? "preview_refresh" : "none",
       } satisfies Partial<FollowUpResolutionRecord>,
       policyMessage,
       body.context ?? {},
@@ -335,7 +363,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       ok: true,
       intent: resolution.currentIntent,
-      executionMode: executionModeForIntent(resolution.currentIntent),
+      executionMode: semanticRuntimeControl ? "control" : executionModeForIntent(resolution.currentIntent),
       confidence: clampConfidence(parsed?.confidence),
       rationale: resolution.rationale,
       continuity: resolution.continuity,
@@ -421,57 +449,6 @@ function executionModeForIntent(intent: ProjectTurnIntent) {
   return "read-only";
 }
 
-function applyProjectIntentPolicy(intent: ProjectTurnIntent, message: string, context: ProjectIntentContext | undefined): ProjectTurnIntent {
-  // An observed failure in a connected project is executable scope by itself. This precedes the
-  // generic clarification policy deliberately: choosing the file/component and tracing the broken
-  // event flow are Foundry's engineering responsibilities, never clarification questions for users.
-  if (
-    isConnectedProjectContext(context) &&
-    looksLikeExecutableBugReport(message) &&
-    !explicitlyReadOnlyDiagnostic(message)
-  ) {
-    return "debug";
-  }
-
-  // Misroute guard: a concrete imperative change request must start an edit mission — even when it bundles
-  // conflicting requirements. Contradictions are a *plan conflict* the mission resolves with its own
-  // one-at-a-time decision prompt (which pauses and resumes the same run), NOT a reason to dead-end the turn
-  // as a read-only "clarify" chat note that never touches the project. Without this,
-  // "Change storage: use ONLY localStorage / ONLY IndexedDB / ONLY cookies — do all three" was classified
-  // clarify and no mission ever started. Scoped to clarify (and bare read-only reads) so genuine forks the
-  // model flags on an already-blocked mission still ask; explicitly read-only diagnostics still explain.
-  if (
-    (intent === "clarify" || intent === "question" || intent === "inspection" || intent === "status" || intent === "retrospective") &&
-    isConnectedProjectContext(context) &&
-    looksLikeImperativeMutation(message) &&
-    !explicitlyReadOnlyDiagnostic(message)
-  ) {
-    return "edit";
-  }
-
-  if (intent !== "question" && intent !== "inspection" && intent !== "diagnose" && intent !== "status") return intent;
-  if (!isConnectedProjectContext(context)) return intent;
-  // "Is it running? Can you start it?" reads like a status question, but it's a request to actually take
-  // action — without this override it was answered as read-only inspection and nothing ever started.
-  if (looksLikeServerActionRequest(message)) return "edit";
-  if (intent === "status") return intent;
-  if (!looksLikeExecutableBugReport(message)) return intent;
-  if (explicitlyReadOnlyDiagnostic(message)) return intent === "question" || intent === "inspection" ? "diagnose" : intent;
-  return "debug";
-}
-
-function looksLikeImperativeMutation(message: string) {
-  // The user is telling Foundry to alter the project. Broad on change verbs, but each must sit in an
-  // imperative position (clause start, after a connector, or behind please/can you/now) so questions like
-  // "why does the store fail" or "what should I use here" don't trip it.
-  return /(?:^|[.!?;:\n]\s*|\b(?:and|then|also|please|now)\s+|,\s*|\bcan you\s+|\bcould you\s+|\bi(?:'d| would) like (?:you )?to\s+|\bi want (?:you )?to\s+)(change|add|remove|delete|drop|update|implement|build|create|make|replace|refactor|rename|move|set|switch|convert|store|save|persist|use|wire|integrate|install|migrate|rewrite|redesign|restyle|style|connect|enable|disable|configure|hook up|fix|support|allow)\b/i.test(
-    message,
-  );
-}
-
-function looksLikeServerActionRequest(message: string) {
-  return /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,40}\b(?:server|app|project|service|api|backend|frontend|dev server|application|build|tests?|lint|linter|typecheck|checks?)\b/i.test(message);
-}
 
 function normalizeInterpretationKind(value: unknown): InterpretationKind {
   return value === "surface-only" || value === "meaning-bearing" || value === "ambiguous" ? value : "verbatim";
@@ -502,23 +479,6 @@ function normalizeDiscourseText(value: string) {
 function isConnectedProjectContext(context: ProjectIntentContext | undefined) {
   const source = context?.source ?? "";
   return /^(local-agent|local-path|browser-folder|uploaded-copy|previous-execution)/i.test(source) || Boolean(context?.objective);
-}
-
-function looksLikeExecutableBugReport(message: string) {
-  const text = message.toLowerCase();
-  const hasFailureSignal =
-    /\b(upload failed|json\.?parse|unexpected character|syntaxerror|typeerror|referenceerror|uncaught|exception|stack trace|traceback|500|404|403|401)\b/i.test(text) ||
-    /\b(error|failed|fails|failing|broken|broke|crash|crashes|crashing|bug|issue|problem|unresponsive|stuck|frozen|hangs?|glitch(?:es|ing)?)\b/i.test(text) ||
-    /\b(?:is|are|was|were|has|have|had|seems?|keeps?|started|stopped)\b[^.?!\n]{0,80}\b(?:not working|not opening|not responding|not loading|not saving|not updating|not showing|not closing|not navigating|not doing anything|doing nothing|no longer works?)\b/i.test(text) ||
-    /\b(?:does|do|did)\s+(?:not|nothing)\b/i.test(text) ||
-    /\b(?:won't|will not|can't|cannot|couldn't|doesn't|does not)\s+(?:open|close|submit|save|load|update|show|render|navigate|respond|work|run|start|stop|copy|delete|create|add|remove)\b/i.test(text);
-  const hasWorkflowSignal = /\b(when|while|trying to|on upload|during|after|before|click|submit|save|load|parse|upload|download|import|export)\b/i.test(text);
-  const hasProjectArtifactSignal = /\b(file|sheet|excel|csv|json|api|server|client|browser|frontend|backend|route|endpoint|form|upload|request|response|app|page|screen|view|modal|dialog|menu|button|link|control|field|input|feature|login|checkout|report|dashboard|navigation|preview)\b/i.test(text);
-  return hasFailureSignal && (hasWorkflowSignal || hasProjectArtifactSignal);
-}
-
-function explicitlyReadOnlyDiagnostic(message: string) {
-  return /\b(only|just)\s+(explain|tell me|diagnose|review|inspect|analy[sz]e|show me)\b|\b(how (do|can|should) i fix|how to fix|tell me how to fix|what should i change|what would fix|why is|why does|what caused|root cause|explain why)\b/i.test(message);
 }
 
 function clampConfidence(value: unknown) {

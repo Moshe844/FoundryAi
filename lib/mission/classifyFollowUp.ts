@@ -64,6 +64,9 @@ export type FollowUpResolutionRecord = {
   rationale: string;
   clarifyingQuestion: string;
   clarifyingOptions: string[];
+  /** Semantic platform operation selected by the language resolver. This is deliberately structured
+   * so runtime behavior never depends on reproducing one of a finite set of phrases. */
+  runtimeOperation?: "none" | "preview_refresh";
 };
 
 export type InterpretationKind = "verbatim" | "surface-only" | "meaning-bearing" | "ambiguous";
@@ -100,6 +103,12 @@ export function interpretationConfirmation(assessment: InterpretationAssessment)
   // behind a pointless "Is that correct?" card (test B01).
   const normalize = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
   if (normalize(originalRequest) === normalize(interpretedRequest)) return null;
+  // High-confidence semantic understanding is the point of the resolver. A misspelling may cause
+  // the model to label its correction "meaning-bearing" even though there is only one credible
+  // executable reading ("resdign the UX" -> "redesign the UX"). Pausing those requests turns typo
+  // tolerance into an approval ritual. Ambiguity still always pauses; a meaning-bearing correction
+  // pauses only when the resolver itself is not confident enough to own it.
+  if (kind === "meaning-bearing" && assessment.confidence >= 0.8) return null;
 
   const prefix = kind === "ambiguous"
     ? "Your wording could mean more than one action. My current interpretation is:"
@@ -138,11 +147,17 @@ export class LatestFollowUpQueue<T> {
 const HARD_STOP_PATTERN = /^(?:stop|halt|cancel|wait[, ]+stop)\b/i;
 const APPROVAL_REPLY_PATTERN = /^(?:approved:\s*run\s|denied approval to run\s)/i;
 const DESTRUCTIVE_PATTERN = /\b(?:undo|revert|roll back|rollback|delete|remove|drop|erase|clear|reset|change (?:it|that) back)\b/i;
-const MUTATING_PATTERN = /\b(?:add|create|make|build|implement|edit|change|update|modify|fix|repair|move|delete|remove|rename|refactor|install|enable|wire|replace|style|darken|lighten)\b/i;
+// Kept in parity with IMPERATIVE_COMMAND's verb set. When these two drifted apart — redesign,
+// restyle, switch, convert, migrate, rewrite, generate, separate, split, extract, disable were in
+// the imperative detector but missing here — a plain "redesign my page" request was neither seen as
+// a standalone mutation nor excluded from read-only, so it was answered as inspection and nothing
+// changed. Genuine "why/how/what" questions are caught by looksLikeReadOnlyQuestionForm before this
+// vocabulary is consulted, so widening it does not pull real questions into mutation.
+const MUTATING_PATTERN = /\b(?:add|create|make|build|generate|implement|edit|change|update|modify|fix|repair|separate|split|extract|move|delete|remove|rename|refactor|install|enable|disable|wire|replace|switch|convert|redesign|restyle|migrate|rewrite|style|darken|lighten)\b/i;
+const RUNTIME_CONTROL_PATTERN = /\b(?:start|restart|launch|run|reopen|bring (?:it|the preview) back)\b[^.?!\n]{0,50}\b(?:server|site|website|webpage|preview|app|application)\b|\b(?:server|site|website|webpage|preview|app|application)\b[^.?!\n]{0,80}\b(?:start|restart|launch|run|reopen|bring it back)\b|\b(?:server|site|website|webpage|preview|app|application)\b[^.?!\n]{0,35}\b(?:stopped|isn['’]?t|is not|not)\s+(?:running|available|up)\b/i;
 const CURRENT_RUNTIME_FAILURE_PATTERN = /\b(?:crash(?:es|ed|ing)?|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|does\s+not\s+work|doesn['’]?t\s+work|not\s+working|freezes?|hangs?|disappears?|broken|failing|failed|throws?|errors?)\b/i;
 const MANUAL_GUIDANCE_PATTERN = /\bhow\s+(?:do|can|should|would)\s+i\b[^.!?\n]{0,180}\b(?:manually|myself|by hand|on my own)\b|\b(?:manually|myself|by hand|on my own)\b[^.!?\n]{0,180}\b(?:steps?|instructions?|how)\b/i;
 const EXPLICIT_NO_MUTATION_PATTERN = /\b(?:do not|don't|never)\b[^.!?\n]{0,100}\b(?:make|apply|perform|write|edit|modify|change|touch|implement|create|delete|remove|rewrite)(?:ing)?\b[^.!?\n]{0,80}\b(?:changes?|edits?|files?|code|anything)\b|\bwithout\b[^.!?\n]{0,100}\b(?:changing|editing|modifying|writing|touching|creating|deleting|removing)\b|\bno\s+(?:changes?|edits?|writes?|file changes?|code changes?)\b/i;
-const READ_ONLY_REQUEST_PATTERN = /\b(?:explain|describe|summarize|inspect|review|analy[sz]e|walk me through|tell me|show me|what|why|how)\b/i;
 const PROJECT_EVIDENCE_PATTERN = /\b(?:this|current|connected)\b[^.!?\n]{0,50}\b(?:project|codebase|repo(?:sitory)?|application|app)\b|(?:^|[\s`"'])(?:src|app|lib|components|packages)[/\\][\w./\\-]+|\b[\w./\\-]+\.(?:js|jsx|ts|tsx|mjs|cjs|css|html?|json|py|rb|php|java|kt|swift|cs|go|rs|vue|svelte|md|yml|yaml|toml)\b/i;
 const RECORDED_STATUS_PATTERN = /\b(?:what (?:has )?changed|what did you (?:change|do)|what happened|last (?:run|mission)|previous (?:run|mission))\b/i;
 const EXPLICIT_FOLLOW_ON_MUTATION_PATTERN = /(?:\b(?:then|and|also|now)\s+|[.!?;]\s*)(?:(?:can|could|would)\s+you\s+|please\s+)?(?:implement|apply|make|change|edit|create|add|fix|update)\b/i;
@@ -155,6 +170,13 @@ const PROJECT_BEHAVIOR_SUBJECT_PATTERN = /\b(?:data|record|item|state|value|file
 // one at a time never converges, so this reads sentence *form* instead.
 const INTERROGATIVE_OPENER =
   /^(?:so\s+|and\s+|but\s+|ok(?:ay)?[,\s]+|hey[,\s]+|just\s+)*(?:how|what|what'?s|why|where|when|which|who|whose|whom|does|do|did|is|are|am|was|were|can|could|will|would|should|shall|has|have|had|any|explain|describe|summari[sz]e|clarify|walk me through|tell me|show me|help me understand|curious|wondering|i'?m curious|i wonder)\b/i;
+
+// A request directed at Foundry to do something — "can you X", "could you X", "how about you X",
+// "I want you to X", "let's X". Whether it is read-only or an edit depends entirely on X, the verb,
+// which no fixed list can fully enumerate ("polish", "swap", "spruce up", "modernize"…). So this
+// form is deliberately NOT treated as an authoritative read-only override; it defers to the model.
+const POLITE_REQUEST_OPENER =
+  /^(?:\s*(?:please|just|kindly|hey|ok|okay|so|now|then|also)\b[,\s]+)*(?:(?:can|could|would|will)\s+(?:you|we|ya)|(?:how|what)\s+about\s+(?:you|we)|i(?:'d| would)\s+like\s+(?:you|us)\s+to|i\s+(?:want|need)\s+(?:you|us)\s+to|let'?s|let\s+us|why\s+don'?t\s+(?:you|we)|why\s+not)\b/i;
 
 // Polite and connector-led commands. These *look* interrogative ("can you add…", "how about you add…")
 // but are real change requests, so they must keep their imperative reading.
@@ -199,8 +221,27 @@ export function looksLikeReadOnlyQuestionForm(message: string): boolean {
  * from folding a self-contained task into an older failed execution merely because both concern the
  * same project. It deliberately reuses the broad mutation family rather than matching release-gate
  * sentences or one exact continuation phrase. */
+/**
+ * A stated requirement is an instruction, not a question. "The page must show exactly: the heading
+ * \"Sam Carter\", the bio line \"…\", and three skill tags labelled Design, Prototyping and Research"
+ * carries no imperative verb, so it fell through to read-only: Foundry inspected the page, correctly
+ * explained what was missing, and changed nothing. Obligation language about what the product SHOULD
+ * contain is a change request.
+ */
+const REQUIREMENT_OBLIGATION =
+  /\b(?:must|should|needs?\s+to|has\s+to|have\s+to|ought\s+to|is\s+supposed\s+to)\s+(?:also\s+|only\s+|still\s+)?(?:show|display|include|contain|have|render|list|say|read|use|support|be|look|match)\b|\bmake\s+sure\b|\bensure\s+that\b|\bit\s+needs\b/i;
+
+/** True when the message states what the product is REQUIRED to be/show — an instruction to make it so. */
+export function statesRequiredOutcome(message: string): boolean {
+  const text = message.trim();
+  return Boolean(text) && REQUIREMENT_OBLIGATION.test(text) && !EXPLICIT_NO_MUTATION_PATTERN.test(text);
+}
+
 export function standaloneMutationIntent(message: string): "edit" | "debug" | null {
   const text = message.trim();
+  // Checked before the read-only guard: a requirement statement is never a request for commentary.
+  if (statesRequiredOutcome(text)) return "edit";
+  if (isPreviewRestartRequest(text) || RUNTIME_CONTROL_PATTERN.test(text)) return "edit";
   if (!text || explicitReadOnlyProjectIntent(text)) return null;
   if (/\b(?:fix|repair|bug|error|crash(?:es|ed|ing)?|broken|failing|failed|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|freezes?|hangs?|disappears?)\b/i.test(text)) return "debug";
   return MUTATING_PATTERN.test(text) && !looksLikeReadOnlyQuestionForm(text) ? "edit" : null;
@@ -245,30 +286,65 @@ export function isRetrospectiveRequest(message: string): boolean {
   return asksForReason && referencesPriorWork;
 }
 
+type ReadOnlySignals = {
+  /** Explicit user constraint on WHO acts: "don't change anything", "just explain", manual how-to. */
+  hardConstraint: boolean;
+  /** Grammatically a question through and through, with no imperative clause. Vocabulary-independent. */
+  pureQuestionForm: boolean;
+  /** A heuristic GUESS: question-word + project noun + no recognized change verb. Vocabulary-dependent. */
+  vocabEvidenceQuestion: boolean;
+};
+
+function readOnlySignals(text: string): ReadOnlySignals | null {
+  if (isPreviewRestartRequest(text) || RUNTIME_CONTROL_PATTERN.test(text)) return null;
+  if (!text || RECORDED_STATUS_PATTERN.test(text) || EXPLICIT_FOLLOW_ON_MUTATION_PATTERN.test(text)) return null;
+  // Only an explicit denial of mutation is a deterministic authority boundary. Manual guidance,
+  // question grammar, and vocabulary are semantic intent and must remain the resolver's decision.
+  const hardConstraint = EXPLICIT_NO_MUTATION_PATTERN.test(text);
+  const notImperative = !IMPERATIVE_COMMAND.test(text);
+  // A message that is grammatically all-question with no imperative clause is a question whatever
+  // verbs it contains — form, not vocabulary. The one exception is the polite-request form
+  // ("can you <verb>?"), whose meaning turns on the verb; it is excluded here and left to the model
+  // so an unlisted action verb ("can you polish the hero?") is never force-read to inspection.
+  const pureQuestionForm = notImperative && !POLITE_REQUEST_OPENER.test(text) && looksLikeReadOnlyQuestionForm(text);
+  // The one vocabulary-dependent signal. Kept only for the offline fallback, never allowed to
+  // override a live model, because a hand-maintained verb list can never cover every phrasing.
+  const vocabEvidenceQuestion = notImperative
+    && PROJECT_BEHAVIOR_QUESTION_PATTERN.test(text)
+    && PROJECT_BEHAVIOR_SUBJECT_PATTERN.test(text)
+    && !MUTATING_PATTERN.test(text);
+  return { hardConstraint, pureQuestionForm, vocabEvidenceQuestion };
+}
+
+function readOnlyIntentFor(text: string, evidenceQuestion: boolean): "question" | "inspection" {
+  if (evidenceQuestion) return "inspection";
+  return PROJECT_EVIDENCE_PATTERN.test(text) ? "inspection" : "question";
+}
+
 /**
- * Deterministic safety boundary for advice/explanation turns. A model may notice an embedded verb
- * such as "add" or "change" and over-index on it, but manual how-to language and explicit no-write
- * constraints describe who will act. These turns may inspect relevant project evidence, but they
- * must never enter mutation execution or clarification merely because a hypothetical step has a
- * change verb in it.
+ * The ONLY deterministic signal permitted to override a live model verdict. Every part of it is
+ * an explicit denial of mutation ("don't change anything", "without editing files"). Question
+ * grammar, manual-guidance language, and verbs are open-ended semantic intent; none may override a
+ * successful resolver result.
+ */
+export function explicitReadOnlyConstraint(message: string): "question" | "inspection" | null {
+  const signals = readOnlySignals(message.trim());
+  if (!signals?.hardConstraint) return null;
+  return readOnlyIntentFor(message.trim(), true);
+}
+
+/**
+ * The FALLBACK read-only classifier, used only when the model is unavailable. It additionally makes
+ * the vocabulary-based guess above. That guess deliberately stays out of explicitReadOnlyConstraint:
+ * a guess may stand in for the model when there is no model answer, but must never overrule one.
  */
 export function explicitReadOnlyProjectIntent(message: string): "question" | "inspection" | null {
   const text = message.trim();
-  if (!text || RECORDED_STATUS_PATTERN.test(text) || EXPLICIT_FOLLOW_ON_MUTATION_PATTERN.test(text)) return null;
-  const manualGuidance = MANUAL_GUIDANCE_PATTERN.test(text);
-  const explicitNoMutation = EXPLICIT_NO_MUTATION_PATTERN.test(text) && READ_ONLY_REQUEST_PATTERN.test(text);
-  // Two ways to qualify as a read-only evidence question. The subject-noun route needs the message to
-  // be free of change verbs; the sentence-form route does not, because an all-interrogative message with
-  // no imperative clause is a question whatever verbs it contains. Without the second route, asking
-  // "how does the data move around in here?" started an edit mission and rewrote the user's page.
-  const evidenceQuestion = !EXPLICIT_FOLLOW_ON_MUTATION_PATTERN.test(text)
-    && (looksLikeReadOnlyQuestionForm(text)
-      || (PROJECT_BEHAVIOR_QUESTION_PATTERN.test(text)
-        && PROJECT_BEHAVIOR_SUBJECT_PATTERN.test(text)
-        && !MUTATING_PATTERN.test(text)));
-  if (!manualGuidance && !explicitNoMutation && !evidenceQuestion) return null;
-  if (evidenceQuestion) return "inspection";
-  return PROJECT_EVIDENCE_PATTERN.test(text) ? "inspection" : "question";
+  const signals = readOnlySignals(text);
+  if (!signals) return null;
+  const evidenceQuestion = signals.pureQuestionForm || signals.vocabEvidenceQuestion;
+  if (!signals.hardConstraint && !evidenceQuestion) return null;
+  return readOnlyIntentFor(text, evidenceQuestion);
 }
 
 export function isApprovalReplyMessage(message: string): boolean {
@@ -381,7 +457,11 @@ export function fallbackFollowUpResolution(message: string, context: ProjectInte
     });
   }
 
-  if (MUTATING_PATTERN.test(text) || CURRENT_RUNTIME_FAILURE_PATTERN.test(text)) {
+  // IMPERATIVE_COMMAND is the canonical "the user is telling Foundry to act" detector and includes
+  // redesign/restyle/switch/convert/migrate/rewrite that MUTATING_PATTERN historically missed.
+  // Without it here, a clear command like "redesign the page" fell through every branch to the
+  // final clarify record and no mission ever started.
+  if (MUTATING_PATTERN.test(text) || IMPERATIVE_COMMAND.test(text) || CURRENT_RUNTIME_FAILURE_PATTERN.test(text)) {
     const referential = hasReferentialTarget(text);
     if (referential && !referencedPriorAction && explicitFiles.length === 0) {
       return clarifyRecord("edit", "Which prior change, file, or component are you referring to?", 0.25, DESTRUCTIVE_PATTERN.test(text));
@@ -398,6 +478,18 @@ export function fallbackFollowUpResolution(message: string, context: ProjectInte
       continuity: referential ? "carry_forward_plan" : "fresh_plan",
       rationale: referential ? "The mutation refers to the immediately preceding recorded work." : "This is a concrete new mutation request.",
     });
+  }
+
+  // Offline only. A request aimed at Foundry ("can you <verb> the <thing>?") whose verb we could not
+  // classify as either read-only or mutating above is genuinely ambiguous without the model — "polish
+  // the hero" edits, "see the hero" explains, and the difference is a verb no list fully covers. If
+  // it names a clear read-only verb, answer; otherwise ask, rather than silently treating it as a
+  // question just because it ends in "?". This is the safe degraded stand-in until the model returns.
+  if (POLITE_REQUEST_OPENER.test(text)) {
+    if (/\b(?:explain|describe|summari[sz]e|review|analy[sz]e|walk (?:me )?through|tell me|show me|see|understand|clarify|look at)\b/i.test(text)) {
+      return readOnlyRecord("inspection", explicitFiles, false);
+    }
+    return clarifyRecord("clarify", "Did you want me to change something here, or just explain it? Tell me which and I'll do exactly that.", 0.3, false);
   }
 
   if (text.endsWith("?")) {
@@ -427,7 +519,10 @@ export function normalizeFollowUpResolution(
   // clarify. This is the last UI-side gate before WorkspaceShell decides whether to invoke the
   // mutation runtime, so returning the deterministic read-only record here prevents a bad model
   // classification from becoming filesystem authority.
-  if (explicitReadOnlyProjectIntent(message)) return fallback;
+  // Only a hard authority boundary (explicit no-mutation, or a purely grammatical question) may
+  // override the model verdict this function is normalizing. The vocabulary-based guess is left to
+  // the offline fallback so an incomplete verb list can never demote a real edit to read-only.
+  if (explicitReadOnlyConstraint(message)) return fallback;
   if (!value || !isProjectTurnIntent(value.currentIntent)) return fallback;
 
   const knownExecutions = new Map((context.recentMissionMemory ?? []).filter((item) => item.id).map((item) => [item.id as string, item]));
@@ -449,18 +544,21 @@ export function normalizeFollowUpResolution(
   ]);
   const requestedFiles = uniquePaths(value.relevantFiles ?? []);
   const relevantFiles = referencedPriorAction ? requestedFiles.filter((file) => knownFiles.some((known) => samePath(known, file))) : requestedFiles;
-  const destructive = Boolean(value.destructive) || DESTRUCTIVE_PATTERN.test(message);
-  const referentialMutation = hasReferentialTarget(message) && isMutatingIntent(value.currentIntent);
+  // A successful semantic resolution is authoritative. Lexical destructive-word detection belongs
+  // only in the offline fallback; reapplying it here would second-guess open-ended language.
+  const destructive = Boolean(value.destructive);
+  const runtimeControl = value.runtimeOperation === "preview_refresh";
   const confidence = clampConfidence(value.referenceConfidence);
-  const ambiguousRemoval = /\bremove that\b/i.test(message) && relevantFiles.length !== 1;
-  const unsafeReference = (destructive || referentialMutation || value.currentIntent === "undo") && (!referencedPriorAction || confidence < 0.72);
+  // Project discovery can resolve ordinary non-destructive targets such as "this page", "make it
+  // cleaner", or any equivalent phrasing. Reclassifying a successful semantic edit with a pronoun
+  // regex made natural language behave like a password list. Only an actually destructive semantic
+  // verdict or undo requires a recorded target before filesystem authority is granted.
+  const unsafeReference = !runtimeControl && (destructive || value.currentIntent === "undo") && (!referencedPriorAction || confidence < 0.72);
 
-  if (unsafeReference || ambiguousRemoval) {
+  if (unsafeReference) {
     return clarifyRecord(
       value.currentIntent,
-      ambiguousRemoval
-        ? "What exactly should I remove? Name the file, component, or most recent change."
-        : value.clarifyingQuestion || "Which exact prior change, file, or component should I use as the target?",
+      value.clarifyingQuestion || "Which exact prior change, file, or component should I use as the target?",
       confidence,
       destructive,
     );
@@ -478,6 +576,7 @@ export function normalizeFollowUpResolution(
     rationale: String(value.rationale || fallback.rationale).trim(),
     clarifyingQuestion: value.currentIntent === "clarify" ? String(value.clarifyingQuestion || fallback.clarifyingQuestion).trim() : "",
     clarifyingOptions: value.currentIntent === "clarify" && Array.isArray(value.clarifyingOptions) ? value.clarifyingOptions.map(String).map((item) => item.trim()).filter(Boolean).slice(0, 4) : [],
+    runtimeOperation: value.runtimeOperation === "preview_refresh" ? "preview_refresh" : "none",
   });
 }
 
@@ -581,3 +680,4 @@ function clampConfidence(value: unknown) {
   if (typeof value !== "number" || !Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(1, value));
 }
+import { isPreviewRestartRequest } from "@/lib/factory/preview-intent";

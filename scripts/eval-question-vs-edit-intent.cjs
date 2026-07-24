@@ -43,7 +43,9 @@ Module._resolveFilename = function (request, ...rest) {
 const loadTs = (relative) => require(path.join(root, relative));
 
 const { deterministicMutationIntent } = loadTs("lib/ai/mission/intent-classifier.ts");
-const { explicitReadOnlyProjectIntent, projectBehaviorDiagnosisIntent, standaloneMutationIntent } = loadTs("lib/mission/classifyFollowUp.ts");
+const { explicitReadOnlyConstraint, fallbackFollowUpResolution, projectBehaviorDiagnosisIntent, standaloneMutationIntent } = loadTs("lib/mission/classifyFollowUp.ts");
+const projectCtx = { source: "uploaded-copy", objective: "connected project" };
+const READ_ONLY_INTENTS = new Set(["question", "inspection", "diagnose", "retrospective", "status"]);
 
 // Must NOT mutate. Every one of these carries a change verb as ordinary English.
 const questions = [
@@ -79,6 +81,14 @@ const commands = [
   "what does this do? also delete the unused import",
   "let's refactor the expense list",
   "i want you to install chart.js",
+  // Design/restructure verbs the mutation vocabulary once lacked, so a clear change request was
+  // answered as read-only inspection and the project never changed. The "?" does not make an
+  // imperative a question.
+  "Can you please redesign my payment test page beautifully?",
+  "please restyle the checkout page",
+  "switch the storage to IndexedDB",
+  "convert this page to TypeScript",
+  "can you rewrite the nav as a component?",
 ];
 
 // Neither questions nor commands: real claims about broken behavior. The question-form guard must not
@@ -111,17 +121,21 @@ for (const message of commands) {
   report("command", message, intent, mutating);
 }
 
-// Abstaining is not enough. The online classifier independently returned "edit" for the question that
-// rewrote page.tsx, so the read-only guard has to actively veto a mutating verdict.
-console.log("\n=== questions: must VETO a mutating verdict from the online classifier ===");
+// Questions must resolve read-only end-to-end. The deterministic OVERRIDE (explicitReadOnlyConstraint)
+// may defer an ambiguous polite form to the model — that is correct — so the guarantee is the offline
+// resolution, which must never be a mutation for a genuine question.
+console.log("\n=== questions: must resolve read-only offline ===");
 for (const message of questions) {
-  const veto = explicitReadOnlyProjectIntent(message);
-  report("veto", message, veto, veto === "question" || veto === "inspection");
+  const intent = fallbackFollowUpResolution(message, projectCtx).currentIntent;
+  report("read-only", message, intent, READ_ONLY_INTENTS.has(intent));
 }
 
-console.log("\n=== change requests: must NOT be vetoed into read-only ===");
+// THE CORE ARCHITECTURAL GUARANTEE: no deterministic word list may override the model on a real
+// change request. explicitReadOnlyConstraint is the ONLY thing allowed to veto a live model verdict,
+// and it must never fire on a command — whatever verb it uses, listed or not.
+console.log("\n=== change requests: the model-override guard must never veto them ===");
 for (const message of commands) {
-  const veto = explicitReadOnlyProjectIntent(message);
+  const veto = explicitReadOnlyConstraint(message);
   report("no-veto", message, veto, veto === null);
 }
 
@@ -135,9 +149,9 @@ for (const message of commands) {
   report("standalone-c", message, intent, intent === "edit" || intent === "debug");
 }
 
-console.log("\n=== defect reports: must not be vetoed into read-only ===");
+console.log("\n=== defect reports: the model-override guard must not veto them ===");
 for (const message of defectReports) {
-  const veto = explicitReadOnlyProjectIntent(message);
+  const veto = explicitReadOnlyConstraint(message);
   report("defect", message, veto, veto === null);
 }
 

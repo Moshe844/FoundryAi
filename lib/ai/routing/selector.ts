@@ -5,13 +5,15 @@ const RANK: Record<ModelTier, number> = { fast: 1, builder: 2, architect: 3, "en
 const COST = { "ultra-low": 0.05, low: 0.15, medium: 0.35, high: 0.7, premium: 1 };
 const LATENCY = { instant: 0, fast: 0.2, normal: 0.55, slow: 1 };
 
-export function selectModel(profile: TaskProfile, registry: CapabilityRegistry, options: { preference?: RoutingPreference; budget?: RoutingBudget; preferredProvider?: RegisteredModel["provider"]; disabledProviders?: RegisteredModel["provider"][] } = {}): RoutingDecision | undefined {
+export function selectModel(profile: TaskProfile, registry: CapabilityRegistry, options: { preference?: RoutingPreference; budget?: RoutingBudget; preferredProvider?: RegisteredModel["provider"]; disabledProviders?: RegisteredModel["provider"][]; includeUnavailable?: boolean } = {}): RoutingDecision | undefined {
   const tier = capTier(profile.recommendedIntelligenceTier, options.budget?.maximumTier);
   const requirements = requirementsFor(tier, profile);
   const preference = options.preference ?? "balanced";
   const costWeight = preference === "economy" ? 0.55 : preference === "quality-first" ? 0.12 : 0.32;
   const latencyWeight = preference === "lowest-latency" || tier === "fast" ? 0.3 : 0.1;
-  const candidates = registry.list().filter((model) => model.available && !model.deprecated && model.status !== "unknown-alias" && !options.disabledProviders?.includes(model.provider) && withinBudget(model, options.budget) && satisfies(model, requirements));
+  // `includeUnavailable` is the caller's explicit last resort: when every candidate has been marked
+  // unhealthy by recent failures, trying the least-unhealthy one beats refusing to route at all.
+  const candidates = registry.list().filter((model) => (options.includeUnavailable || model.available) && !model.deprecated && model.status !== "unknown-alias" && !options.disabledProviders?.includes(model.provider) && withinBudget(model, options.budget) && satisfies(model, requirements));
   // Capability requirements are a gate, not a score bonus that lets an unnecessarily expensive
   // model beat a capable cheap one. Choose within the cheapest cost class that clears the gate.
   const cheapestCost = candidates.reduce((minimum, model) => Math.min(minimum, COST[model.costClass]), Number.POSITIVE_INFINITY);

@@ -15,6 +15,8 @@
     "eval:recovery-policy": "node scripts/eval-recovery-policy.cjs",
     "eval:provider-resilience": "node scripts/eval-provider-resilience.cjs",
     "eval:preview-source-contract": "node scripts/eval-preview-source-contract.cjs",
+    "eval:static-preview-assets": "node scripts/eval-static-preview-assets.cjs",
+    "eval:acceptance-softness": "node scripts/eval-acceptance-softness.cjs",
     "eval:attachment-lifecycle": "node scripts/eval-attachment-lifecycle.cjs",
     "eval:project-deletion-recovery": "node scripts/eval-project-deletion-recovery.cjs",
     "eval:live-build-continuity": "node scripts/eval-live-build-continuity.cjs",

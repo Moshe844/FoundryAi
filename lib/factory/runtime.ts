@@ -8,7 +8,7 @@ import { capabilityLevelForStackChoice, checklistForRequest, detectStackProfile,
 import { classifyIntent, deterministicMutationIntent, deterministicTaskAssessment } from "@/lib/ai/mission/intent-classifier";
 import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { planMission } from "@/lib/ai/mission/mission-planner";
-import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
+import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiredDomFeaturesForTask, requiredVisibleTextsForTask, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
 import { hasRunnableProjectEntry, runMissionExecutor } from "@/lib/ai/mission/executor";
 import { reviewArchitecture } from "@/lib/ai/mission/architecture-review";
 import { verifyMissionResult } from "@/lib/ai/mission/mission-verifier";
@@ -60,6 +60,9 @@ import { acceptanceWorkflowTemplate, parseAcceptanceWorkflowManifest, type Accep
 import { projectIntegrationEnvironment } from "@/lib/integrations/runtime-environment";
 import { detectProjectIntegrations } from "@/lib/integrations/detection";
 import { integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "@/lib/integrations/requirements";
+import { isPreviewRestartRequest } from "@/lib/factory/preview-intent";
+import { attachedAssetPlacement, attachedAssetPublicPath } from "@/lib/factory/asset-placement";
+import { buildUploadIntakeMarker, uploadIntakeMarkerFile, uploadIntakeMarkerMatches } from "@/lib/factory/upload-intake";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 type EvidenceAttachments = NonNullable<FactoryExistingProjectRequest["evidenceAttachments"]>;
@@ -91,15 +94,12 @@ function safeAttachedAssetName(fileName: string, mediaType: string, index: numbe
   return `${base}${suppliedExtension || extensionByType[mediaType.toLowerCase()] || ".bin"}`;
 }
 
-function attachedAssetDirectory(stackId: string) {
-  return /^(?:nextjs|react|vite|static-html|astro|remix|svelte)/i.test(stackId) ? "public/foundry-uploads" : "assets/foundry-uploads";
-}
-
 async function materializeAttachedProjectAssets(access: ProjectAccess, attachments: EvidenceAttachments, task: string, stackId: string, materializeAll = false) {
   const explicitAssetRequest = requestsAttachedFilesAsProjectAssets(task);
   const projectAssets = attachments.filter((attachment) => materializeAll || attachment.evidenceKind === "photo" || explicitAssetRequest);
   if (!projectAssets.length || !access.writeBinary) return { assets: [] as MaterializedProjectAsset[], failures: [] as string[] };
-  const directory = attachedAssetDirectory(stackId);
+  const placement = attachedAssetPlacement(stackId);
+  const { directory } = placement;
   const usedNames = new Set<string>();
   const assets: MaterializedProjectAsset[] = [];
   const failures: string[] = [];
@@ -125,7 +125,7 @@ async function materializeAttachedProjectAssets(access: ProjectAccess, attachmen
     assets.push({
       sourceFileName: attachment.fileName,
       projectPath,
-      publicPath: directory.startsWith("public/") ? `/${projectPath.slice("public/".length)}` : projectPath,
+      publicPath: attachedAssetPublicPath(projectPath, placement),
       bytes: written.bytes ?? Buffer.from(match[2], "base64").byteLength,
     });
   }
@@ -456,12 +456,21 @@ function workingSetWithCommandFailure(base: ProjectWorkingSet, failure: FactoryC
 
 function missingRelativeImportTarget(failure: FactoryCommandEvent, projectPath: string) {
   const output = stripTerminalFormatting(`${failure.stdout}\n${failure.stderr}`);
-  const match = /Could not resolve\s+["']([^"']+)["']\s+from\s+["']([^"']+)["']/i.exec(output);
-  if (!match?.[1]?.startsWith(".") || !match[2]) return undefined;
-  const importer = match[2].replace(/\\/g, "/");
-  const target = path.relative(projectPath, path.resolve(projectPath, path.dirname(importer), match[1])).replace(/\\/g, "/");
+  const relativeMatch = /Could not resolve\s+["']([^"']+)["']\s+from\s+["']([^"']+)["']/i.exec(output);
+  const aliasMatch = /(?:Module not found:\s*)?(?:Can't|Cannot) resolve\s+["'](@\/[^"']+)["']/i.exec(output);
+  const specifier = relativeMatch?.[1] ?? aliasMatch?.[1];
+  const importer = relativeMatch?.[2]?.replace(/\\/g, "/")
+    ?? extractCompilerSourcePaths(output, projectPath).find((candidate) => /\.[cm]?[jt]sx?$/i.test(candidate));
+  if (!specifier || !importer || (!specifier.startsWith(".") && !specifier.startsWith("@/"))) return undefined;
+  const resolved = specifier.startsWith("@/")
+    ? path.resolve(projectPath, "src", specifier.slice(2))
+    : path.resolve(projectPath, path.dirname(importer), specifier);
+  const target = path.relative(projectPath, resolved).replace(/\\/g, "/");
   if (!target || target.startsWith("../") || path.isAbsolute(target) || existsSync(path.join(projectPath, target))) return undefined;
-  return { importer, specifier: match[1], target };
+  const targetExistsWithExtension = [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx"]
+    .some((suffix) => existsSync(path.join(projectPath, `${target}${suffix}`)));
+  if (targetExistsWithExtension) return undefined;
+  return { importer, specifier, target };
 }
 
 function commandTracebackSourcePaths(workingSet: ProjectWorkingSet, projectPath: string, limit = 3): string[] {
@@ -647,12 +656,19 @@ function compactNewProjectChecklist(projectType: string): FactoryObjectiveCheckl
 
 const projectsRoot = path.join(process.cwd(), "projects");
 type PreviewProcessRecord = { port: number; processId?: number; lastUsedAt: number; previewUrl: string; projectPath: string; kind: "static" | "app"; ownershipToken?: string; runtimeLog?: string; runtimeVersion?: string };
-const previewProcessGlobal = globalThis as typeof globalThis & { __foundryPreviewProcesses?: Map<string, PreviewProcessRecord> };
+type PreviewStatusOutcome = { previewState: FactoryPreviewState; previewUrl?: string; previewReason?: string; previewPlatform?: FactoryPreviewPlatform };
+const previewProcessGlobal = globalThis as typeof globalThis & {
+  __foundryPreviewProcesses?: Map<string, PreviewProcessRecord>;
+  __foundryPreviewRefreshes?: Map<string, Promise<void>>;
+  __foundryPreviewRefreshOutcomes?: Map<string, PreviewStatusOutcome>;
+};
 // Next.js compiles API routes into separate module graphs. A module-local map lets the execution
 // route start a detached preview while the preview/stop route sees an empty registry and falsely
 // reports success. Process-global ownership keeps start/status/stop consistent across route bundles
 // and survives development hot reloads without orphaning locked project directories.
 const previewProcesses = previewProcessGlobal.__foundryPreviewProcesses ??= new Map<string, PreviewProcessRecord>();
+const previewRefreshes = previewProcessGlobal.__foundryPreviewRefreshes ??= new Map<string, Promise<void>>();
+const previewRefreshOutcomes = previewProcessGlobal.__foundryPreviewRefreshOutcomes ??= new Map<string, PreviewStatusOutcome>();
 const workspacePreviewRegistryDirectory = path.join(process.cwd(), ".foundry-data", "preview-processes-v1");
 
 function staticPreviewRuntimeVersion() {
@@ -665,6 +681,21 @@ function staticPreviewRuntimeVersion() {
 
 function workspacePreviewRecordPath(projectId: string) {
   return path.join(workspacePreviewRegistryDirectory, `${createHash("sha256").update(projectId).digest("hex")}.json`);
+}
+
+/**
+ * Registers the process that now owns this project's preview, stopping whichever one it replaces.
+ *
+ * `previewProcesses.set` alone silently abandoned the previous server: it kept running, kept holding
+ * its port, and was no longer referenced by anything that could stop it. Repeated refreshes stacked
+ * up dozens of orphans — one workspace was found holding ports 3100-3142 — which eats the managed
+ * port range until `findPreviewPort` can no longer allocate one.
+ */
+function registerPreviewProcess(projectId: string, preview: PreviewProcessRecord) {
+  const previous = previewProcesses.get(projectId);
+  if (previous?.processId && previous.processId !== preview.processId) stopPreviewProcessTree(previous.processId);
+  previewProcesses.set(projectId, preview);
+  persistWorkspacePreview(projectId, preview);
 }
 
 function persistWorkspacePreview(projectId: string, preview: PreviewProcessRecord) {
@@ -1724,6 +1755,18 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     result.turnsUsed += buildRepair.turnsUsed;
 
     if (!buildRepair.changedFiles.length) {
+      if (missingImport && compilerRepairPass < maxCompilerRepairPasses) {
+        // A missing imported module is ordinary incomplete-generation evidence, not a product
+        // decision. If the first bounded repair failed to write it, change model strategy inside
+        // the existing autonomous allowance instead of asking the customer to authorize a normal
+        // compiler repair. The next loop receives the same exact compiler evidence and escalates.
+        await emitExecution(execution, "reasoning", "warning", "The first compiler repair made no source change; Foundry is switching strategy automatically", {
+          details: { failureFingerprint, failureSignature, missingTarget: missingImport.target, paidRepairPasses: compilerRepairPass, automaticRecovery: true, terminal: false },
+        });
+        result.status = "failed";
+        result.blocker = `The generated batch is missing ${missingImport.target}; automatic compiler recovery is continuing from the preserved diagnostic.`;
+        continue;
+      }
       // A paid repair that made no mutation is not progress. Retrying the same diagnostic with a
       // different prompt used to consume the remaining mission budget while showing the same two
       // messages to the user. Preserve the compiler evidence and require an explicit continuation;
@@ -1965,10 +2008,14 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // completion after later source changes exposed a failing build.
   const productionBuildPassed = result.commands.filter((command) => isProductionBuildCommand(command.command)).at(-1)?.exitCode === 0;
 
-  // A successful real build is enough to expose the actual preview for the remaining interactive
-  // gate even when the mission is still honestly blocked on browser/playthrough evidence.
+  // The preview shows what is on disk; it is not a reward for a passing verdict. Withholding it
+  // until the mission passed meant that the one time a user most needs to see their project — when
+  // Foundry reports a problem with it — the workspace showed nothing at all. Any run that wrote
+  // files gets a preview; readiness gating below still decides what may be *validated*.
   const generatedPreviewTarget = { kind: "workspace" as const, projectId, projectPath };
-  let preview = status === "passed" || mockGateReached || productionBuildPassed ? await startProjectPreview(generatedPreviewTarget, stackProfile.label, events, execution) : undefined;
+  let preview = status === "passed" || mockGateReached || productionBuildPassed || result.changedFiles.length > 0
+    ? await startProjectPreview(generatedPreviewTarget, stackProfile.label, events, execution)
+    : undefined;
   const readyBuiltWebPreview = Boolean(
     preview?.previewUrl
     && preview.previewState === "ready"
@@ -1981,7 +2028,10 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   if (readyBuiltWebPreview && preview?.previewUrl) {
     let browserEvidence = await validateGeneratedStaticPreview(preview.previewUrl, projectPath, execution, preview.previewOwnershipToken, task);
     browserEvidence = await enforceProductionIntegrationReadiness(browserEvidence, projectPath, projectId, task);
-    if (!browserEvidence.verified && stackProfile.id === "static-html") {
+    // A broken asset reference is a path mistake in any stack, not a static-HTML quirk. Gating this
+    // on one stack id sent every other stack straight into a paid repair loop for a fix Foundry can
+    // make deterministically from what is already on disk.
+    if (!browserEvidence.verified) {
       const repairedBrokenImages = browserEvidence.brokenImageSources?.length
         ? await repairBrokenStaticImages(access, browserEvidence.brokenImageSources, execution)
         : false;
@@ -2014,13 +2064,13 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     const browserRepairChangedFiles = new Set<string>();
     const attemptedBrowserRepairFingerprints = new Set<string>();
     const repeatedBrowserFindings = new Map<string, number>();
-    const maximumBrowserRepairStages = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES);
+    const maximumBrowserRepairStages = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 2);
     let browserVerificationConflict = false;
     for (let repairAttempt = 1; !browserEvidence.verified && !browserEvidence.infrastructureFailure && repairAttempt <= maximumBrowserRepairStages; repairAttempt += 1) {
       const findingFingerprint = verificationFindingFingerprint(browserEvidence.evidence);
       const findingCount = (repeatedBrowserFindings.get(findingFingerprint) ?? 0) + 1;
       repeatedBrowserFindings.set(findingFingerprint, findingCount);
-      if (findingCount > 4) {
+      if (findingCount > 1) {
         browserVerificationConflict = true;
         await emitExecution(execution, "planning", "warning", "Stopped repeated generated-project repair on unchanged browser findings", {
           internal: true,
@@ -2169,11 +2219,11 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       evidence: browserEvidence.evidence,
     });
     if (!browserEvidence.verified) {
-      status = browserVerificationConflict ? "needs-clarification" : "failed";
+      status = "failed";
       blocker = browserVerificationConflict
         ? `Foundry preserved the unfinished project after every configured browser-repair strategy returned unchanged source and evidence. Continue recovery from this exact browser gate.\n\n${browserEvidence.evidence}`
         : browserEvidence.evidence;
-      if (browserVerificationConflict) result.clarificationQuestions = [{ question: "Continue autonomous repair from the preserved browser evidence using a fresh strategy?", options: ["Continue recovery", "Pause here"] }];
+      result.clarificationQuestions = undefined;
     } else if (browserEvidenceCanSupersedeBlocker || onlyBoundedBookkeepingRemains || successfulBuildSupersedesBatchBoundary) {
       status = "passed";
       blocker = undefined;
@@ -2366,9 +2416,18 @@ async function validateObservableBrowserContract(
 ): Promise<{ verified: boolean; applicable: boolean; evidence: string; problem?: string; bestUrl?: string }> {
   const contract = observableBrowserContractForTask(task);
   const requested = [...new Set(contract.requirements.flatMap((item) => item.capabilities))];
-  if (!requested.length && !workflowManifest?.workflows.length) {
-    return { verified: false, applicable: false, evidence: "No deterministic rendered capability contract could be derived from this request." };
+  // Literal content the user spelled out ("the heading \"Sam Carter\"", "labelled Design, Prototyping
+  // and Research") is checkable even when the request maps to no CRUD capability at all. Treating that
+  // as "nothing to verify" is what let a page deliver one of three stated requirements and report Done.
+  const requiredTexts = requiredVisibleTextsForTask(task);
+  // Element-level claims from the brief ("Responsive images with lazy loading", "footer navigation").
+  // A self-reported checklist ticked these complete on a page containing no <img> at all.
+  const requiredDom = requiredDomFeaturesForTask(task);
+  if (!requested.length && !workflowManifest?.workflows.length && !requiredTexts.length && !requiredDom.length) {
+    return { verified: false, applicable: false, evidence: "Nothing in this request was specific enough to check automatically in the browser, so no behaviour was asserted beyond the page rendering cleanly." };
   }
+  const renderedTexts: string[] = [];
+  const domFeaturesFound = new Set<string>();
 
   const declaredWorkflow = workflowManifest
     ? await executeAcceptanceWorkflowManifest(page, urls[0], workflowManifest)
@@ -2442,31 +2501,93 @@ async function validateObservableBrowserContract(
       if (observed.editablePricing) capabilities.push("editable-pricing");
       if (observed.visualPolish) capabilities.push("visual-polish");
       observations.push({ url: page.url(), capabilities });
+      if (requiredTexts.length) renderedTexts.push(await page.innerText("body").catch(() => ""));
+      for (const feature of requiredDom) {
+        if (domFeaturesFound.has(feature.label)) continue;
+        if (await page.locator(feature.selector).count().catch(() => 0) > 0) domFeaturesFound.add(feature.label);
+      }
     } catch {
       // Navigation health is reported by the main browser gate; this probe only records positive capability evidence.
     }
   }
 
-  const workflowCapabilities = requested.filter((capability) => ["create-record", "search-filter", "update-record", "assign-record", "complete-record", "permission-denied", "cancel-record", "conflict-rejection", "toggle-state", "delete-record", "persistent-state"].includes(capability));
+  // A capability Foundry can DRIVE end-to-end (create a record, run a search, toggle state) is real
+  // acceptance: requested but not exercisable means the feature genuinely is not there. A capability
+  // it can only look for by SHAPE ("is there a file input", "is this styled enough") is a heuristic
+  // presence check, brittle on both sides, and must never be a hard failure.
+  const drivenWorkflowCapabilities = new Set<ObservableBrowserCapability>(["create-record", "search-filter", "update-record", "assign-record", "complete-record", "permission-denied", "cancel-record", "conflict-rejection", "toggle-state", "delete-record", "persistent-state"]);
+  const workflowCapabilities = requested.filter((capability) => drivenWorkflowCapabilities.has(capability));
   const workflow = workflowCapabilities.length
     ? await exerciseNamedBrowserWorkflow(page, workflowCapabilities, [...new Set(urls)])
     : { covered: [] as ObservableBrowserCapability[], evidence: "", problems: [] as string[], url: undefined as string | undefined };
   if (workflow.url) observations.push({ url: workflow.url, capabilities: workflow.covered });
 
   const covered = new Set(observations.flatMap((item) => item.capabilities));
-  const missing = requested.filter((capability) => !covered.has(capability));
+  // Only a driven-workflow capability may be a hard shortfall. Presence-only capabilities
+  // (visual-polish, an image upload input, an editable price field) are heuristics on both the
+  // request side and the DOM side — they are observed as positive evidence but never fail a page that
+  // renders cleanly. Treating them as hard gates is what failed a working "add an image upload button"
+  // and a working redesign, then burned the mission budget in a repair loop chasing them.
+  const hardRequested = requested.filter((capability) => drivenWorkflowCapabilities.has(capability));
+  const missing = hardRequested.filter((capability) => !covered.has(capability));
+  const unmetPresenceCapabilities = requested.filter((capability) => !drivenWorkflowCapabilities.has(capability) && !covered.has(capability));
   const best = observations.sort((left, right) => right.capabilities.filter((item) => requested.includes(item)).length - left.capabilities.filter((item) => requested.includes(item)).length)[0];
   // Unsupported prose is reported transparently, but it must not downgrade capabilities that the
   // deterministic driver actually exercised. A stack choice or product description is not itself
   // a DOM behavior; the observable contract is complete when every mapped capability passed.
-  const uncoveredProse = contract.unsupported.filter((requirement) => !declaredWorkflow.passed.includes(requirement));
-  const verified = missing.length === 0 && declaredWorkflow.problems.length === 0 && uncoveredProse.length === 0;
-  const evidence = `Requirement-directed browser acceptance covered ${requested.length - missing.length}/${requested.length} observable capabilities across ${observations.length} reachable route(s)${best?.url ? `; strongest matching surface: ${best.url}` : ""}.${workflow.evidence ? ` ${workflow.evidence}` : ""}`;
-  const problems = [...(missing.length ? [`missing or failing capability: ${missing.join(", ")}`] : []), ...workflow.problems, ...declaredWorkflow.problems, ...(uncoveredProse.length ? [`no executable acceptance workflow covers: ${uncoveredProse.join("; ")}`] : [])];
-  const unsupportedEvidence = uncoveredProse.length ? ` No executable browser contract was available for: ${uncoveredProse.join("; ")}.` : "";
+  // Explicitly demanded on-screen content, checked against what actually rendered.
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim().toLowerCase();
+  const renderedBody = normalize(renderedTexts.join("\n"));
+  const missingTexts = requiredTexts.filter((text) => !renderedBody.includes(normalize(text)));
+  const verifiedTexts = requiredTexts.filter((text) => !missingTexts.includes(text));
+  // A prose requirement whose stated literal content was found on screen IS covered — it must not also
+  // be reported as un-actionable prose.
+  const uncoveredProse = contract.unsupported
+    .filter((requirement) => !declaredWorkflow.passed.includes(requirement))
+    .filter((requirement) => !verifiedTexts.some((text) => normalize(requirement).includes(normalize(text))));
+  // A required DOM element is derived by matching a NOUN in the task ("images" → expect <img>). It
+  // cannot read intent: "remove all the images" matched "images" and then demanded the page keep the
+  // very images the user asked to delete — failing a correct implementation. Element presence is
+  // therefore reported, never a hard failure. Objective breakage, driven workflows, and explicit
+  // on-screen text the user quoted still gate hard.
+  const missingDom = requiredDom.filter((feature) => !domFeaturesFound.has(feature.label));
+  const verified = missing.length === 0 && workflow.problems.length === 0 && declaredWorkflow.problems.length === 0 && missingTexts.length === 0;
+  const textEvidence = requiredTexts.length
+    ? ` Required on-screen content: ${verifiedTexts.length}/${requiredTexts.length} present.`
+    : "";
+  const domEvidence = requiredDom.length
+    ? ` Requested page elements: ${requiredDom.length - missingDom.length}/${requiredDom.length} present.`
+    : "";
+  // "covered 0/0 observable capabilities" states a ratio about nothing and reads as a failure. When
+  // the request mapped to no observable capability, say what was actually checked instead.
+  const coverageEvidence = hardRequested.length
+    ? `Requirement-directed browser acceptance covered ${hardRequested.length - missing.length}/${hardRequested.length} observable capabilities across ${observations.length} reachable route(s)${best?.url ? `; strongest matching surface: ${best.url}` : ""}.`
+    : `Requirement-directed browser acceptance checked ${observations.length} reachable route(s)${best?.url ? `; strongest matching surface: ${best.url}` : ""}.`;
+  const evidence = `${coverageEvidence}${textEvidence}${domEvidence}${workflow.evidence ? ` ${workflow.evidence}` : ""}`;
+  // The uncovered list is every requirement with no automatic check — for a rich brief that is the whole
+  // brief. Joining it verbatim produced a multi-thousand-character wall in the user's summary that could
+  // not be read or acted on. Name a few, count the rest.
+  const briefly = (items: string[], limit = 3) => {
+    const shown = items.slice(0, limit).map((item) => item.length > 90 ? `${item.slice(0, 87)}…` : item);
+    const remaining = items.length - shown.length;
+    return `${shown.join("; ")}${remaining > 0 ? ` (and ${remaining} more)` : ""}`;
+  };
+  const problems = [...(missing.length ? [`missing or failing capability: ${missing.join(", ")}`] : []), ...(missingTexts.length ? [`the request explicitly required this on-screen content, which is not rendered: ${missingTexts.map((text) => `"${text}"`).join(", ")}`] : []), ...workflow.problems, ...declaredWorkflow.problems];
+  // Best-effort observations that could not be confirmed by shape. Reported so the terminal handoff is
+  // honest, but they do not fail the mission or authorize a paid repair — the model that did the work
+  // and the objective render-health gate are the deciders.
+  const softNotes = [
+    ...(unmetPresenceCapabilities.length ? [`could not confirm by shape: ${unmetPresenceCapabilities.join(", ")}`] : []),
+    ...(missingDom.length ? [`no element matched for: ${missingDom.map((feature) => feature.label).join(", ")}` ] : []),
+  ];
+  const softNoteEvidence = softNotes.length ? ` Best-effort (non-blocking): ${softNotes.join("; ")}.` : "";
+  const unsupportedEvidence = uncoveredProse.length ? ` ${uncoveredProse.length} requested item(s) could not be checked automatically: ${briefly(uncoveredProse)}.` : "";
   return problems.length
-    ? { verified, applicable: true, evidence: `${evidence} ${problems.join(". ")}.${unsupportedEvidence}`, problem: `The browser health check passed, but requested behavior acceptance did not: ${problems.join(". ")}.`, bestUrl: best?.url }
-    : { verified, applicable: true, evidence: `${evidence}${declaredWorkflow.passed.length ? ` Executed ${declaredWorkflow.passed.length} declared acceptance workflow(s).` : ""}${unsupportedEvidence}`, bestUrl: declaredWorkflow.bestUrl ?? best?.url };
+    ? { verified, applicable: true, evidence: `${evidence} ${problems.join(". ")}.${softNoteEvidence}${unsupportedEvidence}`, problem: `The browser health check passed, but requested behavior acceptance did not: ${problems.join(". ")}.`, bestUrl: best?.url }
+    // Nothing failed here. The un-automatable remainder of a rich brief is a coverage limitation the
+    // engineering report already carries; repeating it inside passing evidence turned every clean
+    // acceptance line into a wall of caveats.
+    : { verified, applicable: true, evidence: `${evidence}${declaredWorkflow.passed.length ? ` Executed ${declaredWorkflow.passed.length} declared acceptance workflow(s).` : ""}${softNoteEvidence}`, bestUrl: declaredWorkflow.bestUrl ?? best?.url };
 }
 
 async function executeAcceptanceWorkflowManifest(page: import("playwright").Page, previewUrl: string, manifest: AcceptanceWorkflowManifest) {
@@ -2581,6 +2702,9 @@ async function validateGeneratedStaticPreview(
 }
 
 async function validateGeneratedStaticPreviewOnce(previewUrl: string, artifactRoot: string, execution: ExecutionContext, expectedOwnershipToken?: string, requestedTask = ""): Promise<BrowserPreviewEvidence> {
+  // A structured Foundry brief contains alternative stacks, future ideas, paths, and planning
+  // metadata. Browser acceptance must test only the durable current product requirements.
+  requestedTask = durableBrowserRequirementsFromBrief(requestedTask);
   const artifactDir = path.join(artifactRoot, ".foundry-artifacts", "validation");
   const screenshotPath = path.join(artifactDir, "generated-preview.png");
   await mkdir(artifactDir, { recursive: true });
@@ -2885,8 +3009,13 @@ async function validateGeneratedStaticPreviewOnce(previewUrl: string, artifactRo
         ...(rendered.misplacedControls.length ? [`Visible control(s) escaped their semantic layout container: ${rendered.misplacedControls.join(", ")}.`] : []),
         ...(rendered.brokenImages ? [`${rendered.brokenImages} visibly broken image(s) remained in the rendered interface.`] : []),
         ...(rendered.textLength < 80 || rendered.height < 240 || (rendered.meaningfulElements < 1 && rendered.interactiveControls < 2 && rendered.productCards < 3) ? ["The rendered page did not contain enough meaningful visible application content."] : []),
-        ...(requiresSubstantialUiAcceptance(requestedTask) && (rendered.textLength < 500 || rendered.meaningfulElements < 7 || rendered.interactiveControls < 10 || rendered.formFields < 2 || rendered.styledControls < 8)
-          ? [`The request described an advanced or feature-rich product, but the rendered interface was still a thin shell (${rendered.textLength} text characters, ${rendered.meaningfulElements} semantic regions, ${rendered.interactiveControls} controls, ${rendered.formFields} form fields, ${rendered.styledControls} intentionally styled controls).`]
+        // Form fields are NOT a proxy for richness. A product page, a marketing page, or a read-only
+        // dashboard can be genuinely feature-rich with zero inputs — one such page (12k characters, 20
+        // regions, 31 controls, 22 styled controls) was called a "thin shell" purely because it had no
+        // form. When a form is actually requested, requiredDomFeaturesForTask asserts it directly, so
+        // this generic gate only judges substance: text, structure, controls, and styling.
+        ...(requiresSubstantialUiAcceptance(requestedTask) && (rendered.textLength < 500 || rendered.meaningfulElements < 7 || rendered.interactiveControls < 10 || rendered.styledControls < 8)
+          ? [`The request described an advanced or feature-rich product, but the rendered interface was still a thin shell (${rendered.textLength} text characters, ${rendered.meaningfulElements} semantic regions, ${rendered.interactiveControls} controls, ${rendered.styledControls} intentionally styled controls).`]
           : []),
         ...navigationFailures,
         ...Array.from(responsiveLayoutIssues).map((issue) => `Responsive layout: ${issue}.`),
@@ -2908,7 +3037,12 @@ async function validateGeneratedStaticPreviewOnce(previewUrl: string, artifactRo
       const visibleProblems = compactValidationProblems(problems);
       const evidence = verified
         ? `Real browser preview rendered successfully (${rendered.textLength} text characters, ${rendered.meaningfulElements} semantic regions, ${rendered.interactiveControls} interactive controls). ${observableAcceptanceProbe.evidence} ${namedControlProbe.evidence} Exercised ${navigationChecks.length} same-origin navigation target(s), ${responsiveLayoutChecks.length} desktop/mobile route layout check(s), and ${namedControlProbe.verified ? "the exact named-control workflow" : observableAcceptanceProbe.verified ? "the requirement-directed acceptance contract" : interactionProbe.verified ? "a representative control" : "the rendered surface"} with no console, page, local-request, responsive-layout, interaction, or navigation errors. Screenshot of ${acceptanceScreenshotUrl}: ${screenshotPath}`
-        : `Browser preview verification failed: ${visibleProblems.join(" ")} ${observableAcceptanceProbe.evidence} ${namedControlProbe.evidence} Screenshot of ${acceptanceScreenshotUrl}: ${screenshotPath}`;
+        // A failure message must lead with what is actually wrong. Appending both acceptance probes
+        // unconditionally buried a one-line defect ("an image 404s") under coverage bookkeeping —
+        // "covered 0/0 capabilities", "37 items could not be checked automatically" — that names no
+        // failure at all and made every report read like a catastrophe. Probe evidence is included
+        // only when that probe is what failed.
+        : `Browser preview verification failed: ${visibleProblems.join(" ")}${acceptanceProblems.length ? ` ${[observableAcceptanceProbe.evidence, namedControlProbe.evidence].filter(Boolean).join(" ")}` : ""} Screenshot of ${acceptanceScreenshotUrl}: ${screenshotPath}`;
       // An inapplicable probe has nothing to disprove. When the request names no broken control AND no
       // rendered capability contract can be derived from it (e.g. "add a switch to toggle dark mode"),
       // neither probe applies — and reading that absence as a negative verdict failed healthy missions
@@ -3506,32 +3640,110 @@ async function validateRequestedStaticExperience(page: import("playwright").Page
   }
 }
 
-async function repairBrokenStaticImages(access: ProjectAccess, brokenSources: string[], execution: ExecutionContext) {
-  const entries = await access.listDir("");
-  const entry = entries.find((item) => item.kind === "file" && /\.html?$/i.test(item.name));
-  if (!entry) return false;
-  const source = await access.readFile(entry.name, { limitBytes: 500_000 });
-  if (!source.exists || source.truncated) return false;
+/** Every real image/media file in the project, indexed by file name, with the URL that serves it. */
+async function projectMediaFilesByName(access: ProjectAccess) {
+  const byName = new Map<string, string>();
+  const queue = [{ path: "", depth: 0 }];
+  let inspected = 0;
+  while (queue.length && inspected < 2_000) {
+    const current = queue.shift()!;
+    const entries = await access.listDir(current.path).catch(() => []);
+    for (const entry of entries) {
+      inspected += 1;
+      const relative = current.path ? `${current.path}/${entry.name}` : entry.name;
+      if (entry.kind === "directory") {
+        if (current.depth < 5 && !isGeneratedProjectDirectory(entry.name)) queue.push({ path: relative, depth: current.depth + 1 });
+        continue;
+      }
+      if (!/\.(?:png|jpe?g|webp|gif|avif|svg|bmp|ico|mp4|webm)$/i.test(entry.name)) continue;
+      // `public/` and `static/` are web roots, not URL segments — a framework and Foundry's own
+      // static preview both serve `public/foundry-uploads/logo.png` as `/foundry-uploads/logo.png`.
+      const served = `/${relative.replace(/^(?:public|static)\//, "")}`;
+      if (!byName.has(entry.name.toLowerCase())) byName.set(entry.name.toLowerCase(), served);
+    }
+  }
+  return byName;
+}
 
+/** Text files whose source can carry an image reference (markup, scripts, styles, data). */
+async function projectImageReferenceFiles(access: ProjectAccess) {
+  const files: string[] = [];
+  const queue = [{ path: "", depth: 0 }];
+  let inspected = 0;
+  while (queue.length && inspected < 2_000 && files.length < 60) {
+    const current = queue.shift()!;
+    const entries = await access.listDir(current.path).catch(() => []);
+    for (const entry of entries) {
+      inspected += 1;
+      const relative = current.path ? `${current.path}/${entry.name}` : entry.name;
+      if (entry.kind === "directory") {
+        if (current.depth < 5 && !isGeneratedProjectDirectory(entry.name)) queue.push({ path: relative, depth: current.depth + 1 });
+        continue;
+      }
+      if (/\.(?:html?|[cm]?[jt]sx?|vue|svelte|astro|css|scss|json)$/i.test(entry.name)) files.push(relative);
+    }
+  }
+  return files;
+}
+
+/**
+ * A broken <img> in the preview is almost always a *path* mistake, not a missing asset: the file the
+ * user uploaded is on disk, the generated markup just points somewhere it isn't served from. Repair
+ * therefore re-points the reference at the real file, and only substitutes a placeholder when no such
+ * file exists — replacing a user's uploaded logo with generic artwork is a worse outcome than the 404.
+ */
+async function repairBrokenStaticImages(access: ProjectAccess, brokenSources: string[], execution: ExecutionContext) {
+  const mediaByName = await projectMediaFilesByName(access);
   // Keep the fallback safe in HTML attributes, single-quoted JavaScript strings,
   // double-quoted JavaScript strings, and JSON. Literal SVG attribute quotes can
   // terminate the generated source context when a broken URL is replaced in place.
   const placeholder = "data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%22800%22%20height=%22600%22%20viewBox=%220%200%20800%20600%22%3E%3Crect%20width=%22800%22%20height=%22600%22%20fill=%22%23f4e7df%22/%3E%3Cpath%20d=%22M160%20420l150-150%2090%2090%2090-100%20150%20160z%22%20fill=%22%23d8b4a0%22/%3E%3Ccircle%20cx=%22570%22%20cy=%22180%22%20r=%2252%22%20fill=%22%23fff7ed%22/%3E%3C/svg%3E";
-  let content = source.content;
-  for (const brokenSource of brokenSources) content = content.split(brokenSource).join(placeholder);
-  if (content === source.content && !content.includes("data-foundry-image-fallback")) {
-    const fallback = `<script data-foundry-image-fallback>document.querySelectorAll('img').forEach((image)=>{const fallback=${JSON.stringify(placeholder)};const repair=()=>{if(image.src!==fallback)image.src=fallback};image.addEventListener('error',repair,{once:true});if(image.complete&&image.naturalWidth===0)repair()});</script>`;
-    content = content.replace(/<\/body\s*>/i, `${fallback}</body>`);
-  }
-  if (content === source.content) return false;
 
-  await emitExecution(execution, "edit", "running", "Replacing broken preview images with reliable local fallbacks", { filePath: entry.name });
-  const write = await access.writeFile(entry.name, content);
-  await emitExecution(execution, "edit", write.verified ? "completed" : "error", write.verified ? "Repaired broken preview images" : "Could not repair broken preview images", {
-    filePath: entry.name,
-    details: { repairedImages: brokenSources.length, reason: write.reason },
+  // The browser reports the *resolved* URL; source carries the literal it was written as. Rewrite
+  // every literal form that resolves to the same broken asset.
+  const replacements = new Map<string, { to: string; recovered: boolean }>();
+  for (const brokenSource of brokenSources) {
+    if (!brokenSource || brokenSource.startsWith("data:")) continue;
+    let pathname = brokenSource;
+    try { pathname = new URL(brokenSource).pathname; } catch { /* already a relative reference */ }
+    const name = decodeURIComponent(pathname.split("/").pop() || "").toLowerCase();
+    const recovered = name ? mediaByName.get(name) : undefined;
+    const to = recovered ?? placeholder;
+    for (const literal of new Set([brokenSource, pathname, pathname.replace(/^\//, ""), `.${pathname}`])) {
+      if (literal && literal !== to) replacements.set(literal, { to, recovered: Boolean(recovered) });
+    }
+  }
+  if (!replacements.size) return false;
+  // Longest literal first, so rewriting the bare path never truncates the full URL form.
+  const ordered = [...replacements.entries()].sort(([left], [right]) => right.length - left.length);
+  const unrecoverable = ordered.some(([, replacement]) => !replacement.recovered);
+
+  const changedFiles: string[] = [];
+  for (const filePath of await projectImageReferenceFiles(access)) {
+    const source = await access.readFile(filePath, { limitBytes: 500_000 }).catch(() => undefined);
+    if (!source?.exists || source.truncated) continue;
+    let content = source.content;
+    for (const [from, replacement] of ordered) content = content.split(from).join(replacement.to);
+    // Images injected by scripts after load never get a static rewrite, so a page that still has an
+    // unrecoverable reference also gets a runtime guard that covers nodes added later.
+    if (unrecoverable && /\.html?$/i.test(filePath) && !content.includes("data-foundry-image-fallback") && /<\/body\s*>/i.test(content)) {
+      const fallback = `<script data-foundry-image-fallback>(function(){var f=${JSON.stringify(placeholder)};function r(i){if(i&&i.tagName==='IMG'&&i.src!==f&&i.complete&&i.naturalWidth===0)i.src=f}document.addEventListener('error',function(e){r(e.target)},true);function s(){document.querySelectorAll('img').forEach(r)}s();new MutationObserver(s).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['src']})})();</script>`;
+      content = content.replace(/<\/body\s*>/i, `${fallback}</body>`);
+    }
+    if (content === source.content) continue;
+    const write = await access.writeFile(filePath, content);
+    if (write.verified) changedFiles.push(filePath);
+  }
+  if (!changedFiles.length) return false;
+
+  const recoveredCount = ordered.filter(([, replacement]) => replacement.recovered).length;
+  await emitExecution(execution, "edit", "completed", recoveredCount
+    ? "Re-pointed broken image references at the real project assets"
+    : "Replaced unrecoverable image references with a local placeholder", {
+    filePath: changedFiles[0],
+    details: { changedFiles: changedFiles.join(", "), repairedReferences: ordered.length, recoveredReferences: recoveredCount },
   });
-  return write.verified;
+  return true;
 }
 
 async function executeExistingProjectTaskCore(
@@ -3566,7 +3778,7 @@ async function executeExistingProjectTaskCore(
   if (localPath) {
     return executeLocalProjectTask(brief, task, localPath, projectName, onEvent, signal, approvedCategories, approvedCommands, parentMission, followUpResolution, continuity, approvalResponse, quality, modelMode, evidenceAttachments, idempotencyCandidate, retryExecutionId);
   }
-  const safeFiles = uploadedFiles.filter((file) => isUsefulUploadedFile(file.path)).map((file) => ({ ...file, path: safeRelativePath(file.path) })).filter((file) => file.path);
+  const safeFiles = normalizeUploadedProjectFiles(uploadedFiles);
   const connectedPath = connectedProjectPathFromFiles(uploadedFiles);
   if (!safeFiles.length) {
     const emptyProjectId = `connected-${slugify(connectedPath) || "project"}`;
@@ -3590,7 +3802,8 @@ async function executeExistingProjectTaskCore(
       sourceMode: "uploaded-copy",
     });
   }
-  const projectPath = await uniqueProjectPath(`uploaded-${slugify(projectName || connectedPath) || "project-copy"}`);
+  const resolvedTarget = await resolveUploadedProjectPath(safeFiles, projectName, connectedPath);
+  const projectPath = resolvedTarget.projectPath;
   const projectId = path.basename(projectPath);
   const briefPath = path.join(projectPath, "foundry-brief.md");
   const events: string[] = [];
@@ -3617,10 +3830,16 @@ async function executeExistingProjectTaskCore(
   });
 
   const detected = detectExistingProject(safeFiles);
-  await writeVirtualFilesToDisk(projectPath, new Map(safeFiles.map((file) => [file.path, file.content])));
-  await emitExecution(execution, "file", "completed", "Copied uploaded files into Foundry target", {
+  // Upload intake already wrote this exact upload into this exact folder so the preview could show
+  // the project immediately. Re-copying would overwrite anything a previous mission changed there.
+  if (!resolvedTarget.reusedIntakeCopy) {
+    await writeVirtualFilesToDisk(projectPath, new Map(safeFiles.map((file) => [file.path, file.content])));
+  }
+  await emitExecution(execution, "file", "completed", resolvedTarget.reusedIntakeCopy ? "Continued in the existing Foundry copy of this upload" : "Copied uploaded files into Foundry target", {
     filePath: projectPath,
-    details: { reason: "Uploaded files need a writable Foundry copy. Export the result to use it outside Foundry.", files: safeFiles.length },
+    details: resolvedTarget.reusedIntakeCopy
+      ? { reason: "This upload was already materialized when the folder was opened; the preview and this mission share one copy.", files: safeFiles.length }
+      : { reason: "Uploaded files need a writable Foundry copy. Export the result to use it outside Foundry.", files: safeFiles.length },
   });
   events.push(`Detected stack: ${detected.stack}`);
   await emitExecution(execution, "inspection", "completed", "Detected project structure", {
@@ -3640,7 +3859,7 @@ async function executeExistingProjectTaskCore(
   const files = mission.projectDeleted ? [] : await listProjectFilesWithStatuses(projectPath, mission.changedFiles, new Set(safeFiles.map((file) => file.path)));
   events.push(...mission.events);
   const preferredStaticEntries = explicitProjectFileNames(task).filter((filePath) => /\.html?$/i.test(filePath));
-  const preview = mission.status === "passed" && !mission.projectDeleted && missionHasPreviewableWork(mission) ? await startProjectPreview({ kind: "workspace", projectId, projectPath }, detected.stack, events, execution, preferredStaticEntries) : undefined;
+  const preview = shouldAttachProjectPreview(mission) ? await startProjectPreview({ kind: "workspace", projectId, projectPath }, detected.stack, events, execution, preferredStaticEntries) : undefined;
   const reusedMission = mission.verification?.some((item) => item.check_type === "file-read" && /complete SHA-256 fingerprints/i.test(item.evidence));
   if (mission.status === "passed" && reusedMission && (!preview || preview.previewState === "ready")) {
     await emitExecution(execution, "summary", "completed", "Request already completed and verified", { details: { reusedResult: true, paidModelCalls: 0 } });
@@ -3804,7 +4023,11 @@ async function exerciseNamedBrowserWorkflow(
       problems.push("no visible create form was available for the named record workflow");
     } else {
       await fillRecordForm(createForm);
-      if (!(await submitRecordForm(createForm))) {
+      // Modal editors normally close after a successful create; permanent inline forms do not.
+      // Requiring every valid form to disappear misreported a working submit button as unusable
+      // and prevented the remaining create/complete/delete workflow from being exercised.
+      const createFormIsModal = await createForm.locator("xpath=ancestor::dialog | ancestor::*[@role='dialog']").count() > 0;
+      if (!(await submitRecordForm(createForm, createFormIsModal))) {
         problems.push("the create form had no usable submit control");
       } else {
         let created = (await page.locator("body").innerText()).includes(token);
@@ -4033,16 +4256,23 @@ async function exerciseNamedBrowserWorkflow(
     await revealListSurface();
     let container = record();
     let complete = container.locator('button, [role="button"]').filter({ hasText: /^(?:complete|mark complete|mark done|resolve|close(?:\s+\w+){0,2})$/i }).first();
+    let completionToggle = container.locator('input[type="checkbox"], [role="checkbox"], [role="switch"]').first();
     if (!(await complete.count()) && await container.count()) {
       await container.click({ timeout: 3_000 }).catch(() => undefined);
       await page.waitForTimeout(700);
       complete = page.locator('button:visible, [role="button"]:visible').filter({ hasText: /^(?:complete|mark complete|mark done|resolve|close(?:\s+\w+){0,2})$/i }).first();
+      container = record();
+      completionToggle = container.locator('input[type="checkbox"], [role="checkbox"], [role="switch"]').first();
     }
-    if (!(await complete.count())) {
+    if (!(await complete.count()) && !(await completionToggle.count())) {
       problems.push("the created record exposed no completion control");
     } else {
       page.once("dialog", (dialog) => void dialog.accept());
-      const activated = await complete.click({ timeout: 3_000 }).then(() => true).catch(() => false);
+      const activated = await complete.count()
+        ? await complete.click({ timeout: 3_000 }).then(() => true).catch(() => false)
+        : await completionToggle.check({ timeout: 3_000 }).then(() => true).catch(async () =>
+            completionToggle.click({ timeout: 3_000 }).then(() => true).catch(async () =>
+              completionToggle.evaluate((element) => (element as HTMLElement).click()).then(() => true).catch(() => false)));
       await page.waitForTimeout(700);
       // A confirmation is only a second step when it appears in a modal/editor. Searching the
       // whole page can mistake another record's identical action for a confirmation and mutate
@@ -4051,6 +4281,7 @@ async function exerciseNamedBrowserWorkflow(
       const confirm = confirmationSurface.locator('button:visible, [role="button"]:visible').filter({ hasText: /^(?:confirm|yes|complete|mark complete|resolve)$/i }).last();
       if (activated && await confirm.count()) await confirm.click({ timeout: 3_000 }).catch(() => undefined);
       let state = "";
+      let completionStateExposed = false;
       // Server-backed mutations commonly refetch and reorder a list after the request succeeds.
       // Poll the named record's observable state instead of taking one race-prone DOM sample.
       for (let attempt = 0; activated && attempt < 8; attempt += 1) {
@@ -4058,9 +4289,13 @@ async function exerciseNamedBrowserWorkflow(
         await revealListSurface();
         container = record();
         state = await container.textContent().catch(() => "") || "";
-        if (/\b(?:completed|complete|done|resolved|closed)\b/i.test(state)) break;
+        const refreshedToggle = container.locator('input[type="checkbox"], [role="checkbox"], [role="switch"]').first();
+        const checked = await refreshedToggle.isChecked().catch(() => false);
+        const ariaChecked = await refreshedToggle.getAttribute("aria-checked").catch(() => null);
+        completionStateExposed = checked || ariaChecked === "true" || /\b(?:completed|complete|done|resolved|closed)\b/i.test(state);
+        if (completionStateExposed) break;
       }
-      if (activated && /\b(?:completed|complete|done|resolved|closed)\b/i.test(state)) covered.add("complete-record");
+      if (activated && completionStateExposed) covered.add("complete-record");
       else problems.push("the completion action did not expose a completed record state");
     }
   }
@@ -4302,12 +4537,12 @@ async function executeConnectorProjectTask(brief: string, task: string, connecto
   let blocker = mission.blocker;
   const verification = [...(mission.verification ?? [])];
   const preferredStaticEntries = explicitProjectFileNames(task).filter((filePath) => /\.html?$/i.test(filePath));
-  const preview = status === "passed" && !mission.projectDeleted && missionHasPreviewableWork(mission) ? await startProjectPreview(connectorPreviewTarget(projectId, connector), mission.stackLabel ?? "Local connector project", events, execution, preferredStaticEntries) : undefined;
+  const preview = mission.preview ?? (shouldAttachProjectPreview(mission) ? await startProjectPreview(connectorPreviewTarget(projectId, connector), mission.stackLabel ?? "Local connector project", events, execution, preferredStaticEntries) : undefined);
   if (preview) {
     const isReady = preview.previewState === "ready";
     await emitExecution(execution, "preview", isReady ? "completed" : "error", isReady ? "Preview ready" : "Preview failed its live readiness check", { details: { previewUrl: preview.previewUrl, reason: preview.previewReason, state: preview.previewState } });
   }
-  if (status === "passed" && mission.stackLabel === "Static HTML/CSS/JS" && preview?.previewUrl && existsSync(rootLabel)) {
+  if (status === "passed" && !isPreviewRestartRequest(task) && mission.stackLabel === "Static HTML/CSS/JS" && preview?.previewUrl && existsSync(rootLabel)) {
     const acceptanceTask = `${brief.trim()}\n\nCurrent follow-up requirement:\n${task.trim()}`;
     const browserEvidence = await validateGeneratedStaticPreview(preview.previewUrl, rootLabel, execution, preview.previewOwnershipToken, acceptanceTask);
     verification.push({ check_type: "preview", result: browserEvidence.verified ? "pass" : "fail", evidence: browserEvidence.evidence });
@@ -4388,7 +4623,6 @@ async function executeLocalProjectTask(brief: string, task: string, localPath: s
   });
 
   const detected = detectExistingProject(localFiles);
-  const existingEnvironment = await environmentReadinessForStack(capabilityLevelForStackChoice(detected.stack).id);
   await emitExecution(execution, "inspection", "completed", "Detected project structure", {
     details: {
       stack: detected.stack,
@@ -4413,14 +4647,14 @@ async function executeLocalProjectTask(brief: string, task: string, localPath: s
   const reusedMission = verification.some((item) => item.check_type === "file-read" && /complete SHA-256 fingerprints/i.test(item.evidence));
   const deterministicStaticSeparation = verification.some((item) => item.check_type === "file-read" && /deterministic static source separation/i.test(item.evidence));
   const preferredStaticEntries = explicitProjectFileNames(task).filter((filePath) => /\.html?$/i.test(filePath));
-  const preview = status === "passed" && !mission.projectDeleted && missionHasPreviewableWork(mission) ? await startProjectPreview({ kind: "workspace", projectId, projectPath }, detected.stack, events, execution, preferredStaticEntries) : undefined;
+  const preview = mission.preview ?? (shouldAttachProjectPreview(mission) ? await startProjectPreview({ kind: "workspace", projectId, projectPath }, detected.stack, events, execution, preferredStaticEntries) : undefined);
   if (status === "passed" && preview?.previewPlatform === "web" && preview.previewState !== "ready") {
     status = "failed";
     blocker = preview.previewReason || "The web preview did not reach a verified ready state.";
     verification.push({ check_type: "preview", result: "fail", evidence: blocker });
     finishObjectiveChecklist(execution, "failed", blocker);
   }
-  if (status === "passed" && detected.stack === "Static HTML/CSS/JS" && preview?.previewUrl) {
+  if (status === "passed" && !isPreviewRestartRequest(task) && detected.stack === "Static HTML/CSS/JS" && preview?.previewUrl) {
     // A follow-up extends the durable project contract; it does not replace it. Validate the saved
     // creation brief and the current instruction together so "preserve everything" cannot pass after
     // a rewrite silently removes earlier controls, seed data, or interaction requirements.
@@ -4505,7 +4739,6 @@ async function executeLocalProjectTask(brief: string, task: string, localPath: s
     sessionSummary,
     clarificationQuestions,
     verification,
-    environment: existingEnvironment,
   };
 }
 
@@ -4612,7 +4845,7 @@ async function runExistingProjectMission(params: {
   evidenceAttachments?: EvidenceAttachments;
   idempotencyCandidate?: MissionParentContext;
   retryExecutionId?: string;
-}): Promise<{ status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: MissionClarification[]; changedFiles: string[]; commands?: FactoryCommandEvent[]; sessionSummary?: FactorySessionSummary; verification?: ExecutionMissionVerification[]; events: string[]; projectDeleted?: boolean }> {
+}): Promise<{ status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: MissionClarification[]; changedFiles: string[]; commands?: FactoryCommandEvent[]; sessionSummary?: FactorySessionSummary; verification?: ExecutionMissionVerification[]; events: string[]; projectDeleted?: boolean; preview?: PreviewOutcome }> {
   const { projectPath, task, sourceMode, execution, signal, approvedCategories, approvedCommands, parentMission, followUpResolution, continuity, approvalResponse, quality, modelMode, evidenceAttachments, idempotencyCandidate, retryExecutionId } = params;
   const access = createServerProjectAccess(projectPath, sourceMode, signal);
   const snapshot = await buildProjectSnapshot(access);
@@ -4813,7 +5046,7 @@ async function runExistingProjectMissionWithAccess(params: {
   evidenceAttachments?: EvidenceAttachments;
   idempotencyCandidate?: MissionParentContext;
   retryExecutionId?: string;
-}): Promise<{ status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: MissionClarification[]; changedFiles: string[]; commands?: FactoryCommandEvent[]; sessionSummary?: FactorySessionSummary; verification?: ExecutionMissionVerification[]; events: string[]; stackLabel?: string; projectDeleted?: boolean }> {
+}): Promise<{ status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: MissionClarification[]; changedFiles: string[]; commands?: FactoryCommandEvent[]; sessionSummary?: FactorySessionSummary; verification?: ExecutionMissionVerification[]; events: string[]; stackLabel?: string; projectDeleted?: boolean; preview?: PreviewOutcome }> {
   const { access, task: requestedTask, sourceMode, execution, projectSnapshot, workspaceProjectPath, previewTarget, signal, approvedCategories = [], approvedCommands = [], parentMission, followUpResolution, continuity, approvalResponse: structuredApprovalResponse, quality = DEFAULT_MISSION_QUALITY, modelMode = "auto", evidenceAttachments = [], idempotencyCandidate, retryExecutionId } = params;
   // Older browser bundles sent approval controls as synthetic prose. Treat that wire format as a
   // control response on the server too, so a stale tab can never restart a premium Builder mission.
@@ -4831,6 +5064,48 @@ async function runExistingProjectMissionWithAccess(params: {
     finishObjectiveChecklist(execution, "failed");
     return { status: "failed", blocker, changedFiles: [], commands: [], verification: [], events: [blocker] };
   }
+  // Runtime control is an owned Foundry operation, never an implementation mission. Keep this
+  // server-side so an old browser bundle cannot accidentally send "start the site" through project
+  // discovery, a paid model, source writes, or browser-repair acceptance. This branch intentionally
+  // runs before reading the saved brief or classifying the request as an edit.
+  if (followUpResolution?.runtimeOperation === "preview_refresh" || isPreviewRestartRequest(requestedTask)) {
+    if (!previewTarget) {
+      const blocker = "This project does not have a preview target that Foundry can start.";
+      await emitExecution(execution, "blocked", "error", blocker, { details: { paidModelCalls: 0, changedFiles: 0, runtimeControl: true } });
+      finishObjectiveChecklist(execution, "failed");
+      return { status: "failed", blocker, changedFiles: [], commands: [], verification: [], events: [blocker] };
+    }
+    await emitExecution(execution, "preview", "running", "Starting the project preview", {
+      details: { paidModelCalls: 0, changedFiles: 0, runtimeControl: true },
+    });
+    const detected = await detectStackProfileAndEntriesForAccess(access);
+    const preview = await startProjectPreview(previewTarget, detected.profile.label, [], execution);
+    const canonicalStaticEntry = detected.rootEntries.find((entry) => /^index\.html?$/i.test(entry));
+    if (canonicalStaticEntry && preview.previewUrl) {
+      const canonicalUrl = new URL(canonicalStaticEntry, preview.previewUrl).toString();
+      preview.previewUrl = canonicalUrl;
+      const ownedPreview = previewProcesses.get(previewTarget.projectId);
+      if (ownedPreview) ownedPreview.previewUrl = canonicalUrl;
+    }
+    const ready = preview.previewState === "ready";
+    const message = ready
+      ? `Preview is running${preview.previewUrl ? ` at ${preview.previewUrl}` : ""}. No project files were changed.`
+      : preview.previewReason || "Foundry could not start this project's preview.";
+    await emitExecution(execution, "preview", ready ? "completed" : "error", message, {
+      details: { paidModelCalls: 0, changedFiles: 0, runtimeControl: true, previewState: preview.previewState, previewUrl: preview.previewUrl },
+    });
+    finishObjectiveChecklist(execution, ready ? "passed" : "failed");
+    return {
+      status: ready ? "passed" : "failed",
+      blocker: ready ? undefined : message,
+      changedFiles: [],
+      commands: [],
+      verification: [],
+      events: [message],
+      stackLabel: detected.profile.label,
+      preview,
+    };
+  }
   const originalTask = parentMission?.source_requirements?.find((requirement) => requirement.trim());
   const operationVerbPresent = /\b(?:run|execute|rerun|verify|validate|revalidate|check|recheck|publish|build|test|retest|launch|open|expose)\b/i.test(requestedTask);
   const explicitlyNoMutation = /\b(?:do not|don't|without)\b[^.!?\n]{0,100}\b(?:edit|change|modify|rewrite|touch)(?:ing)?\b|\bno\s+(?:source|file|code)\s+changes?\b/i.test(requestedTask);
@@ -4843,12 +5118,17 @@ async function runExistingProjectMissionWithAccess(params: {
     || followUpResolution?.currentIntent === "debug"
     || followUpResolution?.currentIntent === "undo"
     || followUpResolution?.currentIntent === "continue"
-    || Boolean(deterministicMutationIntent(requestedTask))
+    || (!followUpResolution && Boolean(deterministicMutationIntent(requestedTask)))
   );
   const exactRetry = Boolean(retryExecutionId && parentMission?.id === retryExecutionId);
-  const standaloneMutationRequest = Boolean(deterministicMutationIntent(requestedTask));
+  const standaloneMutationRequest = followUpResolution
+    ? followUpResolution.currentIntent === "edit" || followUpResolution.currentIntent === "debug"
+    : Boolean(deterministicMutationIntent(requestedTask));
   const isControlContinuation = Boolean(approvalResponse)
-    || exactRetry
+    // Retry identifies the failed execution, but a complete new edit instruction remains the
+    // authoritative scope. Treating every retry as "continue the old plan" resurrected the original
+    // creation checklist over a later named-person portfolio rewrite.
+    || (exactRetry && !standaloneMutationRequest)
     || (followUpResolution?.currentIntent === "continue" && !standaloneMutationRequest);
   let task = continuity === "carry_forward_plan" && !explicitlyReadOnlyOperation && originalTask && isControlContinuation
     ? `${originalTask}\n\nContinuation decision: ${requestedTask}. Continue the entire original request; do not stop after only the approved action or decision.`
@@ -4887,7 +5167,8 @@ async function runExistingProjectMissionWithAccess(params: {
   // A request that names a concrete change carries its own acceptance. A bare continuation ("retry",
   // "finish it") or a build/rebuild names none, so those still inherit the brief — which is the case the
   // inheritance was originally added for.
-  const requestNamesConcreteChange = deterministicMutationIntent(requestedTask) === "edit"
+  const requestNamesConcreteChange = followUpResolution?.currentIntent === "edit"
+    || (!followUpResolution && deterministicMutationIntent(requestedTask) === "edit")
     || looksUnambiguouslyLikeSmallEdit(requestedTask)
     || looksLikeBoundedClientInteraction(requestedTask);
   const inheritedBrowserRequest = [
@@ -4957,6 +5238,22 @@ async function runExistingProjectMissionWithAccess(params: {
   const detectedStackMismatch = Boolean(authoritativeGeneratedStack && authoritativeGeneratedStack.id !== detectedStack.profile.id);
   let stackProfile = authoritativeGeneratedStack ?? detectedStack.profile;
   const { rootEntries } = detectedStack;
+  const staticSourceTopology = detectedStack.profile.id === "static-html"
+    ? await captureStaticSourceTopology(access, rootEntries)
+    : undefined;
+  if (staticSourceTopology?.linkedFiles.length) {
+    workingSet = {
+      ...workingSet,
+      likelyFiles: [...new Set([
+        ...workingSet.likelyFiles,
+        staticSourceTopology.entry,
+        ...staticSourceTopology.linkedFiles,
+      ])],
+    };
+    task = `${task}
+
+Mandatory existing-source contract: preserve this project's established multi-file architecture. The HTML entry ${staticSourceTopology.entry} must continue loading ${staticSourceTopology.linkedFiles.join(", ")}. Keep styling and behavior in their existing linked files; do not replace them with competing inline CSS or JavaScript, duplicate the implementation, or orphan those files unless the user explicitly asked to consolidate the source.`;
+  }
   let verificationProfile = detectedStack.verificationProfile;
   const runCanonicalProjectBuild = async (): Promise<FactoryCommandEvent | undefined> => {
     if (!stackHasBuildStep(stackProfile.id) || !access.runCommand) return undefined;
@@ -5503,7 +5800,7 @@ async function runExistingProjectMissionWithAccess(params: {
   if (!apiKey) {
     const blocker = "No configured AI provider is available. Add OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.";
     await emitExecution(execution, "summary", "error", "Mission blocked", { details: { blocker } });
-    finishObjectiveChecklist(execution, "failed", blocker);
+    finishObjectiveChecklist(execution, "failed", blocker ?? "The web preview did not reach a verified ready state.");
     return { status: "failed", blocker, changedFiles: [], events: [blocker] };
   }
 
@@ -5530,7 +5827,9 @@ async function runExistingProjectMissionWithAccess(params: {
     const assetContract = materializedAssets.map((asset) => `- ${asset.sourceFileName} -> ${asset.publicPath} (project file: ${asset.projectPath})`).join("\n");
     task = `${task}\n\nAttached project asset contract (already written and byte-verified by Foundry):\n${assetContract}\nUse these exact local files in the requested implementation. If the user asked to replace existing assets or remove extras, remove the old generated/remote references and leave only the requested attached assets in that surface. Do not regenerate substitutes.`;
     workingSet = await discoverProjectWorkingSet(access, task);
-    await emitExecution(execution, "file", "completed", `Imported ${materializedAssets.length} attached project asset${materializedAssets.length === 1 ? "" : "s"}`, {
+    // Staging an input is preparation, not implementation. Reporting this as a created application
+    // file made a provider refusal look like partial delivery even though no requested source changed.
+    await emitExecution(execution, "inspection", "completed", `Staged ${materializedAssets.length} attached project asset${materializedAssets.length === 1 ? "" : "s"} for implementation`, {
       details: { files: materializedAssets.map((asset) => asset.projectPath), byteVerified: true, paidModelCalls: 0 },
     });
   }
@@ -5635,14 +5934,30 @@ async function runExistingProjectMissionWithAccess(params: {
     && !/\b(?:delete|remove\s+(?:the\s+)?project|migration|database|authentication|authorization|payment|billing|secret|credential)\b/i.test(task);
   const boundedStaticWholeRewrite = boundedStaticFollowUp
     && /\b(?:redesign|overhaul|rewrite|rebuild|replace)\b[^.\n]{0,60}\b(?:entire|whole|complete|page|screen|site|interface|ui)\b|\bfrom scratch\b/i.test(task);
-  const enforcedReadOnlyIntent = explicitReadOnlyProjectIntent(task);
+  const coordinatedStaticRewrite = boundedStaticWholeRewrite && Boolean(staticSourceTopology?.linkedFiles.length);
+  const enforcedReadOnlyIntent = followUpResolution ? null : explicitReadOnlyProjectIntent(task);
   const skipClassifyCall = Boolean(preModelBrowserEvidence) || resumingIncompleteProject || Boolean(approvalResponse) || (continuity === "carry_forward_plan" && isControlContinuation) || namedControlDefect || looksUnambiguouslyLikeSmallEdit(task) || boundedStaticFollowUp;
+  const resolvedRuntimeIntent = followUpResolution?.currentIntent === "question"
+    ? "question" as const
+    : followUpResolution?.currentIntent === "inspection" || followUpResolution?.currentIntent === "diagnose" || followUpResolution?.currentIntent === "retrospective"
+      ? "analyze" as const
+      : followUpResolution?.currentIntent === "status"
+        ? "status" as const
+        : followUpResolution?.currentIntent === "undo"
+          ? "undo" as const
+          : followUpResolution?.currentIntent === "debug"
+            ? "debug" as const
+            : followUpResolution
+              ? "edit" as const
+              : undefined;
   const classification = enforcedReadOnlyIntent
     ? {
         intent: enforcedReadOnlyIntent === "question" ? "question" as const : "analyze" as const,
         needsProjectInspection: enforcedReadOnlyIntent === "inspection",
         rationale: "Deterministic read-only authority boundary: manual guidance and explicit no-change requests cannot enter mutation execution.",
       }
+    : resolvedRuntimeIntent
+    ? { intent: resolvedRuntimeIntent, needsProjectInspection: resolvedRuntimeIntent !== "question", rationale: "Using the authoritative conversation-level semantic resolution without reclassifying the user's wording." }
     : skipClassifyCall
     ? { intent: resumingIncompleteProject ? "build" as const : "edit" as const, needsProjectInspection: true, rationale: resumingIncompleteProject ? "Resuming the unfinished saved project build without paying for another intent-classification call." : "Recognized as a small, unambiguous edit — skipped an extra classification step to start faster." }
     : await classifyIntent({ message: task, hasProjectContext: true, apiKey, provider: initialModel.provider, projectEvidence: { likelyFiles: workingSet.likelyFiles, estimatedSubsystems: workingSet.estimatedSubsystems, crossLayer: workingSet.crossLayer } });
@@ -5666,7 +5981,7 @@ async function runExistingProjectMissionWithAccess(params: {
     classification.needsProjectInspection = true;
     classification.rationale = "A real browser failure was already collected deterministically, so paid intent classification would only repeat known evidence.";
   }
-  const deterministicIntent = deterministicMutationIntent(task);
+  const deterministicIntent = followUpResolution ? undefined : deterministicMutationIntent(task);
   if (effectiveCommandOnlyRequest && (classification.intent === "question" || classification.intent === "status" || classification.intent === "analyze")) {
     classification.intent = "edit";
     classification.needsProjectInspection = true;
@@ -5791,6 +6106,9 @@ async function runExistingProjectMissionWithAccess(params: {
     : referencedProposal
       ? `Foundry's referenced proposal (authoritative executable scope):\n${referencedProposal}\n\nCurrent instruction:\n${requestedTask}`
       : requestedTask;
+  const semanticVisualStaticTransformation = stackProfile.id === "static-html"
+    && Boolean(staticSourceTopology?.linkedFiles.length)
+    && routingAssessment.visualOutcome;
   // Browser acceptance tests the user's concrete outcome, not the planner/executor context
   // envelope. For a referential continuation ("do it", "go ahead"), recover the nearest prior
   // requirement that exposes a browser-observable capability.
@@ -6187,7 +6505,7 @@ async function runExistingProjectMissionWithAccess(params: {
     const routedImplementationTier = fullGeneratedRecovery ? "builder" : boundedCompilerRepair ? "fast" : implementationTier;
     implementationModel = await modelForMissionStage(task, modelMode, routedImplementationTier, workingSet, parentMission?.state === "failed" ? 1 : 0, routingAssessment) ?? initialModel!;
     await emitModelSelection(execution, "implementation", implementationModel);
-    await emitExecution(execution, "reasoning", "completed", `The working plan is ready. I’m applying the ${classification.intent === "debug" ? "smallest evidence-backed repair" : "requested change"} now and will report any scope change before escalating.`);
+    await emitExecution(execution, "reasoning", "completed", "The working plan is ready. Foundry is reserving the implementation pass now; no source change is claimed until a write is verified on disk.");
     result = await runMissionExecutor({
     objective,
     task,
@@ -6218,7 +6536,7 @@ async function runExistingProjectMissionWithAccess(params: {
     routingAssessment,
     commandOnly: effectiveCommandOnlyRequest,
     initialProjectEvidence: boundedWorkingSetEvidence ?? compilerRepairEvidence,
-    requireFirstMutation: Boolean(boundedWorkingSetEvidence || compilerRepairEvidence || boundedCompilerRepair),
+    requireFirstMutation: Boolean(boundedWorkingSetEvidence || compilerRepairEvidence || boundedCompilerRepair) && !(coordinatedStaticRewrite || semanticVisualStaticTransformation),
     avoidFirstMutationPaths: boundedCoordinatedEdit
       ? parentMission?.files_touched.filter((file) => file.verified).map((file) => file.path)
       : undefined,
@@ -6228,15 +6546,18 @@ async function runExistingProjectMissionWithAccess(params: {
     // this returns. Announcing "Mission blocked" here made a mission that then succeeded look failed
     // mid-run. The runtime still emits the real verdict at the end, under the same stable summary id.
     continuableBatch: true,
-    staticProject: resumingIncompleteStaticProject || boundedStaticFollowUp,
+    // Preserve an established HTML/CSS/JS source set as a coordinated existing project. The
+    // self-contained static generator intentionally exposes only index.html and would contradict
+    // this project's existing architecture.
+    staticProject: resumingIncompleteStaticProject || (boundedStaticFollowUp && !(coordinatedStaticRewrite || semanticVisualStaticTransformation)),
     evidenceFirstRepair: Boolean(preModelBrowserEvidence || boundedCompilerRepair),
     evidenceRepairReadPaths: [...new Set([...compilerRepairReadPaths, ...preModelRepairReadPaths])],
-    maxTurns: preModelBrowserEvidence ? 6 : boundedCompilerRepair ? 6 : approvalResponse ? 20 : boundedSmallEdit ? 6 : boundedStaticFollowUp ? 3 : boundedCoordinatedEdit ? 12 : resumingIncompleteStaticProject ? 8 : resumingIncompleteProject ? 32 : undefined,
-    maxOutputTokens: preModelBuildFailure ? 1_500 : preModelBrowserEvidence ? 5_000 : boundedCompilerRepair ? 1_500 : boundedStaticWholeRewrite ? 16_000 : boundedSmallEdit ? 3_500 : boundedStaticFollowUp ? 3_000 : boundedCoordinatedEdit ? 5_000 : resumingIncompleteProject ? 16_000 : undefined,
+    maxTurns: preModelBrowserEvidence ? 6 : boundedCompilerRepair ? 6 : approvalResponse ? 20 : boundedSmallEdit ? 6 : (coordinatedStaticRewrite || semanticVisualStaticTransformation) ? 6 : boundedStaticFollowUp ? 3 : boundedCoordinatedEdit ? 12 : resumingIncompleteStaticProject ? 8 : resumingIncompleteProject ? 32 : undefined,
+    maxOutputTokens: preModelBuildFailure ? 1_500 : preModelBrowserEvidence ? 5_000 : boundedCompilerRepair ? 1_500 : (coordinatedStaticRewrite || semanticVisualStaticTransformation) ? 16_000 : boundedStaticWholeRewrite ? 16_000 : boundedSmallEdit ? 3_500 : boundedStaticFollowUp ? 3_000 : boundedCoordinatedEdit ? 5_000 : resumingIncompleteProject ? 16_000 : undefined,
     // Generated-project continuation shares one deliberately small ledger across every batch.
     // Deterministic scaffold/build/browser work is unmetered; source generation cannot silently
     // expand one Retry click into an enterprise-tier 40-call mission.
-    routingBudget: preModelBuildFailure ? { estimatedCostUsd: 0.08 } : preModelBrowserEvidence ? { estimatedCostUsd: 0.8 } : boundedCompilerRepair ? { estimatedCostUsd: 0.08 } : boundedSmallEdit ? boundedSmallEditBudget : boundedStaticFollowUp ? { estimatedCostUsd: 0.5 } : boundedCoordinatedEdit ? { estimatedCostUsd: 1 } : resumingIncompleteProject ? generatedRecoveryBudgetForTier(routingBudgetForTier(implementationModel.tier)) : undefined,
+    routingBudget: preModelBuildFailure ? { estimatedCostUsd: 0.08 } : preModelBrowserEvidence ? { estimatedCostUsd: 0.8 } : boundedCompilerRepair ? { estimatedCostUsd: 0.08 } : boundedSmallEdit ? boundedSmallEditBudget : boundedCoordinatedEdit ? { estimatedCostUsd: 1 } : resumingIncompleteProject ? generatedRecoveryBudgetForTier(routingBudgetForTier(implementationModel.tier)) : undefined,
   });
     if (recoveryPreflight) {
       result.changedFiles = Array.from(new Set([...recoveryPreflight.changedFiles, ...result.changedFiles]));
@@ -6260,7 +6581,10 @@ async function runExistingProjectMissionWithAccess(params: {
       details: { changedFiles: result.changedFiles, paidWrapUpCalls: 0 },
     });
   }
-  const boundedStaticWriteAwaitingBrowser = boundedStaticFollowUp
+  const executorInteractionEvidenceAwaitingBrowser = stackProfile.id === "static-html"
+    && result.changedFiles.length > 0
+    && /Interactive UI file\(s\) changed[\s\S]*no finding\/decision confirms the actual interactive behavior/i.test(result.blocker ?? "");
+  const boundedStaticWriteAwaitingBrowser = (boundedStaticFollowUp || executorInteractionEvidenceAwaitingBrowser)
     && result.status === "failed"
     && result.changedFiles.length > 0;
   if (boundedStaticWriteAwaitingBrowser) {
@@ -6800,6 +7124,21 @@ async function runExistingProjectMissionWithAccess(params: {
         result.blocker = managedPreview.previewReason || "Real browser verification was requested, but Foundry could not start an owned web preview.";
       } else {
         let browserEvidence = await validateGeneratedStaticPreview(managedPreview.previewUrl, previewArtifactRoot(previewTarget!), execution, managedPreview.previewOwnershipToken, browserAcceptanceTask);
+        browserEvidence = await includeStaticTopologyEvidence(access, staticSourceTopology, browserEvidence);
+        // A refused connection is owned preview infrastructure, not evidence that product source is
+        // defective. Restart the exact preview generation and retry deterministically before either
+        // rebuilding framework assets or spending another model call.
+        if (!browserEvidence.verified && browserEvidence.infrastructureFailure && previewTarget) {
+          await emitExecution(execution, "preview", "running", "The owned preview stopped responding. Restarting it and repeating the same browser checks without a model call.", {
+            details: { paidModelCalls: 0, recovery: "owned-preview-restart" },
+          });
+          await stopProjectPreview(previewTarget);
+          managedPreview = await startProjectPreview(previewTarget, stackProfile.label, [], execution);
+          if (managedPreview.previewUrl && managedPreview.previewPlatform === "web" && managedPreview.previewState === "ready") {
+            browserEvidence = await validateGeneratedStaticPreview(managedPreview.previewUrl, previewArtifactRoot(previewTarget), execution, managedPreview.previewOwnershipToken, browserAcceptanceTask);
+            browserEvidence = await includeStaticTopologyEvidence(access, staticSourceTopology, browserEvidence);
+          }
+        }
         if (!browserEvidence.verified && browserEvidence.infrastructureFailure && previewTarget && stackHasBuildStep(stackProfile.id)) {
           await emitExecution(execution, "reasoning", "completed", "The production source is valid, but its generated framework assets changed while the preview was live. I’m pausing the preview, rebuilding, and rechecking without a model call.", {
             details: { paidModelCalls: 0, recovery: "framework-preview-generation" },
@@ -6819,13 +7158,14 @@ async function runExistingProjectMissionWithAccess(params: {
             managedPreview = await startProjectPreview(previewTarget, stackProfile.label, [], execution);
             if (managedPreview.previewUrl && managedPreview.previewPlatform === "web" && managedPreview.previewState === "ready") {
               browserEvidence = await validateGeneratedStaticPreview(managedPreview.previewUrl, previewArtifactRoot(previewTarget), execution, managedPreview.previewOwnershipToken, browserAcceptanceTask);
+              browserEvidence = await includeStaticTopologyEvidence(access, staticSourceTopology, browserEvidence);
             }
           }
         }
         const browserRepairChangedFiles = new Set<string>();
         const attemptedBrowserRepairFingerprints = new Set<string>();
         const repeatedBrowserFindings = new Map<string, number>();
-        const maximumBrowserRepairStages = boundedSmallEdit ? 1 : autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES);
+        const maximumBrowserRepairStages = boundedSmallEdit || boundedStaticFollowUp ? 1 : autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 2);
         let browserVerificationConflict = false;
         const browserRepairSourcePaths = () => [...new Set([
           ...workingSet.likelyFiles,
@@ -6847,7 +7187,7 @@ async function runExistingProjectMissionWithAccess(params: {
           const findingFingerprint = verificationFindingFingerprint(browserEvidence.evidence);
           const findingCount = (repeatedBrowserFindings.get(findingFingerprint) ?? 0) + 1;
           repeatedBrowserFindings.set(findingFingerprint, findingCount);
-          if (findingCount > 4) {
+          if (findingCount > 1) {
             browserVerificationConflict = true;
             await emitExecution(execution, "planning", "warning", "Stopped repeated repair on unchanged browser findings", {
               internal: true,
@@ -6863,7 +7203,7 @@ async function runExistingProjectMissionWithAccess(params: {
               details: { evidenceFingerprint, sourceFingerprint, paidCallPrevented: true, repairAttempt },
             });
             const rechecked = await validateGeneratedStaticPreview(managedPreview.previewUrl!, previewArtifactRoot(previewTarget!), execution, managedPreview.previewOwnershipToken, browserAcceptanceTask);
-            browserEvidence = rechecked;
+            browserEvidence = await includeStaticTopologyEvidence(access, staticSourceTopology, rechecked);
             if (rechecked.verified) break;
             const recheckedFingerprint = semanticRepairFingerprint(rechecked.evidence, sourceFingerprint);
             if (attemptedBrowserRepairFingerprints.has(recheckedFingerprint)) {
@@ -6923,6 +7263,7 @@ async function runExistingProjectMissionWithAccess(params: {
               details: { evidenceFingerprint, sourceFingerprint, paidCallPrevented: true, repairAttempt },
             });
             browserEvidence = await validateGeneratedStaticPreview(managedPreview.previewUrl!, previewArtifactRoot(previewTarget!), execution, managedPreview.previewOwnershipToken, browserAcceptanceTask);
+            browserEvidence = await includeStaticTopologyEvidence(access, staticSourceTopology, browserEvidence);
             if (browserEvidence.verified) break;
             const repeatedFingerprint = semanticRepairFingerprint(browserEvidence.evidence, sourceFingerprint);
             if (attemptedBrowserRepairFingerprints.has(repeatedFingerprint)) {
@@ -6961,6 +7302,7 @@ async function runExistingProjectMissionWithAccess(params: {
               continue;
             }
             browserEvidence = await validateGeneratedStaticPreview(managedPreview.previewUrl, previewArtifactRoot(previewTarget!), execution, managedPreview.previewOwnershipToken, browserAcceptanceTask);
+            browserEvidence = await includeStaticTopologyEvidence(access, staticSourceTopology, browserEvidence);
           }
         }
         result.verification.push({ check_type: "preview", result: browserEvidence.verified ? "pass" : "fail", evidence: browserEvidence.evidence });
@@ -7022,11 +7364,11 @@ async function runExistingProjectMissionWithAccess(params: {
             }
           }
         } else if (!browserEvidence.verified) {
-          result.status = browserVerificationConflict ? "needs-clarification" : "failed";
+          result.status = "failed";
           result.blocker = browserVerificationConflict
             ? `Foundry preserved the unfinished implementation after every configured browser-repair strategy returned unchanged source and evidence. Continue recovery from this exact browser gate.\n\n${browserEvidence.evidence}`
             : browserEvidence.evidence;
-          if (browserVerificationConflict) result.clarificationQuestions = [{ question: "Continue autonomous repair from the preserved browser evidence using a fresh strategy?", options: ["Continue recovery", "Pause here"] }];
+          result.clarificationQuestions = undefined;
           result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
           result.sessionSummary.outcome = browserVerificationConflict
             ? "Foundry preserved the unfinished implementation and its exact browser evidence for a fresh repair strategy."
@@ -7129,7 +7471,11 @@ async function runExistingProjectMissionWithAccess(params: {
   // Observed live — the model concluded the total was already above the filter bar, changed nothing, and
   // reported "Done". An unchanged file is exactly the evidence that the move did not happen, so it must
   // be checked, not skipped.
-  if (result.status === "passed" && requestNamesConcreteChange) {
+  // Broad visual redesigns are proven by the real responsive browser workflow below. The
+  // token/position-oriented source-diff compliance checker cannot prove hierarchy, accessibility,
+  // empty states, or interaction quality; applying it here invented violations after healthy
+  // browser-ready source and spent repeated correction calls until the mission budget failed.
+  if (result.status === "passed" && requestNamesConcreteChange && !boundedStaticWholeRewrite && !semanticVisualStaticTransformation) {
     const originalContent = new Map<string, string | undefined>();
     for (const event of result.timeline) {
       if (!event.filePath || event.beforeContent === undefined) continue;
@@ -7442,7 +7788,19 @@ async function runExistingProjectMissionWithAccess(params: {
     const unfinished = result.checklist.filter((item) => item.status === "pending" || item.status === "running" || item.status === "blocked");
     if (unfinished.length) {
       const failedGate = result.verification.find((item) => item.result === "fail");
-      if (failedGate) {
+      // A mutating request (edit/debug/undo) whose plan is still unfinished AND that changed NO file
+      // did not do the work: the model read the project and concluded without applying the change. A
+      // cleanly-rendering UNCHANGED page is not evidence the edit happened — the browser gate proves
+      // health, not fulfilment. Do NOT paper the rows over as complete (that produced the confusing
+      // "returned success before completing the mission plan" Failed banner over a real no-op); fail
+      // honestly and say so. A genuinely already-satisfied request has a COMPLETE plan and never
+      // reaches this branch.
+      if (mutatingOutcomeRequired && result.changedFiles.length === 0) {
+        result.status = "failed";
+        result.blocker = result.blocker
+          || "You asked for a change, but Foundry did not edit any file — the requested change was not applied. Tell me the specific change (or which file to edit) and I will apply it directly.";
+        if (!failedGate) result.verification.push({ check_type: "file-read", result: "fail", evidence: result.blocker });
+      } else if (failedGate) {
         result.status = "failed";
         result.blocker = result.blocker || `The mission cannot conclude as passed: ${unfinished.length} plan item(s) are unfinished and a verification gate failed — ${failedGate.evidence.slice(0, 300)}`;
       } else {
@@ -8165,6 +8523,56 @@ async function checkProjectFolderSafety(rootEntries: string[], task: string): Pr
   return `I found existing files in this folder that don't appear related to the new project you're describing: ${sample}${meaningfulEntries.length > 12 ? ", ..." : ""}. Tell me how to handle them before I start: create a subfolder for the new work, archive the old files first, delete the old files first, continue anyway and mix the new work in here, or cancel.`;
 }
 
+type StaticSourceTopology = {
+  entry: string;
+  linkedFiles: string[];
+};
+
+async function captureStaticSourceTopology(access: ProjectAccess, rootEntries: string[]): Promise<StaticSourceTopology | undefined> {
+  const entry = rootEntries.find((name) => /^index\.html?$/i.test(name));
+  if (!entry) return undefined;
+  const source = await access.readFile(entry, { limitBytes: 500_000 }).catch(() => undefined);
+  if (!source?.exists) return undefined;
+  const links = [
+    ...Array.from(source.content.matchAll(/<link\b[^>]*\bhref\s*=\s*["']([^"'?#]+)(?:[?#][^"']*)?["'][^>]*>/gi), (match) => match[1]),
+    ...Array.from(source.content.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"'?#]+)(?:[?#][^"']*)?["'][^>]*>/gi), (match) => match[1]),
+  ]
+    .map((value) => value.replace(/\\/g, "/").replace(/^\.\//, ""))
+    .filter((value) => value && !/^(?:[a-z]+:|\/\/|data:|#)/i.test(value));
+  return { entry, linkedFiles: [...new Set(links)] };
+}
+
+async function includeStaticTopologyEvidence(
+  access: ProjectAccess,
+  topology: StaticSourceTopology | undefined,
+  evidence: BrowserPreviewEvidence,
+): Promise<BrowserPreviewEvidence> {
+  if (!topology?.linkedFiles.length) return evidence;
+  const source = await access.readFile(topology.entry, { limitBytes: 500_000 }).catch(() => undefined);
+  if (!source?.exists) {
+    return {
+      ...evidence,
+      verified: false,
+      acceptanceVerified: false,
+      infrastructureFailure: false,
+      evidence: `The established HTML entry ${topology.entry} was removed. Restore it and its linked source files before browser acceptance.\n${evidence.evidence}`,
+    };
+  }
+  const normalized = source.content.replace(/\\/g, "/");
+  const missing = topology.linkedFiles.filter((linkedFile) => {
+    const escaped = linkedFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return !new RegExp(`(?:href|src)\\s*=\\s*["'][^"']*${escaped}(?:[?#][^"']*)?["']`, "i").test(normalized);
+  });
+  if (!missing.length) return evidence;
+  return {
+    ...evidence,
+    verified: false,
+    acceptanceVerified: false,
+    infrastructureFailure: false,
+    evidence: `Source architecture regression: ${topology.entry} no longer loads ${missing.join(", ")}. Restore those existing links and keep their CSS/JavaScript implementation in those files; do not leave competing inline copies.\n${evidence.evidence}`,
+  };
+}
+
 async function detectStackProfileAndEntriesForAccess(access: ProjectAccess): Promise<{ profile: StackProfile; rootEntries: string[]; verificationProfile: VerificationProfile }> {
   const rootEntries = (await access.listDir("")).map((entry) => entry.name);
   const manifestPaths = await discoverNestedManifestPaths(access);
@@ -8641,14 +9049,37 @@ function existingProjectResult({
   projectDeleted?: boolean;
 }): FactoryProjectResult {
   const previewFailed = status === "passed" && preview?.previewPlatform === "web" && preview.previewState !== "ready";
-  const truthfulStatus: FactoryProjectResult["status"] = previewFailed ? "failed" : status;
-  const truthfulBlocker = previewFailed
+  let truthfulStatus: FactoryProjectResult["status"] = previewFailed ? "failed" : status;
+  let truthfulBlocker = previewFailed
     ? preview.previewReason || "The web preview did not reach a verified ready state."
     : blocker;
   const truthfulVerification = [
     ...(verification ?? []),
     ...(previewFailed ? [{ check_type: "preview" as const, result: "fail" as const, evidence: truthfulBlocker! }] : []),
   ];
+  // Final reconciliation for EVERY existing-project path (uploaded, local folder, connector). A
+  // mission may not conclude "passed" while its own plan still shows unfinished steps — the client
+  // otherwise flips that into the confusing "returned success before completing the mission plan"
+  // Failed banner. Reconcile by evidence: a failed gate or ZERO file changes means the requested work
+  // did not land, so fail honestly and say plainly that no edit was made; genuine work whose rows were
+  // simply never ticked is completed citing the recorded evidence. A truly no-op-free success has a
+  // complete plan and never enters this branch.
+  const unfinishedPlan = execution.checklist.filter((item) => item.status !== "completed" && item.status !== "skipped");
+  if (truthfulStatus === "passed" && unfinishedPlan.length) {
+    const changedFileCount = files.filter((file) => file.status === "created" || file.status === "edited").length;
+    const failedGate = truthfulVerification.find((item) => item.result === "fail");
+    if (failedGate || changedFileCount === 0) {
+      truthfulStatus = "failed";
+      truthfulBlocker = truthfulBlocker || (changedFileCount === 0
+        ? "You asked for a change, but Foundry did not edit any file — the requested change was not applied. Tell me the specific change (or which file to edit) and I will apply it directly."
+        : `The mission cannot conclude as passed while ${unfinishedPlan.length} plan step(s) remain unfinished.`);
+    } else {
+      for (const item of unfinishedPlan) {
+        item.status = "completed";
+        item.evidence = item.evidence || "Completed at mission conclusion with the recorded file and verification evidence.";
+      }
+    }
+  }
   return {
     projectId,
     projectName,
@@ -8963,6 +9394,88 @@ async function readLocalProjectFiles(projectPath: string) {
 
   await visit(projectPath);
   return files;
+}
+
+/**
+ * The uploaded files, as they should sit inside the Foundry copy.
+ *
+ * A folder upload arrives with every path prefixed by the picked folder's own name, and copying that
+ * verbatim buries the project one level down — so the copy's root is not the project's root. A page
+ * asking for "/img/logo.svg" then resolves against a directory containing nothing but the wrapper
+ * folder, and the asset 404s no matter how correct the project is. Strip the single shared wrapper
+ * so the copy is the project. Applied on both the intake and mission paths, so the copy's layout and
+ * the file list the mission reports against it stay in agreement.
+ */
+function normalizeUploadedProjectFiles(uploadedFiles: FactoryUploadedFile[]) {
+  const safeFiles = uploadedFiles
+    .filter((file) => isUsefulUploadedFile(file.path))
+    .map((file) => ({ ...file, path: safeRelativePath(file.path) }))
+    .filter((file) => file.path);
+  const roots = new Set(safeFiles.map((file) => file.path.split("/")[0]));
+  // Only when one folder genuinely wraps every file: a lone root that is also a file name is a
+  // top-level file, not a wrapper, and stripping it would delete part of the project.
+  if (roots.size !== 1 || !safeFiles.every((file) => file.path.includes("/"))) return safeFiles;
+  const [wrapper] = roots;
+  return safeFiles.map((file) => ({ ...file, path: file.path.slice(wrapper.length + 1) }));
+}
+
+function uploadedProjectSlug(projectName: string, connectedPath: string) {
+  return `uploaded-${slugify(projectName || connectedPath) || "project-copy"}`;
+}
+
+/**
+ * The one workspace folder that represents this upload. Finds the copy upload intake already
+ * materialized by searching for its content marker rather than guessing a folder name: intake runs
+ * before the brief exists and names the folder from the uploaded root, while the mission names it
+ * from the brief. Guessing by name silently forked a second copy, so the mission edited a different
+ * folder than the one the user was watching in the preview.
+ */
+async function resolveUploadedProjectPath(files: Array<{ path: string; content: string }>, projectName: string, connectedPath: string) {
+  await mkdir(projectsRoot, { recursive: true });
+  const entries = await readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(projectsRoot, entry.name);
+    const marker = await readFile(path.join(candidate, uploadIntakeMarkerFile), "utf8").catch(() => undefined);
+    if (uploadIntakeMarkerMatches(marker, files)) return { projectPath: candidate, reusedIntakeCopy: true };
+  }
+  return { projectPath: await uniqueProjectPath(uploadedProjectSlug(projectName, connectedPath)), reusedIntakeCopy: false };
+}
+
+/**
+ * Creates the workspace copy for a browser-uploaded project at pick time and starts its preview, so
+ * opening an existing project shows that project instead of an empty dock. The user's own folder is
+ * never written — a browser upload has no writable handle on it — this only copies what was read.
+ */
+export async function materializeUploadedProjectForPreview(uploadedFiles: FactoryUploadedFile[], projectName: string) {
+  const safeFiles = normalizeUploadedProjectFiles(uploadedFiles);
+  if (!safeFiles.length) {
+    return {
+      ok: false as const,
+      previewState: "unavailable" as const,
+      previewPlatform: "web" as const,
+      previewReason: "The selected folder contained no readable project files, so there is nothing to preview yet.",
+    };
+  }
+  const connectedPath = connectedProjectPathFromFiles(uploadedFiles);
+  // Name the folder after the uploaded root the user recognises — read from the original paths,
+  // since the copy's own paths have had that wrapper stripped. Identity does not depend on this
+  // label (the mission finds this copy by content marker), so it is free to be human-readable.
+  const uploadedRoot = commonTopLevelPath(uploadedFiles.map((file) => safeRelativePath(file.path)).filter(Boolean));
+  const resolved = await resolveUploadedProjectPath(safeFiles, /^multiple /i.test(uploadedRoot) ? projectName : uploadedRoot || projectName, connectedPath);
+  const { projectPath } = resolved;
+  const projectId = path.basename(projectPath);
+  if (!resolved.reusedIntakeCopy) {
+    const markerPath = path.join(projectPath, uploadIntakeMarkerFile);
+    await mkdir(path.dirname(markerPath), { recursive: true });
+    await writeVirtualFilesToDisk(projectPath, new Map(safeFiles.map((file) => [file.path, file.content])));
+    await writeFile(markerPath, `${JSON.stringify(buildUploadIntakeMarker(safeFiles, projectName), null, 2)}\n`, "utf8");
+  }
+  const detected = detectExistingProject(safeFiles);
+  const target = { kind: "workspace" as const, projectId, projectPath };
+  await stopProjectPreview(target);
+  const preview = await startProjectPreview(target, detected.stack);
+  return { ok: true as const, projectId, projectPath, stack: detected.stack, fileCount: safeFiles.length, reusedIntakeCopy: resolved.reusedIntakeCopy, ...preview };
 }
 
 function connectedProjectPathFromFiles(files: FactoryUploadedFile[]) {
@@ -9511,6 +10024,16 @@ function missionHasPreviewableWork(mission: { changedFiles: string[]; commands?:
     || Boolean(mission.verification?.some((item) => item.result === "pass"));
 }
 
+/**
+ * Whether this run should attach a live preview to the project folder. Deliberately independent of
+ * the mission verdict: the preview is a window onto what is on disk, and a user whose mission just
+ * reported a problem needs to see the project more, not less. Only a deleted project — nothing left
+ * to serve — withholds it.
+ */
+function shouldAttachProjectPreview(mission: { projectDeleted?: boolean; changedFiles: string[]; commands?: Array<{ exitCode: number | null }>; verification?: ExecutionMissionVerification[] }) {
+  return !mission.projectDeleted && missionHasPreviewableWork(mission);
+}
+
 function normalizeIdempotentRequest(value: string) {
   return value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
@@ -10049,8 +10572,7 @@ async function startPythonPreview(
   child.unref();
   const previewPath = entry.kind === "asgi" ? "/docs" : "/";
   const previewUrl = `http://127.0.0.1:${port}${previewPath}`;
-  previewProcesses.set(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", runtimeLog });
-  persistWorkspacePreview(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", runtimeLog });
+  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", runtimeLog });
   // A cold Python service (uvicorn/gunicorn importing a large app, or Django's first-request setup)
   // can take well past the old 6s budget. Wait the same generous dev-server window and also probe
   // whatever port the framework reports it bound (Django prints "Starting development server at
@@ -10066,8 +10588,7 @@ async function startPythonPreview(
   const readyUrl = child.exitCode == null ? await waitForDevServerReady(candidateUrls, () => child.exitCode == null) : null;
   if (readyUrl) {
     const boundPort = Number(new URL(readyUrl).port) || port;
-    previewProcesses.set(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
-    persistWorkspacePreview(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
+    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
     events.push(`Python service preview ready: ${readyUrl}`);
     if (execution) await emitExecution(execution, "preview", "completed", "Python service is live", { details: { previewUrl: readyUrl, port: boundPort, entry: entry.module, framework: entry.kind, ready: true, paidModelCalls: 0 } });
     return { previewUrl: readyUrl, previewState: "ready", previewPlatform: "api" };
@@ -10149,7 +10670,10 @@ async function startPreview(projectId: string, projectPath: string, stack: strin
   // every Node HTTP server already respects.
   const nodeScript = await detectNodeStartScript(projectPath);
   if (nodeScript) {
-    return startGenericNodePreview(projectId, projectPath, nodeScript, events, execution, platform);
+    return reconcileNodePreviewWithStaticEntry(
+      await startGenericNodePreview(projectId, projectPath, nodeScript, events, execution, platform),
+      { projectId, projectPath, nodeScript, events, execution, preferredStaticEntries },
+    );
   }
 
   const pythonEntry = await detectPythonPreviewEntry(projectPath);
@@ -10446,8 +10970,7 @@ async function startStaticPreview(projectId: string, projectPath: string, entryF
     // verified SPA exports mount at the server root.
     const encodedEntryPath = entryFile.replace(/\\/g, "/").split("/").map(encodeURIComponent).join("/");
     const previewUrl = useRootUrl ? `http://127.0.0.1:${port}/` : `http://127.0.0.1:${port}/${encodedEntryPath}`;
-    previewProcesses.set(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "static", ownershipToken, runtimeVersion });
-    persistWorkspacePreview(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "static", ownershipToken, runtimeVersion });
+    registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "static", ownershipToken, runtimeVersion });
     const ready = await waitForStaticPreviewReady(previewUrl, ownershipToken);
     if (ready) {
       events.push(`Interactive preview ready: ${previewUrl}`);
@@ -10552,8 +11075,7 @@ async function startNextPreview(projectId: string, projectPath: string, events: 
   child.stderr?.on("data", capture);
   if (process.platform !== "win32") child.unref();
   const previewUrl = `http://127.0.0.1:${port}`;
-  previewProcesses.set(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", runtimeLog });
-  persistWorkspacePreview(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", runtimeLog });
+  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", runtimeLog });
   // A different process can occupy a port between the availability probe and spawn. Give npm a
   // moment to fail before accepting any HTTP response on that port as this project's preview.
   await new Promise((resolve) => setTimeout(resolve, 250));
@@ -10570,8 +11092,7 @@ async function startNextPreview(projectId: string, projectPath: string, events: 
     : null;
   if (readyUrl) {
     const boundPort = Number(new URL(readyUrl).port) || port;
-    previewProcesses.set(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
-    persistWorkspacePreview(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
+    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
     events.push(`Preview process reachable: ${readyUrl}; browser smoke verification is pending.`);
     if (execution) await emitExecution(execution, "preview", "running", "Preview process reachable; running browser smoke verification", { details: { previewUrl: readyUrl, port: boundPort, processReachable: true, browserVerified: false } });
     return { previewUrl: readyUrl, previewState: "ready", previewPlatform: platform };
@@ -10624,6 +11145,91 @@ async function isExpoProject(projectPath: string) {
   }
 }
 
+/**
+ * What a running preview server actually serves, established by asking it rather than by reading its
+ * source. A folder holding both `server.js` and `index.html` can mean two very different things — a
+ * server that renders that page, or an API that has nothing to do with it — and only the response
+ * settles which. Readiness alone cannot: a JSON API answers just as promptly as a rendered page, so
+ * treating "the port responded" as "there is a page here" put an API response inside an iframe and
+ * showed the user a broken-document icon with no explanation.
+ */
+async function classifyServedPreviewSurface(baseUrl: string, staticEntry: string | undefined) {
+  const probe = async (target: string) => {
+    try {
+      const response = await fetch(new URL(target, baseUrl), { signal: AbortSignal.timeout(5_000), redirect: "follow" });
+      return { status: response.status, contentType: (response.headers.get("content-type") ?? "").toLowerCase() };
+    } catch {
+      return undefined;
+    }
+  };
+  const root = await probe("/");
+  if (root && root.status < 400 && root.contentType.includes("html")) return { kind: "page" as const, url: baseUrl, root };
+  // A server can render the project's page on an explicit path while answering its root with an API
+  // status payload. That still counts as serving the page.
+  if (staticEntry) {
+    const entryUrl = new URL(`/${staticEntry.replace(/^\/+/, "")}`, baseUrl).toString();
+    const entry = await probe(entryUrl);
+    if (entry && entry.status < 400 && entry.contentType.includes("html")) return { kind: "page" as const, url: entryUrl, root };
+  }
+  return { kind: root ? ("api" as const) : ("unreachable" as const), url: baseUrl, root };
+}
+
+function describeServedResponse(root: { status: number; contentType: string } | undefined) {
+  if (!root) return "did not respond";
+  const type = root.contentType.split(";")[0]?.trim();
+  return `answered HTTP ${root.status}${type ? ` with ${type}` : ""}`;
+}
+
+/**
+ * Decides what the preview should actually show once a project's Node server is running.
+ *
+ * The server winning unconditionally was wrong for the common "API plus a static page" folder: the
+ * dock framed a JSON response. Now the server keeps the preview only when it really serves a page.
+ * When it does not, the user gets whichever real surface exists — their page, or the API playground —
+ * and, either way, a plain statement of what Foundry found so the result is never a silent blank.
+ */
+async function reconcileNodePreviewWithStaticEntry(
+  outcome: PreviewOutcome,
+  context: {
+    projectId: string;
+    projectPath: string;
+    nodeScript: string;
+    events: string[];
+    execution?: ExecutionContext;
+    preferredStaticEntries: string[];
+  },
+): Promise<PreviewOutcome> {
+  if (outcome.previewState !== "ready" || !outcome.previewUrl) return outcome;
+  const { projectId, projectPath, nodeScript, events, execution, preferredStaticEntries } = context;
+  const staticEntry = await findStaticHtmlPreviewEntry(projectPath, preferredStaticEntries).catch(() => undefined);
+  const surface = await classifyServedPreviewSurface(outcome.previewUrl, staticEntry);
+  if (surface.kind === "page") {
+    return { ...outcome, previewUrl: surface.url, previewPlatform: "web" };
+  }
+
+  const servedDescription = describeServedResponse(surface.root);
+  if (!staticEntry) {
+    // Nothing else to show. The API playground is a real surface for this project; an iframe is not.
+    const previewReason = `\`npm run ${nodeScript}\` is running at ${outcome.previewUrl}, but it ${servedDescription} at / rather than a page, and this project has no HTML entry file. Foundry is showing the API playground instead of an empty browser frame.`;
+    if (execution) await emitExecution(execution, "preview", "completed", "Preview attached to the running API", { details: { previewUrl: outcome.previewUrl, servedContentType: surface.root?.contentType, surface: "api", script: nodeScript } });
+    events.push(previewReason);
+    return { ...outcome, previewPlatform: "api", previewReason };
+  }
+
+  // Two separate things: an API, and a page it does not serve. Show the page — that is what the user
+  // opened — and name the server explicitly rather than leaving them to guess why it is not on screen.
+  stopPreview(projectId);
+  const staticPreview = await startStaticPreview(projectId, projectPath, staticEntry, events, execution);
+  const previewReason = `This folder holds two separate things. \`npm run ${nodeScript}\` ${servedDescription} at / and does not serve ${staticEntry}, so it is an API rather than the server for this page. Foundry is previewing ${staticEntry} directly; the API is not running, so any request the page makes to it will fail until you start it yourself.`;
+  if (execution) {
+    await emitExecution(execution, "preview", "completed", `Previewing ${staticEntry}; the project's server does not serve it`, {
+      details: { staticEntry, nodeScript, nodeServerUrl: outcome.previewUrl, servedContentType: surface.root?.contentType, surface: "separate-api-and-page" },
+    });
+  }
+  events.push(previewReason);
+  return staticPreview.previewState === "ready" ? { ...staticPreview, previewReason } : { ...staticPreview, previewReason: `${staticPreview.previewReason ?? ""} ${previewReason}`.trim() };
+}
+
 async function startGenericNodePreview(
   projectId: string,
   projectPath: string,
@@ -10662,8 +11268,7 @@ async function startGenericNodePreview(
   child.stderr?.on("data", capture);
   if (process.platform !== "win32") child.unref();
   const requestedUrl = `http://127.0.0.1:${port}`;
-  previewProcesses.set(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl: requestedUrl, projectPath, kind: "app", runtimeLog });
-  persistWorkspacePreview(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl: requestedUrl, projectPath, kind: "app", runtimeLog });
+  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl: requestedUrl, projectPath, kind: "app", runtimeLog });
   // A cold dev server (Vite/Svelte/Vue/Astro first run does an esbuild dependency optimize, and on
   // Windows the command goes cmd → npm → the bundler) routinely needs 10–30s before it serves — the
   // old 8×400ms ≈ 3s budget expired first and wrongly reported the app "not ready", driving working
@@ -10682,8 +11287,7 @@ async function startGenericNodePreview(
   if (readyUrl) {
     // Re-register under the port the server actually bound so later reuse/verification targets it.
     const boundPort = Number(new URL(readyUrl).port) || port;
-    previewProcesses.set(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
-    persistWorkspacePreview(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
+    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
     events.push(`Preview process reachable: ${readyUrl}; browser smoke verification is pending.`);
     if (execution) await emitExecution(execution, "preview", "running", "Preview process reachable; running browser smoke verification", { details: { previewUrl: readyUrl, port: boundPort, processReachable: true, browserVerified: false, script } });
     return { previewUrl: readyUrl, previewState: "ready", previewPlatform: platform };
@@ -10959,24 +11563,25 @@ function stopOrphanedStaticPreviewsForProjectPath(projectPath: string) {
   if (process.platform !== "win32") return;
   const powershell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const query = "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*foundry-static-preview.cjs*' } | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
-  const listed = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", query], { encoding: "utf8", windowsHide: true });
-  if (listed.status !== 0 || !listed.stdout.trim()) return;
-  let records: Array<{ ProcessId?: number; CommandLine?: string }> = [];
-  try {
-    const parsed = JSON.parse(listed.stdout) as { ProcessId?: number; CommandLine?: string } | Array<{ ProcessId?: number; CommandLine?: string }>;
-    records = Array.isArray(parsed) ? parsed : [parsed];
-  } catch {
-    return;
-  }
   const canonicalRoot = path.resolve(projectPath).toLowerCase();
   const previewScript = path.resolve(process.cwd(), "scripts", "foundry-static-preview.cjs").toLowerCase();
-  for (const record of records) {
-    const commandLine = String(record.CommandLine ?? "").toLowerCase();
-    const processId = Number(record.ProcessId);
-    if (!Number.isInteger(processId) || processId <= 0 || processId === process.pid) continue;
-    if (!commandLine.includes(previewScript) || !commandLine.includes(canonicalRoot)) continue;
-    stopPreviewProcessTree(processId);
-  }
+  const listed = spawn(powershell, ["-NoProfile", "-NonInteractive", "-Command", query], { windowsHide: true });
+  let stdout = "";
+  listed.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
+  listed.once("close", () => {
+    if (!stdout.trim()) return;
+    try {
+      const parsed = JSON.parse(stdout) as { ProcessId?: number; CommandLine?: string } | Array<{ ProcessId?: number; CommandLine?: string }>;
+      const records = Array.isArray(parsed) ? parsed : [parsed];
+      for (const record of records) {
+        const commandLine = String(record.CommandLine ?? "").toLowerCase();
+        const processId = Number(record.ProcessId);
+        if (!Number.isInteger(processId) || processId <= 0 || processId === process.pid) continue;
+        if (commandLine.includes(previewScript) && commandLine.includes(canonicalRoot)) stopPreviewProcessTree(processId);
+      }
+    } catch { /* A failed cleanup probe must never block preview or cancellation. */ }
+  });
+  listed.unref();
 }
 
 function stopPreviewProcessTree(processId: number) {
@@ -10984,8 +11589,10 @@ function stopPreviewProcessTree(processId: number) {
     // Static/framework previews are detached so they survive the request that launched them. On
     // Windows, process.kill() does not reliably terminate a detached child tree and can leave its
     // working directory locked. taskkill receives a numeric pid directly (no shell interpolation).
-    const stopped = spawnSync("taskkill.exe", ["/pid", String(processId), "/t", "/f"], { stdio: "ignore", windowsHide: true });
-    if (stopped.status === 0) return;
+    const stopped = spawn("taskkill.exe", ["/pid", String(processId), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+    stopped.once("error", () => { try { process.kill(processId); } catch { /* Already exited. */ } });
+    stopped.unref();
+    return;
   }
   try {
     process.kill(processId);
@@ -11006,10 +11613,17 @@ if (typeof setInterval === "function") {
 }
 
 export async function getPreviewStatus(projectId: string): Promise<{ previewState: FactoryPreviewState; previewUrl?: string; previewReason?: string }> {
+  if (previewRefreshes.has(projectId)) {
+    const active = previewProcesses.get(projectId);
+    const previous = previewRefreshOutcomes.get(projectId);
+    if (active?.previewUrl) return { previewState: "ready", previewUrl: active.previewUrl };
+    if (previous?.previewState === "ready") return previous;
+    return { previewState: "starting" };
+  }
   const preview = previewProcesses.get(projectId);
   const connector = connectorPreviews.get(projectId);
   if (!preview && connector) return connectorPreviewStatus(connector);
-  if (!preview) return { previewState: "unavailable" };
+  if (!preview) return previewRefreshOutcomes.get(projectId) ?? { previewState: "unavailable" };
   const reachable = await waitForUrlReady(preview.previewUrl, 1, 0);
   if (!reachable) {
     const previewReason = preview.runtimeLog?.trim()
@@ -11092,6 +11706,35 @@ export async function refreshPreviewForProject(projectId: string, localConnector
   }
   await stopProjectPreview({ kind: "workspace", projectId, projectPath });
   return startProjectPreview({ kind: "workspace", projectId, projectPath }, stack);
+}
+
+/** Starts preview recovery without holding a chat request open for framework boot/readiness checks. */
+export function beginPreviewRefreshForProject(projectId: string, localConnector?: LocalConnectorConfig): PreviewStatusOutcome {
+  const active = previewProcesses.get(projectId);
+  const previous = previewRefreshOutcomes.get(projectId);
+  if (previewRefreshes.has(projectId)) {
+    if (active?.previewUrl) return { previewState: "ready", previewUrl: active.previewUrl, previewPlatform: "web" };
+    if (previous?.previewState === "ready") return previous;
+    return { previewState: "starting", previewPlatform: "web" };
+  }
+  // Static servers already serve current disk contents and framework servers hot-reload. Restarting
+  // a healthy owned process during React reconciliation blanked and reloaded the iframe repeatedly.
+  if (active?.previewUrl) {
+    active.lastUsedAt = Date.now();
+    return { previewState: "ready", previewUrl: active.previewUrl, previewPlatform: "web" };
+  }
+  const operation = refreshPreviewForProject(projectId, localConnector)
+    .then((outcome) => { previewRefreshOutcomes.set(projectId, outcome); })
+    .catch((error) => {
+      previewRefreshOutcomes.set(projectId, {
+        previewState: "error",
+        previewPlatform: "web",
+        previewReason: error instanceof Error ? error.message : "The project preview could not be refreshed.",
+      });
+    })
+    .finally(() => { previewRefreshes.delete(projectId); });
+  previewRefreshes.set(projectId, operation);
+  return { previewState: "starting", previewPlatform: "web" };
 }
 
 function desktopPlatformForPath(executable: string) {

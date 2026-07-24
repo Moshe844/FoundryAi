@@ -26,12 +26,21 @@ function isLongRunningServerCommand(command) {
 
 function killProcessTree(pid) {
   if (process.platform === "win32") {
-    try {
-      execSync(`taskkill /pid ${pid} /t /f`, { stdio: "ignore" });
-    } catch {
-      // Process may have already exited.
-    }
-    return;
+    return new Promise((resolve) => {
+      const child = spawn("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+      let settled = false;
+      const finish = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch { /* taskkill may already have exited. */ }
+        try { process.kill(pid, "SIGKILL"); } catch { /* Target may already have exited. */ }
+        finish();
+      }, 2_500);
+      child.once("close", finish);
+      child.once("error", () => {
+        try { process.kill(pid, "SIGKILL"); } catch { /* Target may already have exited. */ }
+        finish();
+      });
+    });
   }
   try {
     process.kill(-pid, "SIGKILL");
@@ -42,6 +51,7 @@ function killProcessTree(pid) {
       // Process may have already exited.
     }
   }
+  return Promise.resolve();
 }
 const previewProcesses = new Map();
 const previewRegistryDirectory = path.join(os.tmpdir(), "foundry-local-preview-records-v1");
@@ -598,7 +608,7 @@ async function stopWindowsDirectoryLockOwners(root, processIds) {
   const stopped = [];
   for (const owner of targets) {
     try {
-      killProcessTree(Number(owner.pid));
+      await killProcessTree(Number(owner.pid));
       stopped.push(owner);
     } catch {
       // Verify remaining owners below.
@@ -906,7 +916,7 @@ async function startPreview(root, relativePath, command, preferredEntries = [], 
   return { state: "ready", previewUrl, port };
 }
 
-function stopPreview(root, relativePath) {
+async function stopPreview(root, relativePath) {
   const fullPath = resolveContained(root, relativePath || "");
   const key = fullPath || relativePath;
   const existing = previewProcesses.get(key);
@@ -917,7 +927,7 @@ function stopPreview(root, relativePath) {
     return { state: "error", reason: "The project preview process exited before its HTTP server became ready." };
   }
   try {
-    if (existing.pid) killProcessTree(existing.pid);
+    if (existing.pid) await killProcessTree(existing.pid);
   } catch {
     // Process may have already exited.
   }
@@ -1023,7 +1033,7 @@ async function stopPreviewsForRoot(root) {
     const belongsToRoot = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
     if (!belongsToRoot) continue;
     if (preview.pid && processIsRunning(preview.pid)) {
-      killProcessTree(preview.pid);
+      await killProcessTree(preview.pid);
       stoppedPids.push(preview.pid);
     }
     previewProcesses.delete(previewPath);
@@ -1450,7 +1460,7 @@ function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false, si
         finish(null);
         return;
       }
-      if (typeof child.pid === "number") killProcessTree(child.pid);
+      if (typeof child.pid === "number") void killProcessTree(child.pid);
       else child.kill();
       // On Windows, killing a shell-wrapped child does not always fire 'close' for the
       // original process — force resolution instead of hanging the mission forever.
@@ -1463,7 +1473,7 @@ function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false, si
     if (signal && !keepAliveOnTimeout) {
       abortHandler = () => {
         if (settled) return;
-        if (typeof child.pid === "number") killProcessTree(child.pid);
+        if (typeof child.pid === "number") void killProcessTree(child.pid);
         else child.kill();
         setTimeout(() => finish(null), 300);
       };
@@ -1670,7 +1680,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/preview/stop") {
       if (!requireApprovedRoot(res, body.root)) return;
-      return send(res, 200, stopPreview(body.root, String(body.path || "")));
+      return send(res, 200, await stopPreview(body.root, String(body.path || "")));
     }
     if (url.pathname === "/preview/status") {
       if (!requireApprovedRoot(res, body.root)) return;

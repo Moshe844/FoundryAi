@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getPreviewStatus, launchAndroidPreview, launchDesktopPreview, refreshPreviewForProject, stopPreviewForProject } from "@/lib/factory/runtime";
+import { beginPreviewRefreshForProject, getPreviewStatus, launchAndroidPreview, launchDesktopPreview, stopPreviewForProject } from "@/lib/factory/runtime";
 import { captureAndroidEmulatorFrame, sendAndroidEmulatorTap } from "@/lib/factory/android-emulator";
 
 type PreviewRequest = {
@@ -56,7 +56,7 @@ export async function POST(request: Request) {
             rootLabel: body.localConnector.rootLabel,
           }
         : undefined;
-      return NextResponse.json(await refreshPreviewForProject(body.projectId, localConnector));
+      return NextResponse.json(beginPreviewRefreshForProject(body.projectId, localConnector));
     } catch (error) {
       return NextResponse.json({
         previewState: "unavailable",

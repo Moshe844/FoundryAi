@@ -63,6 +63,7 @@ export function completeExecution(controlId: string | undefined, result: unknown
   const id = idFor(controlId);
   if (!id) return;
   const current = executionSnapshots.get(id) ?? { state: "running" as const, events: [], updatedAt: new Date().toISOString() };
+  if (current.state === "stopped") return;
   executionSnapshots.set(id, { ...current, state: "completed", result, updatedAt: new Date().toISOString() });
 }
 
@@ -70,6 +71,7 @@ export function failExecution(controlId: string | undefined, error: string) {
   const id = idFor(controlId);
   if (!id) return;
   const current = executionSnapshots.get(id) ?? { state: "running" as const, events: [], updatedAt: new Date().toISOString() };
+  if (current.state === "stopped") return;
   executionSnapshots.set(id, { ...current, state: "failed", error, updatedAt: new Date().toISOString() });
 }
 

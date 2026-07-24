@@ -81,4 +81,12 @@ export type ManagedCallOptions = {
   signal?: AbortSignal;
   /** Hard ceiling for one managed provider call, including retries. */
   timeoutMs?: number;
+  /**
+   * Called when one provider candidate fails (timeout, transport, unusable response) and the dispatcher
+   * falls back to another. Without this the fallback is invisible: a slow candidate can burn its full
+   * per-attempt window, hand off to the next, and the user stares at a frozen status for minutes with no
+   * indication anything is happening. Emitting from here is the only honest progress signal available
+   * during a single long provider call.
+   */
+  onAttemptFailure?: (info: { provider: string; model: string; kind: string; message: string; nextCandidate?: string }) => void | Promise<void>;
 };

@@ -11,7 +11,7 @@ import type { MissionState } from "@/lib/mission-engine";
 import { deriveMissionDisplayStatus, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
 import { answerTaskFor, buildMissionVM } from "@/lib/canvas/adapter";
 import type { CanvasDotState, CanvasMissionVM } from "@/lib/canvas/model";
-import { currentFocusOf, dotStateOf, hasVerificationConflict, latestLiveEvent, needsRepairAction } from "@/lib/canvas/model";
+import { currentActivityOf, currentFocusOf, dotStateOf, hasVerificationConflict, latestLiveEvent, needsRepairAction } from "@/lib/canvas/model";
 import type { BlockedCommandAction } from "@/components/execution/ApprovalPrompt";
 import { CanvasComposer } from "@/components/canvas/CanvasComposer";
 import { CollapsedMissionRow } from "@/components/canvas/CollapsedMissionRow";
@@ -80,6 +80,9 @@ export function MissionCanvas({
     } catch { /* storage unavailable — drafts just don't persist */ }
   }, [task, draftKey]);
   const [expandedPriorId, setExpandedPriorId] = useState<string | null>(null);
+  // The focus box opens by default while work is live: "what is happening right now" should never
+  // require scrolling to the bottom of the trail to find.
+  const [focusOpen, setFocusOpen] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [revealEventIds, setRevealEventIds] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -259,6 +262,49 @@ export function MissionCanvas({
     });
     return () => { cancelled = true; };
   }, [connectedProjectId, execution?.previewState, hasExecution, previewConnector, missionStatus.isBusy, projectDeleted]);
+
+  // "refresh" returns previewState:"starting" IMMEDIATELY and resolves the real outcome in the
+  // background, so a single POST leaves the dock reading "Starting the preview server…" forever. During a
+  // mission the event stream happens to deliver readiness; open a project and press Preview with no
+  // mission running and nothing ever asked again. Poll until it settles, and surface a real error rather
+  // than spinning silently.
+  useEffect(() => {
+    if (projectDeleted || !connectedProjectId) return;
+    if (effectiveExecution?.previewState !== "starting") return;
+    let cancelled = false;
+    let attempts = 0;
+    const maximumAttempts = 40; // ~60s at 1.5s intervals
+    const settle = (status: Partial<FactoryProjectResult>) => {
+      setRecoveredPreview({ ...status, projectId: connectedProjectId });
+      onPreviewStateChangeRef.current?.(status);
+    };
+    const timer = setInterval(() => {
+      void (async () => {
+        attempts += 1;
+        try {
+          const response = await fetch("/api/factory/preview", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ projectId: connectedProjectId, action: "status", localConnector: previewConnector }),
+          });
+          const status = (await response.json().catch(() => null)) as Partial<FactoryProjectResult> | null;
+          if (cancelled) return;
+          if (status?.previewState && status.previewState !== "starting") {
+            clearInterval(timer);
+            settle(status);
+            return;
+          }
+        } catch {
+          // A transient status failure is not a verdict; keep polling until the attempt cap.
+        }
+        if (!cancelled && attempts >= maximumAttempts) {
+          clearInterval(timer);
+          settle({ previewState: "error", previewReason: "The preview server did not report ready within 60 seconds. Check the command timeline for what failed, then press Retry preview." });
+        }
+      })();
+    }, 1500);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [connectedProjectId, effectiveExecution?.previewState, previewConnector, projectDeleted]);
 
   useEffect(() => {
     const previewIdentity = connectedProjectId
@@ -556,19 +602,6 @@ export function MissionCanvas({
               </div>
             ) : null}
             <div className="mx-auto max-w-[760px]">
-              {activeVM?.isBusy && activeExecution ? (
-                <div className="canvas-enter mb-5 flex items-center gap-3 rounded-xl border border-foundry-teal/20 bg-foundry-teal/[0.05] px-4 py-3 shadow-[0_1px_0_rgba(0,0,0,0.02)]">
-                  <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foundry-teal/50" />
-                    <span className="relative inline-flex h-2 w-2 rounded-full bg-foundry-teal" />
-                  </span>
-                  <p className="min-w-0 flex-1 truncate text-[13px] leading-5 text-foundry-ink">
-                    <span className="font-bold text-foundry-teal">Current focus: </span>
-                    <span className="font-semibold">{currentFocusOf(activeExecution)}</span>
-                  </p>
-                  <span className="hidden shrink-0 text-[11px] text-foundry-subtle sm:block">Older progress collapses automatically</span>
-                </div>
-              ) : null}
               {mission.compaction ? (
                 <p className="mb-3 text-[11px] leading-5 text-foundry-subtle">Earlier project activity compacted into project memory.</p>
               ) : null}
@@ -609,6 +642,10 @@ export function MissionCanvas({
                   vm={activeVM}
                   revealEventIds={revealEventIds}
                   liveActivity={liveEvent ? { id: liveEvent.id, text: liveEvent.text, elapsedMs: silenceMs } : null}
+                  currentFocus={activeExecution ? currentFocusOf(activeExecution) : undefined}
+                  currentStateLabel={activeExecution ? currentActivityOf(activeExecution).label : undefined}
+                  focusOpen={focusOpen}
+                  onFocusToggle={() => setFocusOpen((current) => !current)}
                   suggestions={recommendations}
                   onAnswer={handleAnswer}
                   onApprove={handleApprove}

@@ -23,12 +23,15 @@ export type IntentClassification = {
 const EXPLICIT_ADVICE_PATTERN = /\b(?:only|just)\s+(?:explain|advise|inspect|review|analy[sz]e|tell me|show me|summarize)\b|\b(?:how would|how should|what would be the best way to|what should i|would it be better|is it better|would you recommend|do you (?:think|recommend)|should (?:i|we|it)|what do you think|advice only)\b|\b(?:don'?t|do not)\s+(?:change|implement|edit|touch|modify|apply)\b/i;
 const DEBUG_PATTERN = /\b(?:fix|repair|bug|error|crash(?:es|ed|ing)?|broken|exception|stack trace|failing|failed|clos(?:e|es|ed|ing)|exit(?:s|ed|ing)?|shuts?\s+down|stops?\s+working|freezes?|hangs?|disappears?)\b/i;
 const BUILD_PATTERN = /\b(?:create|build|scaffold|generate(?: a new)?|set up|make a new)\b/i;
+// Design/restructure verbs (redesign, restyle, switch, convert, migrate, rewrite, style, disable)
+// belong here just as much as add/change/fix. Their earlier absence is why "redesign my page" got
+// no deterministic mutation verdict and was answered as read-only inspection.
 const MUTATION_PATTERN =
-  /\b(?:add|create|make|build|generate|implement|edit|change|update|modify|fix|repair|separate|split|extract|move|delete|remove|rename|refactor|install|allow|enable|wire|hook up|replace)\b/i;
+  /\b(?:add|create|make|build|generate|implement|edit|change|update|modify|fix|repair|separate|split|extract|move|delete|remove|rename|refactor|install|allow|enable|disable|wire|hook up|replace|switch|convert|redesign|restyle|migrate|rewrite|style)\b/i;
 // "start/restart/stop the server" reads like a status question ("is it running?") but is really an action
 // request — without this, it fell through to the LLM classifier with no deterministic safety net and could
 // get answered as read-only inspection instead of actually starting anything.
-const SERVER_ACTION_PATTERN = /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,30}\b(?:server|app|project|service|api|backend|frontend|dev server|application|build|tests?|lint|linter|typecheck)\b/i;
+const SERVER_ACTION_PATTERN = /\b(?:start|restart|launch|stop|kill|run)\b[^.?!\n]{0,40}\b(?:server|site|website|webpage|preview|app|project|service|api|backend|frontend|dev server|application|build|tests?|lint|linter|typecheck)\b|\b(?:server|site|website|webpage|preview|app|application)\b[^.?!\n]{0,70}\b(?:start|restart|launch|run|bring it back)\b/i;
 const READ_ONLY_PATTERN = /\b(?:can you see|what does|what is this|explain|tell me about|do you understand|review|audit|analy[sz]e|architecture assessment|status|what happened|last run|previous run)\b/i;
 
 export function deterministicMutationIntent(message: string): MissionIntent | undefined {

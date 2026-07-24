@@ -14,7 +14,7 @@ Module._extensions[".ts"] = (m, f) => m._compile(ts.transpileModule(fs.readFileS
 const orig = Module._resolveFilename;
 Module._resolveFilename = function (r, ...a) { const t = r.startsWith("@/") ? path.join(root, r.slice(2)) : r; try { return orig.call(this, t, ...a); } catch (e) { for (const x of [".ts", ".tsx"]) if (fs.existsSync(`${t}${x}`)) return `${t}${x}`; throw e; } };
 
-const { groupExecutionUnits, currentActivityOf, normalizeLineRange, verificationChecksOf, currentFocusOf, browserStepsOf } = require(path.join(root, "lib/canvas/model.ts"));
+const { groupExecutionUnits, currentActivityOf, normalizeLineRange, verificationChecksOf, currentFocusOf, browserStepsOf, groupTimeline } = require(path.join(root, "lib/canvas/model.ts"));
 
 let failures = 0;
 const ok = (label, cond) => { if (!cond) failures++; console.log(`${cond ? "PASS" : "FAIL"}  ${label}`); };
@@ -66,6 +66,41 @@ ok("running a test command => 'Running tests'", currentActivityOf(mission("runni
 ok("a decision event => deciding", currentActivityOf(mission("running", [{ kind: "reasoning", tier: "decision", status: "completed", title: "" }])).state === "deciding");
 ok("complete => completed", currentActivityOf(mission("complete", [])).state === "completed");
 
+console.log("\n=== entry count: only real narrative beats open a box (the '50 boxes' bug) ===");
+// The exact voice sequence from the live 2026-07-22 profile-site run.
+const liveTimeline = [
+  { id: "v1", kind: "planning", status: "completed", title: "Planning project", timestamp: "t" },
+  { id: "v2", kind: "planning", status: "completed", title: "Architecture selected", timestamp: "t" },
+  { id: "v3", kind: "planning", status: "completed", title: "Execution strategy: autonomous-mission", timestamp: "t" },
+  { id: "v4", kind: "reasoning", status: "completed", title: "", rationale: "I've translated the brief into a staged implementation. I'm defining the project structure and verification path before generating files.", timestamp: "t" },
+  { id: "v5", kind: "reasoning", status: "completed", title: "", rationale: "The plan is set. I'm building the first coherent working version now, then I'll verify the result against the brief.", timestamp: "t" },
+  { id: "v6", kind: "planning", status: "completed", title: "Model · openai/gpt-5.1-codex-mini", timestamp: "t" },
+  { id: "v7", kind: "planning", status: "completed", title: "Build-model usage · 3 turns · $0.0271 estimated", timestamp: "t" },
+  { id: "e1", kind: "edit", status: "completed", title: "Updated index.html", filePath: "index.html", timestamp: "t" },
+  { id: "v8", kind: "reasoning", status: "completed", title: "", rationale: "The source is written (index.html). I'm opening it in a real browser now to verify the rendered result.", timestamp: "t" },
+];
+const liveGroups = groupTimeline(liveTimeline);
+// 8 voice-ish events → one leading group of status rows + 3 narrative entries. Before this fix every
+// status label opened its own box, which is what produced the "50 collapsible boxes" wall.
+ok(`8 voice-ish events collapse to at most 4 boxes (got ${liveGroups.length})`, liveGroups.length <= 4);
+ok("status labels never become their own entry", !liveGroups.some((g) => /^(Planning project|Architecture selected|Model ·|Build-model usage)/.test(g.voice ?? "")));
+ok("the label lines survive as rail rows inside an entry", liveGroups.some((g) => g.events.some((e) => /Model · openai/.test(e.text))));
+ok("real narrative beats are kept", liveGroups.filter((g) => g.voice).length === 3);
+
+const setupUnits = groupExecutionUnits([
+  w({ id: "folder", kind: "folder", filePath: "C:/projects/docs-site", text: "Created docs-site" }),
+  w({ id: "brief", kind: "file", filePath: "foundry-brief.md", text: "Created foundry-brief.md" }),
+]);
+ok("a created directory is not counted as a created file", setupUnits.filter((unit) => unit.kind === "file").length === 1);
+
+const repeatedNarration = "The source is written (index.html). I'm opening it in a real browser now to verify the rendered result.";
+const retryGroups = groupTimeline([
+  { id: "r1", kind: "reasoning", status: "completed", title: repeatedNarration, timestamp: "2026-07-22T01:00:00Z" },
+  { id: "r2", kind: "preview", status: "completed", title: "Checking rendered project", timestamp: "2026-07-22T01:00:01Z" },
+  { id: "r3", kind: "reasoning", status: "completed", title: repeatedNarration, timestamp: "2026-07-22T01:00:02Z" },
+]);
+ok("identical retry narration remains one Foundry entry", retryGroups.filter((group) => group.voice === repeatedNarration).length === 1);
+
 console.log("\n=== VerificationSummary: real gates only, latest result each, in canonical order ===");
 let checks = verificationChecksOf([
   { check_type: "file-read", result: "pass", evidence: "read back" },
@@ -88,6 +123,14 @@ ok("uses the latest voice line, first sentence", currentFocusOf({ state: "runnin
 ok("falls back to the activity label when there is no voice", currentFocusOf({ state: "running", timeline: [
   { id: "1", kind: "command", command: "npm test", status: "running", title: "" },
 ] }) === "Running tests");
+ok("newer concrete work replaces a stale reading-request voice line", currentFocusOf({ state: "running", timeline: [
+  { id: "1", kind: "planning", status: "running", title: "Reading project request", timestamp: "2026-07-22T01:00:00.000Z" },
+  { id: "2", kind: "command", status: "running", title: "Running production build", command: "npm run build", timestamp: "2026-07-22T01:00:05.000Z" },
+] }) === "Building and verifying");
+ok("hidden provider wait replaces stale visible narration", currentFocusOf({ state: "running", timeline: [
+  { id: "1", kind: "reasoning", status: "completed", title: "The source is written.", timestamp: "2026-07-22T01:00:00.000Z" },
+  { id: "2", kind: "reasoning", status: "running", title: "Generating the next source repair", timestamp: "2026-07-22T01:00:05.000Z", internal: true },
+] }) === "Generating the next source repair");
 
 console.log("\n=== browserStepsOf: real preview steps only, latest state each, in order ===");
 const steps = browserStepsOf([

@@ -38,7 +38,9 @@ type CandidateFailure = {
 
 const MIN_PROVIDER_ATTEMPT_TIMEOUT_MS = 45_000;
 const MAX_PROVIDER_ATTEMPT_TIMEOUT_MS = 160_000;
-const MAX_LOGICAL_FALLBACK_WINDOW_MS = 300_000;
+// Hard ceiling on how long ONE logical model call may block. 300s meant a pathological pair of hanging
+// providers could freeze a mission for five minutes; nothing healthy ever approaches this bound.
+const MAX_LOGICAL_FALLBACK_WINDOW_MS = 210_000;
 
 /** Picks the best configured provider for a tier and falls back cleanly when a key is absent. */
 export function providerForTier(tier: ModelTier, preferred?: ProviderId): { provider: ProviderId; apiKey: string } | undefined {
@@ -140,6 +142,11 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
       if (error instanceof CostGuardError) {
         lastResult = blockedResult(candidateRequest, options, error.message, "guardrail");
         candidateFailures.push({ provider, model: candidate.modelId, message: error.message, kind: "guardrail" });
+        // A candidate-specific worst-case estimate can exceed the remaining allowance while a
+        // cheaper same-tier fallback still fits. No call was sent and no reservation was consumed,
+        // so continue through the configured candidates. Mission-wide call, premium, parallel, and
+        // daily-spend ceilings cannot be solved by changing models and remain terminal here.
+        if (/^Estimated request cost would exceed/i.test(error.message)) continue;
         break;
       }
       throw error;
@@ -151,6 +158,11 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
     // healthy alternate provider can still complete the requested tool action.
     // Always compose the per-candidate deadline with the logical call's bounded fallback window and
     // the user's cancellation signal. A slow primary can no longer starve the alternate provider.
+    // NOTE: an earlier revision probed "degraded" candidates on a 60s leash to fall back sooner. It made
+    // things worse: cutting a slow-but-valid call short produced another recorded failure, which decayed
+    // that model's health further, and a few of those in a row drove models below the availability floor
+    // until routing had nothing left to pick ("No validated, healthy model satisfies fast requirements").
+    // Every candidate gets its real allowance; slowness is surfaced through onAttemptFailure instead.
     const candidateSignal = AbortSignal.any([overallSignal, AbortSignal.timeout(candidateTimeoutMs)]);
     const candidateOptions = { ...options, apiKey, signal: candidateSignal, timeoutMs: candidateTimeoutMs, maxAttempts: 1 };
     let result: ManagedModelResult;
@@ -196,6 +208,15 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
       message: failureMessage,
       kind: failureKind,
       transportReason: failureKind === "transport" ? transportFailureReason(failureMessage) : undefined,
+    });
+    // Tell the caller a candidate just burned its window so it can show real progress. A silent handoff
+    // here is what leaves the user watching a frozen "Generating…" line for minutes.
+    await options.onAttemptFailure?.({
+      provider,
+      model: candidate.modelId,
+      kind: failureKind,
+      message: failureMessage,
+      nextCandidate: candidates[candidates.indexOf(candidate) + 1]?.modelId,
     });
     lastResult = { ...failedResult, failureKind };
     // A charged but unusable response must not silently trigger another provider bill. Automatic

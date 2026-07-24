@@ -38,7 +38,7 @@ assert(
     && factoryRuntime.includes("namedControlDefect || looksUnambiguouslyLikeSmallEdit")
     && factoryRuntime.includes("maximumModelCalls: 6, premiumCallLimit: 1, estimatedCostUsd: 0.15, hardCeiling: true")
     && factoryRuntime.includes('isStructuralRelocationRequest(requestedTask) ? "builder" : "fast"')
-    && factoryRuntime.includes("maximumBrowserRepairStages = boundedSmallEdit ? 1")
+    && factoryRuntime.includes("maximumBrowserRepairStages = boundedSmallEdit || boundedStaticFollowUp ? 1")
     && factoryRuntime.includes("shouldRunVerify(quality) && !boundedStaticFollowUp && !boundedSmallEdit"),
   "A small explicit UI edit can still expand into an expensive multi-stage mission.",
 );
@@ -88,7 +88,7 @@ assert(
   "The mission terminal title still labels every transport failure as provider unavailability.",
 );
 assert(
-  executor.includes("input.staticProject ? 90_000 : input.fastLane ? 60_000 : 160_000"),
+  executor.includes("input.staticProject ? 60_000 : input.fastLane ? 60_000 : 160_000"),
   "Existing static implementation calls do not receive a full coding-model attempt window.",
 );
 assert(

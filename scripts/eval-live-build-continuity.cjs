@@ -37,10 +37,12 @@ async function waitForHealth(baseUrl, token) {
 
 async function run() {
   const dashboard = source("components/BuildDashboard.tsx");
+  const workspaceShell = source("components/WorkspaceShell.tsx");
   const adapter = source("lib/canvas/adapter.ts");
   const liveActivity = source("components/canvas/LiveActivityRow.tsx");
   const executor = source("lib/ai/mission/executor.ts");
   const runtime = source("lib/factory/runtime.ts");
+  const canvasModel = source("lib/canvas/model.ts");
   const projectAccess = source("lib/ai/mission/project-access.ts");
   const connectorSource = source("scripts/foundry-local-connector.cjs");
 
@@ -82,6 +84,15 @@ async function run() {
   assert.match(runtime, /path\.join\(projectPath, "out", "index\.html"\)/);
   assert.match(runtime, /startScript === "start" \? 50 : 90/);
   assert.match(runtime, /Preview failed to start: \$\{trimOutput\(runtimeLog\)\}/);
+  assert.match(workspaceShell, /readFactoryExecutionStream\(response, missionId, controlId, controller\.signal\)/, "Live streams are not recoverable by execution control id.");
+  assert.match(workspaceShell, /Reconnecting to the active execution[\s\S]+api\/factory\/execution\?controlId=/, "A dropped live stream still becomes a terminal project failure instead of polling its server snapshot.");
+  assert.match(workspaceShell, /snapshot\.state === "completed" && snapshot\.result[\s\S]+return snapshot\.result/, "Recovered streams do not return the real completed result.");
+  assert.match(workspaceShell, /Execution connection could not be recovered:[\s\S]+state: "cancelled"/, "A vanished server execution is still mislabeled as a blocked project.");
+  assert.doesNotMatch(runtime, /const existingEnvironment = await environmentReadinessForStack\(capabilityLevelForStackChoice\(detected\.stack\)\.id\)/, "Local project inspection still blocks on an unused synchronous toolchain probe.");
+  assert.match(canvasModel, /newest\?\.status === "running" && isInternalExecutionEvent\(newest\) && newest\.title\.trim\(\)/, "Current focus still ignores the newest provider-wait stage.");
+  assert.match(runtime, /boundedSmallEdit \|\| boundedStaticFollowUp \? 1 : autonomousRepairStageLimit\(process\.env\.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 2\)/, "Bounded static follow-ups get one repair while larger missions retain staged recovery.");
+  assert.doesNotMatch(runtime, /spawnSync\("taskkill\.exe", \["\/pid", String\(processId\), "\/t", "\/f"\]/, "Preview cleanup can still block the server event loop and prevent Stop.");
+  assert.match(runtime, /const listed = spawn\(powershell,[\s\S]+listed\.unref\(\)/, "Orphan preview discovery still blocks execution and cancellation.");
 
   assert.match(projectAccess, /function normalizeCommandForExecution/);
   assert.match(connectorSource, /function normalizeCommandForExecution/);

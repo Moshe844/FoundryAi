@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createFactoryProject } from "@/lib/factory/runtime";
 import { completeExecution, failExecution, recordExecutionEvent, registerExecution } from "@/lib/factory/execution-control";
 import type { FactoryCreateRequest, FactoryExecutionEvent } from "@/lib/factory/types";
+import { stackManifest } from "@/lib/certified-build";
 
 export async function POST(request: Request) {
   try {
@@ -9,6 +10,29 @@ export async function POST(request: Request) {
     const body = (await request.json()) as Partial<FactoryCreateRequest>;
     if (!body.brief?.trim()) {
       return NextResponse.json({ error: "Project brief is required." }, { status: 400 });
+    }
+    const certifiedStackId = body.brief.match(/^Certified stack id:\s*(.+)$/im)?.[1]?.trim();
+    if (certifiedStackId === "none") {
+      return NextResponse.json({
+        error: "Foundry did not find a Level 4 certified stack that can deliver this project in the current environment. Review the architecture limitation or configure the required build environment before starting execution.",
+        code: "NO_ELIGIBLE_CERTIFIED_STACK",
+      }, { status: 409 });
+    }
+    if (certifiedStackId) {
+      const manifest = stackManifest(certifiedStackId);
+      if (!manifest || manifest.supportLevel !== 4 || manifest.status !== "certified") {
+        return NextResponse.json({ error: "The selected stack does not have a current Level 4 Foundry certification manifest.", code: "STACK_NOT_CERTIFIED" }, { status: 409 });
+      }
+    }
+    const architectureLine = body.brief.match(/^Project architecture:\s*(.+)$/im)?.[1]?.trim();
+    if (architectureLine) {
+      try {
+        const architecture = JSON.parse(architectureLine) as { applications?: Array<{ stackId?: string }> };
+        const unsupported = (architecture.applications ?? []).map((application) => application.stackId ?? "").filter((stackId) => { const manifest = stackManifest(stackId); return !manifest || manifest.supportLevel !== 4 || manifest.status !== "certified"; });
+        if (unsupported.length) return NextResponse.json({ error: `The composite project includes stacks without a current Level 4 implementation: ${unsupported.join(", ")}.`, code: "COMPOSITE_STACK_NOT_CERTIFIED" }, { status: 409 });
+      } catch {
+        return NextResponse.json({ error: "The certified project architecture is malformed.", code: "INVALID_PROJECT_ARCHITECTURE" }, { status: 400 });
+      }
     }
 
     if (url.searchParams.get("stream") === "1") {

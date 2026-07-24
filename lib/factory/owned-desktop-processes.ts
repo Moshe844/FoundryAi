@@ -1,4 +1,4 @@
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -166,6 +166,28 @@ async function waitForExit(processId: number, timeoutMs = 3_000) {
   return !processIsAlive(processId);
 }
 
+async function terminateOwnedProcessTree(processId: number) {
+  if (process.platform !== "win32") {
+    try { process.kill(processId, "SIGTERM"); } catch { /* Verify below. */ }
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const child = spawn("taskkill.exe", ["/pid", String(processId), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* taskkill may already have exited. */ }
+      try { process.kill(processId, "SIGKILL"); } catch { /* Target may already have exited. */ }
+      finish();
+    }, 2_500);
+    child.once("close", finish);
+    child.once("error", () => {
+      try { process.kill(processId, "SIGKILL"); } catch { /* Target may already have exited. */ }
+      finish();
+    });
+  });
+}
+
 export async function suspendOwnedDesktopProcesses(projectPath: string) {
   restoreOwnedDesktopProcesses();
   const matching = Array.from(ownedDesktopProcesses.values()).filter((record) => projectsOverlap(projectPath, record.projectPath));
@@ -180,11 +202,7 @@ export async function suspendOwnedDesktopProcesses(projectPath: string) {
       forget(record);
       continue;
     }
-    if (process.platform === "win32") {
-      spawnSync("taskkill.exe", ["/pid", String(record.processId), "/t", "/f"], { stdio: "ignore", windowsHide: true, timeout: 8_000 });
-    } else {
-      try { process.kill(record.processId, "SIGTERM"); } catch { /* Verify below. */ }
-    }
+    await terminateOwnedProcessTree(record.processId);
     if (await waitForExit(record.processId)) {
       suspended.push(record);
       forget(record);

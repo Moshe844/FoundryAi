@@ -300,7 +300,8 @@ assert.match(runtime, /No generation model was called/, "Missing project integra
 assert.match(runtime, /enforceProductionIntegrationReadiness/, "Browser completion must include the universal production integration source gate.");
 assert.match(runtime, /authentication state is stored only in memory and disappears on restart/, "In-memory auth substitutes must be rejected explicitly.");
 assert.match(runtime, /transactional email is logged to the console instead of being provider-delivered/, "Console-logged reset mail must never pass as working delivery.");
-assert.match(runtime, /Compiler repair paused before another paid attempt/, "A zero-mutation compiler repair must stop before purchasing another attempt.");
+assert.match(runtime, /missingImport && compilerRepairPass < maxCompilerRepairPasses/, "A missing generated import must automatically change repair strategy instead of asking the customer to approve ordinary compiler work.");
+assert.match(runtime, /Compiler repair paused before another paid attempt/, "A zero-mutation compiler repair without actionable missing-generation evidence must still stop before unbounded paid attempts.");
 assert.match(runtime, /result\.commands\.filter\(\(command\) => isProductionBuildCommand\(command\.command\)\)\.at\(-1\)\?\.exitCode === 0/, "Only the latest production build may authorize preview and completion.");
 assert.match(runtime, /Preview process reachable; running browser smoke verification/, "A listening HTTP process must not be presented as a verified live application.");
 assert.match(runtime, /Preview port was occupied; relaunching on a clean port/, "App previews must recover when a probed port is claimed before the child process binds it.");

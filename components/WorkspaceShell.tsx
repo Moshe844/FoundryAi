@@ -13,6 +13,7 @@ import { artifactKindForOutcome } from "@/lib/artifacts";
 import { classifyEvidenceKind, ingestFile } from "@/lib/files";
 import { executeBrowserFolderTask, getBrowserFolderHandle, readBrowserFolderFiles } from "@/lib/factory/browser-folder";
 import { customInstructionsFromProjectBrief } from "@/lib/factory/project-brief";
+import { isPreviewRestartRequest } from "@/lib/factory/preview-intent";
 import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryProjectResult, FactoryUploadedFile, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
 import { mergeExecutionTimelines } from "@/lib/factory/event-contract";
 import type { WorkspaceAttachment } from "@/lib/files";
@@ -26,8 +27,6 @@ import {
   isAcceptedInterpretationReply,
   isApprovalReplyMessage,
   normalizeFollowUpResolution,
-  projectBehaviorDiagnosisIntent,
-  standaloneMutationIntent,
   LatestFollowUpQueue,
 } from "@/lib/mission/classifyFollowUp";
 import type { FollowUpResolutionRecord, ProjectTurnIntent } from "@/lib/mission/classifyFollowUp";
@@ -857,6 +856,35 @@ export function WorkspaceShell() {
 
   async function executeProjectMission(missionId: string, task: string, approvalResponse?: FactoryExistingProjectRequest["approvalResponse"], evidenceFiles: File[] = [], control?: { retryExecutionId?: string; undoExecutionId?: string }) {
     const targetMission = workspaceRef.current.missions.find((item) => item.missionId === missionId);
+    if (targetMission && !approvalResponse && !evidenceFiles.length && isPreviewRestartRequest(task)) {
+      const currentExecution = projectExecutionFromWorkspaceMission(targetMission);
+      if (!currentExecution?.projectId) {
+        appendProjectFollowUpNote(missionId, task, "I couldn't restart the preview because this project has no recorded runtime target yet.");
+        return;
+      }
+      const localConnector = localConnectorFromMission(targetMission);
+      try {
+        const response = await fetch("/api/factory/preview", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ projectId: currentExecution.projectId, action: "refresh", localConnector }),
+        });
+        const preview = await response.json() as Pick<FactoryProjectResult, "previewState" | "previewUrl" | "previewPlatform" | "previewReason">;
+        reconcileProjectPreview(missionId, preview);
+        appendProjectFollowUpNote(
+          missionId,
+          task,
+          preview.previewState === "ready"
+            ? `Preview restarted${preview.previewUrl ? ` at ${preview.previewUrl}` : ""}. No model call or source edit was used.`
+            : preview.previewState === "starting"
+              ? "Preview restart started. Foundry will update the Preview panel when the runtime is ready. No model call or source edit was used."
+            : `Preview restart failed: ${preview.previewReason || "the runtime did not become ready"}. No model call or source edit was used.`,
+        );
+      } catch (error) {
+        appendProjectFollowUpNote(missionId, task, `Preview restart failed: ${error instanceof Error ? error.message : "the preview endpoint was unavailable"}. No model call or source edit was used.`);
+      }
+      return;
+    }
     const recoveryQuestion = targetMission?.pendingClarification?.question.startsWith("A queued instruction survived the reload:");
     if (recoveryQuestion && /^Discard it\b/i.test(task.trim())) {
       setWorkspace((current) => ({
@@ -956,14 +984,18 @@ export function WorkspaceShell() {
           && result.previewPlatform === "web"
           && result.previewState === "ready";
         const failed = preview.previewState === "error" || lostVerifiedWebPreview;
-        const verified = preview.previewState === "ready";
+        // Preview health proves only that the existing project can be served. It cannot verify a
+        // follow-up which failed before writing source. Keep the dock usable without adding false
+        // mission evidence or changing the failed implementation verdict.
+        const previewMayVerifyMission = result.status === "passed";
+        const verified = preview.previewState === "ready" && previewMayVerifyMission;
         const failureReason = preview.previewReason || "The real preview failed its readiness check.";
         const previewBlocker = `Preview verification failed: ${failureReason}`;
-        const recoveringPreviewBlocker = preview.previewState === "ready" && active.blocked_reason?.startsWith("Preview verification failed:");
+        const recoveringPreviewBlocker = previewMayVerifyMission && preview.previewState === "ready" && active.blocked_reason?.startsWith("Preview verification failed:");
         const nextResult: FactoryProjectResult = {
           ...result,
           ...preview,
-          ...(failed ? { status: "failed", blocker: previewBlocker } : recoveringPreviewBlocker ? { status: "passed", blocker: undefined } : {}),
+          ...(failed && previewMayVerifyMission ? { status: "failed", blocker: previewBlocker } : recoveringPreviewBlocker ? { status: "passed", blocker: undefined } : {}),
         };
         const previewEvidence = {
           check_type: "preview" as const,
@@ -986,7 +1018,7 @@ export function WorkspaceShell() {
         };
         const nextExecution = {
           ...active,
-          ...(failed ? {
+          ...(failed && previewMayVerifyMission ? {
             state: "failed" as const,
             verification_status: "failed" as const,
             blocked_reason: previewBlocker,
@@ -995,8 +1027,12 @@ export function WorkspaceShell() {
             verification_status: "passed" as const,
             blocked_reason: undefined,
           } : {}),
-          verification: [...active.verification.filter((entry) => entry.check_type !== "preview"), previewEvidence],
-          timeline: [...active.timeline.filter((event) => event.id !== timelineEvent.id && !event.id.startsWith("preview-reconciliation-")), timelineEvent],
+          verification: previewMayVerifyMission
+            ? [...active.verification.filter((entry) => entry.check_type !== "preview"), previewEvidence]
+            : active.verification,
+          timeline: previewMayVerifyMission
+            ? [...active.timeline.filter((event) => event.id !== timelineEvent.id && !event.id.startsWith("preview-reconciliation-")), timelineEvent]
+            : active.timeline,
           updated_at: now,
         };
         const nextArtifact: CreatedArtifact = { ...artifact, body: JSON.stringify(nextResult, null, 2), description: `Factory execution ${nextResult.status}.` };
@@ -1152,7 +1188,7 @@ export function WorkspaceShell() {
     const confirmedResolution = confirmedInterpretationTask
       ? fallbackFollowUpResolution(confirmedInterpretationTask, context)
       : undefined;
-    let resolvedIntent = undoExecution
+    const resolvedIntent = undoExecution
       ? {
           ...fallbackFollowUpResolution(task, context),
           currentIntent: "undo" as const,
@@ -1205,39 +1241,6 @@ export function WorkspaceShell() {
       : approvalResponse
       ? { ...fallbackFollowUpResolution(task, context), currentIntent: "edit" as const, continuity: "carry_forward_plan" as const, referenceConfidence: 1, plannedAction: `Resolve the recorded approval decision for ${approvalResponse.requestedCommand}.` }
       : await resolveProjectMessageIntent(targetMission, task);
-    if (!exactMissionRetry && !approvalResponse && projectBehaviorDiagnosisIntent(task)) {
-      resolvedIntent = {
-        ...resolvedIntent,
-        currentIntent: "diagnose",
-        referencedPriorAction: null,
-        relevantFiles: [],
-        expectedScope: "Inspect the active project and its recorded/runtime evidence to explain the reported behavior without changing source.",
-        destructive: false,
-        referenceConfidence: 1,
-        plannedAction: task,
-        continuity: "fresh_plan",
-        rationale: "The message combines a current application failure with a request for explanation, so project evidence must be inspected before answering.",
-        clarifyingQuestion: "",
-        clarifyingOptions: [],
-      };
-    }
-    const currentStandaloneMutation = standaloneMutationIntent(task);
-    if (!exactMissionRetry && !approvalResponse && currentStandaloneMutation && !isMutatingProjectIntent(resolvedIntent.currentIntent)) {
-      resolvedIntent = {
-        ...resolvedIntent,
-        currentIntent: currentStandaloneMutation,
-        referencedPriorAction: null,
-        relevantFiles: [],
-        expectedScope: "Implement only the current message against the active project.",
-        destructive: false,
-        referenceConfidence: 1,
-        plannedAction: task,
-        continuity: "fresh_plan",
-        rationale: "The current message contains a complete standalone change request, so a non-mutating model classification cannot turn it into a status answer or fold it into an older execution.",
-        clarifyingQuestion: "",
-        clarifyingOptions: [],
-      };
-    }
     const projectIntent = resolvesExecutionDecisions ? "edit" : resolvedIntent.currentIntent;
     const continuity = resolvesExecutionDecisions ? "carry_forward_plan" : resolvedIntent.continuity;
     const { clarifyingQuestion, clarifyingOptions } = resolvedIntent;
@@ -2002,7 +2005,7 @@ export function WorkspaceShell() {
       });
       if (!response.ok || !response.body) throw new Error((await response.text()) || fallbackMessage);
 
-      const streamedResult = await readFactoryExecutionStream(response, missionId);
+      const streamedResult = await readFactoryExecutionStream(response, missionId, controlId, controller.signal);
       if (!streamedResult) throw new Error("Factory execution ended without a result.");
       if (task) updateProjectExecution(missionId, streamedResult, task);
       else updateProjectExecution(missionId, streamedResult);
@@ -2041,6 +2044,25 @@ export function WorkspaceShell() {
       }
 
       const message = error instanceof Error ? error.message : fallbackMessage;
+      if (/^Execution connection could not be recovered:/i.test(message)) {
+        const interruptedAt = new Date().toISOString();
+        setWorkspace((current) => ({
+          ...current,
+          missions: current.missions.map((item) => item.missionId === missionId ? {
+            ...item,
+            executionMissions: updateActiveExecutionMission(item, {
+              state: "cancelled",
+              blocked_reason: undefined,
+              summary: message,
+              updated_at: interruptedAt,
+            }),
+            lastResult: message,
+            liveWorkEvents: [],
+            updatedAt: interruptedAt,
+          } : item),
+        }));
+        return;
+      }
       const failedEvent: FactoryExecutionEvent = {
         id: `execution-error-${Date.now()}`,
         timestamp: new Date().toISOString(),
@@ -2082,7 +2104,7 @@ export function WorkspaceShell() {
     }
   }
 
-  async function readFactoryExecutionStream(response: Response, missionId: string): Promise<FactoryProjectResult | null> {
+  async function readFactoryExecutionStream(response: Response, missionId: string, controlId: string, signal: AbortSignal): Promise<FactoryProjectResult | null> {
     const reader = response.body?.getReader();
     if (!reader) return null;
 
@@ -2121,11 +2143,45 @@ export function WorkspaceShell() {
       }
     } catch (error) {
       const concreteFailure = [...timeline].reverse().find((event) => event.status === "error");
+      if (!concreteFailure && !signal.aborted) {
+        appendProjectExecutionEvent(missionId, {
+          id: `execution-reconnecting-${controlId}`,
+          timestamp: new Date().toISOString(),
+          kind: "planning",
+          status: "running",
+          title: "Reconnecting to the active execution",
+          details: { controlId, transportInterrupted: true },
+        });
+        let consecutiveUnavailable = 0;
+        while (!signal.aborted && consecutiveUnavailable < 12) {
+          const snapshotResponse = await fetch(`/api/factory/execution?controlId=${encodeURIComponent(controlId)}`, { cache: "no-store", signal }).catch(() => undefined);
+          if (!snapshotResponse?.ok) {
+            consecutiveUnavailable += 1;
+            await new Promise((resolve) => window.setTimeout(resolve, 1000));
+            continue;
+          }
+          consecutiveUnavailable = 0;
+          const snapshot = await snapshotResponse.json() as {
+            state: "running" | "completed" | "failed" | "stopped";
+            events?: FactoryExecutionEvent[];
+            result?: FactoryProjectResult;
+            error?: string;
+          };
+          const merged = new Map(timeline.map((event) => [event.id, event]));
+          for (const event of snapshot.events ?? []) merged.set(event.id, event);
+          timeline.splice(0, timeline.length, ...merged.values());
+          updateMissionTimeline(missionId, timeline);
+          if (snapshot.state === "completed" && snapshot.result) return snapshot.result;
+          if (snapshot.state === "failed") throw new Error(snapshot.error || "The server execution failed after the connection was restored.");
+          if (snapshot.state === "stopped") throw new DOMException("The execution was stopped.", "AbortError");
+          await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        }
+      }
       const reason = concreteFailure
         ? String(concreteFailure.details?.reason || concreteFailure.details?.blocker || concreteFailure.output || concreteFailure.title)
-        : "The live execution connection ended before Foundry returned a final result.";
+        : "Execution connection could not be recovered: the server execution snapshot was unavailable after twelve reconnect attempts.";
       const transport = error instanceof Error ? error.message : "connection interrupted";
-      throw new Error(`${reason} The project history was preserved and this mission can be retried without starting over. Connection detail: ${transport}`);
+      throw new Error(`${reason} Project history was preserved. Connection detail: ${transport}`);
     }
 
     if (buffer.trim()) await handleLine(buffer);

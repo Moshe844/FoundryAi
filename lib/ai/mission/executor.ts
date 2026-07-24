@@ -15,6 +15,7 @@ import { assessAutonomousBlocker } from "@/lib/ai/mission/autonomy-contract";
 import { routingContext } from "@/lib/ai/routing/request-context";
 import type { DynamicTaskAssessment, RoutingBudget } from "@/lib/ai/routing/types";
 import type { FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
+import { explicitReadOnlyConstraint } from "@/lib/mission/classifyFollowUp";
 import { isUserFacingUiOutcome, requiresPresentationLayerChange } from "@/lib/ai/mission/requirement-contract";
 import { redactSensitiveData, redactSensitiveText } from "@/lib/security/secret-redaction";
 import { Script } from "node:vm";
@@ -572,9 +573,16 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       .map((candidate) => candidate.replace(/\\/g, "/").trim())
       .filter(Boolean),
   ));
+  // Withholding write tools is the one decision that makes an edit physically impossible, so it must
+  // NOT rest on the classified intent alone — a single misclassification then silently turns "remove
+  // the photos and add an upload button" into a read-only turn with no way to edit, and the user is
+  // told nothing was done. Strip write tools only when the request is EXPLICITLY read-only (a pure
+  // question, or an explicit "don't change anything") — vocabulary-free and independent of the label.
+  // Anything else keeps write access; giving the model the ability to edit never forces it to.
   const readOnlyFollowUp = !input.newProject && !input.requireFirstMutation && Boolean(
     input.followUpResolution
-    && ["question", "inspection", "diagnose", "status", "retrospective"].includes(input.followUpResolution.currentIntent),
+    && ["question", "inspection", "diagnose", "status", "retrospective"].includes(input.followUpResolution.currentIntent)
+    && explicitReadOnlyConstraint(input.task),
   );
   // A new static project has one meaningful model action: write its complete first artifact. Keeping
   // the full inspection/deletion/reporting catalogue in this forced-tool request adds schema noise
@@ -730,7 +738,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       timeline,
       changedFiles: Array.from(changedFiles),
       commands,
-      sessionSummary: buildSessionSummary(timeline, changedFiles, status, blocker),
+      sessionSummary: buildSessionSummary(timeline, changedFiles, status, blocker, input.objective || input.task),
       verification: buildVerificationEntries(checklist, changedFiles, commands, timeline),
       turnsUsed,
       usage,
@@ -762,7 +770,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             input.initialProjectEvidence
               ? "Foundry already read the bounded working set immediately before this call and included its exact current contents below. Do not list the project, read package.json, or reread those files before editing. Apply the first real source mutation immediately from that verified evidence, then continue through every acceptance item."
               : "",
-            "write_file always takes one complete new file, while write_files writes a coordinated verified set in one operation. For a new project or multi-file feature, prefer one write_files call over one model turn per file. For a localized change in an existing file, prefer replace_in_file with an exact old_text match so a small repair never requires a risky whole-file rewrite.",
+            "write_file always takes one complete new file, while write_files writes a coordinated verified set in one operation. For a new project or multi-file feature, prefer one write_files call over one model turn per file. For a localized change in an existing file, prefer replace_in_file with an exact old_text match so a small repair never requires a risky whole-file rewrite. Never re-emit an existing file of roughly 6 KB or more through write_file just to change part of it: that response is cut off mid-content, the JSON fails to parse, and the edit is lost entirely. Large file, small change means replace_in_file.",
             input.newProject && !input.staticProject
               ? "For an unfinished multi-file generated build, each write_files response must be a substantial executable product slice: normally 8–12 complete coordinated files and no more than roughly 100,000 characters total. Include the user-visible screen or workflow, its state/domain logic, persistence or real integration boundary, and meaningful automated tests in the SAME batch. Tiny utility-only batches, one-class-per-call work, markers, constants-only batches, and build-process artifacts are invalid. A passing compiler proves only that the current slice compiles; it is never evidence that the saved product brief is implemented. Do not edit Gradle files unless a concrete compiler diagnostic requires it. Prefer three substantial verified product slices over dozens of tiny batches."
               : "",
@@ -925,6 +933,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const completedEvidenceRepairReads = new Set<string>();
   let modelCallsSinceDurableProgress = 0;
   let consecutiveRejectedGeneratedWrites = 0;
+  // How many times a whole-file write was cut off mid-content this batch; escalates the retry guidance.
+  let truncatedWriteRecoveries = 0;
   let paidModelCallsThisBatch = 0;
   // A healthy implementation batch coordinates files and then hands verification to deterministic
   // tools. It must not consume the entire mission allowance by turning every tiny file into another
@@ -1037,14 +1047,37 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     const maxModelCallsWithoutDurableProgress = durableWorkExistsNow ? configuredNoProgressCalls : preMutationNoProgressCalls;
     if (modelCallsSinceDurableProgress >= maxModelCallsWithoutDurableProgress) {
       const durableWorkExists = durableWorkExistsNow;
-      const reason = durableWorkExists
-        ? `NO_PROGRESS_AFTER_MUTATION: ${changedFiles.size} verified file change${changedFiles.size === 1 ? " is" : "s are"} already on disk, but the current implementation batch then used ${modelCallsSinceDurableProgress} model calls without another durable change or unique successful command. Preserve the written work and continue with deterministic verification or one refreshed continuation batch.`
-        : `NO_PROGRESS_BEFORE_MUTATION: The initial implementation route used ${modelCallsSinceDurableProgress} consecutive model calls without a new file change or unique successful command. No additional provider call was sent; the runtime should preserve the inspected evidence and try one stronger action-enforced route.`;
-      await emit("planning", "warning", "Implementation route needs escalation", {
-        internal: true,
-        details: { reason, paidCallPrevented: true, recoverable: true, durableWorkExists },
-      });
-      return finalize("failed", reason, Math.max(0, turn - 1));
+      // NO_PROGRESS_BEFORE_MUTATION used to fail here immediately — and the error text itself promised
+      // a "stronger action-enforced route" that was never actually run, so an existing-project edit
+      // that spent its first calls inspecting (or on a rejected backup write) dead-ended every time.
+      // Honor the promise: if we have not yet forced a mutation on this existing project, arm it and
+      // grant one more turn where tool choice REQUIRES a real change to the actual file. Only if that
+      // enforced attempt has already been spent (or there is nothing to inspect from) do we stop.
+      const canForceRealMutation = !durableWorkExists && !input.newProject && !input.commandOnly && !mutationRecoveryUsed && inspectedExistingProject;
+      if (canForceRealMutation) {
+        const alreadyArmed = Boolean(forcedMutationRecovery);
+        forcedMutationRecovery = forcedMutationRecovery ?? mutationToolForExistingProject();
+        // Step the counter back below the cap so the enforced turn actually runs instead of re-tripping.
+        modelCallsSinceDurableProgress = Math.max(0, maxModelCallsWithoutDurableProgress - 1);
+        if (!alreadyArmed) {
+          conversation.push({
+            role: "user",
+            content: [{
+              type: "text",
+              text: `Inspection is complete. Make the requested change now with ${forcedMutationRecovery}, applied to the real existing file the user asked about. Do not read, list, or search again, and do not write a backup or renamed copy (no .bak, -backup, -copy, or -redesigned file). Use the file evidence already in this conversation, make one real source change to the original file, then verify it.`,
+            }],
+          });
+        }
+      } else {
+        const reason = durableWorkExists
+          ? `NO_PROGRESS_AFTER_MUTATION: ${changedFiles.size} verified file change${changedFiles.size === 1 ? " is" : "s are"} already on disk, but the current implementation batch then used ${modelCallsSinceDurableProgress} model calls without another durable change or unique successful command. Preserve the written work and continue with deterministic verification or one refreshed continuation batch.`
+          : `NO_PROGRESS_BEFORE_MUTATION: The initial implementation route used ${modelCallsSinceDurableProgress} consecutive model calls without a new file change or unique successful command, and the action-enforced mutation route has already been tried. Preserve the inspected evidence for a refreshed continuation batch.`;
+        await emit("planning", "warning", "Implementation route needs escalation", {
+          internal: true,
+          details: { reason, paidCallPrevented: true, recoverable: true, durableWorkExists },
+        });
+        return finalize("failed", reason, Math.max(0, turn - 1));
+      }
     }
 
     // Announce the work once. Later turns are an implementation detail of the model/tool loop, not
@@ -1133,7 +1166,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         : input.newProject
           ? "Generating the first runnable source batch"
           : forcedMutationRecovery
-            ? "Applying the required source change"
+            ? "Preparing the required source change"
             : "Preparing the next verified project action";
     // Greenfield recovery must buy coordinated implementation, not one tiny file per provider call.
     const coordinatedNewProjectFoundation = coordinatedGeneratedFoundationNeeded && !input.staticProject && generatedWriteCalls < 10;
@@ -1205,7 +1238,17 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           budget: input.routingBudget,
         },
       },
-      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 1, signal: input.signal, timeoutMs: input.staticProject && (input.newProject || input.staticRewrite || (input.fastLane && input.tier && input.tier !== "fast")) ? 120_000 : input.staticProject ? 90_000 : input.fastLane ? 60_000 : 160_000 },
+      { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 1, signal: input.signal,
+        // A long provider call emits nothing on its own. When a candidate burns its window and the
+        // dispatcher falls back, say so — otherwise the status line sits frozen for minutes and the user
+        // cannot tell whether Foundry is working or hung.
+        onAttemptFailure: async ({ model, kind, message, nextCandidate }) => {
+          await emit("reasoning", "warning", nextCandidate
+            ? `${model} did not return a usable response (${kind}). Switching to ${nextCandidate} and continuing the same step.`
+            : `${model} did not return a usable response (${kind}). No alternate provider is available for this step.`,
+            { details: { model, kind, message, nextCandidate, paidCallPrevented: false } });
+        },
+        timeoutMs: input.staticProject && (input.newProject || input.staticRewrite || (input.fastLane && input.tier && input.tier !== "fast")) ? 45_000 : input.staticProject ? 60_000 : input.fastLane ? 60_000 : 160_000 },
     );
     if (result.usage.requestCount > 0) {
       modelCallsSinceDurableProgress += 1;
@@ -1221,7 +1264,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
     if (result.stopReason === "error") {
       if (input.continuableBatch && /(?:Model-call|Premium-model call|Estimated request cost).*limit|would exceed/i.test(result.errorMessage ?? "")) {
         const reason = result.errorMessage || "This bounded execution batch reached its safety boundary.";
-        await emit("planning", "completed", "Execution batch complete", { details: { reason, continuation: true } });
+        await emit("planning", "warning", paidModelCallsThisBatch === 0 ? "Implementation pass could not start" : "Implementation pass paused", { details: { reason, continuation: true, sourceChanges: changedFiles.size, paidModelCalls: paidModelCallsThisBatch } });
         return finalize("failed", reason, turn);
       }
       // A provider failure after the executor has already collected sufficient completion
@@ -1440,9 +1483,24 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       normalizeToolCallPaths(args, input.access.rootLabel);
       if (explorationToolNames.has(call.name ?? "")) inspectedExistingProject = true;
       if (!parsedArgs && rawArgs.length > 2) {
-        const reason = "The tool call arguments could not be parsed, most likely because the file content was too large and got cut off mid-write. Split this into a smaller change and try again.";
+        // A whole-file rewrite of a large file does not fit in one response: the JSON is cut off
+        // mid-content and never parses. Telling the model only to "split this" left it retrying the same
+        // doomed shape and quietly dropping the requested content. Name the file and force a targeted
+        // patch instead — the change itself is small even when the file is not.
+        const truncatedPath = /"path"\s*:\s*"([^"\n]{1,200})"/.exec(rawArgs)?.[1]?.replace(/\\\\/g, "/");
+        truncatedWriteRecoveries += 1;
+        const reason = [
+          `The ${call.name} arguments could not be parsed because the file content was cut off mid-write — the whole file does not fit in one response.`,
+          truncatedPath ? `Do NOT rewrite ${truncatedPath} in full.` : "Do NOT rewrite the whole file.",
+          "Use replace_in_file with a small exact old_text match and only the lines that must change. Keep every other line untouched.",
+          truncatedWriteRecoveries >= 2 ? "This has now failed twice: make the smallest possible replacement that satisfies the request, one region at a time." : "",
+        ].filter(Boolean).join(" ");
         hadUnresolvedToolFailure = true;
-        await emit("edit", "warning", "Large edit failed, switching to a smaller patch", { details: { reason } });
+        await emit("edit", "warning", "Whole-file write was too large — switching to a targeted patch", {
+          filePath: truncatedPath,
+          details: { reason, forcedTool: "replace_in_file", attempt: truncatedWriteRecoveries },
+        });
+        conversation.push({ role: "user", content: [{ type: "text", text: reason }] });
         toolResultParts.push({ type: "tool_result", toolUseId: callId, content: JSON.stringify({ verified: false, accepted: false, reason }) });
         continue;
       }
@@ -1662,7 +1720,11 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       const generatedRecoveryWriteIssue = input.newProject && !runnableEntryExistsNow && call.name === "write_file" && !EXECUTABLE_SOURCE_PATH.test(writePath)
         ? "The runnable application entry is still missing. This recovery batch accepts only real executable application source or styles until the app has a coherent entry point; marker, metadata, and handoff files do not count."
         : undefined;
-      const firstStaticArtifactIssue = input.staticProject && (input.newProject || input.staticRewrite) && generatedWriteCalls === 0 && call.name === "write_file"
+      // This is a creation guard, not a repair guard. During browser repair the project already has a
+      // runnable index.html, but generatedWriteCalls starts at zero for the fresh executor batch. Treating
+      // that repair as "the first write" rejected legitimate full-file fixes and trapped the mission in an
+      // unchanged-source loop after Foundry had already identified the exact browser defect.
+      const firstStaticArtifactIssue = input.staticProject && !runnableEntryExistsNow && (input.newProject || input.staticRewrite) && generatedWriteCalls === 0 && call.name === "write_file"
         && (writePath.toLowerCase() !== "index.html" || !isCompleteSelfContainedStaticEntry(writePath, String(args.content ?? "")))
         ? "The first static-project write must be the finished index.html, not a skeleton or initialization placeholder. Write at least 2,500 characters with the complete requested content, embedded responsive CSS, embedded interactive JavaScript, realistic seed data, accessible controls, and closing </script>, </body>, and </html> tags. This one coherent artifact lets Foundry verify the browser without buying several follow-up model turns."
         : undefined;
@@ -1696,13 +1758,24 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       // typecheck was recorded before the writes, the bundler failed after the mission concluded, and
       // the app shipped broken. Every import must resolve against the real project (or a file in the
       // same coordinated batch) BEFORE the write touches disk.
+      // Existing-project edits must change the real file, not leave a renamed copy beside it.
+      const backupShadowIssue = !input.newProject && ["write_file", "write_files"].includes(call.name ?? "")
+        ? await backupShadowWriteIssue(input.access, generatedMutationPaths).catch(() => undefined)
+        : undefined;
+      // A visual redesign of an existing page must keep the user's content, not regenerate a new site.
+      // Runs by default on any existing-page rewrite; skipped only when the user explicitly asked to
+      // change the content. Keyed on the diff, not on recognizing aesthetic words, so it protects
+      // against "make it beautiful / cool / stunning / slick / …" alike.
+      const contentPreservationIssue = !input.newProject && call.name === "write_file" && /\.html?$/i.test(writePath) && !requestsContentReplacement(input.task)
+        ? await existingPageContentPreservationIssue(input.access, writePath, String(args.content ?? "")).catch(() => undefined)
+        : undefined;
       const unresolvedImportIssue = ["write_file", "write_files", "replace_in_file"].includes(call.name ?? "")
         ? await unresolvedRelativeImportIssue(input.access, call.name ?? "", args, generatedMutationPaths).catch(() => undefined)
         : undefined;
       const duplicateJvmIssue = input.newProject && ["write_file", "write_files"].includes(call.name ?? "")
         ? await duplicateJvmDeclarationIssue(input.access, proposedGeneratedFiles).catch(() => undefined)
         : undefined;
-      const staticWriteIssue = wrongForcedRequiredPath ?? unresolvedImportIssue ?? duplicateJvmIssue ?? repeatedGeneratedWriteIssue ?? generatedApplicationRootIssue ?? generatedManifestIssue ?? coordinatedGeneratedWriteIssue ?? protectedGeneratedBriefIssue ?? generatedDocumentationIssue ?? generatedMarkerIssue ?? generatedRecoveryWriteIssue ?? firstStaticArtifactIssue ?? (input.staticProject && call.name === "write_file"
+      const staticWriteIssue = backupShadowIssue ?? contentPreservationIssue ?? wrongForcedRequiredPath ?? unresolvedImportIssue ?? duplicateJvmIssue ?? repeatedGeneratedWriteIssue ?? generatedApplicationRootIssue ?? generatedManifestIssue ?? coordinatedGeneratedWriteIssue ?? protectedGeneratedBriefIssue ?? generatedDocumentationIssue ?? generatedMarkerIssue ?? generatedRecoveryWriteIssue ?? firstStaticArtifactIssue ?? (input.staticProject && call.name === "write_file"
         ? invalidStaticEntryWrite(writePath, String(args.content ?? ""))
         : undefined);
       const evidenceRepairReplacement = typeof args.new_text === "string" ? args.new_text : "";
@@ -1726,6 +1799,12 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           details: { reason: rejectedWriteReason },
         });
         toolResult = { verified: false, reason: rejectedWriteReason };
+        // A rejected backup-shadow write leaves the mission with no durable change and only inflates
+        // the no-progress counter. Arm the enforced in-place mutation so the next turn is granted (by
+        // the pre-mutation cap grace above) and forced to write the real file instead of another copy.
+        if (backupShadowIssue && !input.newProject && !mutationRecoveryUsed) {
+          forcedMutationRecovery = "write_file";
+        }
         if (input.newProject && ["write_file", "write_files", "replace_in_file"].includes(call.name ?? "")) {
           consecutiveRejectedGeneratedWrites += 1;
           if (consecutiveRejectedGeneratedWrites >= 2) {
@@ -1738,7 +1817,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           }
         }
       } else {
-        toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions).catch((error) => ({
+        toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions, input.newProject).catch((error) => ({
           error: error instanceof Error ? error.message : "Tool call failed unexpectedly.",
         }));
       }
@@ -2569,6 +2648,7 @@ async function executeTool(
   task = "",
   standingApprovedCommands: string[] = [],
   deniedActions: string[] = [],
+  treatWritesAsCreated = false,
 ): Promise<unknown> {
   const pathArg = typeof args.path === "string" ? args.path : "";
   const basename = pathArg.split("/").pop() || pathArg;
@@ -2648,7 +2728,7 @@ async function executeTool(
       }
       const results: Array<{ path: string; result: unknown }> = [];
       for (const file of normalized) {
-        const result = await executeTool("write_file", file, access, emit, changedFiles, commands, narrativeObjects, preApprovedCommands, approvedCategories, rationale, task, standingApprovedCommands, deniedActions);
+        const result = await executeTool("write_file", file, access, emit, changedFiles, commands, narrativeObjects, preApprovedCommands, approvedCategories, rationale, task, standingApprovedCommands, deniedActions, treatWritesAsCreated);
         results.push({ path: file.path, result });
         if (isFailedWriteResult(result)) return { verified: false, reason: result.reason || `Batch write failed for ${file.path}.`, results };
       }
@@ -2692,7 +2772,8 @@ async function executeTool(
         }
       }
       const existedBeforeHint = await access.readFile(pathArg, { limitBytes: 1 });
-      await emit(existedBeforeHint.exists ? "edit" : "file", "running", `${existedBeforeHint.exists ? "Editing" : "Creating"} ${basename}`, { tier: "trace" });
+      const createdForThisMission = treatWritesAsCreated || !existedBeforeHint.exists;
+      await emit(createdForThisMission ? "file" : "edit", "running", `${createdForThisMission ? "Creating" : "Editing"} ${basename}`, { tier: "trace", fileName: basename, filePath: pathArg });
       const result = await access.writeFile(pathArg, content);
       if (result.verified) {
         if (!result.contentChanged) {
@@ -2712,7 +2793,7 @@ async function executeTool(
               ? `Line ${result.firstChangedLine}`
               : `Lines ${result.firstChangedLine}-${result.lastChangedLine}`
             : undefined;
-        await emit(result.existedBefore ? "edit" : "file", "completed", writeEventTitle(pathArg, result.existedBefore, task, content, rationale, delta), {
+        await emit(treatWritesAsCreated || !result.existedBefore ? "file" : "edit", "completed", writeEventTitle(pathArg, treatWritesAsCreated ? false : result.existedBefore, task, content, rationale, delta), {
           tier: "trace",
           fileName: basename,
           filePath: pathArg,
@@ -3005,7 +3086,24 @@ function concreteEditEvidence(timeline: FactoryExecutionEvent[]) {
     });
 }
 
-function buildSessionSummary(timeline: FactoryExecutionEvent[], changedFiles: Set<string>, status: MissionExecutorResult["status"], blocker?: string): FactorySessionSummary {
+/**
+ * Last-resort completion sentence, in product terms. "Updated 1 file and verified the writes on disk"
+ * describes plumbing, not what the user received — it reads like machine output because it is. Name the
+ * thing that was built and the files it lives in; the disk read-back already has its own evidence line.
+ */
+function deliveredOutcomeSentence(changed: string[], requestedWork?: string): string {
+  const files = changed.filter((filePath) => !/(?:^|\/)foundry-brief\.md$/i.test(filePath));
+  const delivered = files.length ? files : changed;
+  if (!delivered.length) return "No user-facing outcome was verified.";
+  const subject = (requestedWork ?? "").split(/[\n.]/)[0]?.trim().replace(/^(?:build|create|make)\s+/i, "") ?? "";
+  const what = subject && subject.length <= 90 ? subject : "the requested project";
+  const where = delivered.length === 1
+    ? delivered[0]
+    : `${delivered.slice(0, 3).join(", ")}${delivered.length > 3 ? ` and ${delivered.length - 3} more` : ""}`;
+  return `Built ${what} in ${where}.`;
+}
+
+function buildSessionSummary(timeline: FactoryExecutionEvent[], changedFiles: Set<string>, status: MissionExecutorResult["status"], blocker?: string, requestedWork?: string): FactorySessionSummary {
   const narrative = timeline.map((event) => event.narrative).filter((item): item is FactoryNarrativeObject => Boolean(item));
   const findings = narrative.filter((item) => item.tier === "finding");
   const decisions = narrative.filter((item) => item.tier === "decision");
@@ -3021,7 +3119,7 @@ function buildSessionSummary(timeline: FactoryExecutionEvent[], changedFiles: Se
     : reportedOutcome ||
       decisions.at(-1)?.rationale ||
       findings.at(-1)?.rationale ||
-      (changed.length ? `Updated ${changed.length} file${changed.length === 1 ? "" : "s"} and verified the writes on disk.` : "No user-facing outcome was verified.");
+      deliveredOutcomeSentence(changed, requestedWork);
 
   return {
     outcome,
@@ -3151,6 +3249,95 @@ export function relativeImportSpecifiers(content: string): string[] {
     if (specifiers.size >= 24) break;
   }
   return [...specifiers];
+}
+
+/**
+ * The original file a backup/renamed-copy write would shadow, or undefined if the path is not a
+ * backup form. Two shapes: an extra suffix appended after the real extension (index.html.bak,
+ * styles.css.orig) and a backup token wedged before the extension (index-backup.html, app_old.js,
+ * page.redesigned.html). "new"/"v2"-style names are intentionally excluded — those are commonly real
+ * new files, not shadows of an existing one.
+ */
+export function originalPathForBackupWrite(writePath: string): string | undefined {
+  const normalized = writePath.replace(/\\/g, "/").trim();
+  if (!normalized) return undefined;
+  const slash = normalized.lastIndexOf("/");
+  const dir = slash >= 0 ? normalized.slice(0, slash + 1) : "";
+  const name = normalized.slice(dir.length);
+  const appended = name.match(/^(.+\.[a-z0-9]+)\.(?:bak|backup|orig|original|old|save|tmp|copy)$/i);
+  if (appended) return dir + appended[1];
+  const infix = name.match(/^(.+?)[._ -]+\(?(?:backup|bak|copy|old|orig|original|prev|previous|redesign|redesigned)\)?(\.[a-z0-9]+)$/i);
+  if (infix) return dir + infix[1] + infix[2];
+  return undefined;
+}
+
+/**
+ * Rejects an existing-project write that would drop a backup/renamed copy beside a file that already
+ * exists, instead of changing that file. This is the "it created a backup file instead of updating
+ * the original" failure: a redesign lands in index-backup.html / index.html.bak and the real page the
+ * user sees is untouched. Only fires when the shadowed original actually exists on disk.
+ */
+export async function backupShadowWriteIssue(access: ProjectAccess, paths: readonly string[]): Promise<string | undefined> {
+  for (const candidate of paths.filter(Boolean)) {
+    const original = originalPathForBackupWrite(candidate);
+    if (!original) continue;
+    const exists = Boolean((await access.readFile(original, { limitBytes: 1 }).catch(() => null))?.exists);
+    if (exists) {
+      return `${candidate} is a backup or renamed copy of ${original}, which already exists. Apply the change to ${original} itself — edit it in place with replace_in_file, or overwrite it with write_file at that exact path — so the change lands in the real file the user sees. Do not create a separate .bak, -backup, -copy, -old, or -redesigned file; Foundry already preserves history and can undo the edit.`;
+    }
+  }
+  return undefined;
+}
+
+/** Visible text tokens of an HTML document — script/style stripped, tags removed, words of length ≥ 4. */
+function visibleTextTokens(html: string): Set<string> {
+  const text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .toLowerCase();
+  return new Set(text.match(/[a-z][a-z0-9'-]{3,}/g) ?? []);
+}
+
+/**
+ * True only when the user EXPLICITLY asked to change/replace the page's content or start it over.
+ *
+ * This is the opt-out for the content-preservation guard, and it is intentionally the ONLY thing we
+ * enumerate — not "is this a redesign". The ways to ask for a nicer look are unbounded (beautiful,
+ * cool, stunning, slick, sleek, gorgeous, modern, snazzy, …); the ways to ask to replace the actual
+ * words are small and bounded. Keying on content/replacement wording means every phrasing of "make it
+ * look better" preserves content by default, and a miss here is fail-safe — it keeps the user's
+ * content rather than destroying it. Design-scope words ("redesign", "overhaul the design") are
+ * deliberately excluded: they restyle and must NOT drop content.
+ */
+export function requestsContentReplacement(task: string): boolean {
+  const contentNoun = "content|text|copy|wording|words|verbiage|paragraphs?|headings?|blurb|writing|messaging";
+  const replaceVerb = "rewrite|reword|rework|rephrase|replace|change|update|swap|redo|remove|delete|drop|scrap|gut";
+  const contentChange = new RegExp(`\\b(?:${replaceVerb})\\b[^.\\n]{0,40}\\b(?:${contentNoun})\\b|\\b(?:${contentNoun})\\b[^.\\n]{0,40}\\b(?:${replaceVerb})\\b`, "i");
+  const fullReplacement = /\bfrom scratch\b|\bstart (?:over|fresh|from scratch|again)\b|\bnew (?:content|copy|text|page|site|website|version)\b|\bcoming[- ]soon\b|\bplaceholder (?:page|site)\b|\bblank (?:page|slate)\b|\bdifferent content\b|\bwipe (?:it|the page)\b/i;
+  return contentChange.test(task) || fullReplacement.test(task);
+}
+
+/**
+ * Rejects an edit that throws away the existing page's content when no content change was requested.
+ * Foundry has shipped "redesign the UX to be beautiful" as a brand-new website with different text —
+ * the exact opposite of what was asked. Any edit may change every tag, class, and rule freely, but it
+ * must carry the user's actual words across; retaining only a small fraction of the original's visible
+ * text means the content was replaced, not edited. Phrasing-independent: it reads the diff, not the
+ * request. The caller skips it only when requestsContentReplacement() says the user opted in.
+ */
+export async function existingPageContentPreservationIssue(access: ProjectAccess, path: string, newContent: string): Promise<string | undefined> {
+  const original = await access.readFile(path, { limitBytes: 500_000 }).catch(() => undefined);
+  if (!original?.exists || original.truncated) return undefined;
+  const originalTokens = visibleTextTokens(original.content);
+  // Too little text to judge preservation meaningfully (e.g. a near-empty skeleton page).
+  if (originalTokens.size < 20) return undefined;
+  const newTokens = visibleTextTokens(newContent);
+  let retained = 0;
+  for (const token of originalTokens) if (newTokens.has(token)) retained += 1;
+  const ratio = retained / originalTokens.size;
+  if (ratio >= 0.5) return undefined;
+  return `This edit keeps only ${Math.round(ratio * 100)}% of the current ${path}'s text — it is replacing the user's existing content with different content, which was not requested. Re-read the current ${path} and change it in place: keep every existing heading, paragraph, label, link text, list item, and data value, and change only what was actually asked (the styling, layout, or the specific element named). Do not regenerate the page as a new site with new copy.`;
 }
 
 /**

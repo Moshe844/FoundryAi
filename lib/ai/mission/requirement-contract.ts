@@ -90,6 +90,93 @@ function acceptanceScopeForFollowUp(text: string): string {
 }
 
 /** Framework-independent DOM capabilities that Foundry can verify without another model call. */
+const NON_CONTENT_LITERAL = /^(?:index\.html|html|css|js|javascript|typescript|react|next\.?js|vite|astro|svelte|node|npm|json|ya?ml|scss|tsx?|jsx?|api|ui|ux)$/i;
+
+function isCheckableLiteral(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed.length < 2 || trimmed.length > 80) return false;
+  if (!/[a-z0-9]/i.test(trimmed)) return false;
+  if (NON_CONTENT_LITERAL.test(trimmed)) return false;
+  if (/^https?:\/\//i.test(trimmed) || /\.\w{2,4}$/.test(trimmed)) return false;
+  return true;
+}
+
+/**
+ * The literal on-screen content a request explicitly demands. A brief like
+ *
+ *   must show exactly: the heading "Sam Carter", the bio line "Product designer who likes calm
+ *   interfaces", and three skill tags labelled Design, Prototyping and Research
+ *
+ * carries exact strings — the most checkable requirement that exists. The capability contract only ever
+ * understood CRUD verbs, so none of this reached the browser gate: it derived nothing, verified nothing,
+ * and a page delivering one of three requirements still reported "Done". These literals are checked
+ * against the rendered text so an omission becomes a real, repairable acceptance failure.
+ */
+export function requiredVisibleTextsForTask(task: string): string[] {
+  const scope = acceptanceScopeForFollowUp(task);
+  const texts = new Set<string>();
+
+  // Quoted literals — straight, smart, and backtick quotes.
+  for (const match of scope.matchAll(/["“”'‘’`]([^"“”'‘’`\n]{2,80})["“”'‘’`]/g)) {
+    if (isCheckableLiteral(match[1])) texts.add(match[1].trim());
+  }
+
+  // Explicit label lists: `labelled Design, Prototyping and Research`, `named Alpha and Beta`.
+  for (const match of scope.matchAll(/\b(?:labell?ed|named|called|titled|reading)\s+([A-Z0-9][\w'&-]*(?:\s*(?:,|and|&)\s*(?:and\s+)?[A-Z0-9][\w'&-]*){1,6})/g)) {
+    for (const part of match[1].split(/\s*(?:,|and|&)\s*/)) {
+      if (isCheckableLiteral(part)) texts.add(part.trim());
+    }
+  }
+
+  // Natural product instructions rarely quote their most important identity requirements:
+  // "portfolio about Moshe Ekstein", "working at Sola Payments", "as an Integration Specialist".
+  // Those are still exact, visible claims and are stronger browser evidence than a generic render.
+  const identityPatterns = [
+    /\b(?:portfolio|profile|website|site|page)\s+(?:(?:is|to\s+be)\s+)?about\s+([A-Z][\p{L}'-]+(?:\s+[A-Z][\p{L}'-]+){1,4})/giu,
+    /\b(?:works?|working|employed)\s+(?:at|for)\s+([A-Z][\p{L}'&.-]+(?:[ \t]+[A-Z][\p{L}'&.-]+){0,4})/gu,
+    /\b(?:works?|working)\s+as\s+(?:an?\s+)?((?!(?:at|for|with)\b)[\p{L}'&/-]+(?:[ \t]+(?!(?:at|for|with)\b)[\p{L}'&/-]+){0,3})(?=[ \t]*(?:[.,;]|\n|$|\bat\b))/giu,
+  ];
+  for (const pattern of identityPatterns) {
+    for (const match of scope.matchAll(pattern)) {
+      const literal = match[1].replace(/\s+(?:and|who|with|at|for)\s*$/i, "").trim();
+      if (isCheckableLiteral(literal)) texts.add(literal);
+    }
+  }
+
+  return [...texts].slice(0, 12);
+}
+
+export type RequiredDomFeature = { label: string; selector: string };
+
+/**
+ * Element-level claims a request makes about the finished page. These are deliberately generic — if the
+ * brief names a visible thing, the rendered page must actually contain it. A portfolio brief listing
+ * "Responsive images with lazy loading" was ticked complete against a page with ZERO <img> tags (its
+ * "media" were CSS gradient divs); nothing checked, because the acceptance contract only understood
+ * quoted literals and CRUD verbs. Element existence is the least arguable evidence available.
+ */
+const DOM_FEATURE_RULES: Array<{ match: RegExp; label: string; selector: string }> = [
+  { match: /\blazy[- ]?load(?:ing|ed|s)?\b/i, label: "lazy-loaded media", selector: "img[loading='lazy'], iframe[loading='lazy']" },
+  { match: /\b(?:image|images|photo|photos|picture|pictures|gallery|thumbnail|thumbnails|screenshot|screenshots)\b/i, label: "images", selector: "img, picture" },
+  { match: /\bfooter\b/i, label: "a footer", selector: "footer, [role='contentinfo']" },
+  { match: /\b(?:navigation|navbar|nav bar|nav|menu)\b/i, label: "navigation", selector: "nav, [role='navigation']" },
+  { match: /\b(?:form|contact form|signup form|sign-?up form)\b/i, label: "a form", selector: "form" },
+  { match: /\bvideos?\b/i, label: "video", selector: "video, iframe[src*='youtube'], iframe[src*='vimeo']" },
+  { match: /\bsearch\b/i, label: "a search control", selector: "input[type='search'], [role='search'], input[name*='search' i], input[placeholder*='search' i]" },
+  { match: /\b(?:chart|charts|graph|graphs|visuali[sz]ation)\b/i, label: "a chart", selector: "canvas, svg, [class*='chart' i]" },
+];
+
+export function requiredDomFeaturesForTask(task: string): RequiredDomFeature[] {
+  const scope = acceptanceScopeForFollowUp(task);
+  const features = new Map<string, RequiredDomFeature>();
+  for (const rule of DOM_FEATURE_RULES) {
+    if (rule.match.test(scope)) features.set(rule.label, { label: rule.label, selector: rule.selector });
+  }
+  // "lazy-loaded media" already implies images; keep the stricter one only.
+  if (features.has("lazy-loaded media")) features.delete("images");
+  return [...features.values()];
+}
+
 export function observableBrowserContractForTask(task: string) {
   // Runtime continuity labels are useful context for the planner, but they are not product
   // requirements. Remove the labels here so browser acceptance never reports Foundry's own

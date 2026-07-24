@@ -20,10 +20,24 @@ function processIsAlive(processId) {
 
 function killProcessTree(processId) {
   if (process.platform === "win32") {
-    spawnSync("taskkill.exe", ["/pid", String(processId), "/t", "/f"], { stdio: "ignore", windowsHide: true, timeout: 8000 });
-    return;
+    return new Promise((resolve) => {
+      const child = spawn("taskkill.exe", ["/pid", String(processId), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+      let settled = false;
+      const finish = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch { /* taskkill may already have exited. */ }
+        try { process.kill(processId, "SIGKILL"); } catch { /* Target may already have exited. */ }
+        finish();
+      }, 2500);
+      child.once("close", finish);
+      child.once("error", () => {
+        try { process.kill(processId, "SIGKILL"); } catch { /* Target may already have exited. */ }
+        finish();
+      });
+    });
   }
   try { process.kill(processId, "SIGTERM"); } catch { /* Verify below. */ }
+  return Promise.resolve();
 }
 
 async function waitForExit(processId, timeoutMs = 3000) {
@@ -56,7 +70,7 @@ async function suspendOwnedDesktopProcesses(projectPath) {
       ownedDesktopProcesses.delete(record.processId);
       continue;
     }
-    killProcessTree(record.processId);
+    await killProcessTree(record.processId);
     if (await waitForExit(record.processId)) {
       suspended.push(record);
       ownedDesktopProcesses.delete(record.processId);

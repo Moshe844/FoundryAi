@@ -58,15 +58,29 @@ function discoveryPlatformEvidence(discovery: ProjectDiscoveryResult) {
 }
 
 type WorkloadSignals={simple:boolean;auth:boolean;email:boolean;database:boolean;payments:boolean;ai:boolean;realtime:boolean;offline:boolean;enterprise:boolean;windows:boolean;ios:boolean;android:boolean;hardware:boolean;browserGame:boolean;threeD:boolean};
+/**
+ * Drops explicitly negated mentions before signal matching. "Nothing else — no dashboard, no records,
+ * no forms" previously read as a request FOR a dashboard and records and pulled in PostgreSQL + Prisma;
+ * a user asking for "no database" would literally be given one. Only the negated span is removed, so the
+ * rest of the brief still counts.
+ */
+function withoutNegatedMentions(text:string):string{
+  return text.replace(/\b(?:no|without|not|never)\s+(?:a|an|any|the)?\s*[\w-]+(?:\s*(?:,|and|or)\s*(?:no\s+|any\s+)?[\w-]+){0,4}/gi," ");
+}
 function workloadSignals(discovery:ProjectDiscoveryResult):WorkloadSignals{
   // Recommended stacks and architecture prose are model output, not user requirements. Feeding
   // them back here made one hallucinated Auth.js choice self-confirming for every later website.
-  const evidence=`${discovery.prompt} ${discovery.projectType} ${(discovery.mainFeatures||[]).join(" ")}`.toLowerCase();
+  const evidence=withoutNegatedMentions(`${discovery.prompt} ${discovery.projectType} ${(discovery.mainFeatures||[]).join(" ")}`.toLowerCase());
   const targetEvidence=`${discovery.prompt} ${discovery.projectType} ${discovery.decisions?.find(item=>item.dimension==="platform")?.hypothesis||""}`.toLowerCase();
-  const auth=/\bauth(?:entication)?|login|log in|sign[- ]?up|password|session|user account|member account|mfa|oauth|password reset\b/.test(evidence);
-  const database=/\bdatabase|persist(?:ence|ent)?|inventory|order management|booking|records?|dashboard|multi-user|shared data|postgres|mysql|sqlite\b/.test(evidence);
-  const dynamic=/\bapi|payment|checkout|realtime|real-time|ai|upload|admin|multi-user\b/.test(evidence);
-  return{simple:!auth&&!database&&!dynamic,auth,email:/\bemail|password reset|verification|invite|notification\b/.test(evidence),database,payments:/\bpayment|checkout|stripe|paypal|subscription|billing\b/.test(evidence),ai:/\bai|llm|model|embedding|vector|inference|machine learning\b/.test(evidence),realtime:/\brealtime|real-time|websocket|chat|presence|live collaboration\b/.test(evidence),offline:/\boffline|local-first|sync\b/.test(evidence),enterprise:/\benterprise|sso|saml|compliance|audit|multi-tenant|rbac\b/.test(evidence),windows:/\bwindows|wpf|winui\b/.test(targetEvidence),ios:/\bios|iphone|ipad|apple\b/.test(targetEvidence),android:/\bandroid|jetpack\b/.test(targetEvidence),hardware:/\bpax|poslink|payment terminal|barcode scanner|licensed sdk|device sdk|usb|serial|bluetooth\b/.test(evidence),browserGame:/\bbrowser game|web game|html5 game\b/.test(evidence),threeD:/\b3d|console|vr|ar|photoreal\b/.test(evidence)};
+  // Every alternation below is wrapped in \b(?:…)\b. Without the group the boundaries bind only to the
+  // FIRST and LAST alternative, leaving short tokens unanchored — `ai` then matched inside "plain",
+  // "email", "main", "detail"; `ar`/`vr` matched inside "marketing", "card", "start". A request for a
+  // "plain HTML page" was therefore classified as dynamic, skipped the static stack branch, and was
+  // forced into the Next.js + database stack. This one character class drove most wrong-stack builds.
+  const auth=/\b(?:auth(?:entication)?|login|log in|sign[- ]?up|password|session|user account|member account|mfa|oauth|password reset)\b/.test(evidence);
+  const database=/\b(?:database|persist(?:ence|ent)?|inventory|order management|booking|records?|dashboard|multi-user|shared data|postgres|mysql|sqlite)\b/.test(evidence);
+  const dynamic=/\b(?:api|payment|checkout|realtime|real-time|ai|upload|admin|multi-user)\b/.test(evidence);
+  return{simple:!auth&&!database&&!dynamic,auth,email:/\b(?:email|password reset|verification|invite|notification)\b/.test(evidence),database,payments:/\b(?:payment|checkout|stripe|paypal|subscription|billing)\b/.test(evidence),ai:/\b(?:ai|llm|model|embedding|vector|inference|machine learning)\b/.test(evidence),realtime:/\b(?:realtime|real-time|websocket|chat|presence|live collaboration)\b/.test(evidence),offline:/\b(?:offline|local-first|sync)\b/.test(evidence),enterprise:/\b(?:enterprise|sso|saml|compliance|audit|multi-tenant|rbac)\b/.test(evidence),windows:/\b(?:windows|wpf|winui)\b/.test(targetEvidence),ios:/\b(?:ios|iphone|ipad|apple)\b/.test(targetEvidence),android:/\b(?:android|jetpack)\b/.test(targetEvidence),hardware:/\b(?:pax|poslink|payment terminal|barcode scanner|licensed sdk|device sdk|usb|serial|bluetooth)\b/.test(evidence),browserGame:/\b(?:browser game|web game|html5 game)\b/.test(evidence),threeD:/\b(?:3d|console|vr|ar|photoreal)\b/.test(evidence)};
 }
 function option(name:string,why:string,recommended=false):StackOption{return{name,why,recommended};}
 function capabilityAwareOptions(family:Exclude<ProjectPlatformFamily,"unconstrained">,discovery:ProjectDiscoveryResult):StackOption[]{const s=workloadSignals(discovery);
@@ -81,16 +95,20 @@ function capabilityAwareOptions(family:Exclude<ProjectPlatformFamily,"unconstrai
  if(family==="cli"||family==="data"||family==="library"||family==="embedded")return platformFallbacks[family].map(item=>({...item}));
  if(s.browserGame)return[option("Phaser + TypeScript + Vite","Best fit for a browser game with fast iteration, web deployment, asset loading, input, scenes, and deterministic tests.",true),option("Godot","A visual-editor alternative that can also export to the web."),option("Unity","A larger alternative when future native or console delivery matters.")];if(s.threeD)return[option("Unity + C#","Best fit for a cross-platform 3D game with mature tooling, physics, assets, profiling, and deployment support.",true),option("Unreal Engine + C++/Blueprints","A high-end alternative for advanced rendering or console ambitions."),option("Godot + GDScript/C#","An open-source alternative for smaller 3D scope and a lighter editor.")];return[option("Godot + GDScript","Best fit for a focused 2D game with a fast editor loop, scenes, input, animation, export, and low tooling overhead.",true),option("Unity + C#","A mature alternative with a larger asset and platform ecosystem."),option("Phaser + TypeScript","A browser-first alternative for lightweight 2D delivery."),option("Bevy + Rust","A code-first alternative for data-oriented performance and engine control.")];}
 
+// Every pattern is word-bounded. Unbounded alternatives silently misfiled stacks: "Vi(test)" matched
+// "vite" and a package toolchain was classified WEB, so "TypeScript + tsup + Vitest — npm publishing"
+// was offered as the recommended stack for a portfolio website. Library toolchains are named explicitly
+// for the same reason: unnamed ones fell through to "unconstrained", which the fit filter always accepts.
 function familyForExplicitStack(stack: string): ProjectPlatformFamily {
-  if (/electron|tauri|wpf|winforms|pyside|pyqt|desktop/i.test(stack)) return "desktop";
-  if (/\bmobile\b|react native|expo|flutter|swiftui|android|jetpack/i.test(stack)) return "mobile";
-  if (/express|fastapi|asp\.net|spring|django|flask|backend|api/i.test(stack)) return "backend";
-  if (/godot|unity|unreal|phaser|bevy|game/i.test(stack)) return "game";
-  if (/commander|typer|cobra|clap|command[- ]line|\bcli\b/i.test(stack)) return "cli";
-  if (/polars|pandas|duckdb|spark|dbt|data pipeline|etl/i.test(stack)) return "data";
-  if (/embedded|platformio|zephyr|micropython|embedded-hal|firmware/i.test(stack)) return "embedded";
-  if (/library|package|sdk|crate|module/i.test(stack)) return "library";
-  if (/html|css|javascript|next|react|vite|vue|svelte|astro|web/i.test(stack)) return "web";
+  if (/\b(?:electron|tauri|wpf|winforms|pyside|pyqt|desktop)\b/i.test(stack)) return "desktop";
+  if (/\b(?:mobile|react native|expo|flutter|swiftui|android|jetpack)\b/i.test(stack)) return "mobile";
+  if (/\b(?:express|fastapi|asp\.net|spring|django|flask|backend|api)\b/i.test(stack)) return "backend";
+  if (/\b(?:godot|unity|unreal|phaser|bevy|game)\b/i.test(stack)) return "game";
+  if (/\b(?:commander|typer|cobra|clap|command[- ]line|cli)\b/i.test(stack)) return "cli";
+  if (/\b(?:polars|pandas|duckdb|spark|dbt|data pipeline|etl)\b/i.test(stack)) return "data";
+  if (/\b(?:embedded|platformio|zephyr|micropython|embedded-hal|firmware)\b/i.test(stack)) return "embedded";
+  if (/\b(?:library|package|sdk|crate|module|tsup|hatch|poetry|setuptools|maturin|cargo)\b|npm publishing|pypi|crates\.io/i.test(stack)) return "library";
+  if (/\b(?:html|css|javascript|next|next\.js|react|vite|vue|svelte|sveltekit|astro|remix|nuxt|gatsby|hugo|eleventy|web)\b/i.test(stack)) return "web";
   return "unconstrained";
 }
 
@@ -118,12 +136,72 @@ function dynamicOptionsWithinPolicy(family: Exclude<ProjectPlatformFamily, "unco
     ? []
     : proposed.filter((item) => item.name.trim() && proposedOptionFitsProject(item, family, discovery));
   const fallback = capabilityAwareOptions(family, discovery);
-  const proposedRecommended = accepted.find((item) => item.recommended)?.name;
+  // A project with no server, account, or shared-data requirement must not be upsold into a framework
+  // just because the discovery model proposed one. A portfolio was recommended Next.js (React runtime +
+  // build step) while the deterministic policy's own card said "no server, account, or shared-data
+  // requirement" and sat last. The lightest viable stack owns the recommendation slot for a simple
+  // project; the model's proposals stay on offer as alternatives, so nothing is taken away.
+  // "Simple" alone is not enough to force a static stack: an interactive museum site with a 3D artifact
+  // viewer has no auth or database either, yet a framework is the right call there. Only a genuinely
+  // content-only site — no interactivity, no rich media surface — gets its recommendation forced.
+  const richnessEvidence = `${discovery.prompt} ${discovery.projectType} ${(discovery.mainFeatures || []).join(" ")}`.toLowerCase();
+  const interactiveRichness = /\b(?:interactive|3d|webgl|canvas|animation|animated|viewer|editor|simulator|map|chart|visuali[sz]ation|drag|realtime|real-time|configurator|quiz|calculator)\b/.test(richnessEvidence);
+  const staticFirst = family === "web" && (explicitlyStatic || (signals.simple && !interactiveRichness));
+  const proposedRecommended = staticFirst ? undefined : accepted.find((item) => item.recommended)?.name;
   const primary = proposedRecommended ? accepted : fallback;
   const secondary = proposedRecommended ? fallback : accepted;
   const combined = [...primary, ...secondary.filter((candidate) => !primary.some((item) => item.name.toLowerCase() === candidate.name.toLowerCase()))].slice(0, 5);
   const recommendedName = proposedRecommended ?? combined[0]?.name;
   return combined.map((item) => ({ ...item, recommended: item.name === recommendedName }));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Keeps the architecture prose consistent with the stack that was actually selected.
+ *
+ * The discovery model writes this paragraph alongside its OWN stack recommendation. When policy
+ * overrides that recommendation the paragraph still described the rejected framework — a portfolio
+ * showed "STACK: HTML + CSS + TypeScript (Vite)" in the sidebar while the memo read "Portfolio built
+ * with Next.js … MDX-based content authoring". That paragraph is carried into the brief that drives the
+ * build, so the builder could scaffold the very framework the policy rejected. Rewrite the rejected
+ * stack's name and state the selected stack decisively.
+ */
+export function architectureForSelectedStack(architecture: string, proposedStack: string, selectedStack: string): string {
+  const text = (architecture ?? "").trim();
+  if (!text || !proposedStack?.trim() || !selectedStack?.trim()) return text;
+  if (proposedStack.trim().toLowerCase() === selectedStack.trim().toLowerCase()) return text;
+  // "Next.js (React + Static Generation)" -> "Next.js": the head token is what the prose repeats.
+  const primary = proposedStack.split(/[+(,]/)[0].trim();
+  const rewritten = primary.length >= 3
+    ? text.replace(new RegExp(escapeRegExp(primary), "gi"), selectedStack)
+    : text;
+  return `${rewritten}\n\nImplementation stack: ${selectedStack}. This is the selected stack for this project; ignore any other framework named above.`;
+}
+
+/**
+ * Rewrites the rejected stack name everywhere it appears in the discovery memo.
+ *
+ * `preserveUserProductSignal` composes "<scope> built with <recommendedStack>, organized around …" and
+ * copies that sentence into `decisions[architecture].hypothesis` and `keyFacts` BEFORE policy overrides
+ * the stack. Fixing only `architecture` therefore fixed nothing the user could see: the UI renders the
+ * decisions, so a portfolio whose sidebar said "HTML + CSS + TypeScript (Vite)" still read "built with
+ * Next.js … MDX-based content authoring" in its architectural direction — and that memo drives the build.
+ */
+export function discoveryWithSelectedStack<T extends ProjectDiscoveryResult>(discovery: T, proposedStack: string, selectedStack: string): T {
+  if (!proposedStack?.trim() || !selectedStack?.trim()) return discovery;
+  if (proposedStack.trim().toLowerCase() === selectedStack.trim().toLowerCase()) return discovery;
+  const primary = proposedStack.split(/[+(,]/)[0].trim();
+  if (primary.length < 3) return discovery;
+  const swap = (text: string) => (text ?? "").replace(new RegExp(escapeRegExp(primary), "gi"), selectedStack);
+  return {
+    ...discovery,
+    architecture: architectureForSelectedStack(discovery.architecture, proposedStack, selectedStack),
+    keyFacts: (discovery.keyFacts ?? []).map(swap),
+    decisions: (discovery.decisions ?? []).map((decision) => ({ ...decision, hypothesis: swap(decision.hypothesis) })),
+  };
 }
 
 /** A selected starter is authoritative; custom briefs derive their family from the discovery memo. */
@@ -141,13 +219,18 @@ export function platformFamilyForProject(starterId: string, discovery?: ProjectD
   const evidence = discoveryPlatformEvidence(discovery);
   if (/\bdesktop|windows native|macos native|linux desktop|wpf|winforms|electron|tauri\b/.test(evidence)) return "desktop";
   if (/\bmobile|ios|android|iphone|ipad|react native|flutter\b/.test(evidence)) return "mobile";
-  if (/\bcli\b|command-line|terminal tool|developer command\b/.test(evidence)) return "cli";
-  if (/\bdata pipeline|etl|analytics pipeline|data processing|batch processing\b/.test(evidence)) return "data";
-  if (/\bfirmware|microcontroller|embedded|arduino|esp32|raspberry pi pico|rtos\b/.test(evidence)) return "embedded";
-  if (/\blibrary|package|reusable sdk|npm package|python package|crate\b/.test(evidence)) return "library";
-  if (/\bapi|backend|microservice|webhook service|server-only\b/.test(evidence)) return "backend";
-  if (/\bgame|gameplay|game engine|level editor\b/.test(evidence)) return "game";
-  if (/\bweb|website|browser|saas|storefront|dashboard\b/.test(evidence)) return "web";
+  // Word-bounded throughout: the unbounded form left short alternatives loose (the same defect that made
+  // "ai" match inside "plain"), so a website mentioning a "package" was filed as a library.
+  if (/\b(?:cli|command-line|terminal tool|developer command)\b/.test(evidence)) return "cli";
+  if (/\b(?:data pipeline|etl|analytics pipeline|data processing|batch processing)\b/.test(evidence)) return "data";
+  if (/\b(?:firmware|microcontroller|embedded|arduino|esp32|raspberry pi pico|rtos)\b/.test(evidence)) return "embedded";
+  if (/\b(?:library|reusable sdk|npm package|python package|crate)\b/.test(evidence)) return "library";
+  if (/\b(?:api|backend|microservice|webhook service|server-only)\b/.test(evidence)) return "backend";
+  if (/\b(?:game|gameplay|game engine|level editor)\b/.test(evidence)) return "game";
+  // Ordinary words for a website. Without these a "portfolio site" matched nothing, fell through to
+  // "unconstrained", and the discovery model's arbitrary stacks were passed through unchecked — which is
+  // how a portfolio was offered an npm-publishing package toolchain as its recommended stack.
+  if (/\b(?:web|web ?app|website|site|web page|page|browser|saas|storefront|shop|dashboard|portfolio|blog|landing|docs|documentation|marketing|e-?commerce)\b/.test(evidence)) return "web";
   return "unconstrained";
 }
 

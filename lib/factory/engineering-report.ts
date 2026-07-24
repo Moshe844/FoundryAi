@@ -75,9 +75,9 @@ export function enforceCreationCompletionContract(result: FactoryProjectResult):
   const blocker = `Foundry cannot mark this created project complete: ${missing.join("; ")}. Continue the same mission from its recorded evidence until the completion contract passes.`;
   return {
     ...result,
-    status: "needs-clarification",
+    status: "failed",
     blocker,
-    clarificationQuestions: [{ question: "Foundry has preserved the incomplete project and its verification evidence. Continue autonomous repair until every completion gate passes?", options: ["Continue recovery", "Pause here"] }],
+    clarificationQuestions: undefined,
     sessionSummary: result.sessionSummary
       ? { ...result.sessionSummary, outcome: "The project remains in autonomous recovery because its completion contract has not passed.", flags: unique([...result.sessionSummary.flags, blocker]) }
       : { outcome: "The project remains in autonomous recovery because its completion contract has not passed.", changes: [], preserved: ["Generated files and recorded verification evidence"], flags: [blocker] },

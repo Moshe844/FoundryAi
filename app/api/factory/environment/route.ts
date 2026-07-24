@@ -1,11 +1,14 @@
 import { NextResponse } from "next/server";
 import { environmentReadinessForStack, installToolchain } from "@/lib/toolchains/provisioner";
+import { inspectCertifiedStackEnvironment, toolchainManagerMemory } from "@/lib/certified-build/toolchain-manager";
 
 export const maxDuration = 1200;
 
 export async function POST(request: Request) {
   try {
-    const body = (await request.json()) as { action?: "inspect" | "install"; stackId?: string; toolchainId?: string; approvedCommand?: string };
+    const body = (await request.json()) as { action?: "inspect" | "inspect-certified" | "memory" | "install"; stackId?: string; toolchainId?: string; approvedCommand?: string };
+    if (body.action === "inspect-certified" && body.stackId) return NextResponse.json(inspectCertifiedStackEnvironment(body.stackId));
+    if (body.action === "memory") return NextResponse.json(toolchainManagerMemory());
     if (body.action === "inspect" && body.stackId) return NextResponse.json(await environmentReadinessForStack(body.stackId));
     if (body.action === "install" && body.toolchainId && body.approvedCommand) {
       const result = await installToolchain(body.toolchainId, body.approvedCommand);
