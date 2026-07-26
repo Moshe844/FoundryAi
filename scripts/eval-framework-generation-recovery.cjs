@@ -280,14 +280,28 @@ assert.match(executor, /competingProjectManifestPath/);
 assert.match(executor, /Repair the existing project in place/);
 assert.match(executor, /Recoverable engineering failure returned to execution/);
 assert.match(executor, /assessAutonomousBlocker\(reason\)/);
+const continuationAuthority = source("lib/ai/mission/continuation-authority.ts");
 assert.match(runtime, /FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES/);
 assert.match(runtime, /autonomousRepairStageLimit\(process\.env\.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 20\)/, "Distinct compiler failures must be allowed to continue beyond the old four-pass ceiling.");
 assert.ok(runtime.indexOf("compilerRepairPass += 1;") > runtime.indexOf("const failureFingerprint = compilerFailureFingerprint"), "Paid compiler-repair capacity must be consumed only after deterministic dependency and source repair routes are exhausted.");
 assert.match(runtime, /fingerprintMutations >= 2 \|\| signatureMutations >= 2/, "Repeated semantic compiler failures must trigger strategy escalation only after real mutations, not repeated inspections.");
 assert.match(runtime, /strategyReset: true, terminal: false/, "Repeated engineering failures must change strategy instead of becoming terminal project failures.");
 assert.doesNotMatch(runtime, /Compiler repair reached a genuine repeated-error blocker/, "A repeated compiler diagnostic must never be presented as proof that a project cannot be completed.");
-assert.match(runtime, /The project is unfinished, not failed\. Confirm continued recovery/, "A spending boundary must preserve a resumable project instead of returning a failed terminal state.");
-assert.match(runtime, /options: \["Continue recovery", "Pause here"\]/, "A preserved recovery boundary must offer an actual resumable user decision instead of a dead approval state.");
+// The wording this used to assert on was replaced by the continuation policy in
+// lib/ai/mission/continuation-authority.ts, which enforces the same guarantee more strongly: a spending
+// boundary now continues automatically while budget remains, and can only ever ask — never fail.
+assert.match(runtime, /if \(deterministicBuildFailure && \(compilerRepairPass >= maxCompilerRepairPasses[\s\S]{0,600}resolveContinuation\(\{/, "A spending boundary must route through the continuation policy instead of deciding for itself.");
+assert.match(runtime, /function resolveContinuation\([\s\S]{0,900}result\.status = "needs-clarification";/, "The continuation policy must preserve a resumable project rather than returning a failed terminal state.");
+assert.doesNotMatch(runtime, /function resolveContinuation\([\s\S]{0,900}result\.status = "failed";/, "A spending boundary must never produce a terminal failure.");
+assert.match(continuationAuthority, /preserved/, "A stop must tell the user their completed work is preserved.");
+assert.doesNotMatch(continuationAuthority, /"Continue recovery"/, "The generic retry prompt must not return.");
+// This asserted the literal ["Continue recovery", "Pause here"] options. Those were the generic retry
+// prompt the reliability contract forbids, and they are gone. The guarantee behind the assertion — that a
+// preserved boundary offers a real resumable decision rather than a dead approval state — is kept, and
+// the decision now names what continuing does and what it costs.
+assert.match(runtime, /function resolveContinuation\([\s\S]{0,900}clarificationQuestions = \[\{ question: decision\.question, options: decision\.options \}\]/, "A preserved recovery boundary must offer an actual resumable user decision.");
+assert.match(continuationAuthority, /options: \[`Continue — about \$\$\{signals\.nextAttemptUsd\.toFixed\(2\)\}`/, "The continue option must state what continuing costs.");
+assert.match(continuationAuthority, /options: \["Try again anyway", "Leave it here"\]/, "A boundary with nothing left to try must still leave the choice with the user.");
 assert.match(runtime, /failureAttempt > 1 \|\| signatureAttempt > 1/, "A second zero-change compiler observation must enforce a mutation instead of purchasing another inspection-only pass.");
 assert.match(runtime, /transientBuildArtifactDirectory\(deterministicBuildFailure, projectPath\)/, "Missing generated build-cache artifacts must receive deterministic recovery before a repair model is charged.");
 assert.match(runtime, /prisma", "generate"/, "Prisma projects must generate their client before build and preview.");

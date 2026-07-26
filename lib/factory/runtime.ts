@@ -14,6 +14,8 @@ import { closeRequirementLedger, openRequirementLedger, unbuiltRequirements, typ
 import { assessAttachments } from "@/lib/ai/mission/attachment-intake";
 import { recordStageOutcome } from "@/lib/ai/routing/telemetry";
 import { deriveMissionOutcome, formatMissionOutcome } from "@/lib/ai/mission/mission-outcome";
+import { decideContinuation } from "@/lib/ai/mission/continuation-authority";
+import { DEFAULT_ROUTING_BUDGET, routingBudgetSnapshot } from "@/lib/ai/routing/cost-guard";
 import { recordedDecisions } from "@/lib/factory/execution-journal";
 import type { ModelTier as RoutingDecisionTier } from "@/lib/ai/model-router";
 import { verifyAgainstReferences, visualRepairInstruction } from "@/lib/ai/mission/visual-acceptance";
@@ -32,6 +34,7 @@ import { duplicateFileProblem, safelyRemovableDuplicatePaths } from "@/lib/verif
 import { deterministicCompilerSourceRepair } from "@/lib/verification/deterministic-source-repair";
 import { planDependencyRepair } from "@/lib/verification/deterministic-dependency-repair";
 import { missingModuleImports, resolveProjectModulePath } from "@/lib/verification/missing-module-diagnostic";
+import { describeModuleExports, exportedSymbols, missingExportInstruction, missingExports } from "@/lib/verification/module-exports";
 import { hasDisposableFrameworkAssetFailure } from "@/lib/verification/browser-infrastructure";
 import type { VerificationProfile } from "@/lib/verification/types";
 import { assessMissionComplexity, shouldRunArchitectureReview, shouldRunVerify, tierForStage } from "@/lib/ai/mission/orchestration";
@@ -1846,7 +1849,11 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       ? `\n\nThe compiler proves ${missingImport.importer} imports ${missingImport.specifier}, but the required target does not exist. Create the missing file ${missingImport.target} now; do not make a cosmetic edit to ${missingImport.importer}.`
       : "";
     const exactDiagnostic = compilerDiagnosticOutput(deterministicBuildFailure);
-    const buildRepairTask = `Repair the exact compiler failure in this generated project. Preserve the product behavior and all source unrelated to the diagnostic. The runtime will rerun the same verification command after your edit, so mutate the named source immediately and do not spend a turn rerunning the build or narrating completion.${missingImportInstruction}\n\nOriginal project request:\n${task}\n\nAuthoritative compiler output:\n${exactDiagnostic}`;
+    // A module that exists but lacks the imported name is a different fault from a module that is
+    // absent, and the compiler names both sides of it. Saying so beats handing over a raw build failure.
+    const exportMismatch = missingExportInstruction(missingExports(exactDiagnostic));
+    const exportMismatchInstruction = exportMismatch ? `\n\n${exportMismatch}` : "";
+    const buildRepairTask = `Repair the exact compiler failure in this generated project. Preserve the product behavior and all source unrelated to the diagnostic. The runtime will rerun the same verification command after your edit, so mutate the named source immediately and do not spend a turn rerunning the build or narrating completion.${missingImportInstruction}${exportMismatchInstruction}\n\nOriginal project request:\n${task}\n\nAuthoritative compiler output:\n${exactDiagnostic}`;
     const buildRepairWorkingSet = workingSetWithCommandFailure(await discoverProjectWorkingSet(access, buildRepairTask), deterministicBuildFailure, projectPath);
     const evidenceRepairReadPaths = commandTracebackSourcePaths(buildRepairWorkingSet, projectPath);
     const compilerSourceEvidence = evidenceRepairReadPaths.length
@@ -1915,12 +1922,15 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       // different prompt used to consume the remaining mission budget while showing the same two
       // messages to the user. Preserve the compiler evidence and require an explicit continuation;
       // a resumed mission can choose a new strategy without charging repeatedly in this run.
-      result.status = "needs-clarification";
-      result.blocker = `Foundry stopped after one compiler-repair attempt returned without changing source. No additional model calls were made for this diagnostic. The project and exact compiler evidence are preserved: ${summarizeCommandFailure(deterministicBuildFailure)}`;
-      result.clarificationQuestions = [{
-        question: "The first compiler repair made no source change. Continue with a fresh repair strategy from the preserved diagnostic?",
-        options: ["Continue with a fresh strategy", "Pause here"],
-      }];
+      // A repair that changed nothing is a reason to try differently, not a reason to stop and ask.
+      resolveContinuation({
+        execution,
+        reason: `A compiler repair returned without changing any source: ${summarizeCommandFailure(deterministicBuildFailure)}`,
+        nextAction: "Re-diagnose from the compiler evidence with a stronger model and a different repair strategy",
+        nextAttemptUsd: compilerRepairBudgetUsd(),
+        madeProgress: result.changedFiles.length > 0,
+        result,
+      });
       await emitExecution(execution, "summary", "warning", "Compiler repair paused before another paid attempt", {
         details: { failureFingerprint, failureSignature, paidRepairPasses: compilerRepairPass, resumable: true, terminal: false, blocker: result.blocker },
       });
@@ -1956,12 +1966,24 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     }
   }
   if (deterministicBuildFailure && (compilerRepairPass >= maxCompilerRepairPasses || compilerRecoveryCycle >= maxCompilerRecoveryCycles) && !signal?.aborted) {
-    result.status = "needs-clarification";
-    result.blocker = `Foundry preserved the project and its latest compiler evidence after reaching the configured autonomous-recovery spending boundary. The project is unfinished, not failed. Confirm continued recovery to resume from this exact diagnostic without repeating completed work: ${summarizeCommandFailure(deterministicBuildFailure)}`;
-    result.clarificationQuestions = [{ question: "Foundry has preserved all completed work. Should it continue autonomous recovery from the current compiler diagnostic?", options: ["Continue recovery", "Pause here"] }];
-    await emitExecution(execution, "summary", "warning", "Autonomous repair is ready to continue when confirmed", {
-      details: { paidRepairPasses: compilerRepairPass, recoveryCycles: compilerRecoveryCycle, distinctFailureFingerprints: compilerFailureAttempts.size, resumable: true, terminal: false, blocker: result.blocker },
+    // Reaching a repair-pass ceiling is not one of the six reasons the contract permits a pause. Ask
+    // only if continuing would spend past what this mission was authorised for.
+    const continuation = resolveContinuation({
+      execution,
+      reason: `The production build still fails: ${summarizeCommandFailure(deterministicBuildFailure)}`,
+      nextAction: "Repair the remaining compiler failure from the preserved diagnostic",
+      nextAttemptUsd: compilerRepairBudgetUsd(),
+      madeProgress: result.changedFiles.length > 0,
+      result,
     });
+    await emitExecution(execution, "summary", continuation.action === "continue" ? "completed" : "warning",
+      continuation.action === "continue" ? "Continuing autonomous repair" : "Foundry needs your decision before spending more", {
+        details: {
+          paidRepairPasses: compilerRepairPass, recoveryCycles: compilerRecoveryCycle,
+          distinctFailureFingerprints: compilerFailureAttempts.size, resumable: true, terminal: false,
+          blocker: continuation.action === "ask" ? result.blocker : undefined,
+        },
+      });
   }
 
   // Non-Node ecosystems use the same progress protocol through their registered verification
@@ -1988,12 +2010,20 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       while (!ecosystemGate.passed && ecosystemGate.failure && !signal?.aborted) {
         ecosystemRecoveryCycles += 1;
         if (ecosystemRecoveryCycles > maxCompilerRecoveryCycles) {
-          result.status = "needs-clarification";
-          result.blocker = `Foundry preserved the ${generatedVerificationProfile.ecosystem} project and its latest verification evidence after reaching the configured autonomous-recovery spending boundary. The project is unfinished, not failed. Confirm continued recovery to resume without repeating completed work: ${summarizeCommandFailure(ecosystemGate.failure)}`;
-          result.clarificationQuestions = [{ question: `Foundry has preserved all completed work. Should it continue autonomous ${generatedVerificationProfile.ecosystem} recovery from the current diagnostic?`, options: ["Continue recovery", "Pause here"] }];
-          await emitExecution(execution, "summary", "warning", `${generatedVerificationProfile.ecosystem} recovery is ready to continue when confirmed`, {
-            details: { recoveryCycles: ecosystemRecoveryCycles - 1, resumable: true, terminal: false, blocker: result.blocker },
+          const continuation = resolveContinuation({
+            execution,
+            reason: `${generatedVerificationProfile.ecosystem} verification still fails: ${summarizeCommandFailure(ecosystemGate.failure)}`,
+            nextAction: `Repair the ${generatedVerificationProfile.ecosystem} verification failure from the preserved diagnostic`,
+            nextAttemptUsd: compilerRepairBudgetUsd(),
+            madeProgress: result.changedFiles.length > 0,
+            result,
           });
+          await emitExecution(execution, "summary", continuation.action === "continue" ? "completed" : "warning",
+            continuation.action === "continue"
+              ? `Continuing ${generatedVerificationProfile.ecosystem} recovery`
+              : "Foundry needs your decision before spending more", {
+              details: { recoveryCycles: ecosystemRecoveryCycles - 1, resumable: true, terminal: false, blocker: continuation.action === "ask" ? result.blocker : undefined },
+            });
           break;
         }
         const failure = ecosystemGate.failure;
@@ -2182,6 +2212,17 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         .filter((file) => !/(?:^|\/)(?:package(?:-lock)?\.json|tsconfig\.json|next-env\.d\.ts|.*\.config\.[cm]?[jt]s)$/i.test(file))
         .slice(0, 120);
 
+      // File names alone left a later batch guessing at interfaces: one batch wrote src/lib/auth.ts,
+      // another imported getCurrentUser and listOrders from it, and neither existed — a complete
+      // application that failed its build on two imports. Give each batch the real contract so it
+      // imports what is there rather than what it assumes should be.
+      const moduleContracts = (await Promise.all(existingSourceInventory
+        .filter((file) => /\.[cm]?[jt]sx?$/i.test(file))
+        .map(async (file) => {
+          const read = await access.readFile(file, { limitBytes: 200_000 }).catch(() => undefined);
+          return read?.exists ? describeModuleExports(file, exportedSymbols(read.content)) : undefined;
+        }))).filter((line): line is string => Boolean(line));
+
       await emitExecution(execution, "reasoning", "completed", `${outstanding.length} requested feature${outstanding.length === 1 ? " has" : "s have"} no implementation yet. I’m building ${outstanding.length === 1 ? "it" : "them"} before verifying the finished experience.`, {
         tier: "decision",
         rationale: `Deterministic gates passed on a project that does not yet implement: ${outstanding.join("; ")}.`,
@@ -2194,7 +2235,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         // already exists, every batch restarts from the shared foundation: observed live, four
         // consecutive batches rewrote the same types/validation/auth/store modules and never reached
         // the routes that were actually 404ing. The file list is what turns repetition into progress.
-        task: `Continue this new project. It already has a working scaffold, configuration, and the source files listed below, and its production build passes.\n\nSource files that ALREADY EXIST — do not recreate, rewrite, or reorganise these:\n${existingSourceInventory.map((file) => `- ${file}`).join("\n") || "- (none yet)"}\n\nImplement these requested features, which have no implementation yet:\n${outstanding.map((item) => `- ${item}`).join("\n")}\n\nBuild the user-facing entry points these features need — the pages, routes and API handlers a person actually visits — using the existing modules above rather than rewriting them. A feature with no reachable route does not exist. Do not write placeholders, markers, or documentation in place of working code.\n\nOriginal project request:\n${task}`,
+        task: `Continue this new project. It already has a working scaffold, configuration, and the source files listed below, and its production build passes.\n\nSource files that ALREADY EXIST — do not recreate, rewrite, or reorganise these:\n${existingSourceInventory.map((file) => `- ${file}`).join("\n") || "- (none yet)"}\n\nWhat those modules actually export. Import ONLY these names from them — if you need something else, add it to that module in the same batch rather than assuming it is already there:\n${moduleContracts.map((line) => `- ${line}`).join("\n") || "- (nothing yet)"}\n\nImplement these requested features, which have no implementation yet:\n${outstanding.map((item) => `- ${item}`).join("\n")}\n\nBuild the user-facing entry points these features need — the pages, routes and API handlers a person actually visits — using the existing modules above rather than rewriting them. A feature with no reachable route does not exist. Do not write placeholders, markers, or documentation in place of working code.\n\nOriginal project request:\n${task}`,
         missionContext: requirementLedger.missionContext,
         checklist: result.checklist,
         costScopeId: execution.costScopeId,
@@ -2223,8 +2264,70 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       // A batch that wrote nothing will not write anything next time either; stop rather than pay again.
       if (!featureBatch.changedFiles.length) break;
 
-      const rebuild = await runCommand(projectPath, "npm.cmd", ["run", "build"], events, execution);
+      let rebuild = await runCommand(projectPath, "npm.cmd", ["run", "build"], events, execution);
       result.commands.push(rebuild);
+
+      // A batch that breaks the build must be repaired before the next one runs. Without this the loop
+      // kept adding features on top of a broken build — observed live, the build failed on batch 3 and
+      // every later batch, and the mission reached its browser gate with a project that could not
+      // compile. The compiler-repair stage runs earlier in the mission, so it never sees these.
+      if (rebuild.exitCode !== 0) {
+        const diagnostic = compilerDiagnosticOutput(rebuild);
+
+        // Free repairs first: an install the package manager can do, and the exact export mismatch the
+        // compiler already named. Neither needs a model.
+        const dependencyPlan = planDependencyRepair({
+          diagnostic,
+          manifest: (await access.readFile("package.json", { limitBytes: 200_000 }).catch(() => undefined))?.content,
+        });
+        if (dependencyPlan) {
+          result.commands.push(await runCommand(projectPath, "npm.cmd", ["install", "--save-dev", "--no-audit", "--no-fund", ...dependencyPlan.packages], events, execution));
+        }
+
+        const mismatch = missingExportInstruction(missingExports(diagnostic));
+        await emitExecution(execution, "reasoning", "completed", "That batch broke the build. I’m repairing it before adding anything else.", {
+          tier: "decision",
+          rationale: mismatch || summarizeCommandFailure(rebuild),
+          details: { batch, stage: "post-batch build repair" },
+        });
+
+        const buildFix = await runMissionExecutor({
+          objective,
+          task: `The production build fails after the last change. Repair exactly this failure and change nothing unrelated.${mismatch ? `\n\n${mismatch}` : ""}\n\nAuthoritative compiler output:\n${diagnostic}`,
+          checklist: [{ id: "feature-batch-build-repair", label: "Repair the production build", status: "pending" }],
+          costScopeId: execution.costScopeId,
+          access,
+          apiKey: implementationModel.apiKey,
+          provider: implementationModel.provider,
+          tier: implementationModel.tier,
+          onEvent: emitEvent,
+          signal,
+          approvedCategories: ["dependencies", "package-runner"],
+          hasBuildTooling: runtimeBuildAvailable,
+          newProject: true,
+          continuableBatch: true,
+          routingAssessment: creationAssessment,
+          maxTurns: 4,
+          routingBudget: { maximumModelCalls: 3, estimatedCostUsd: 0.5 },
+        });
+        result.changedFiles = Array.from(new Set([...result.changedFiles, ...buildFix.changedFiles]));
+        result.commands.push(...buildFix.commands);
+        result.verification.push(...buildFix.verification);
+        mergeExecutionTimeline(result.timeline, buildFix.timeline);
+        result.usage.push(...buildFix.usage);
+        result.turnsUsed += buildFix.turnsUsed;
+
+        rebuild = await runCommand(projectPath, "npm.cmd", ["run", "build"], events, execution);
+        result.commands.push(rebuild);
+        result.verification.push({
+          check_type: "build",
+          result: rebuild.exitCode === 0 ? "pass" : "fail",
+          evidence: rebuild.exitCode === 0
+            ? "The production build was repaired after the feature batch that broke it."
+            : `The feature batch left the production build failing: ${summarizeCommandFailure(rebuild)}`,
+        });
+      }
+
       if (rebuild.exitCode === 0) {
         status = "passed";
         blocker = undefined;
@@ -7766,12 +7869,19 @@ Mandatory existing-source contract: preserve this project's established multi-fi
           //
           // Say exactly what is and is not proven, and stop here: there is no defect to repair, so
           // spending more paid repair calls on it cannot help.
-          result.status = "needs-clarification";
-          result.blocker = `The application renders cleanly, but the requested behavior still lacks passing executable acceptance evidence. Foundry will not call an unproven behavior complete. ${browserEvidence.evidence}`;
-          result.clarificationQuestions = [{ question: "Continue autonomous implementation and acceptance-workflow repair from the preserved evidence?", options: ["Continue recovery", "Pause here"] }];
+          // There is no defect to repair here, so no further attempt could change the outcome — the
+          // policy is told there is no next action, and asks rather than charging for a repeat.
+          resolveContinuation({
+            execution,
+            reason: `The application renders cleanly, but the requested behavior still lacks passing executable acceptance evidence. Foundry will not call an unproven behavior complete. ${browserEvidence.evidence}`,
+            nextAction: undefined,
+            nextAttemptUsd: 0,
+            madeProgress: result.changedFiles.length > 0,
+            result,
+          });
           // "skipped" alongside the passing build/typecheck records is what makes the mission read
           // "Complete (partially verified)" — an honest claim, not a silent pass.
-          result.verification.push({ check_type: "preview", result: "fail", evidence: result.blocker });
+          result.verification.push({ check_type: "preview", result: "fail", evidence: result.blocker ?? browserEvidence.evidence });
           result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
           result.sessionSummary.outcome = "Applied the requested change and verified it with the project's own checks — file read-back, typecheck, production build and a clean live render all passed. Foundry could not independently demonstrate the behavior in the browser, so that part is unproven rather than broken.";
           result.sessionSummary.changes = [...new Set([...result.sessionSummary.changes, ...browserRepairChangedFiles])];
@@ -8383,6 +8493,42 @@ async function applyJournalGroundedSummary(input: {
  * requirements and one that is waiting on a credential were both simply "failed"; now each says what it
  * actually is, and the headline leads the session summary so the user reads the accurate thing first.
  */
+/**
+ * Whether a stalled mission may carry on by itself, and what to say when it may not.
+ *
+ * Each of these sites used to end the same way: status "needs-clarification" and a "Continue recovery"
+ * button. Pressing it started another paid run that, with nothing changed, stopped in the same place —
+ * the retry prompt the reliability contract forbids. The policy in continuation-authority.ts decides
+ * instead, and the only question it ever puts to the user is one they can actually answer.
+ */
+function resolveContinuation(input: {
+  execution: ExecutionContext;
+  reason: string;
+  nextAction?: string;
+  nextAttemptUsd: number;
+  madeProgress: boolean;
+  externallyBlocked?: boolean;
+  result: { status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: MissionClarification[] };
+}) {
+  const ledger = routingBudgetSnapshot(input.execution.costScopeId);
+  const decision = decideContinuation({
+    reason: input.reason,
+    nextAction: input.nextAction,
+    spentUsd: ledger?.estimatedCostUsd ?? 0,
+    ceilingUsd: ledger?.estimatedCostLimitUsd ?? DEFAULT_ROUTING_BUDGET.estimatedCostUsd,
+    nextAttemptUsd: input.nextAttemptUsd,
+    madeProgress: input.madeProgress,
+    externallyBlocked: input.externallyBlocked,
+  });
+
+  if (decision.action === "continue") return decision;
+
+  input.result.status = "needs-clarification";
+  input.result.blocker = decision.question;
+  input.result.clarificationQuestions = [{ question: decision.question, options: decision.options }];
+  return decision;
+}
+
 async function reportMissionOutcome(input: {
   execution: ExecutionContext;
   passed: boolean;
