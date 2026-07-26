@@ -64,3 +64,51 @@ export function terminalBlockerWithNextAction(reason: string) {
   if (!assessment.terminal || !assessment.nextAction || reason.includes(assessment.nextAction)) return reason;
   return `${reason.trim()} Next action: ${assessment.nextAction}`;
 }
+
+/**
+ * A complete blocked report.
+ *
+ * Stopping is allowed; stopping opaquely is not. The reliability contract requires four things to be
+ * stated when Foundry remains blocked, and only two of them were reliably present: the reason and the
+ * required input. What actually succeeded was left implicit, which is the difference between "your work
+ * is preserved and here is what is left" and a bare error the user reads as everything having failed.
+ *
+ * Only real facts are included — an empty section is omitted rather than filled with reassurance.
+ */
+export function buildBlockedExplanation(input: {
+  /** The recorded blocker text. */
+  reason: string;
+  /** Files the mission changed and kept. */
+  changedFiles?: string[];
+  /** Names of verification checks that passed before the mission stopped. */
+  passedChecks?: string[];
+  /** Requirement-ledger position, when requirement accounting ran for this mission. */
+  requirements?: { finalized: number; total: number };
+}): string {
+  const reason = input.reason.trim();
+  const assessment = assessAutonomousBlocker(reason);
+  const changed = input.changedFiles?.filter(Boolean) ?? [];
+  const passed = [...new Set(input.passedChecks?.filter(Boolean) ?? [])];
+
+  const succeeded: string[] = [];
+  if (input.requirements && input.requirements.total > 0) {
+    succeeded.push(`${input.requirements.finalized} of ${input.requirements.total} requested item(s) are complete`);
+  }
+  if (changed.length) {
+    succeeded.push(`${changed.length} file(s) were changed and kept${changed.length <= 5 ? ` (${changed.join(", ")})` : ""}`);
+  }
+  if (passed.length) succeeded.push(`these checks passed: ${passed.join(", ")}`);
+
+  const requiredInput = assessment.nextAction
+    ?? (assessment.disposition === "recoverable-engineering"
+      // Foundry ran out of bounded recovery rather than hitting an external wall, so the honest ask is
+      // direction, not a credential or a permission.
+      ? "Tell me how you would like to proceed — a more specific instruction, or which part to focus on — and I will continue from the preserved work."
+      : "Let me know how you would like to proceed.");
+
+  return [
+    succeeded.length ? `What succeeded: ${succeeded.join("; ")}.` : "What succeeded: no change was completed before Foundry stopped.",
+    `What is still blocked: ${reason}`,
+    `What is needed: ${requiredInput}`,
+  ].join(" ");
+}

@@ -2,6 +2,7 @@ import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
 import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
 import { commandPermissionIdentity, isLongRunningServerCommand, isSensitiveFilePath, normalizeCommandForExecution, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
+import { clearFailedCommand, commandRepeatKey, createCommandRepeatState, evaluateCommandRepeat, recordFailedCommand, type CommandRepeatState } from "@/lib/ai/mission/command-repeat-guard";
 import { approvalScopeLabel, type CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 import { isEmptySourceWrite } from "@/lib/ai/mission/write-verification";
 import type { ManagedToolCall, NeutralContentPart, NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
@@ -75,6 +76,14 @@ export type MissionExecutorInput = {
   hasBuildTooling?: boolean;
   /** Advisory concerns from the Architecture Review stage (lib/ai/mission/architecture-review.ts), folded into the system prompt as extra context. Never blocks — the executor treats these exactly like any other planning input. */
   architectureNotes?: string;
+  /**
+   * The mission's durable staging context (lib/ai/mission/mission-stages.ts): the approved
+   * specification verbatim, the staged sequence, where the work currently stands, and the next exact
+   * action. Carried in the user message rather than the system prompt because it is part of the
+   * request, not an instruction about how to behave — and because a continuation window that has lost
+   * the original specification will otherwise rebuild a plausible one and quietly narrow the scope.
+   */
+  missionContext?: string;
   /** Empty-project creation can generate coordinated files without repeatedly rediscovering an existing codebase. */
   newProject?: boolean;
   /** A dependency-free browser project whose runtime verification is owned by Foundry's deterministic
@@ -898,6 +907,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             `Objective: ${input.objective}`,
             `Task: ${input.task}`,
             `Project root: ${input.access.rootLabel}`,
+            ...(input.missionContext ? ["", input.missionContext] : []),
             ...(input.priorContext ? ["", "Mission this continues:", formatParentContext(input.priorContext)] : []),
             ...(input.followUpResolution ? ["", "Accepted follow-up resolution:", JSON.stringify(input.followUpResolution)] : []),
             ...(input.initialProjectEvidence ? ["", "Verified current working-set source (authoritative):", input.initialProjectEvidence] : []),
@@ -918,6 +928,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const maxCompletionRejections = 3;
   let lastFailedWriteSignature = "";
   let repeatedWriteFailures = 0;
+  // Commands are guarded the same way writes already were: a failed command may not be reissued
+  // unchanged until the project has actually changed.
+  const commandRepeatState = createCommandRepeatState();
   let generatedWriteCalls = 0;
   let hadUnresolvedToolFailure = false;
   let lastReasoningNormalized = "";
@@ -1817,7 +1830,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           }
         }
       } else {
-        toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions, input.newProject).catch((error) => ({
+        toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions, input.newProject, commandRepeatState).catch((error) => ({
           error: error instanceof Error ? error.message : "Tool call failed unexpectedly.",
         }));
       }
@@ -2649,6 +2662,7 @@ async function executeTool(
   standingApprovedCommands: string[] = [],
   deniedActions: string[] = [],
   treatWritesAsCreated = false,
+  commandRepeatState: CommandRepeatState = createCommandRepeatState(),
 ): Promise<unknown> {
   const pathArg = typeof args.path === "string" ? args.path : "";
   const basename = pathArg.split("/").pop() || pathArg;
@@ -2728,7 +2742,7 @@ async function executeTool(
       }
       const results: Array<{ path: string; result: unknown }> = [];
       for (const file of normalized) {
-        const result = await executeTool("write_file", file, access, emit, changedFiles, commands, narrativeObjects, preApprovedCommands, approvedCategories, rationale, task, standingApprovedCommands, deniedActions, treatWritesAsCreated);
+        const result = await executeTool("write_file", file, access, emit, changedFiles, commands, narrativeObjects, preApprovedCommands, approvedCategories, rationale, task, standingApprovedCommands, deniedActions, treatWritesAsCreated, commandRepeatState);
         results.push({ path: file.path, result });
         if (isFailedWriteResult(result)) return { verified: false, reason: result.reason || `Batch write failed for ${file.path}.`, results };
       }
@@ -2890,6 +2904,23 @@ async function executeTool(
         return { exitCode: null, stdout: "", stderr: "The user denied this command.", skipped: "denied" };
       }
       const cwd = typeof args.cwd === "string" ? args.cwd : "";
+      // Refuse a bare repeat of a command that already failed with no source change since. Returning
+      // the reason as a skipped result keeps the mission going — the model gets told to fix the cause
+      // or pick a different approach — instead of burning the budget re-confirming the same error.
+      const repeat = evaluateCommandRepeat({
+        previous: commandRepeatState.get(commandRepeatKey(command, cwd)),
+        mutationsNow: changedFiles.size,
+      });
+      if (!repeat.allow) {
+        await emit("command", "skipped", `Skipped a repeat of ${command}`, {
+          tier: "finding",
+          command,
+          cwd,
+          rationale: repeat.reason,
+          details: { guidance: repeat.guidance },
+        });
+        return { exitCode: null, stdout: "", stderr: repeat.guidance, skipped: "repeated-failure" };
+      }
       await emit("command", "running", `Running ${command}`, { tier: "trace", command, cwd });
       if (!access.runCommand) {
         await emit("command", "skipped", `Command unavailable: ${command}`, { tier: "trace", command, cwd });
@@ -2898,6 +2929,8 @@ async function executeTool(
       const result = await access.runCommand(command, cwd, { approvedCommands: preApprovedCommands, approvedCategories, standingApprovedCommands });
       if (!result.skipped) {
         commands.push({ command, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, durationMs: result.durationMs, approvalScope: result.approvalScope });
+        if (result.exitCode === 0) clearFailedCommand(commandRepeatState, command, cwd);
+        else recordFailedCommand(commandRepeatState, { command, cwd, stdout: result.stdout, stderr: result.stderr, mutationsNow: changedFiles.size });
       }
       const isBuildLike = /\b(build|tsc|compile)\b/i.test(command);
       if (result.skipped) {

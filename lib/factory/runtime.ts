@@ -10,6 +10,7 @@ import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { planMission } from "@/lib/ai/mission/mission-planner";
 import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiredDomFeaturesForTask, requiredVisibleTextsForTask, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
 import { closeRequirementLedger, openRequirementLedger, type RequirementGate } from "@/lib/ai/mission/requirement-accounting";
+import { assessCompletion } from "@/lib/ai/mission/requirement-ledger";
 import { appendJournalEntry, readJournal, shouldJournalEvent, writeJournal } from "@/lib/factory/execution-journal";
 import { hasRunnableProjectEntry, runMissionExecutor } from "@/lib/ai/mission/executor";
 import { reviewArchitecture } from "@/lib/ai/mission/architecture-review";
@@ -45,7 +46,7 @@ import { explicitReadOnlyProjectIntent, type FollowUpResolutionRecord } from "@/
 import { reconcileBlockedCommandChecklist } from "@/lib/factory/evidence-reconciliation";
 import { isWholeProjectDeletionRequest, parseProjectDeletionLockApprovalCommand, projectDeletionApprovalCommand, projectDeletionLockApprovalCommand } from "@/lib/factory/project-deletion";
 import { customInstructionsFromProjectBrief } from "@/lib/factory/project-brief";
-import { assessAutonomousBlocker, terminalBlockerWithNextAction } from "@/lib/ai/mission/autonomy-contract";
+import { assessAutonomousBlocker, buildBlockedExplanation, terminalBlockerWithNextAction } from "@/lib/ai/mission/autonomy-contract";
 import { compactValidationProblems, matchingRunningEventId, mergeExecutionTimeline, upsertExecutionEvent } from "@/lib/factory/event-contract";
 import { autonomousRepairStageLimit, buildOnlyRecoveryCanComplete, generatedRecoveryBudgetForTier, normalizeVerificationEvidence, recoveryRoutingBudget, shouldResumeExactFailedRetry, shouldResumeIncompleteGeneratedProject } from "@/lib/factory/recovery-policy";
 import { routingBudgetForTier } from "@/lib/ai/routing/cost-guard";
@@ -1072,17 +1073,29 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // complete implementation contract rather than a loose prompt. Creation therefore always opens a
   // Requirement Ledger: the brief carries every named feature, constraint and data requirement the user
   // signed off on, and none of them may quietly go missing on the way to "Done".
-  const requirementLedger = await openRequirementLedger({ missionId: execution.costScopeId, request: task, apiKey, provider: initialModel.provider });
+  const requirementLedger = await openRequirementLedger({
+    // The project is the mission thread here, so its id keys the ledger across execution windows.
+    // execution.costScopeId identifies only this run and would start a fresh ledger every turn.
+    missionId: projectId,
+    executionId: execution.costScopeId,
+    projectId,
+    request: task,
+    // Creation always begins a new contract; the in-run continuation batches below share this ledger.
+    continuation: false,
+    apiKey,
+    provider: initialModel.provider,
+  });
   if (requirementLedger) {
-    await emitExecution(execution, "planning", "completed", `Requirement ledger opened · ${requirementLedger.requirementCount} requirement(s)`, {
+    await emitExecution(execution, "planning", "completed", `Requirement ledger opened · ${requirementLedger.requirementCount} requirement(s) in ${requirementLedger.stageCount} stage(s)`, {
       internal: true,
       tier: "decision",
-      rationale: `Tracking ${requirementLedger.requirementCount} requirement(s) from this request to a final status${requirementLedger.gating ? "; completion is gated on all of them" : " (recorded only — requirements were split mechanically)"}.`,
+      rationale: `Tracking ${requirementLedger.requirementCount} requirement(s) across ${requirementLedger.stageCount} stage(s) from this request to a final status${requirementLedger.gating ? "; completion is gated on all of them" : " (recorded only — requirements were split mechanically)"}.`,
       details: {
         stage: "request understanding",
         requirements: requirementLedger.requirementCount,
+        stages: requirementLedger.stageCount,
         gating: requirementLedger.gating,
-        openQuestions: requirementLedger.openQuestions.join(" | ") || undefined,
+        openQuestions: requirementLedger.openQuestions.map((item) => `${item.kind}: ${item.question}`).join(" | ") || undefined,
         note: requirementLedger.note,
       },
     });
@@ -1159,6 +1172,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   let result = await runMissionExecutor({
     objective,
     task,
+    missionContext: requirementLedger?.missionContext,
     checklist,
     costScopeId: execution.costScopeId,
     access,
@@ -1231,6 +1245,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     const continuation = await runMissionExecutor({
       objective,
       task: `Continuation batch ${continuationAttempt}: complete this new project from the authoritative brief and the implementation already on disk. Inspect existing files, create only the missing coordinated source and configuration, then install dependencies as needed and run the real production build. Do not rewrite correct files or stop at read-back evidence.\n\nOriginal task:\n${task}`,
+      missionContext: requirementLedger?.missionContext,
       checklist: result.checklist,
       costScopeId: execution.costScopeId,
       access,
@@ -6132,21 +6147,42 @@ Mandatory existing-source contract: preserve this project's established multi-fi
   // for. This deliberately reuses requiresRequirementContract as the substantiality signal rather than
   // inventing a second notion of "big enough to track" that could disagree with the acceptance contract.
   const requirementLedger = requiresRequirementContract && mutatingOutcomeRequired
-    ? await openRequirementLedger({ missionId: execution.costScopeId, request: acceptedRequirementTask, apiKey, provider: initialModel.provider })
+    ? await openRequirementLedger({
+      // Stable across turns so a continued specification finds the ledger the last window left.
+      missionId: execution.projectId ?? currentProjectIdentity,
+      executionId: execution.costScopeId,
+      projectId: execution.projectId,
+      request: acceptedRequirementTask,
+      // Only an established continuation may resume a stored specification. Reusing the existing
+      // continuity signal keeps this from becoming a second, disagreeing notion of "is this the same
+      // work?" — and resumeLedger additionally refuses to hand a settled contract to a new request.
+      continuation: continuity === "carry_forward_plan" || resumingIncompleteProject,
+      apiKey,
+      provider: initialModel.provider,
+    })
     : undefined;
   if (requirementLedger) {
-    await emitExecution(execution, "planning", "completed", `Requirement ledger opened · ${requirementLedger.requirementCount} requirement(s)`, {
+    await emitExecution(execution, "planning", "completed", `Requirement ledger opened · ${requirementLedger.requirementCount} requirement(s) in ${requirementLedger.stageCount} stage(s)`, {
       internal: true,
       tier: "decision",
-      rationale: `Tracking ${requirementLedger.requirementCount} requirement(s) from this request to a final status${requirementLedger.gating ? "; completion is gated on all of them" : " (recorded only — requirements were split mechanically)"}.`,
+      rationale: `Tracking ${requirementLedger.requirementCount} requirement(s) across ${requirementLedger.stageCount} stage(s) from this request to a final status${requirementLedger.gating ? "; completion is gated on all of them" : " (recorded only — requirements were split mechanically)"}.`,
       details: {
         stage: "request understanding",
         requirements: requirementLedger.requirementCount,
+        stages: requirementLedger.stageCount,
         gating: requirementLedger.gating,
-        openQuestions: requirementLedger.openQuestions.join(" | ") || undefined,
+        openQuestions: requirementLedger.openQuestions.map((item) => `${item.kind}: ${item.question}`).join(" | ") || undefined,
         note: requirementLedger.note,
       },
     });
+    // A contradiction in the request cannot be resolved by guessing: whichever half Foundry picks may be
+    // the one the user did not want. Ask now, before a planning call is paid for and before any file is
+    // touched. Undecided details never reach here — those are inferred, which is why this does not turn
+    // into a product that stops to ask about every missing detail.
+    if (requirementLedger.blockingQuestions.length) {
+      const paused = await pauseForPlanConflicts(execution, requirementLedger.blockingQuestions);
+      return { status: paused.status, blocker: paused.blocker, clarificationQuestions: paused.clarificationQuestions, changedFiles: [], events: [paused.blocker], stackLabel: stackProfile.label };
+    }
   }
   const boundedCoordinatedEdit = !approvalResponse
     && atomicUserRequirements.length >= 2
@@ -6539,6 +6575,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
     result = await runMissionExecutor({
     objective,
     task,
+    missionContext: requirementLedger?.missionContext,
     checklist,
     costScopeId: execution.costScopeId,
     access: executorAccess,
@@ -6637,6 +6674,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
     const continuation = await runMissionExecutor({
       objective,
       task: `Finish the remaining parts of this bounded existing-project change. These files were already changed and verified in the first batch: ${result.changedFiles.join(", ")}. Do not rewrite them with equivalent content. Use the refreshed authoritative source below to edit the next incomplete UI, state, server, or test layer immediately, then verify the complete behavior.\n\nOriginal task: ${task}`,
+      missionContext: requirementLedger?.missionContext,
       checklist: result.checklist.map((item) => item.status === "completed" || item.status === "skipped" ? item : { ...item, status: "pending" as const, evidence: undefined }),
       costScopeId: execution.costScopeId,
       access: executorAccess,
@@ -7807,6 +7845,21 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       };
       result.sessionSummary.flags = [...new Set([...result.sessionSummary.flags, result.blocker])];
     }
+    // Whatever the disposition, a blocked mission owes the user all four facts: what succeeded, what is
+    // still blocked, why, and what is needed next. Built from the run's real evidence so a user reading
+    // a stop never has to guess whether their finished work survived.
+    const blockedExplanation = buildBlockedExplanation({
+      reason: result.blocker,
+      changedFiles: result.changedFiles,
+      passedChecks: result.verification.filter((item) => item.result === "pass").map((item) => item.check_type),
+      requirements: requirementLedger ? assessCompletion(requirementLedger.ledger) : undefined,
+    });
+    await emitExecution(execution, "blocked", "error", "Mission stopped before finishing", {
+      details: { stage: "blocked report", explanation: blockedExplanation },
+      output: blockedExplanation,
+    });
+    result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: result.changedFiles, preserved: [], flags: [] };
+    result.sessionSummary.outcome = result.sessionSummary.outcome || blockedExplanation;
   }
   // A mission may not conclude "passed" while its own plan still shows unfinished rows — the client
   // (correctly) flips that contradiction into "returned success before completing the mission plan" and
@@ -7893,6 +7946,19 @@ async function applyRequirementGate(
       details: { stage: "requirement accounting", note: gate.note },
     });
     return;
+  }
+
+  // Scope creep is reported whatever the completion verdict. A mission that delivered everything asked
+  // for AND invented a feature nobody asked for has still not done what the user requested, and silence
+  // is how an unrequested redesign reaches production unnoticed.
+  if (gate.unrequested.length) {
+    await emitExecution(execution, "inspection", "warning", `${gate.unrequested.length} change(s) no requirement asked for`, {
+      details: { stage: "requirement accounting", unrequested: gate.unrequested.join(" | ") },
+    });
+    const notice = `Changed without being asked: ${gate.unrequested.join("; ")}. Tell me if any of that should be reverted.`;
+    result.verification.push({ check_type: "checklist", result: "skipped", evidence: notice });
+    result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
+    result.sessionSummary.flags = [...new Set([...result.sessionSummary.flags, notice])];
   }
 
   if (gate.outcome === "unmet") {

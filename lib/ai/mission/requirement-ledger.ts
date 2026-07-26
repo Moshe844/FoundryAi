@@ -71,6 +71,12 @@ export type LedgerRequirement = {
   originRef?: string;
   /** Ids of requirements that must land before this one can start. */
   dependsOn: string[];
+  /**
+   * How this requirement is to be proven, decided when it was understood rather than after the work.
+   * Writing the check up front is what stops verification from being retro-fitted to whatever the
+   * mission happened to produce.
+   */
+  verification?: string;
   evidence: RequirementEvidence[];
   history: RequirementStatusChange[];
   /**
@@ -95,6 +101,8 @@ export type ExtractedRequirement = {
   kind: RequirementKind;
   /** Source quotes of requirements this one depends on; resolved to ids during merge. */
   dependsOnQuotes?: string[];
+  /** How this requirement should be proven once built. */
+  verification?: string;
 };
 
 /**
@@ -144,7 +152,10 @@ export function mergeRequirements(
       // worth taking from the repeat is a dependency the earlier pass had not spotted yet.
       const existing = requirements[existingIndex];
       const dependsOn = unique([...existing.dependsOn, ...resolveDependencies(item.dependsOnQuotes)]);
-      if (dependsOn.length !== existing.dependsOn.length) requirements[existingIndex] = { ...existing, dependsOn };
+      const verification = existing.verification ?? (normalizeWhitespace(item.verification) || undefined);
+      if (dependsOn.length !== existing.dependsOn.length || verification !== existing.verification) {
+        requirements[existingIndex] = { ...existing, dependsOn, verification };
+      }
       continue;
     }
 
@@ -163,6 +174,7 @@ export function mergeRequirements(
       origin,
       originRef,
       dependsOn: resolveDependencies(item.dependsOnQuotes),
+      verification: normalizeWhitespace(item.verification) || undefined,
       evidence: [],
       history: [{
         from: "none",

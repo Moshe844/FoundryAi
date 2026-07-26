@@ -136,11 +136,28 @@ export type RecordedDecision = {
   filePath?: string;
 };
 
-/** The reasoned choices on the record, optionally narrowed to one mission. */
-export async function recordedDecisions(projectId: string, options?: { missionId?: string; limit?: number }): Promise<RecordedDecision[]> {
+export type JournalScope = {
+  /** Restrict to one execution. */
+  missionId?: string;
+  /**
+   * Restrict to a set of executions. A specification worked across several windows has evidence under
+   * each of their ids, and a resumed mission has to see all of it — reading only the current execution
+   * would report work that plainly happened as never attempted.
+   */
+  missionIds?: string[];
+};
+
+function inScope(entry: { missionId?: string }, scope?: JournalScope): boolean {
+  if (scope?.missionId) return entry.missionId === scope.missionId;
+  if (scope?.missionIds?.length) return Boolean(entry.missionId && scope.missionIds.includes(entry.missionId));
+  return true;
+}
+
+/** The reasoned choices on the record, optionally narrowed to one or more executions. */
+export async function recordedDecisions(projectId: string, options?: JournalScope & { limit?: number }): Promise<RecordedDecision[]> {
   const entries = await readJournal(projectId);
   const decisions = entries
-    .filter((entry) => !options?.missionId || entry.missionId === options.missionId)
+    .filter((entry) => inScope(entry, options))
     .flatMap<RecordedDecision>((entry) => {
       const rationale = (entry.event.rationale ?? entry.event.narrative?.rationale ?? "").trim();
       if (!rationale) return [];
@@ -181,8 +198,8 @@ export type JournalDigest = {
  * Execution Journal. That only works if there is a bounded, already-filtered view of the record to hand
  * it — feeding a summarizer the raw journal is both expensive and an invitation to embellish.
  */
-export async function journalDigest(projectId: string, options?: { missionId?: string }): Promise<JournalDigest> {
-  const entries = (await readJournal(projectId)).filter((entry) => !options?.missionId || entry.missionId === options.missionId);
+export async function journalDigest(projectId: string, options?: JournalScope): Promise<JournalDigest> {
+  const entries = (await readJournal(projectId)).filter((entry) => inScope(entry, options));
 
   const filesChanged = new Map<string, { filePath: string; title: string; rationale?: string }>();
   const commands: Array<{ command: string; exitCode?: number | null }> = [];

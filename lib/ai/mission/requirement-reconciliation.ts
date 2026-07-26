@@ -44,6 +44,13 @@ export type ReconciliationResult = {
   unattempted: LedgerRequirement[];
   /** Requirements that were built but that nothing proved. */
   unverified: LedgerRequirement[];
+  /**
+   * Changes the evidence shows that no requirement accounts for. The completion gate answers "was
+   * everything asked for delivered?"; this answers the opposite question, "was anything delivered that
+   * nobody asked for?" — inventing a feature, redesigning something untouched by the request, or
+   * quietly swapping the requested approach.
+   */
+  unrequested: string[];
   note?: string;
   usage?: RuntimeUsageRecord;
 };
@@ -79,8 +86,22 @@ const RECONCILE_TOOL: NeutralTool = {
           required: ["id", "outcome", "evidence_detail"],
         },
       },
+      unrequested_changes: {
+        type: "array",
+        maxItems: 10,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            description: { type: "string", description: "What was changed that no requirement asked for, in plain language." },
+            evidence: { type: "string", description: "The recorded evidence showing it, such as the file or command." },
+          },
+          required: ["description", "evidence"],
+        },
+        description: "Behavior changes the evidence shows that no requirement accounts for. Empty when everything traces back to a requirement.",
+      },
     },
-    required: ["outcomes"],
+    required: ["outcomes", "unrequested_changes"],
   },
 };
 
@@ -97,6 +118,10 @@ const RECONCILE_SYSTEM_PROMPT = [
   "Constraints and exclusions are verified by evidence that the forbidden change did NOT happen. Absence of any relevant evidence is 'not-attempted', not 'verified'.",
   "Never invent evidence. An empty evidence_detail is the correct answer when there is none.",
   "Report every id you are given, exactly once.",
+  "Then look the other way: list in unrequested_changes anything the evidence shows that no requirement accounts for.",
+  "Be strict about what counts. Supporting work is part of delivering a requirement, not a separate change — a helper module, a type, a style file, a config entry, or a dependency the requirement genuinely needs all trace back to it.",
+  "Report a change only when it alters behavior the request never mentioned: a feature nobody asked for, a redesign of something the request left alone, a different approach substituted for the one the user specified, or a dependency added that no requirement needs.",
+  "An empty list is the normal and expected answer. Do not manufacture entries.",
 ].join("\n");
 
 export async function reconcileRequirements(input: {
@@ -111,7 +136,7 @@ export async function reconcileRequirements(input: {
 }): Promise<ReconciliationResult> {
   const open = activeRequirements(input.ledger);
   if (!open.length) {
-    return { ledger: input.ledger, source: "model", unattempted: [], unverified: [] };
+    return { ledger: input.ledger, source: "model", unattempted: [], unverified: [], unrequested: [] };
   }
 
   const provider: ProviderId = input.provider ?? "openai";
@@ -152,6 +177,7 @@ export async function reconcileRequirements(input: {
       source: "unavailable",
       unattempted: [],
       unverified: [],
+      unrequested: [],
       note: result.errorMessage
         ? `Requirement reconciliation was unavailable (${result.errorMessage}); requirement-level completion was not checked.`
         : "Requirement reconciliation returned nothing usable; requirement-level completion was not checked.",
@@ -191,8 +217,21 @@ export async function reconcileRequirements(input: {
     source: "model",
     unattempted: settled.filter((requirement) => requirement.status === "identified" || requirement.status === "planned"),
     unverified: settled.filter((requirement) => requirement.status === "implemented" || requirement.status === "in-progress"),
+    unrequested: normalizeUnrequested(parsed?.unrequested_changes),
     usage: result.usage,
   };
+}
+
+function normalizeUnrequested(items: ParsedReconciliation["unrequested_changes"]): string[] {
+  if (!Array.isArray(items)) return [];
+  return items
+    .flatMap<string>((item) => {
+      const description = typeof item?.description === "string" ? item.description.replace(/\s+/g, " ").trim() : "";
+      if (!description) return [];
+      const evidence = typeof item?.evidence === "string" ? item.evidence.replace(/\s+/g, " ").trim() : "";
+      return [evidence ? `${description} (${evidence})` : description];
+    })
+    .slice(0, 10);
 }
 
 function formatEvidence(evidence: MissionEvidence): string {
@@ -211,6 +250,7 @@ type ReportedOutcome = "verified" | "implemented" | "blocked" | "excluded";
 
 type ParsedReconciliation = {
   outcomes?: Array<{ id?: unknown; outcome?: unknown; evidence_kind?: unknown; evidence_detail?: unknown; evidence_reference?: unknown }>;
+  unrequested_changes?: Array<{ description?: unknown; evidence?: unknown }>;
 };
 
 function isReportedOutcome(value: unknown): value is ReportedOutcome {
