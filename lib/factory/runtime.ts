@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -9,6 +9,8 @@ import { classifyIntent, deterministicMutationIntent, deterministicTaskAssessmen
 import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { planMission } from "@/lib/ai/mission/mission-planner";
 import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiredDomFeaturesForTask, requiredVisibleTextsForTask, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
+import { closeRequirementLedger, openRequirementLedger, type RequirementGate } from "@/lib/ai/mission/requirement-accounting";
+import { appendJournalEntry, readJournal, shouldJournalEvent, writeJournal } from "@/lib/factory/execution-journal";
 import { hasRunnableProjectEntry, runMissionExecutor } from "@/lib/ai/mission/executor";
 import { reviewArchitecture } from "@/lib/ai/mission/architecture-review";
 import { verifyMissionResult } from "@/lib/ai/mission/mission-verifier";
@@ -36,7 +38,7 @@ import { profileTask } from "@/lib/ai/routing/task-profiler";
 import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
 import { discoverProjectWorkingSet, type ProjectWorkingSet } from "@/lib/ai/routing/project-working-set";
 import { connectLocalConnectorRoot, createLocalConnectorProjectAccess, createServerProjectAccess, createUploadedProjectAccess, isSensitiveFilePath, type LocalConnectorConfig, type PlatformValidationResult, type ProjectAccess } from "@/lib/ai/mission/project-access";
-import type { ExecutionMissionVerification, FactoryArtifact, FactoryCommandEvent, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryExistingProjectRequest, FactoryFileEntry, FactoryJournalEntry, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactoryPreviewPlatform, FactoryPreviewState, FactoryProjectResult, FactorySessionSummary, FactorySourceMode, FactoryUploadedFile, MissionClarification, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
+import type { ExecutionMissionVerification, FactoryArtifact, FactoryCommandEvent, FactoryExecutionEvent, FactoryExecutionEventKind, FactoryExecutionEventStatus, FactoryExistingProjectRequest, FactoryFileEntry, FactoryNarrativeObject, FactoryObjectiveChecklistItem, FactoryPreviewPlatform, FactoryPreviewState, FactoryProjectResult, FactorySessionSummary, FactorySourceMode, FactoryUploadedFile, MissionClarification, MissionParentContext, StructuredDiscovery } from "@/lib/factory/types";
 import { finalizeFactoryProjectResult } from "@/lib/factory/engineering-report";
 import { environmentReadinessForStack } from "@/lib/toolchains/provisioner";
 import { explicitReadOnlyProjectIntent, type FollowUpResolutionRecord } from "@/lib/mission/classifyFollowUp";
@@ -784,7 +786,6 @@ function restoreDesktopPreviewTarget(projectId: string) {
     return undefined;
   }
 }
-const journalsRoot = path.join(process.cwd(), ".foundry-data", "journals");
 type ProjectPreviewTarget =
   | { kind: "workspace"; projectId: string; projectPath: string }
   | { kind: "connector"; projectId: string; connector: LocalConnectorConfig };
@@ -802,8 +803,13 @@ async function emitModelSelection(execution: ExecutionContext, stage: string, se
   if (!selection) return;
   const alreadyEmitted = execution.timeline.some((event) => event.details?.stage === stage && event.details?.provider === selection.provider && event.details?.model === selection.model);
   if (alreadyEmitted) return;
-  await emitExecution(execution, "planning", "completed", "Model route selected", {
+  await emitExecution(execution, "planning", "completed", `Model route selected for ${stage}`, {
     internal: true,
+    // A routing choice is a decision with a reason, and the spec requires that reason to be recorded.
+    // Carrying it as `rationale` (not only inside details) is what puts it in the durable journal and
+    // makes it answerable later, while `internal` still keeps it off the user's timeline.
+    tier: "decision",
+    rationale: `Routed ${stage} to ${selection.provider} ${selection.model} (${selection.tier})${selection.reason ? `: ${selection.reason}` : "."}`,
     details: { stage, tier: selection.tier, provider: selection.provider, model: selection.model, effort: selection.effort ?? "provider default", reason: selection.reason, costClass: selection.costClass },
   });
 }
@@ -823,49 +829,9 @@ function looksLikeBoundedClientInteraction(task: string) {
     && !/\b(?:database|migration|backend|server|api|authentication|authorization|payment|billing|webhook|deployment|infrastructure)\b/i.test(task);
 }
 
-function journalPathFor(projectId: string) {
-  const cleanId = projectId.replace(/[^a-zA-Z0-9-]/g, "_") || "project";
-  return path.join(journalsRoot, cleanId, "journal.ndjson");
-}
-
-export async function appendJournalEntry(projectId: string, event: FactoryExecutionEvent) {
-  const entry: FactoryJournalEntry = {
-    id: `journal-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    projectId,
-    timestamp: event.timestamp,
-    event,
-    beforeContent: event.beforeContent,
-  };
-  const filePath = journalPathFor(projectId);
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf8");
-  return entry;
-}
-
-export async function readJournal(projectId: string): Promise<FactoryJournalEntry[]> {
-  const filePath = journalPathFor(projectId);
-  if (!existsSync(filePath)) return [];
-  const raw = await readFile(filePath, "utf8");
-  return raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line) as FactoryJournalEntry;
-      } catch {
-        return null;
-      }
-    })
-    .filter((entry): entry is FactoryJournalEntry => entry !== null);
-}
-
-async function writeJournal(projectId: string, entries: FactoryJournalEntry[]) {
-  const filePath = journalPathFor(projectId);
-  await mkdir(path.dirname(filePath), { recursive: true });
-  const body = entries.map((entry) => JSON.stringify(entry)).join("\n");
-  await writeFile(filePath, entries.length ? `${body}\n` : "", "utf8");
-}
+// Journal storage and its query API live in lib/factory/execution-journal.ts. Re-exported here because
+// existing callers (and the journal API route) import them from the runtime module.
+export { appendJournalEntry, readJournal };
 
 async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitter, discovery?: StructuredDiscovery, modelMode: ModelMode = "auto", quality: MissionQualityLevel = DEFAULT_MISSION_QUALITY, signal?: AbortSignal, evidenceAttachments: EvidenceAttachments = []): Promise<FactoryProjectResult> {
   brief = redactSensitiveText(brief);
@@ -1101,6 +1067,26 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   const creationAssessment = obviousCreationProfile.taskType === "project_creation" && obviousCreationProfile.recommendedIntelligenceTier === "fast" && obviousCreationProfile.confidence >= 0.8
     ? deterministicTaskAssessment(task)
     : (await classifyIntent({ message: task, hasProjectContext: false, apiKey, provider: initialModel.provider })).routingAssessment;
+
+  // A new project is built from a specification the user reviewed and approved, which makes it a
+  // complete implementation contract rather than a loose prompt. Creation therefore always opens a
+  // Requirement Ledger: the brief carries every named feature, constraint and data requirement the user
+  // signed off on, and none of them may quietly go missing on the way to "Done".
+  const requirementLedger = await openRequirementLedger({ missionId: execution.costScopeId, request: task, apiKey, provider: initialModel.provider });
+  if (requirementLedger) {
+    await emitExecution(execution, "planning", "completed", `Requirement ledger opened · ${requirementLedger.requirementCount} requirement(s)`, {
+      internal: true,
+      tier: "decision",
+      rationale: `Tracking ${requirementLedger.requirementCount} requirement(s) from this request to a final status${requirementLedger.gating ? "; completion is gated on all of them" : " (recorded only — requirements were split mechanically)"}.`,
+      details: {
+        stage: "request understanding",
+        requirements: requirementLedger.requirementCount,
+        gating: requirementLedger.gating,
+        openQuestions: requirementLedger.openQuestions.join(" | ") || undefined,
+        note: requirementLedger.note,
+      },
+    });
+  }
 
   const environment = await environmentReadinessForStack(stackProfile.id);
   const runtimeBuildAvailable = environment?.status === "ready" || stackHasBuildStep(stackProfile.id);
@@ -2251,6 +2237,29 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       blocker = duplicateReconciliation.problem;
     }
   }
+  // Close the Requirement Ledger before the verdict is final, so a project that scaffolded and built
+  // cleanly but skipped features the approved brief named cannot report success over the gap.
+  if (requirementLedger) {
+    const gate = await closeRequirementLedger({
+      opened: requirementLedger,
+      request: task,
+      apiKey,
+      provider: initialModel.provider,
+      evidence: {
+        changedFiles: result.changedFiles,
+        commands: commands.map((command) => ({ command: command.command, exitCode: command.exitCode })),
+        verification: result.verification.map((item) => ({ checkType: item.check_type, result: item.result, evidence: item.evidence })),
+        checklist: execution.checklist.map((item) => ({ label: item.label, status: item.status, evidence: item.evidence })),
+        blocker,
+      },
+    });
+    const carrier = { status, blocker, verification: result.verification, sessionSummary: result.sessionSummary };
+    await applyRequirementGate(gate, execution, carrier);
+    status = carrier.status;
+    blocker = carrier.blocker;
+    result.sessionSummary = carrier.sessionSummary;
+  }
+
   const files = await listProjectFiles(projectPath);
   completeChecklistItem(
     execution,
@@ -6020,7 +6029,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
   }
 
   if (classification.intent === "question" || classification.intent === "status" || classification.intent === "analyze") {
-    const inspection = await runReadOnlyInspection({ message: task, access, apiKey, provider: initialModel.provider, onEvent, routingAssessment });
+    const inspection = await runReadOnlyInspection({ message: task, access, apiKey, provider: initialModel.provider, onEvent, routingAssessment, projectId: execution.projectId });
     await emitExecution(execution, "summary", "completed", "Answered without editing files", { output: inspection.answer });
     finishObjectiveChecklist(execution, "passed");
     return { status: "passed", changedFiles: [], events: [inspection.answer], stackLabel: stackProfile.label };
@@ -6118,6 +6127,27 @@ Mandatory existing-source contract: preserve this project's established multi-fi
   const requiresRequirementContract = atomicUserRequirements.length > 1
     || requiresPolishedUiAcceptance(acceptedRequirementTask)
     || requiresPresentationLayerChange(acceptedRequirementTask);
+  // Open the Requirement Ledger for a substantial mutating request, so every item the user asked for is
+  // tracked to a final status and the mission cannot report completion while any of them is unaccounted
+  // for. This deliberately reuses requiresRequirementContract as the substantiality signal rather than
+  // inventing a second notion of "big enough to track" that could disagree with the acceptance contract.
+  const requirementLedger = requiresRequirementContract && mutatingOutcomeRequired
+    ? await openRequirementLedger({ missionId: execution.costScopeId, request: acceptedRequirementTask, apiKey, provider: initialModel.provider })
+    : undefined;
+  if (requirementLedger) {
+    await emitExecution(execution, "planning", "completed", `Requirement ledger opened · ${requirementLedger.requirementCount} requirement(s)`, {
+      internal: true,
+      tier: "decision",
+      rationale: `Tracking ${requirementLedger.requirementCount} requirement(s) from this request to a final status${requirementLedger.gating ? "; completion is gated on all of them" : " (recorded only — requirements were split mechanically)"}.`,
+      details: {
+        stage: "request understanding",
+        requirements: requirementLedger.requirementCount,
+        gating: requirementLedger.gating,
+        openQuestions: requirementLedger.openQuestions.join(" | ") || undefined,
+        note: requirementLedger.note,
+      },
+    });
+  }
   const boundedCoordinatedEdit = !approvalResponse
     && atomicUserRequirements.length >= 2
     && atomicUserRequirements.length <= 4
@@ -7815,9 +7845,88 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       }
     }
   }
+  // Close the Requirement Ledger before the verdict becomes final. The checklist reconciliation above
+  // asks whether Foundry's own plan rows are finished; this asks the different and more important
+  // question of whether every item the *user* asked for is accounted for by real evidence.
+  if (requirementLedger) {
+    const gate = await closeRequirementLedger({
+      opened: requirementLedger,
+      request: acceptedRequirementTask,
+      apiKey,
+      provider: initialModel.provider,
+      evidence: {
+        changedFiles: result.changedFiles,
+        commands: (result.commands ?? []).map((command) => ({ command: command.command, exitCode: command.exitCode })),
+        verification: result.verification.map((item) => ({ checkType: item.check_type, result: item.result, evidence: item.evidence })),
+        checklist: result.checklist.map((item) => ({ label: item.label, status: item.status, evidence: item.evidence })),
+        blocker: result.blocker,
+      },
+    });
+    await applyRequirementGate(gate, execution, result);
+  }
   execution.checklist.splice(0, execution.checklist.length, ...result.checklist);
   finishObjectiveChecklist(execution, result.status, result.blocker);
   return { status: result.status, blocker: result.blocker, changedFiles: result.changedFiles, commands: result.commands, sessionSummary: result.sessionSummary, verification: result.verification, events: [], stackLabel: stackProfile.label };
+}
+
+/**
+ * Applies the Requirement Ledger's verdict to a mission result.
+ *
+ * The three outcomes are deliberately different in force. An unmet requirement — something the user
+ * asked for that the mission never reached — makes a "passed" verdict false, so it is downgraded with
+ * the specific items named; work already done is preserved and the blocker says so, because the user's
+ * next move is to continue rather than to start over. An unproven requirement was built but nothing
+ * checked it: that is honest completion carrying a warning, not a failure, and overstating it would
+ * reintroduce exactly the false-failure noise that made earlier gates untrustworthy. And when
+ * accounting could not run at all, it changes nothing — silence is not evidence in either direction.
+ */
+async function applyRequirementGate(
+  gate: RequirementGate,
+  execution: ExecutionContext,
+  result: { status: FactoryProjectResult["status"]; blocker?: string; verification: ExecutionMissionVerification[]; sessionSummary?: FactorySessionSummary },
+) {
+  if (gate.outcome === "unchecked") {
+    await emitExecution(execution, "inspection", "warning", "Requirement-level completion was not checked", {
+      internal: true,
+      tier: "flag",
+      rationale: gate.note,
+      details: { stage: "requirement accounting", note: gate.note },
+    });
+    return;
+  }
+
+  if (gate.outcome === "unmet") {
+    await emitExecution(execution, "inspection", "error", `${gate.unattempted.length} requested item(s) were not addressed`, {
+      details: { stage: "requirement accounting", unaddressed: gate.unattempted.map((requirement) => requirement.text).join(" | ") },
+    });
+    result.verification.push({ check_type: "checklist", result: "fail", evidence: gate.blocker });
+    if (result.status === "passed") {
+      result.status = "failed";
+      result.blocker = gate.blocker;
+      result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
+      result.sessionSummary.outcome = "Part of the request was delivered and preserved; the remaining requested items were not addressed.";
+      result.sessionSummary.flags = [...new Set([...result.sessionSummary.flags, gate.blocker])];
+    }
+    return;
+  }
+
+  if (gate.outcome === "unproven") {
+    await emitExecution(execution, "inspection", "warning", `${gate.unverified.length} requested item(s) implemented but not proven`, {
+      details: { stage: "requirement accounting", unproven: gate.unverified.map((requirement) => requirement.text).join(" | ") },
+    });
+    result.verification.push({ check_type: "checklist", result: "skipped", evidence: gate.warning });
+    result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
+    result.sessionSummary.flags = [...new Set([...result.sessionSummary.flags, gate.warning])];
+    return;
+  }
+
+  await emitExecution(execution, "inspection", "completed", "Every requested item is accounted for", {
+    internal: true,
+    tier: "decision",
+    rationale: gate.summary,
+    details: { stage: "requirement accounting", summary: gate.summary },
+  });
+  result.verification.push({ check_type: "checklist", result: "pass", evidence: gate.summary });
 }
 
 function narrativeObjectsFromTimeline(timeline: FactoryExecutionEvent[]): FactoryNarrativeObject[] {
@@ -11900,17 +12009,23 @@ function dependencyCountFromInstallOutput(output: string) {
 
 function createExecutionContext(onEvent?: ExecutionEmitter, projectId?: string): ExecutionContext {
   const timeline: FactoryExecutionEvent[] = [];
+  // One id for the whole execution: it scopes the routing budget and now also groups this mission's
+  // journal entries, so a project's history can be read back one mission at a time.
+  const costScopeId = crypto.randomUUID();
   return {
     timeline,
     checklist: [],
     projectId,
-    costScopeId: crypto.randomUUID(),
+    costScopeId,
     emit: async (event) => {
       // Live UI, durable journal, and follow-up memory all receive the same sanitized event.
       const safeEvent = redactSensitiveData(event);
       upsertExecutionEvent(timeline, safeEvent);
-      if (projectId && !safeEvent.internal && !safeEvent.transient) {
-        await appendJournalEntry(projectId, safeEvent).catch(() => {
+      // shouldJournalEvent decides durability; `internal` continues to decide rendering. A reasoned
+      // decision is kept even when it must not appear on screen, so a later "why did you do that?" has
+      // a record to read instead of a rebuild to run.
+      if (projectId && shouldJournalEvent(safeEvent)) {
+        await appendJournalEntry(projectId, safeEvent, costScopeId).catch(() => {
           // Durable journaling is best-effort; the live timeline already reached the client.
         });
       }

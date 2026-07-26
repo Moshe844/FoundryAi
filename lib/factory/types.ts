@@ -104,6 +104,8 @@ export type FactoryExecutionEvent = {
 export type FactoryJournalEntry = {
   id: string;
   projectId: string;
+  /** The execution this entry belongs to, so a project's history can be read one mission at a time. */
+  missionId?: string;
   timestamp: string;
   event: FactoryExecutionEvent;
   beforeContent?: string;
