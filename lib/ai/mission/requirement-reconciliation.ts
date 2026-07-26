@@ -105,15 +105,18 @@ const RECONCILE_TOOL: NeutralTool = {
   },
 };
 
-const RECONCILE_SYSTEM_PROMPT = [
+export const RECONCILE_PROMPT_TEXT = [
   "You audit a finished software mission against the requirements it was given.",
   "For every requirement id you are shown, report the outcome that the recorded evidence actually supports.",
   "You are auditing, not advocating. Evidence that a file changed is not evidence that a requirement works.",
   "Use 'verified' only when a specific recorded check demonstrates the requirement is satisfied, and quote that check in evidence_detail.",
   "Use 'implemented' when the work plainly happened but no recorded check demonstrates the result.",
   "A passing typecheck or build proves the code compiles. On its own that is 'implemented', never 'verified'.",
+  "When a requirement describes something a PERSON does — a customer browsing, adding to a cart, checking out, signing in; an admin editing or reviewing — it is only implemented once there is an entry point they can actually reach: a page, route, screen, or command that exists and is wired up.",
+  "A helper module, type definition, validation function, or data-access file that nothing routes to is groundwork for the feature, not the feature. Report those requirements 'not-attempted', however much supporting code exists — a feature nobody can reach has not been built.",
   "Use 'not-attempted' when nothing in the evidence relates to the requirement. This is the expected answer for requirements the mission never reached — do not stretch unrelated evidence to cover them.",
-  "Use 'blocked' only when the evidence records a concrete reason the requirement could not be done.",
+  "Use 'blocked' only for an obstacle OUTSIDE the project's own source that must change before the work is possible — an absent credential, an unreachable service, a platform this machine does not have, or a decision only the user can make. Name it.",
+  "Missing implementation is never 'blocked'. A page that 404s, a route that does not exist, a feature nothing was written for, or a test that was never added is 'not-attempted' — the code simply is not there yet, and nothing external is stopping it being written.",
   "Use 'excluded' only when the requirement was a deliberate non-goal.",
   "Constraints and exclusions are verified by evidence that the forbidden change did NOT happen. Absence of any relevant evidence is 'not-attempted', not 'verified'.",
   "Never invent evidence. An empty evidence_detail is the correct answer when there is none.",
@@ -151,7 +154,7 @@ export async function reconcileRequirements(input: {
       provider,
       model,
       effort: effort ?? "medium",
-      system: [RECONCILE_SYSTEM_PROMPT, "Always call reconcile_requirements with your answer. Do not respond with plain text."].join("\n"),
+      system: [RECONCILE_PROMPT_TEXT, "Always call reconcile_requirements with your answer. Do not respond with plain text."].join("\n"),
       messages: [{ role: "user", content: [{ type: "text", text: [
         `Original request:\n${input.request}`,
         `Requirements to account for:\n${open.map((requirement) => `${requirement.id} [${requirement.kind}] ${requirement.text}`).join("\n")}`,
@@ -197,6 +200,12 @@ export async function reconcileRequirements(input: {
     const detail = typeof reported?.evidence_detail === "string" ? reported.evidence_detail.trim() : "";
 
     if (outcome === "not-attempted") continue;
+
+    // "Blocked" is a final status, so an unfounded one silently finalizes work that was never started.
+    // Observed live: eight unbuilt features were marked blocked because the pages 404'd, which settled
+    // the ledger and stopped the mission continuing to build them. A blocker is a claim about something
+    // outside the project, and a claim with nothing cited is not one — it is absent implementation.
+    if (outcome === "blocked" && !detail) continue;
 
     const evidence: RequirementEvidence[] = detail
       ? [{

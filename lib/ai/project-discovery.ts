@@ -163,8 +163,25 @@ export function explicitEntitiesFromPrompt(prompt: string): string[] {
 
 /** Re-applies explicit brief facts after model refinement so a lossy response cannot weaken the contract. */
 export function reconcileDiscoveryWithExplicitBrief(discovery: ProjectDiscoveryResult, prompt: string): ProjectDiscoveryResult {
-  const features = explicitFeaturesFromPrompt(prompt);
-  const entities = explicitEntitiesFromPrompt(prompt);
+  const explicitProductCapabilities = [
+    /\b(?:login|log in|sign in)\b/i.test(prompt) ? "Login" : "",
+    /\b(?:sign[- ]?up|create (?:an )?account|registration)\b/i.test(prompt) ? "Account registration" : "",
+    /\b(?:browse|catalog|storefront|products?)\b/i.test(prompt) ? "Product browsing" : "",
+    /\b(?:add (?:items?|products?) to (?:a |the )?cart|shopping cart)\b/i.test(prompt) ? "Add to cart" : "",
+    /\b(?:checkout|place orders?)\b/i.test(prompt) ? "Order placement and checkout" : "",
+  ].filter(Boolean);
+  const explicitDomainEntities = [
+    /\b(?:login|log in|sign in|sign up|signup|account|session)\b/i.test(prompt) ? "User" : "",
+    /\b(?:login|log in|sign in|session)\b/i.test(prompt) ? "Auth session" : "",
+    /\b(?:product|catalog|storefront)\b/i.test(prompt) ? "Product" : "",
+    /\bcart\b/i.test(prompt) ? "Cart" : "",
+    /\bcart\b/i.test(prompt) ? "Cart item" : "",
+    /\borders?\b/i.test(prompt) ? "Order" : "",
+    /\b(?:checkout|payment)\b/i.test(prompt) ? "Payment" : "",
+    /\b(?:shipping|delivery address|billing address)\b/i.test(prompt) ? "Address" : "",
+  ].filter(Boolean);
+  const features = [...explicitFeaturesFromPrompt(prompt), ...explicitProductCapabilities];
+  const entities = [...explicitEntitiesFromPrompt(prompt), ...explicitDomainEntities];
   const persistence = explicitPersistenceFromPrompt(prompt);
   const canonical = (item: string) => item.toLowerCase().replace(/^(?:and|also)\s+/, "").replace(/[^a-z0-9]+/g, " ").trim();
   const merge = (explicit: string[], proposed: string[]) => {
@@ -326,7 +343,7 @@ const profiles: SignalProfile[] = [
     label: "E-commerce store",
     // Bare "shop" is too generic (coffee shop, tattoo shop, workshop) — dropped as a
     // standalone trigger in favor of unambiguous commerce phrases.
-    patterns: [/\b(e-?commerce|online store|online shop|shopping cart|checkout|product catalog|storefront)\b/i],
+    patterns: [/\b(e-?commerce|online store|online shop|shopping cart|checkout|product catalog|storefront|customer ordering (?:web )?app|ordering (?:web )?app)\b/i],
     stack: "Next.js",
     architecture:
       "Next.js storefront with server-rendered product pages for SEO, optimistic client-side cart state, checkout scaffolding ready for a payment provider, and an admin-ready product/catalog data layer.",
@@ -479,16 +496,12 @@ const profiles: SignalProfile[] = [
     styleRationale: "An auth screen is the first real impression of the product's quality bar, so it's held to a higher visual standard than an average form.",
     features: [
       "Email/password sign-in",
-      "Google OAuth",
-      "GitHub OAuth",
-      "Magic-link sign-in option",
-      "Remember-me / persistent session",
-      "Forgot-password flow with reset token",
-      "Signup with email verification",
-      "MFA-ready session model",
+      "Account creation",
+      "Secure persistent session",
+      "Inline validation and error states",
     ],
-    entities: ["User", "Credential", "OAuth account", "Auth session", "Password reset token", "MFA device (planned)"],
-    users: "People signing in to a product account; assume they expect modern conveniences like social login and magic-link even if not explicitly requested.",
+    entities: ["User", "Credential", "Auth session"],
+    users: "People signing in to a product account.",
     platform: "Web",
     complexity: "Focused UI surface backed by real session/security decisions",
     growth: ["Multi-factor authentication", "Team/organization accounts with roles", "Session and login audit log", "SSO for enterprise customers"],
@@ -756,7 +769,7 @@ function authSource(prompt: string): DiscoverySource {
 }
 
 function authDataApiFor(prompt: string, profile: SignalProfile) {
-  if (profile.id === "auth-page") return "Email/password plus Google and GitHub OAuth, JWT sessions in httpOnly cookies, and a password-reset flow with expiring tokens.";
+  if (profile.id === "auth-page") return "Email/password authentication with hashed credentials and secure httpOnly session cookies. OAuth, magic links, verification email, password reset, and MFA remain optional until requested.";
   if (/\b(?:pax|poslink|payment terminal|licensed sdk|sandbox transaction|do not simulate (?:hardware|payments?))\b/i.test(prompt)) return "Durable local catalog/cart state plus a real licensed terminal-SDK boundary; payment, device discovery, and transaction outcomes must be verified rather than mocked.";
   if (/\b(login|auth|account)\b/i.test(prompt)) return "Account/auth-ready UI wired to a real session model, not just a static form.";
   if (/\b(?:local\s*storage|localstorage)\b/i.test(prompt)) return "Browser-local persistence for the first version, with serialization isolated from the UI so it can be replaced by a service later.";
@@ -770,6 +783,9 @@ function navigationFor(profile: SignalProfile) {
   if (profile.id === "game") return "Start screen, play scene, results/retry screen.";
   if (profile.id === "content") return "Home, listing, detail, about/contact as needed.";
   if (profile.id === "auth-page") return "Single auth surface with secondary account links.";
+  if (profile.id === "commerce") return "Storefront, product detail, cart, checkout, account, and order history.";
+  if (profile.id === "pos") return "Register, held carts, transaction history, refunds, and shift controls.";
+  if (profile.id === "inventory") return "Inventory overview, products/SKUs, stock movements, suppliers, purchase orders, and reports.";
   if (profile.id === "api") return "API routes plus a minimal status/docs surface.";
   return "Dashboard/home, list/table, detail/edit, settings.";
 }

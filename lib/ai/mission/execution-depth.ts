@@ -39,7 +39,18 @@ export type ExecutionDepthPolicy = {
   /** 6. Retry strategy — how hard Foundry tries before reporting a blocker. */
   retry: { maxRepairStages: number; maxContinuationBatches: number; escalateAfterFailures: number };
 
-  /** 7. Cost budget for the whole mission. */
+  /**
+   * 7. Cost budget for the whole mission.
+   *
+   * Declared but NOT applied as the mission's routing budget. It was, briefly, and that starved work:
+   * the tier budget already scales with the selected tier, and the depth already caps which tier may be
+   * selected, so imposing a flat depth budget on top double-counted — a Standard mission routed at the
+   * architect tier was funded for 24 calls instead of that tier's 32 and could run out mid-repair.
+   *
+   * Depth still governs spend through the tier ceiling (`tierWithinDepth`) and the retry limits below,
+   * which are the dials that do not double-count. Wiring this figure needs a design that reconciles the
+   * two budgets rather than stacking them.
+   */
   budget: { maximumModelCalls: number; estimatedCostUsd: number; premiumCallLimit: number };
 
   /** 8. Execution behavior. */

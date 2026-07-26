@@ -9,6 +9,7 @@ import { composeProjectArchitecture } from "./architecture";
 import { buildWorkspaceExecutionPlan } from "./workspace-orchestrator";
 import type { EnvironmentCapabilities } from "./types";
 import { CERTIFIED_STARTER_KINDS, CERTIFIED_STARTER_SUBTYPES, certifiedStarterSeed, type CertifiedStarterId } from "./starter-contracts";
+import { discoverProject } from "../ai/project-discovery";
 
 const webEnv:EnvironmentCapabilities={os:"windows",availableToolchains:["node","npm"],unavailableToolchains:[],remoteMacBuilder:false};
 const recommend=(brief:string)=>recommendStack(extractProductProfile(brief),webEnv);
@@ -33,6 +34,19 @@ describe("Foundry certified build policy",()=>{
   it("keeps a marketing website serverless",()=>{expect(recommend("simple marketing website with contact details; no login or database").selectedStackId).toBe("static-web-vite");});
   it("keeps the exact marketing-site starter on static HTML without model-added architecture",()=>{const profile=extractProductProfile("Marketing site",{prompt:"Marketing site",projectType:"Responsive Website. Subtype: Marketing Site",recommendedStack:"Next.js + PostgreSQL",architecture:"dashboard with a database",mainFeatures:["Admin dashboard","User accounts"],styleDirection:"",dataModel:["User","Record"],assumptions:[],questions:[],decisions:[],keyFacts:[],futureCapabilities:[]});const result=recommendStack(profile,webEnv);expect(result.selectedStackId).toBe("static-web-vite");expect(result.selectedStack?.displayName).toBe("Static HTML + CSS + JavaScript");});
   it("chooses relational full stack for SaaS",()=>{expect(recommend("multi-user SaaS dashboard with login, roles and reports").selectedStackId).toBe("nextjs-typescript-postgres");});
+  it("describes the business stack without falsely requiring an unconfigured production database",()=>{
+    expect(recommend("customer ordering app with login and checkout").selectedStack?.displayName).toBe("Next.js + TypeScript + Relational Database");
+    expect(recommend("customer ordering app with login and checkout").selectedStack?.supportedDatabases).toEqual(expect.arrayContaining(["SQLite","PostgreSQL"]));
+  });
+  it("treats login as a commerce capability rather than replacing the requested product",()=>{
+    const brief="Build a complete customer ordering web app with polished login and sign-up pages. After login, show a storefront where customers add items to a cart, place orders and checkout.";
+    const discovery=discoverProject(brief,"custom");
+    expect(discovery.projectType).toBe("E-commerce store");
+    expect(discovery.dataModel).toEqual(expect.arrayContaining(["User","Auth session","Product","Cart","Cart item","Order","Payment"]));
+    expect(discovery.mainFeatures).toEqual(expect.arrayContaining(["Login","Account registration","Product browsing","Add to cart","Order placement and checkout"]));
+    expect(discovery.decisions.find(item=>item.dimension==="navigation")?.hypothesis).toMatch(/Storefront.*checkout.*order history/i);
+    expect(discovery.mainFeatures.join(" ")).not.toMatch(/Google OAuth|GitHub OAuth|Magic-link|MFA/i);
+  });
   it("never recommends static HTML for payments",()=>{expect(recommend("payment-sensitive merchant portal with checkout and transaction audit history").selectedStackId).not.toBe("static-web-vite");});
   it("uses an API artifact for API-only work",()=>{const r=recommend("REST API webhook service with background jobs");expect(r.selectedStack?.artifacts).toContain("api-playground");expect(r.selectedStack?.artifacts).not.toContain("browser-preview");});
   it("selects the complete iOS implementation while requiring real macOS execution",()=>{const r=recommend("deep Apple platform iPhone app using Bluetooth");expect(r.selectedStackId).toBe("ios-swiftui");expect(r.environmentRequirements.concat(r.limitations).join(" ")).toMatch(/macOS|Xcode/i);});

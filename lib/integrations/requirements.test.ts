@@ -5,19 +5,22 @@ describe("integration requirements", () => {
   it("requires a real email provider for password reset", () => {
     const requirements = integrationRequirementsForBrief("Build signup, login, password reset, and email verification.");
     expect(requirements.some((item) => item.id === "transactional-email")).toBe(true);
-    expect(requirements.some((item) => item.id === "authentication")).toBe(true);
-    expect(missingIntegrationRequirements(requirements, [])).toHaveLength(2);
+    expect(requirements.some((item) => item.id === "authentication")).toBe(false);
+    expect(missingIntegrationRequirements(requirements, [])).toHaveLength(1);
     expect(integrationRequirementPrompt(requirements[0]).question).toContain("Credentials & Integrations");
   });
 
   it("recognizes named providers and environment variables", () => {
     expect(integrationRequirementsForBrief("Charge subscriptions with Stripe").some((item) => item.candidates[0]?.id === "stripe")).toBe(true);
     expect(integrationRequirementsForBrief("Use process.env.OPENAI_API_KEY").some((item) => item.candidates[0]?.id === "openai")).toBe(true);
-    expect(integrationRequirementsForBrief("Store data in PostgreSQL").some((item) => item.candidates[0]?.id === "postgresql")).toBe(true);
+    expect(integrationRequirementsForBrief("Store data in PostgreSQL")).toEqual([]);
+    expect(integrationRequirementsForBrief("Connect to our existing production PostgreSQL through DATABASE_URL").some((item) => item.candidates[0]?.id === "postgresql")).toBe(true);
   });
 
   it("does not prompt for ordinary local SDKs or explicitly excluded providers", () => {
     expect(integrationRequirementsForBrief("Build a local SQLite CLI with no OpenAI")).toEqual([]);
+    expect(integrationRequirementsForBrief("Build login, sign-up, cart, and checkout with local first-party auth and a payment simulator.")).toEqual([]);
+    expect(integrationRequirementsForBrief("PostgreSQL later; use zero-setup SQLite local persistence now and do not require external database credentials.")).toEqual([]);
   });
 
   it("accepts only a verified candidate for a generic capability", () => {

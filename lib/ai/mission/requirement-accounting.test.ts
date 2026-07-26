@@ -10,7 +10,7 @@ vi.mock("@/lib/ai/mission/requirement-reconciliation", () => ({
   reconcileRequirements: vi.fn(),
 }));
 
-import { closeRequirementLedger, openRequirementLedger } from "./requirement-accounting";
+import { closeRequirementLedger, openRequirementLedger, unbuiltRequirements } from "./requirement-accounting";
 import { extractRequirements, type OpenQuestion } from "./requirement-extraction";
 import { reconcileRequirements } from "./requirement-reconciliation";
 import { activeRequirements, recordOutcome, type RequirementLedger } from "./requirement-ledger";
@@ -268,5 +268,126 @@ describe("scope creep", () => {
     // Delivering everything asked for does not excuse also doing something nobody asked for.
     if (gate.outcome === "unchecked") return;
     expect(gate.unrequested).toEqual(["Replaced the site theme with a new colour scheme (app/globals.css)"]);
+  });
+});
+
+describe("under-reading a large request", () => {
+  it("re-reads a product brief that came back as one requirement", async () => {
+    // The live failure: a full ordering-application brief produced a single requirement, so the
+    // completion gate had one thing to check and reported satisfaction over a broken build.
+    const brief = [
+      "Build a complete customer ordering web app.",
+      "- customers browse a product catalogue",
+      "- customers add items to a cart",
+      "- customers check out and pay",
+      "- customers sign up and log in",
+      "- admins manage products and see orders",
+    ].join("\n");
+
+    extractMock
+      .mockResolvedValueOnce(extraction(["build a complete customer ordering web app"]))
+      .mockResolvedValueOnce(extraction(["browse the catalogue", "add items to a cart", "check out", "sign up and log in", "manage products"]));
+
+    const opened = await open({ request: brief });
+
+    expect(extractMock).toHaveBeenCalledTimes(2);
+    // The second pass runs on a stronger tier than the fastest one.
+    expect(extractMock.mock.calls[1][0].tier).toBe("builder");
+    expect(opened?.requirementCount).toBe(5);
+  });
+
+  it("re-reads when the model itself reports low coverage", async () => {
+    const low = { ...extraction(["do the thing"]), coverageConfidence: 0.2 };
+    extractMock
+      .mockResolvedValueOnce(low)
+      .mockResolvedValueOnce(extraction(["do the thing", "and the other thing"]));
+
+    expect((await open())?.requirementCount).toBe(2);
+    expect(extractMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the first reading when a second pass sees no more", async () => {
+    const low = { ...extraction(["do the thing"]), coverageConfidence: 0.2 };
+    extractMock.mockResolvedValueOnce(low).mockResolvedValueOnce(extraction([]));
+    // A weaker second result is not an improvement.
+    expect((await open())?.requirementCount).toBe(1);
+  });
+
+  it("does not pay for a second pass on an ordinary small request", async () => {
+    extractMock.mockResolvedValue(extraction(["make the header darker"]));
+    await open({ request: "make the header darker" });
+    expect(extractMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not escalate a mechanically split reading", async () => {
+    // The deterministic fallback cannot be improved by re-running it at a higher tier.
+    extractMock.mockResolvedValue(extraction(["a"], "deterministic-fallback"));
+    await open({ request: "x".repeat(1_000) });
+    expect(extractMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("asking what is unbuilt, while there is still time to build it", () => {
+  const evidence = { changedFiles: ["package.json", "src/app/page.tsx"], commands: [], verification: [] };
+
+  async function opened(texts: string[]) {
+    extractMock.mockResolvedValue(extraction(texts));
+    return (await open({ request: texts.join(". ") }))!;
+  }
+
+  it("names features the evidence shows were never started", async () => {
+    // The live failure: typecheck, build and tests all passed on a scaffold that implemented nothing,
+    // and eight of eleven requirements were untouched with no one asking until the very end.
+    const ledger = await opened(["add a product catalogue", "add a cart", "add checkout"]);
+    reconcileMock.mockResolvedValue({
+      ledger: ledger.ledger,
+      source: "model",
+      unattempted: [
+        { text: "add a cart", kind: "deliverable" },
+        { text: "add checkout", kind: "deliverable" },
+      ] as never,
+      unverified: [],
+      unrequested: [],
+    });
+
+    expect(await unbuiltRequirements({ opened: ledger, request: "spec", result: evidence, apiKey: "test" }))
+      .toEqual(["add a cart", "add checkout"]);
+  });
+
+  it("ignores an unapproved recommendation", async () => {
+    const ledger = await opened(["add a cart"]);
+    reconcileMock.mockResolvedValue({
+      ledger: ledger.ledger,
+      source: "model",
+      unattempted: [{ text: "also add analytics", kind: "optional-suggestion" }] as never,
+      unverified: [],
+      unrequested: [],
+    });
+    // Building something the user never asked for is the opposite of the problem being solved.
+    expect(await unbuiltRequirements({ opened: ledger, request: "spec", result: evidence, apiKey: "test" })).toEqual([]);
+  });
+
+  it("says nothing is unbuilt when the audit cannot run", async () => {
+    const ledger = await opened(["add a cart"]);
+    reconcileMock.mockResolvedValue({ ledger: ledger.ledger, source: "unavailable", unattempted: [], unverified: [], unrequested: [] });
+    // A mission must never keep building because its auditor was unavailable.
+    expect(await unbuiltRequirements({ opened: ledger, request: "spec", result: evidence, apiKey: "test" })).toEqual([]);
+  });
+
+  it("does not act on a mechanically split reading", async () => {
+    extractMock.mockResolvedValue(extraction(["add a cart"], "deterministic-fallback"));
+    const ledger = (await open())!;
+    expect(await unbuiltRequirements({ opened: ledger, request: "spec", result: evidence, apiKey: "test" })).toEqual([]);
+    expect(reconcileMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the reconciled statuses for the next batch", async () => {
+    const ledger = await opened(["add a cart"]);
+    const advanced = { ...ledger.ledger, revision: 99 };
+    reconcileMock.mockResolvedValue({ ledger: advanced, source: "model", unattempted: [], unverified: [], unrequested: [] });
+
+    await unbuiltRequirements({ opened: ledger, request: "spec", result: evidence, apiKey: "test" });
+    // The following batch should see what is already done rather than rediscovering it.
+    expect(ledger.ledger.revision).toBe(99);
   });
 });

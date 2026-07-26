@@ -4189,6 +4189,10 @@ function genericArchitectureFor(stack: string, entities: string[], projectType =
     return `${stack} presentation site with reusable content sections, static-first pages, responsive media, accessible navigation, per-page SEO metadata, and a real inquiry path. Content editing stays outside the visitor experience unless an admin CMS is explicitly requested.`;
   }
   const primaryEntities = entities.slice(0, 2).join(" and ") || "the core data";
+  if (/\b(?:postgres(?:ql)?|mysql|sql server|supabase)\b/i.test(stack)
+    || /\b(?:login|sign-up|signup|account|session|checkout|order|payment|multi-user)\b/i.test(`${projectShape} ${featureShape}`)) {
+    return `${stack} application with server-enforced authentication and authorization, migration-backed relational persistence for ${primaryEntities}, validated transactional workflows, accessible loading/empty/error states, and automated tests across the critical user journey. Browser-local state is limited to safe, temporary UI state such as an in-progress cart; accounts, inventory, orders, and payment outcomes remain authoritative on the server.`;
+  }
   return `${stack} implementation with create/update/delete flows for ${primaryEntities}, optimistic UI feedback, and local-first storage until a real backend or multi-device sync is requested.`;
 }
 

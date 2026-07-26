@@ -4,6 +4,8 @@ import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
 import { commandPermissionIdentity, isLongRunningServerCommand, isSensitiveFilePath, normalizeCommandForExecution, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
 import { clearFailedCommand, commandRepeatKey, createCommandRepeatState, evaluateCommandRepeat, recordFailedCommand, type CommandRepeatState } from "@/lib/ai/mission/command-repeat-guard";
 import { createWriteScope, evaluateWrite, type WriteScope } from "@/lib/ai/mission/write-scope";
+import { guidanceForRejectedWrite } from "@/lib/ai/mission/rejected-write-strategy";
+import { forcedToolAfterTruncation, guidanceForTruncatedWrite } from "@/lib/ai/mission/truncated-write-recovery";
 import { approvalScopeLabel, type CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 import { isEmptySourceWrite } from "@/lib/ai/mission/write-verification";
 import type { ManagedToolCall, NeutralContentPart, NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
@@ -1508,16 +1510,22 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         // patch instead — the change itself is small even when the file is not.
         const truncatedPath = /"path"\s*:\s*"([^"\n]{1,200})"/.exec(rawArgs)?.[1]?.replace(/\\\\/g, "/");
         truncatedWriteRecoveries += 1;
-        const reason = [
-          `The ${call.name} arguments could not be parsed because the file content was cut off mid-write — the whole file does not fit in one response.`,
-          truncatedPath ? `Do NOT rewrite ${truncatedPath} in full.` : "Do NOT rewrite the whole file.",
-          "Use replace_in_file with a small exact old_text match and only the lines that must change. Keep every other line untouched.",
-          truncatedWriteRecoveries >= 2 ? "This has now failed twice: make the smallest possible replacement that satisfies the request, one region at a time." : "",
-        ].filter(Boolean).join(" ");
+        // The right recovery depends on whether the file exists. Telling a greenfield batch to patch
+        // files it has not written yet is impossible advice, and the model answers it by writing
+        // whatever few small files fit — which is how a whole application became three helper modules.
+        const creatingNewFiles = Boolean(input.newProject);
+        const reason = guidanceForTruncatedWrite({
+          tool: call.name ?? "write_files",
+          path: truncatedPath,
+          creating: creatingNewFiles,
+          attempt: truncatedWriteRecoveries,
+        });
         hadUnresolvedToolFailure = true;
-        await emit("edit", "warning", "Whole-file write was too large — switching to a targeted patch", {
+        await emit("edit", "warning", creatingNewFiles
+          ? "That batch was too large to send at once — writing it in smaller groups"
+          : "Whole-file write was too large — switching to a targeted patch", {
           filePath: truncatedPath,
-          details: { reason, forcedTool: "replace_in_file", attempt: truncatedWriteRecoveries },
+          details: { reason, forcedTool: forcedToolAfterTruncation(creatingNewFiles), attempt: truncatedWriteRecoveries },
         });
         conversation.push({ role: "user", content: [{ type: "text", text: reason }] });
         toolResultParts.push({ type: "tool_result", toolUseId: callId, content: JSON.stringify({ verified: false, accepted: false, reason }) });
@@ -1959,13 +1967,27 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           repeatedWriteFailures = signature === lastFailedWriteSignature ? repeatedWriteFailures + 1 : 1;
           lastFailedWriteSignature = signature;
 
+          // A guard that refused what a file would contain is a different problem from a malformed path,
+          // and it has a different answer: a narrower edit. Without this, a whole-file rewrite could be
+          // resubmitted against a guard objecting to one line inside it until the budget was gone.
+          const rejectionGuidance = guidanceForRejectedWrite({
+            tool: call.name ?? "",
+            path: rawPath,
+            reason: String(toolResult.reason ?? ""),
+            occurrence: repeatedWriteFailures,
+          });
+
           if (repeatedWriteFailures >= 3) {
-            const stuckReason = "I kept repeating the same failing file write and couldn't self-correct, so I'm stopping instead of continuing to guess.";
+            const stuckReason = rejectionGuidance
+              ? `I could not satisfy the same refusal after ${repeatedWriteFailures} attempts and a narrower edit was still refused, so I stopped rather than keep guessing. Refusal: ${String(toolResult.reason ?? "").trim()}`
+              : "I kept repeating the same failing file write and couldn't self-correct, so I'm stopping instead of continuing to guess.";
             await emitBlockedOrContinuation(stuckReason);
             return finalize("failed", stuckReason, turn);
           }
 
-          if (repeatedWriteFailures === 2) {
+          if (rejectionGuidance) {
+            (toolResult as Record<string, unknown>).note = rejectionGuidance.note;
+          } else if (repeatedWriteFailures === 2) {
             (toolResult as Record<string, unknown>).note =
               "You have made this exact write_file call with this exact invalid path twice in a row. Do not repeat it — provide a real relative file path, such as 'styles.css' or 'src/index.js'.";
           }

@@ -5,11 +5,12 @@ import net from "node:net";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { capabilityLevelForStackChoice, checklistForRequest, detectStackProfile, isLikelySmallSingleFileRequest, isStructuralRelocationRequest, unsupportedCreationMessage, unsupportedEditingMessage, type StackCapabilityLevel, type StackProfile } from "@/lib/factory/language-adapters";
+import { externalRuntimeRequirementKeys } from "@/lib/factory/runtime-requirements";
 import { classifyIntent, deterministicMutationIntent, deterministicTaskAssessment } from "@/lib/ai/mission/intent-classifier";
 import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { planMission } from "@/lib/ai/mission/mission-planner";
 import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiredDomFeaturesForTask, requiredVisibleTextsForTask, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
-import { closeRequirementLedger, openRequirementLedger, type RequirementGate } from "@/lib/ai/mission/requirement-accounting";
+import { closeRequirementLedger, openRequirementLedger, unbuiltRequirements, type RequirementGate } from "@/lib/ai/mission/requirement-accounting";
 import { assessAttachments } from "@/lib/ai/mission/attachment-intake";
 import { recordStageOutcome } from "@/lib/ai/routing/telemetry";
 import { deriveMissionOutcome, formatMissionOutcome } from "@/lib/ai/mission/mission-outcome";
@@ -29,6 +30,8 @@ import { complianceVerdict, correctionInstruction, deriveOutcomeAssertions, isDe
 import { evaluatePlacement, spatialRequirementForRequest, type ElementBox } from "@/lib/verification/dom-placement";
 import { duplicateFileProblem, safelyRemovableDuplicatePaths } from "@/lib/verification/duplicate-files";
 import { deterministicCompilerSourceRepair } from "@/lib/verification/deterministic-source-repair";
+import { planDependencyRepair } from "@/lib/verification/deterministic-dependency-repair";
+import { missingModuleImports, resolveProjectModulePath } from "@/lib/verification/missing-module-diagnostic";
 import { hasDisposableFrameworkAssetFailure } from "@/lib/verification/browser-infrastructure";
 import type { VerificationProfile } from "@/lib/verification/types";
 import { assessMissionComplexity, shouldRunArchitectureReview, shouldRunVerify, tierForStage } from "@/lib/ai/mission/orchestration";
@@ -467,23 +470,33 @@ function workingSetWithCommandFailure(base: ProjectWorkingSet, failure: FactoryC
   return { ...base, likelyFiles, evidence: [...new Set([orderedReferenced.map((item) => `${item} (command traceback)`), base.evidence].flat())].slice(0, 20) };
 }
 
+/**
+ * The first project file a compiler says is missing, if any.
+ *
+ * Detection lives in lib/verification/missing-module-diagnostic.ts so every compiler's phrasing is
+ * handled and testable. The version here only recognised the bundler's "Can't resolve", so TypeScript's
+ * "Cannot find module" — the wording that actually appeared in a live failure — produced no instruction
+ * at all, and repair after repair ran without knowing a file simply had to be created.
+ */
 function missingRelativeImportTarget(failure: FactoryCommandEvent, projectPath: string) {
   const output = stripTerminalFormatting(`${failure.stdout}\n${failure.stderr}`);
-  const relativeMatch = /Could not resolve\s+["']([^"']+)["']\s+from\s+["']([^"']+)["']/i.exec(output);
-  const aliasMatch = /(?:Module not found:\s*)?(?:Can't|Cannot) resolve\s+["'](@\/[^"']+)["']/i.exec(output);
-  const specifier = relativeMatch?.[1] ?? aliasMatch?.[1];
-  const importer = relativeMatch?.[2]?.replace(/\\/g, "/")
-    ?? extractCompilerSourcePaths(output, projectPath).find((candidate) => /\.[cm]?[jt]sx?$/i.test(candidate));
-  if (!specifier || !importer || (!specifier.startsWith(".") && !specifier.startsWith("@/"))) return undefined;
-  const resolved = specifier.startsWith("@/")
-    ? path.resolve(projectPath, "src", specifier.slice(2))
-    : path.resolve(projectPath, path.dirname(importer), specifier);
-  const target = path.relative(projectPath, resolved).replace(/\\/g, "/");
-  if (!target || target.startsWith("../") || path.isAbsolute(target) || existsSync(path.join(projectPath, target))) return undefined;
-  const targetExistsWithExtension = [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx"]
-    .some((suffix) => existsSync(path.join(projectPath, `${target}${suffix}`)));
-  if (targetExistsWithExtension) return undefined;
-  return { importer, specifier, target };
+  // The project's own alias mapping decides where the file belongs; assuming "@/" means "src/" would
+  // create it one directory too deep in a project that maps the alias to its root.
+  const tsconfig = existsSync(path.join(projectPath, "tsconfig.json"))
+    ? readFileSync(path.join(projectPath, "tsconfig.json"), "utf8")
+    : undefined;
+
+  for (const candidate of missingModuleImports(output)) {
+    const importer = candidate.importer
+      ?? extractCompilerSourcePaths(output, projectPath).find((entry) => /\.[cm]?[jt]sx?$/i.test(entry));
+    const target = resolveProjectModulePath({ specifier: candidate.specifier, importer, tsconfig });
+    if (!target || !importer || existsSync(path.join(projectPath, target))) continue;
+    const resolvesWithExtension = [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx"]
+      .some((suffix) => existsSync(path.join(projectPath, `${target}${suffix}`)));
+    if (resolvesWithExtension) continue;
+    return { importer, specifier: candidate.specifier, target };
+  }
+  return undefined;
 }
 
 function commandTracebackSourcePaths(workingSet: ProjectWorkingSet, projectPath: string, limit = 3): string[] {
@@ -1038,7 +1051,12 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // An external datastore is a real execution prerequisite, not something an implementation model
   // can repair. Stop before the very first routing call so a new project never consumes model budget
   // producing code that Foundry already knows it cannot run or verify in this environment.
-  const missingRuntimeVariables = externalRuntimeRequirementKeys(spec.stack).filter((key) => !process.env[key]?.trim());
+  // A catalogue stack may support an external datastore without making that production connection a
+  // prerequisite for creating the first runnable project. Only the user's explicit requirements may
+  // introduce this gate; otherwise the implementation uses the stack's certified zero-setup local
+  // persistence path and keeps the external database as a deployment upgrade.
+  const explicitRuntimeRequirements = [spec.projectDescription, spec.instructions].filter(Boolean).join("\n");
+  const missingRuntimeVariables = externalRuntimeRequirementKeys(explicitRuntimeRequirements).filter((key) => !process.env[key]?.trim());
   if (missingRuntimeVariables.length) {
     const names = missingRuntimeVariables.join(", ");
     const question = `This selected stack requires ${names} before Foundry can build and verify it. Configure ${names} in Foundry's environment and retry, or return to the Stack step and choose a zero-setup SQLite/local-storage option.`;
@@ -1628,6 +1646,9 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   const maxCompilerRepairPasses = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 20);
   const maxCompilerRecoveryCycles = maxCompilerRepairPasses * 4;
   let compilerRepairPass = 0;
+  // Dependency installs already attempted for this mission, so a repair that did not resolve the
+  // build cannot be retried forever.
+  const attemptedDependencyRepairs = new Set<string>();
   let compilerRecoveryCycle = 0;
   while (partialGenerationCanUseCompilerRecovery && deterministicBuildFailure && result.changedFiles.length > 0 && !signal?.aborted && compilerRepairPass < maxCompilerRepairPasses && compilerRecoveryCycle < maxCompilerRecoveryCycles) {
     compilerRecoveryCycle += 1;
@@ -1777,6 +1798,46 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       await emitExecution(execution, "reasoning", "warning", oscillating ? "Compiler repair is changing strategy after an oscillation" : "Compiler repair is changing strategy after repeated mutations", {
         details: { failureFingerprint, failureSignature, attempts: Math.max(failureAttempt, signatureAttempt) - 1, oscillationDetected: oscillating, strategyReset: true, terminal: false, paidModelCalls: 0 },
       });
+    }
+    // Some compiler failures are a package manager's job, not a model's. A module with no bundled type
+    // declarations needs one devDependency, and the model cannot know the correct version to pin — so it
+    // guesses, rewrites the manifest, trips the scaffold guard, and the repair budget burns on the
+    // argument while the one-line fix goes unapplied. Install it directly and re-check before paying.
+    const manifestForRepair = await access.readFile("package.json", { limitBytes: 200_000 }).catch(() => undefined);
+    const dependencyPlan = planDependencyRepair({
+      diagnostic: compilerDiagnosticOutput(deterministicBuildFailure),
+      manifest: manifestForRepair?.exists ? manifestForRepair.content : undefined,
+    });
+    if (dependencyPlan && !attemptedDependencyRepairs.has(dependencyPlan.packages.join(" "))) {
+      attemptedDependencyRepairs.add(dependencyPlan.packages.join(" "));
+      await emitExecution(execution, "reasoning", "completed", `Installing ${dependencyPlan.packages.join(", ")} to resolve the compiler failure — no model call needed`, {
+        tier: "decision",
+        rationale: dependencyPlan.reason,
+        details: { packages: dependencyPlan.packages, command: dependencyPlan.command, paidModelCalls: 0 },
+      });
+      const install = await runCommand(projectPath, "npm.cmd", ["install", "--save-dev", "--no-audit", "--no-fund", ...dependencyPlan.packages], events, execution);
+      result.commands.push(install);
+      if (install.exitCode === 0) {
+        const recheck = await runCommand(projectPath, "npm.cmd", ["run", "build"], events, execution);
+        result.commands.push(recheck);
+        result.verification.push({
+          check_type: "build",
+          result: recheck.exitCode === 0 ? "pass" : "fail",
+          evidence: recheck.exitCode === 0
+            ? `Installing ${dependencyPlan.packages.join(", ")} resolved the build without a model call.`
+            : `Installing ${dependencyPlan.packages.join(", ")} was necessary but the build still fails: ${summarizeCommandFailure(recheck)}`,
+        });
+        if (recheck.exitCode === 0) {
+          result.status = "passed";
+          result.blocker = undefined;
+          deterministicBuildFailure = undefined;
+          continue;
+        }
+        // Progress without completion: the diagnostic has genuinely changed, so the next pass reasons
+        // about the remaining failure rather than the one already fixed.
+        deterministicBuildFailure = recheck;
+        continue;
+      }
     }
     compilerRepairPass += 1;
     await emitExecution(execution, "reasoning", "completed", "The production compiler found one concrete integration failure. I’m repairing that exact error once, then rerunning the build.");
@@ -2090,6 +2151,86 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // Only the latest canonical build is authoritative. An earlier pass cannot license preview or
   // completion after later source changes exposed a failing build.
   const productionBuildPassed = result.commands.filter((command) => isProductionBuildCommand(command.command)).at(-1)?.exitCode === 0;
+
+  // A passing compiler is not a built product.
+  //
+  // Observed live: one implementation batch dropped its application payload (the coordinated write was
+  // too large and only the three small config files landed), typecheck/build/test all passed — because a
+  // scaffold with one default page always does — and the mission advanced straight to the browser gate,
+  // which then spent the remaining budget repairing styling on a page that had no features. Eight of
+  // eleven requirements had never been touched, and nothing noticed until the very end.
+  //
+  // Deterministic gates prove the code is valid. Only the Requirement Ledger knows whether the product
+  // exists. So before acceptance begins, ask it — and keep implementing while it says work remains.
+  if (requirementLedger && status !== "awaiting-approval" && status !== "awaiting-mock-approval" && !signal?.aborted) {
+    const implementationBatches = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 4);
+    for (let batch = 1; batch <= implementationBatches; batch += 1) {
+      const outstanding = await unbuiltRequirements({
+        opened: requirementLedger,
+        request: task,
+        result,
+        apiKey,
+        provider: initialModel.provider,
+      });
+      if (!outstanding.length) break;
+
+      // Read from disk each pass: the previous batch's files are what this one must build on rather
+      // than reproduce. Configuration and lockfiles are omitted — they are not what gets rewritten.
+      const existingSourceInventory = (await listProjectFiles(projectPath))
+        .map((file) => (typeof file === "string" ? file : file.path))
+        .filter((file) => /\.(?:[cm]?[jt]sx?|css|scss|json)$/i.test(file))
+        .filter((file) => !/(?:^|\/)(?:package(?:-lock)?\.json|tsconfig\.json|next-env\.d\.ts|.*\.config\.[cm]?[jt]s)$/i.test(file))
+        .slice(0, 120);
+
+      await emitExecution(execution, "reasoning", "completed", `${outstanding.length} requested feature${outstanding.length === 1 ? " has" : "s have"} no implementation yet. I’m building ${outstanding.length === 1 ? "it" : "them"} before verifying the finished experience.`, {
+        tier: "decision",
+        rationale: `Deterministic gates passed on a project that does not yet implement: ${outstanding.join("; ")}.`,
+        details: { outstanding, batch, stage: "requirement-driven implementation" },
+      });
+
+      const featureBatch = await runMissionExecutor({
+        objective,
+        // Each batch is a fresh executor with no memory of the last one. Without an inventory of what
+        // already exists, every batch restarts from the shared foundation: observed live, four
+        // consecutive batches rewrote the same types/validation/auth/store modules and never reached
+        // the routes that were actually 404ing. The file list is what turns repetition into progress.
+        task: `Continue this new project. It already has a working scaffold, configuration, and the source files listed below, and its production build passes.\n\nSource files that ALREADY EXIST — do not recreate, rewrite, or reorganise these:\n${existingSourceInventory.map((file) => `- ${file}`).join("\n") || "- (none yet)"}\n\nImplement these requested features, which have no implementation yet:\n${outstanding.map((item) => `- ${item}`).join("\n")}\n\nBuild the user-facing entry points these features need — the pages, routes and API handlers a person actually visits — using the existing modules above rather than rewriting them. A feature with no reachable route does not exist. Do not write placeholders, markers, or documentation in place of working code.\n\nOriginal project request:\n${task}`,
+        missionContext: requirementLedger.missionContext,
+        checklist: result.checklist,
+        costScopeId: execution.costScopeId,
+        access,
+        apiKey: implementationModel.apiKey,
+        provider: implementationModel.provider,
+        tier: implementationModel.tier,
+        onEvent: emitEvent,
+        signal,
+        approvedCategories: ["dependencies", "package-runner"],
+        hasBuildTooling: runtimeBuildAvailable,
+        newProject: true,
+        continuableBatch: true,
+        evidenceImages,
+        routingAssessment: creationAssessment,
+        maxTurns: 8,
+      });
+
+      result.changedFiles = Array.from(new Set([...result.changedFiles, ...featureBatch.changedFiles]));
+      result.commands.push(...featureBatch.commands);
+      result.verification.push(...featureBatch.verification);
+      mergeExecutionTimeline(result.timeline, featureBatch.timeline);
+      result.usage.push(...featureBatch.usage);
+      result.turnsUsed += featureBatch.turnsUsed;
+
+      // A batch that wrote nothing will not write anything next time either; stop rather than pay again.
+      if (!featureBatch.changedFiles.length) break;
+
+      const rebuild = await runCommand(projectPath, "npm.cmd", ["run", "build"], events, execution);
+      result.commands.push(rebuild);
+      if (rebuild.exitCode === 0) {
+        status = "passed";
+        blocker = undefined;
+      }
+    }
+  }
 
   // The preview shows what is on disk; it is not a reward for a passing verdict. Withholding it
   // until the mission passed meant that the one time a user most needs to see their project — when
@@ -5773,7 +5914,11 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       workingSet = await discoverProjectWorkingSet(access, task);
     }
   }
-  if (explicitBrowserAcceptanceRequest && previewTarget) {
+  // Browser evidence is meaningful only after a runnable product exists. A newly created
+  // workspace may contain only Foundry's brief; attempting preview verification there can
+  // misclassify the missing scaffold as a read-only product failure and block generation.
+  const hasPreModelRunnableEntry = await hasRunnableProjectEntry(access);
+  if (explicitBrowserAcceptanceRequest && previewTarget && hasPreModelRunnableEntry) {
     await emitExecution(execution, "preview", "running", "Running the real build and desktop/mobile browser gate before model routing", {
       details: { paidModelCalls: 0, purpose: "evidence-first browser validation" },
     });
@@ -6821,7 +6966,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
     // Generated-project continuation shares one deliberately small ledger across every batch.
     // Deterministic scaffold/build/browser work is unmetered; source generation cannot silently
     // expand one Retry click into an enterprise-tier 40-call mission.
-    routingBudget: preModelBuildFailure ? { estimatedCostUsd: 0.08 } : preModelBrowserEvidence ? { estimatedCostUsd: 0.8 } : boundedCompilerRepair ? { estimatedCostUsd: 0.08 } : boundedSmallEdit ? boundedSmallEditBudget : boundedCoordinatedEdit ? { estimatedCostUsd: 1 } : resumingIncompleteProject ? generatedRecoveryBudgetForTier(routingBudgetForTier(implementationModel.tier)) : depthPolicy(quality).budget,
+    routingBudget: preModelBuildFailure ? { estimatedCostUsd: 0.08 } : preModelBrowserEvidence ? { estimatedCostUsd: 0.8 } : boundedCompilerRepair ? { estimatedCostUsd: 0.08 } : boundedSmallEdit ? boundedSmallEditBudget : boundedCoordinatedEdit ? { estimatedCostUsd: 1 } : resumingIncompleteProject ? generatedRecoveryBudgetForTier(routingBudgetForTier(implementationModel.tier)) : undefined,
   });
     if (recoveryPreflight) {
       result.changedFiles = Array.from(new Set([...recoveryPreflight.changedFiles, ...result.changedFiles]));
@@ -7036,7 +7181,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
   // A substantial greenfield product can legitimately need more than one bounded executor batch.
   // Preserve one routing/cost identity across continuation batches. On-disk progress can continue,
   // but a batch boundary must never reset the amount the user authorized this mission to spend.
-  const maxContinuationBatches = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, depthPolicy(quality).retry.maxContinuationBatches);
+  const maxContinuationBatches = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 20);
   let consecutiveStagnantContinuationBatches = 0;
   // Churn-proof stagnation. `evidenceProgressed` below counts ANY changed file as progress, so a model
   // that edits a config file every batch while the SAME production build keeps failing (observed live:
@@ -11890,14 +12035,6 @@ async function startGenericNodePreview(
   events.push(reason);
   if (execution) await emitExecution(execution, "preview", "error", "Preview failed its live readiness check", { details: { port, ready: false, script, reason } });
   return { previewState: "error", previewPlatform: platform, previewReason: reason };
-}
-
-function externalRuntimeRequirementKeys(selectedStack: string) {
-  const stack = selectedStack.toLowerCase();
-  const required = new Set<string>();
-  if (/postgres(?:ql)?|mysql|mariadb|mongodb|cockroachdb|planetscale|\bneon\b/.test(stack)) required.add("DATABASE_URL");
-  if (/\bredis\b/.test(stack)) required.add("REDIS_URL");
-  return Array.from(required);
 }
 
 async function previewRuntimeFailureReason(port: number) {

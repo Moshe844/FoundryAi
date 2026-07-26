@@ -20,10 +20,10 @@ const externallyRequired = (definition: IntegrationDefinition) => credentialBack
 
 const genericCapabilities: Array<{ id: string; category: string; pattern: RegExp; reason: string; candidateIds?: string[] }> = [
   { id: "transactional-email", category: "email", pattern: /\b(?:transactional email|send emails?|email delivery|forgot|reset)\s+(?:my\s+)?password\b|\b(?:email verification|verify (?:an? )?email|magic[- ]link)\b/i, reason: "The requested workflow must deliver email." },
-  { id: "payments", category: "payments", pattern: /\b(?:accept|process|take|collect)\s+payments?\b|\b(?:checkout|subscription billing|payment gateway|card payments?)\b/i, reason: "The project must authenticate with a payment processor." },
+  { id: "payments", category: "payments", pattern: /\b(?:accept|process|take|collect)\s+(?:real\s+)?payments?\b|\b(?:payment gateway|card payments?)\b/i, reason: "The project must authenticate with a payment processor." },
   { id: "sms", category: "communications", pattern: /\b(?:send|deliver)\s+(?:an?\s+)?(?:sms|text messages?)\b|\b(?:sms verification|phone verification|otp by (?:sms|text))\b/i, reason: "The requested workflow must deliver SMS messages.", candidateIds: ["twilio", "vonage", "telnyx", "plivo"] },
   { id: "ai-provider", category: "ai", pattern: /\b(?:llm|generative ai|ai assistant|chatbot|text generation|image generation|embeddings?)\b/i, reason: "The project requires a hosted AI model provider.", candidateIds: ["openai", "anthropic", "gemini"] },
-  { id: "authentication", category: "authentication", pattern: /\b(?:user authentication|sign[ -]?in|log[ -]?in|sign[ -]?up|single sign-on|sso|saml|openid connect|social login|identity provider)\b/i, reason: "The project needs a real identity and session provider." },
+  { id: "authentication", category: "authentication", pattern: /\b(?:single sign-on|sso|saml|openid connect|social login|identity provider|hosted authentication|third-party auth)\b/i, reason: "The project needs a real identity and session provider." },
   { id: "push-notifications", category: "communications", pattern: /\b(?:push notifications?|mobile notifications?|notification delivery)\b/i, reason: "The requested workflow must deliver push notifications.", candidateIds: ["firebase-cloud-messaging", "onesignal"] },
   { id: "hosted-database", category: "relational-database", pattern: /\b(?:hosted|cloud|shared|production)\s+(?:sql\s+)?database\b|\bmulti-device sync\b/i, reason: "The application requires a remotely reachable shared data store." },
   { id: "cloud-platform", category: "cloud", pattern: /\b(?:deploy|host|run)\s+(?:it\s+)?(?:on|in)\s+(?:the\s+)?cloud\b|\bcloud infrastructure\b/i, reason: "The project requires a cloud runtime and deployment identity." },
@@ -58,8 +58,15 @@ function candidatesForCategory(category: string, candidateIds?: string[]) {
  * stay in the normal toolchain preflight and never trigger a secret prompt. */
 export function integrationRequirementsForBrief(text: string): IntegrationRequirement[] {
   const requirements = new Map<string, IntegrationRequirement>();
+  const localDatabaseSubstitute = /\b(?:zero-setup sqlite|local sqlite|sqlite local persistence|do not require external (?:database )?credentials)\b/i.test(text);
+  const localPaymentSubstitute = /\b(?:payment simulator|simulated payments?|mock payments?|do not require real (?:payment )?credentials)\b/i.test(text);
+  const localAuthSubstitute = /\b(?:first-party local (?:email\/password )?authentication|local email\/password authentication|do not require external (?:auth )?credentials)\b/i.test(text);
+  const explicitlyExternalDataStore = !localDatabaseSubstitute && /\b(?:database_url|existing|shared|production|hosted|remote|connect(?:ed|ion)?)\b/i.test(text);
   for (const definition of integrationCatalog.filter(externallyRequired)) {
     if (definition.executionKind === "hardware" && /\b(?:simulator[- ]only|use (?:a )?simulator instead|build (?:a )?(?:simulated|mock) (?:terminal|device)|mock hardware|without (?:a )?(?:terminal|device))\b/i.test(text)) continue;
+    if ((definition.category === "database" || definition.category === "relational-database") && !explicitlyExternalDataStore) continue;
+    if (definition.category === "payments" && localPaymentSubstitute) continue;
+    if (definition.category === "authentication" && localAuthSubstitute) continue;
     if (!explicitlyExcluded(text, definition) && explicitlyNames(text, definition)) {
       requirements.set(`provider:${definition.id}`, {
         id: `provider:${definition.id}`,
@@ -70,6 +77,8 @@ export function integrationRequirementsForBrief(text: string): IntegrationRequir
     }
   }
   for (const capability of genericCapabilities) {
+    if (capability.id === "payments" && localPaymentSubstitute) continue;
+    if (capability.id === "authentication" && localAuthSubstitute) continue;
     // A terminal SDK determines which processor/middleware routes are actually supported. Do not
     // guess Stripe/PayPal/etc. from the word "checkout" before inspecting the licensed hardware
     // package and specifications; named processor requirements are already preserved above.

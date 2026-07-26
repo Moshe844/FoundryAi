@@ -1,5 +1,6 @@
 import type { ModelTier } from "@/lib/ai/model-router";
 import { extractRequirements, type OpenQuestion } from "@/lib/ai/mission/requirement-extraction";
+import { isMultiPartRequest } from "@/lib/ai/mission/mission-planner";
 import {
   assessCompletion,
   createLedger,
@@ -78,15 +79,40 @@ export async function openRequirementLedger(input: {
     const resumed = input.continuation ? await resumeLedger(input) : undefined;
     if (resumed) return resumed;
 
-    const extraction = await extractRequirements({
+    const extract = (tier?: ModelTier) => extractRequirements({
       request: input.request,
       apiKey: input.apiKey,
       provider: input.provider,
       workspaceId: input.workspaceId,
       userId: input.userId,
-      tier: input.tier,
+      tier,
       attachments: input.attachments,
     });
+
+    let extraction = await extract(input.tier);
+
+    /**
+     * A second, stronger pass when the first plainly under-read the request.
+     *
+     * Request understanding runs on the fastest model that can be exhaustive, which is right for a
+     * one-line change and wrong for a product brief. Observed live: a full ordering-application
+     * specification came back as a *single* requirement, so the completion gate had one thing to check
+     * and waved through a mission whose build was broken. A ledger that under-counts is worse than no
+     * ledger, because it reports confidence it has not earned.
+     *
+     * Escalation is triggered by the model's own admission of low coverage, or by a single requirement
+     * coming back from a request the codebase already recognises as a requirements list — reusing that
+     * existing signal rather than inventing a second notion of "this is a big request".
+     */
+    const underRead = extraction.source === "model"
+      && (extraction.coverageConfidence < 0.6 || (extraction.requirements.length <= 1 && isMultiPartRequest(input.request)));
+
+    if (underRead && input.tier !== "builder") {
+      const deeper = await extract("builder");
+      // Only accept the second pass if it genuinely saw more; a weaker result is not an improvement.
+      if (deeper.source === "model" && deeper.requirements.length > extraction.requirements.length) extraction = deeper;
+    }
+
     if (!extraction.requirements.length) return undefined;
 
     const ledger = createLedger(input.missionId, extraction.requirements);
@@ -197,6 +223,59 @@ async function resumeLedger(input: {
     stageCount: plan.stages.length,
     note: `Resumed the stored specification and staged plan for this mission.${recovered} ${stagePlanProgress(plan, ledger).nextExactAction}`,
   };
+}
+
+/**
+ * Requirements the mission has not built yet, asked mid-flight rather than at the end.
+ *
+ * The completion gate runs once, after acceptance, which is far too late to act on: by then the budget
+ * is spent and the only remaining option is to report the shortfall. This asks the same question early,
+ * while there is still time to do something about the answer.
+ *
+ * Returns only requirements with *no* implementation at all. Something built but unproven is the
+ * verification stage's problem; something never started is an implementation problem, and they need
+ * different responses. An empty list is returned whenever the question cannot be answered — a mission
+ * must never loop building because its auditor was unavailable.
+ */
+export async function unbuiltRequirements(input: {
+  opened: OpenedLedger;
+  request: string;
+  result: { changedFiles: string[]; commands: Array<{ command: string; exitCode?: number | null }>; verification: Array<{ check_type: string; result: string; evidence: string }> };
+  apiKey: string;
+  provider?: ProviderId;
+  workspaceId?: string;
+  userId?: string;
+}): Promise<string[]> {
+  if (!input.opened.gating) return [];
+
+  try {
+    const reconciliation = await reconcileRequirements({
+      ledger: input.opened.ledger,
+      request: input.request,
+      evidence: {
+        changedFiles: input.result.changedFiles,
+        commands: input.result.commands,
+        verification: input.result.verification.map((item) => ({ checkType: item.check_type, result: item.result, evidence: item.evidence })),
+        checklist: [],
+      },
+      apiKey: input.apiKey,
+      provider: input.provider,
+      workspaceId: input.workspaceId,
+      userId: input.userId,
+    });
+    if (reconciliation.source !== "model") return [];
+
+    // Keep the reconciled statuses: the next batch's context should reflect what is already done, and a
+    // later close of the ledger should not have to rediscover it.
+    input.opened.ledger = reconciliation.ledger;
+    await saveRequirementLedger(reconciliation.ledger);
+
+    return reconciliation.unattempted
+      .filter((requirement) => requirement.kind === "deliverable" || requirement.kind === "constraint")
+      .map((requirement) => requirement.text);
+  } catch {
+    return [];
+  }
 }
 
 export type RequirementGate =
