@@ -3,6 +3,7 @@ import { callManagedModel } from "@/lib/ai/providers/dispatch";
 import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
 import { commandPermissionIdentity, isLongRunningServerCommand, isSensitiveFilePath, normalizeCommandForExecution, normalizeCommandText, type ProjectAccess } from "@/lib/ai/mission/project-access";
 import { clearFailedCommand, commandRepeatKey, createCommandRepeatState, evaluateCommandRepeat, recordFailedCommand, type CommandRepeatState } from "@/lib/ai/mission/command-repeat-guard";
+import { createWriteScope, evaluateWrite, type WriteScope } from "@/lib/ai/mission/write-scope";
 import { approvalScopeLabel, type CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 import { isEmptySourceWrite } from "@/lib/ai/mission/write-verification";
 import type { ManagedToolCall, NeutralContentPart, NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
@@ -931,6 +932,11 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   // Commands are guarded the same way writes already were: a failed command may not be reissued
   // unchanged until the project has actually changed.
   const commandRepeatState = createCommandRepeatState();
+  // The accepted follow-up resolution already tells the model "modify only these files". Deriving the
+  // scope here makes that a boundary rather than a request: relevantFiles is populated only when the
+  // resolver judged the request bounded (a clarify or open-ended resolution leaves it empty), so its
+  // presence is the authoritative signal and an unbounded mission is unaffected.
+  const writeScope = createWriteScope(input.followUpResolution?.relevantFiles);
   let generatedWriteCalls = 0;
   let hadUnresolvedToolFailure = false;
   let lastReasoningNormalized = "";
@@ -1830,7 +1836,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           }
         }
       } else {
-        toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions, input.newProject, commandRepeatState).catch((error) => ({
+        toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions, input.newProject, commandRepeatState, writeScope).catch((error) => ({
           error: error instanceof Error ? error.message : "Tool call failed unexpectedly.",
         }));
       }
@@ -2663,6 +2669,7 @@ async function executeTool(
   deniedActions: string[] = [],
   treatWritesAsCreated = false,
   commandRepeatState: CommandRepeatState = createCommandRepeatState(),
+  writeScope?: WriteScope,
 ): Promise<unknown> {
   const pathArg = typeof args.path === "string" ? args.path : "";
   const basename = pathArg.split("/").pop() || pathArg;
@@ -2742,7 +2749,7 @@ async function executeTool(
       }
       const results: Array<{ path: string; result: unknown }> = [];
       for (const file of normalized) {
-        const result = await executeTool("write_file", file, access, emit, changedFiles, commands, narrativeObjects, preApprovedCommands, approvedCategories, rationale, task, standingApprovedCommands, deniedActions, treatWritesAsCreated, commandRepeatState);
+        const result = await executeTool("write_file", file, access, emit, changedFiles, commands, narrativeObjects, preApprovedCommands, approvedCategories, rationale, task, standingApprovedCommands, deniedActions, treatWritesAsCreated, commandRepeatState, writeScope);
         results.push({ path: file.path, result });
         if (isFailedWriteResult(result)) return { verified: false, reason: result.reason || `Batch write failed for ${file.path}.`, results };
       }
@@ -2765,6 +2772,16 @@ async function executeTool(
           verified: false,
           reason: "path was empty, \".\", or otherwise pointed at the project root. You must pass a real relative file path, such as \"server.js\" or \"src/index.js\" — never an empty string, \".\", \"/\", or the project root.",
         };
+      }
+      const writeVerdict = evaluateWrite({ path: pathArg, operation: "write", scope: writeScope, touched: changedFiles });
+      if (!writeVerdict.allow) {
+        await emit("edit", "error", `Refused out-of-scope write: ${basename}`, {
+          tier: "finding",
+          fileName: basename,
+          filePath: pathArg,
+          rationale: writeVerdict.reason,
+        });
+        return { verified: false, contentChanged: false, reason: writeVerdict.reason };
       }
       if (isEmptySourceWrite(pathArg, content)) {
         const reason = `${basename} would be an empty placeholder. Write its complete meaningful content in this call instead.`;
@@ -2878,6 +2895,16 @@ async function executeTool(
       }
       if (!pathArg.trim() || /^[./\\]*$/.test(pathArg.trim())) {
         return { verified: false, reason: "path was empty, \".\", or otherwise pointed at the project root. Pass a real relative file path." };
+      }
+      const deleteVerdict = evaluateWrite({ path: pathArg, operation: "delete", scope: writeScope, touched: changedFiles });
+      if (!deleteVerdict.allow) {
+        await emit("edit", "error", `Refused out-of-scope deletion: ${basename}`, {
+          tier: "finding",
+          fileName: basename,
+          filePath: pathArg,
+          rationale: deleteVerdict.reason,
+        });
+        return { verified: false, reason: deleteVerdict.reason };
       }
       if (!access.deleteFile) {
         await emit("edit", "skipped", `Delete unavailable: ${basename}`, { tier: "trace", filePath: pathArg });

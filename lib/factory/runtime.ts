@@ -10,6 +10,7 @@ import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { planMission } from "@/lib/ai/mission/mission-planner";
 import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiredDomFeaturesForTask, requiredVisibleTextsForTask, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
 import { closeRequirementLedger, openRequirementLedger, type RequirementGate } from "@/lib/ai/mission/requirement-accounting";
+import { assessAttachments } from "@/lib/ai/mission/attachment-intake";
 import { assessCompletion } from "@/lib/ai/mission/requirement-ledger";
 import { appendJournalEntry, readJournal, shouldJournalEvent, writeJournal } from "@/lib/factory/execution-journal";
 import { hasRunnableProjectEntry, runMissionExecutor } from "@/lib/ai/mission/executor";
@@ -47,6 +48,7 @@ import { reconcileBlockedCommandChecklist } from "@/lib/factory/evidence-reconci
 import { isWholeProjectDeletionRequest, parseProjectDeletionLockApprovalCommand, projectDeletionApprovalCommand, projectDeletionLockApprovalCommand } from "@/lib/factory/project-deletion";
 import { customInstructionsFromProjectBrief } from "@/lib/factory/project-brief";
 import { assessAutonomousBlocker, buildBlockedExplanation, terminalBlockerWithNextAction } from "@/lib/ai/mission/autonomy-contract";
+import { classifyBlocker } from "@/lib/ai/mission/blocker-classifier";
 import { compactValidationProblems, matchingRunningEventId, mergeExecutionTimeline, upsertExecutionEvent } from "@/lib/factory/event-contract";
 import { autonomousRepairStageLimit, buildOnlyRecoveryCanComplete, generatedRecoveryBudgetForTier, normalizeVerificationEvidence, recoveryRoutingBudget, shouldResumeExactFailedRetry, shouldResumeIncompleteGeneratedProject } from "@/lib/factory/recovery-policy";
 import { routingBudgetForTier } from "@/lib/ai/routing/cost-guard";
@@ -834,6 +836,68 @@ function looksLikeBoundedClientInteraction(task: string) {
 // existing callers (and the journal API route) import them from the runtime module.
 export { appendJournalEntry, readJournal };
 
+/**
+ * Readable attachment content that forms part of the request.
+ *
+ * A file carrying a specification is a source of requirements, not something to summarize back at the
+ * user — so its text goes into requirement extraction alongside the message. Unreadable attachments are
+ * excluded here on purpose: their handling note travels separately, because a packaged artifact must
+ * never contribute requirements as though its source had been read.
+ */
+function specificationAttachments(attachments: EvidenceAttachments) {
+  return attachments
+    .filter((attachment) => attachment.uploadStatus === "readable" && Boolean(attachment.rawText?.trim()))
+    .map((attachment) => ({
+      fileName: attachment.fileName,
+      excerpt: redactSensitiveText(attachment.rawText ?? "").slice(0, 20_000),
+    }));
+}
+
+/**
+ * Attachments the mission would otherwise acknowledge and then ignore.
+ *
+ * Readable text is already appended to the task in full and images already reach the model as vision
+ * input, so both are covered. Everything else - an SDK archive, a compiled library, a packaged document
+ * - was counted in an "imported N attachments" event and then never opened. Those are the ones that need
+ * an intake pass.
+ */
+function unusedAttachments(attachments: EvidenceAttachments) {
+  return attachments.filter((attachment) => attachment.uploadStatus !== "readable" && attachment.uploadStatus !== "image");
+}
+
+async function brieflyAssessUnusedAttachments(input: {
+  attachments: EvidenceAttachments;
+  request: string;
+  projectFiles: string[];
+  apiKey?: string;
+  provider?: ProviderId;
+  execution: ExecutionContext;
+}) {
+  const pending = unusedAttachments(input.attachments);
+  if (!pending.length) return "";
+
+  const intake = await assessAttachments({
+    attachments: pending,
+    request: input.request,
+    projectFiles: input.projectFiles,
+    apiKey: input.apiKey,
+    provider: input.provider,
+  });
+
+  await emitExecution(input.execution, "inspection", "completed", `Inspected ${pending.length} non-text attachment${pending.length === 1 ? "" : "s"}`, {
+    tier: "decision",
+    rationale: intake.assessments.map((assessment) => `${assessment.fileName}: ${assessment.relevance ?? "relevance could not be established"}`).join(" | "),
+    details: {
+      files: pending.map((attachment) => attachment.fileName),
+      categories: intake.assessments.map((assessment) => `${assessment.fileName}=${assessment.category}`),
+      // Named explicitly so an attachment Foundry could not place stays visible instead of absent.
+      unrelated: intake.unrelated.map((assessment) => assessment.fileName).join(", ") || undefined,
+    },
+  });
+
+  return intake.briefing;
+}
+
 async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitter, discovery?: StructuredDiscovery, modelMode: ModelMode = "auto", quality: MissionQualityLevel = DEFAULT_MISSION_QUALITY, signal?: AbortSignal, evidenceAttachments: EvidenceAttachments = []): Promise<FactoryProjectResult> {
   brief = redactSensitiveText(brief);
   discovery = discovery ? redactSensitiveData(discovery) : discovery;
@@ -1056,7 +1120,15 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         ...attachedAssetWrite.assets.map((asset) => `- ${asset.sourceFileName} -> ${asset.projectPath}${asset.publicPath !== asset.projectPath ? ` (public URL: ${asset.publicPath})` : ""}`),
       ].join("\n")
     : "";
-  task = [task, readableAttachmentContext ? `User-provided readable attachments:\n\n${readableAttachmentContext}` : "", attachmentAssetContract].filter(Boolean).join("\n\n");
+  const attachmentBriefing = await brieflyAssessUnusedAttachments({
+    attachments: evidenceAttachments,
+    request: task,
+    projectFiles: attachedAssetWrite.assets.map((asset) => asset.projectPath),
+    apiKey,
+    provider: initialModel.provider,
+    execution,
+  });
+  task = [task, readableAttachmentContext ? `User-provided readable attachments:\n\n${readableAttachmentContext}` : "", attachmentAssetContract, attachmentBriefing].filter(Boolean).join("\n\n");
   if (requiredIntegrations.length) {
     task = [
       task,
@@ -1080,6 +1152,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     executionId: execution.costScopeId,
     projectId,
     request: task,
+    attachments: specificationAttachments(evidenceAttachments),
     // Creation always begins a new contract; the in-run continuation batches below share this ledger.
     continuation: false,
     apiKey,
@@ -5813,6 +5886,17 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       details: { files: evidenceAttachments.map((attachment) => attachment.fileName), visionEnabled: evidenceImages.length > 0, readableFiles: evidenceAttachments.filter((attachment) => attachment.uploadStatus === "readable").length },
     });
   }
+  // Non-text attachments were previously counted in an event and then never opened. Inspect them, place
+  // them against the request, and carry the result into the task so the mission can actually use them.
+  const nonTextAttachmentBriefing = await brieflyAssessUnusedAttachments({
+    attachments: evidenceAttachments,
+    request: requestedTask,
+    projectFiles: projectSnapshot.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 300),
+    apiKey: initialModel?.apiKey,
+    provider: initialModel?.provider,
+    execution,
+  });
+  if (nonTextAttachmentBriefing) task = `${task}\n\n${nonTextAttachmentBriefing}`;
 
   if (signal?.aborted) {
     const blocker = "Stopped by user before completion.";
@@ -6153,6 +6237,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       executionId: execution.costScopeId,
       projectId: execution.projectId,
       request: acceptedRequirementTask,
+      attachments: specificationAttachments(evidenceAttachments),
       // Only an established continuation may resume a stored specification. Reusing the existing
       // continuity signal keeps this from becoming a second, disagreeing notion of "is this the same
       // work?" — and resumeLedger additionally refuses to hand a settled contract to a new request.
@@ -7834,9 +7919,18 @@ Mandatory existing-source contract: preserve this project's established multi-fi
     }
   }
   if (result.status === "failed" && result.blocker) {
-    const terminalAssessment = assessAutonomousBlocker(result.blocker);
+    // Model-first only where the deterministic contract has nothing: a matched signature is precise and
+    // free, but its catch-all default is where an unenumerated credential/network/platform wall hides.
+    const terminalAssessment = await classifyBlocker({
+      reason: result.blocker,
+      attemptedSummary: result.commands.slice(-6).map((command) => `${command.command} -> exit ${command.exitCode ?? "unknown"}`).join("; "),
+      apiKey,
+      provider: initialModel.provider,
+    });
     if (terminalAssessment.terminal) {
-      result.blocker = terminalBlockerWithNextAction(result.blocker);
+      result.blocker = terminalAssessment.nextAction && !result.blocker.includes(terminalAssessment.nextAction)
+        ? `${result.blocker.trim()} Next action: ${terminalAssessment.nextAction}`
+        : terminalBlockerWithNextAction(result.blocker);
       result.sessionSummary = result.sessionSummary ?? {
         outcome: "Foundry stopped at a concrete external or authority boundary.",
         changes: result.changedFiles,

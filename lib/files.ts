@@ -1,3 +1,5 @@
+import { describeFileStrategy, fileStrategy, type FileHandlingCategory } from "@/lib/file-intelligence";
+
 export type FileUploadStatus = "readable" | "image" | "binary" | "unsupported" | "error";
 
 export type EvidenceKind =
@@ -32,6 +34,13 @@ export type WorkspaceAttachment = {
   evidenceIndex: FileEvidenceFact[];
   dataUrl?: string;
   uploadStatus: FileUploadStatus;
+  /** How this file may be handled, decided from its content rather than its name. */
+  handlingCategory: FileHandlingCategory;
+  /**
+   * What this file contributed and what it could not. Present on anything Foundry cannot read as
+   * source, so a compiled artifact is never described as if its implementation had been understood.
+   */
+  handlingNote: string;
   createdAt: string;
 };
 
@@ -51,8 +60,15 @@ export type FileEvidenceFact = {
   suppressReason?: string;
 };
 
-const textExtensions = new Set(["txt", "json", "xml", "csv", "yaml", "yml", "md", "markdown", "log"]);
 const imageExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+
+/**
+ * How many leading bytes are enough to classify a file.
+ *
+ * Format signatures live in the first few bytes and a text/binary judgment is statistical, so a prefix
+ * settles both. Reading a 40 MB artifact in full just to learn it is an artifact would be wasteful.
+ */
+const CLASSIFICATION_PREFIX_BYTES = 64 * 1024;
 
 export async function ingestFile(file: File, missionId: string): Promise<WorkspaceAttachment> {
   const createdAt = new Date().toISOString();
@@ -68,24 +84,28 @@ export async function ingestFile(file: File, missionId: string): Promise<Workspa
     rawText: "",
     evidenceIndex: [],
     uploadStatus: "unsupported" as FileUploadStatus,
+    handlingCategory: "unknown" as FileHandlingCategory,
+    handlingNote: "",
     createdAt,
   };
 
   try {
-    if (file.type.startsWith("image/") || imageExtensions.has(extensionFor(file.name))) {
-      return {
-        ...base,
-        dataUrl: await readAsDataUrl(file),
-        uploadStatus: "image",
-      };
+    // Classify from the bytes. The extension allowlist this replaced could only recognise the suffixes
+    // somebody had listed, so an uploaded .vue, .dart, .proto or an extensionless Makefile was treated
+    // as an opaque binary and never read at all.
+    const prefix = new Uint8Array(await file.slice(0, CLASSIFICATION_PREFIX_BYTES).arrayBuffer());
+    const strategy = fileStrategy({ fileName: file.name, bytes: prefix });
+    const handling = {
+      handlingCategory: strategy.category,
+      handlingNote: describeFileStrategy(file.name, strategy),
+    };
+
+    if (strategy.category === "image") {
+      return { ...base, ...handling, dataUrl: await readAsDataUrl(file), uploadStatus: "image" };
     }
 
-    if (!isReadableTextFile(file)) {
-      return {
-        ...base,
-        dataUrl: await readAsDataUrl(file),
-        uploadStatus: "binary",
-      };
+    if (!strategy.editableAsText) {
+      return { ...base, ...handling, dataUrl: await readAsDataUrl(file), uploadStatus: "binary" };
     }
 
     const [rawText, dataUrl] = await Promise.all([file.text(), readAsDataUrl(file)]);
@@ -93,6 +113,7 @@ export async function ingestFile(file: File, missionId: string): Promise<Workspa
 
     return {
       ...base,
+      ...handling,
       rawText,
       dataUrl,
       parsedStructure,
@@ -100,10 +121,7 @@ export async function ingestFile(file: File, missionId: string): Promise<Workspa
       uploadStatus: "readable",
     };
   } catch {
-    return {
-      ...base,
-      uploadStatus: "error",
-    };
+    return { ...base, uploadStatus: "error", handlingNote: `${file.name} could not be read.` };
   }
 }
 
@@ -181,11 +199,6 @@ function detectFileType(file: File) {
 
 function extensionFor(fileName: string) {
   return fileName.split(".").pop()?.toLowerCase() ?? "";
-}
-
-function isReadableTextFile(file: File) {
-  const extension = extensionFor(file.name);
-  return file.type.startsWith("text/") || textExtensions.has(extension) || isSourceCodeExtension(extension);
 }
 
 function isSourceCodeExtension(extension: string) {

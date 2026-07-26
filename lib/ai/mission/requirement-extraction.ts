@@ -108,6 +108,7 @@ const EXTRACT_SYSTEM_PROMPT = [
   "Copy source_quote from the request verbatim. It is how Foundry preserves exact wording, so never paraphrase or tidy it.",
   "A landmark that says where something goes is not a separate requirement. Moving a total above a filter bar is one requirement about the total, not a request for a filter.",
   "Background context, saved briefs, and descriptions of what the project already does are not requirements for this mission. Only extract what this request asks Foundry to do now.",
+  "Attached material is part of the request, not a document to summarize. When an attachment states requirements, acceptance criteria, or exact content, extract each one as its own requirement exactly as an attachment-free request would be treated.",
   "Mark something optional-suggestion only if you are proposing it and the user did not ask for it. Do not invent suggestions to fill the list.",
   "Set coverage_confidence low when the request is long, ambiguous, or references material you cannot see.",
   "For every requirement, state in `verification` the concrete check that would prove it is satisfied: what to look at, run, or exercise, and what result counts as proof.",
