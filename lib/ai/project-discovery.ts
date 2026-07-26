@@ -76,6 +76,7 @@ export function explicitStackFromPrompt(prompt: string): string | undefined {
     [/\bpython\b[^.\n]{0,30}\bdjango\b|\bdjango\b/i, "Python + Django"],
     [/\basp\.?net\s+core\b|\b\.net\s+(?:web\s+)?api\b/i, "ASP.NET Core"],
     [/\b\.net\s+wpf\b|\bwpf\b/i, ".NET WPF"],
+    [/(?:^|[^\w])(?:\.net|dotnet)(?:\s+framework)?\b[^.\n]{0,60}\b(?:desktop\s+(?:app|application)|register|windows\s+(?:app|application))\b|\bdesktop\s+(?:app|application)\b[^.\n]{0,60}(?:^|[^\w])(?:\.net|dotnet)(?:\s+framework)?\b/i, ".NET WPF"],
     [/\breact\s+native\b[^.\n]{0,25}\bexpo\b|\bexpo\b[^.\n]{0,25}\breact\s+native\b/i, "React Native + Expo"],
     [/\belectron\b[^.\n]{0,30}\breact\b/i, "Electron + React + TypeScript"],
     [/\btauri\b[^.\n]{0,30}\breact\b/i, "Tauri + React + TypeScript"],

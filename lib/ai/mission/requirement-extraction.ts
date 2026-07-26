@@ -155,10 +155,7 @@ export async function extractRequirements(input: {
       tools: [EXTRACT_TOOL],
       toolChoice: "auto",
       maxOutputTokens: 2_000,
-      // Request understanding is its own stage in the routing spec, but the stage vocabulary does not
-      // carry it yet. "classify" is the closest existing fast-tier understanding stage; this moves to a
-      // dedicated stage when the full stage set lands.
-      routing: routingContext(request, "classify", tier, input.workspaceId),
+      routing: routingContext(request, "understand", tier, input.workspaceId),
     },
     { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 3 },
   );

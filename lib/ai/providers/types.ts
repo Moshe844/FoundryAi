@@ -50,7 +50,11 @@ export type ManagedModelRequest = {
   routing?: {
     requestId: string;
     missionId?: string;
-    stage: "inspect" | "classify" | "plan" | "review" | "implement" | "verify" | "summarize";
+    /**
+     * The mission stage this call belongs to. Routing telemetry and spend are attributed per stage, so
+     * a stage that has no name of its own cannot be shown to have cost anything.
+     */
+    stage: "inspect" | "classify" | "understand" | "search" | "plan" | "architecture" | "review" | "implement" | "repetitive" | "diagnose" | "interpret-failure" | "verify" | "summarize";
     task: string;
     tier: ModelTier;
     budget?: RoutingBudget;

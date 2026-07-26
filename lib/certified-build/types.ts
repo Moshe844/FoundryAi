@@ -21,6 +21,7 @@ export type ProductProfile = {
   dataSensitivity: Risk;
   deploymentPreference: "local" | "managed-cloud" | "self-hosted" | "unspecified";
   existingTechnologyConstraints: string[];
+  technologyConstraint: import("./technology-constraint").TechnologyConstraint | null;
   userPreferences: string[];
   ambiguities: string[];
   confidence: number;

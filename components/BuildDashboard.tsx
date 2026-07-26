@@ -53,6 +53,7 @@ import { CredentialsSettings } from "@/components/integrations/CredentialsSettin
 import { useModelMode } from "@/lib/ai/model-mode";
 import type { TierResolution } from "@/lib/ai/model-router";
 import { buildWorkspaceExecutionPlan, composeProjectArchitecture, defaultEnvironmentCapabilities, extractProductProfile, recommendStack } from "@/lib/certified-build";
+import { CERTIFIED_STARTER_KINDS, CERTIFIED_STARTER_SUBTYPES } from "@/lib/certified-build/starter-contracts";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 
@@ -320,29 +321,7 @@ const styleDescriptions: Record<string, string> = {
 
 const styleOptions = Object.keys(styleDescriptions);
 
-const projectSubtypeOptions: Record<TemplateId, string[]> = {
-  inventory: [
-    "Retail inventory",
-    "Warehouse inventory",
-    "Manufacturing inventory",
-    "Medical/pharmacy inventory",
-    "Restaurant inventory",
-    "Clothing/apparel inventory",
-    "Asset tracking",
-    "Small business inventory",
-    "Enterprise inventory",
-  ],
-  commerce: ["Clothing store", "Grocery", "Digital products", "Wholesale", "Subscription"],
-  pos: ["Retail POS", "Restaurant POS", "Service business", "Cardknox/payment SDK"],
-  dashboard: ["Operations dashboard", "Sales dashboard", "Inventory dashboard", "Finance dashboard", "Executive dashboard"],
-  website: ["Marketing site", "Portfolio", "Product page", "Docs site", "Business website"],
-  mobile: ["Consumer mobile app", "Field operations app", "Internal business app", "Companion app", "Mobile commerce app"],
-  game: ["2D arcade game", "Puzzle game", "Platformer", "Card/board game", "Educational game"],
-  api: ["REST API", "GraphQL API", "Internal microservice", "Public developer API", "Webhook/integration service", "Auth/identity service", "Data processing API"],
-  ai: ["Chat assistant", "Document Q&A / RAG", "Agentic workflow", "Content generation tool", "AI-powered internal tool", "Voice/multimodal app"],
-  desktop: ["Internal business tool", "Data entry / forms tool", "Utility / productivity tool", "Creative or media tool", "POS/register terminal", "Monitoring/dashboard tool"],
-  custom: ["Web app", "Business app", "Internal tool", "AI app", "Backend/API", "Desktop app"],
-};
+const projectSubtypeOptions: Record<TemplateId, string[]> = CERTIFIED_STARTER_SUBTYPES;
 
 export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelectMission, onCreateMission, onDeleteMission, onCreateProject, onExecuteProject, onPreviewStateChange, onRollbackToEntry, onApproveCategory, onApproveCommand }: BuildDashboardProps) {
   const [activeTemplate, setActiveTemplate] = useState<BuildTemplate | null>(null);
@@ -2069,6 +2048,7 @@ function ProjectStartFlow({
   const projectUploadInputRef = useRef<HTMLInputElement | null>(null);
   const instructionAttachmentInputRef = useRef<HTMLInputElement | null>(null);
   const selectedRecommendation = recommendationForStart(start);
+  const stackSelectionBlocked = !start.customStack.trim() && start.stackOptions.length === 0;
   const canUseFolderPicker = supportsBrowserFolderAccess();
   const hasVisualExperience = projectNeedsVisualStyle(start);
   const steps: FlowStep[] = hasVisualExperience
@@ -2479,14 +2459,14 @@ function ProjectStartFlow({
                   Brief-derived decision: your explicit platform and requirements were sufficient to select compatible delivery stacks locally. No discovery model call was needed.
                 </div>
               ) : null}
-              <div className="rounded-lg border border-foundry-teal/30 bg-foundry-teal/[0.07] p-5">
+              <div className={`rounded-lg border p-5 ${stackSelectionBlocked ? "border-foundry-amber/35 bg-foundry-amber/[0.07]" : "border-foundry-teal/30 bg-foundry-teal/[0.07]"}`}>
                 <div className="flex items-start justify-between gap-4">
                   <div>
                     <p className="section-kicker">Recommended delivery stack</p>
                     <h3 className="mt-2 text-lg font-extrabold text-foundry-ink">{selectedRecommendation.name}</h3>
                     <p className="mt-2 text-[13px] leading-relaxed text-foundry-muted">{selectedRecommendation.why}</p>
                   </div>
-                  <CheckCircle2 className="shrink-0 text-foundry-teal" size={22} />
+                  {stackSelectionBlocked ? null : <CheckCircle2 className="shrink-0 text-foundry-teal" size={22} />}
                 </div>
                 <p className="mt-4 border-t border-foundry-teal/15 pt-3 text-xs leading-5 text-foundry-subtle">{stackCapabilityLine(selectedRecommendation.name)}</p>
               </div>
@@ -2629,7 +2609,7 @@ function ProjectStartFlow({
                     <button
                       className="inline-flex items-center gap-2 rounded-md bg-foundry-teal px-5 py-2.5 text-[13.5px] font-bold text-foundry-bg shadow-[0_6px_20px_-8px_rgba(79,209,189,0.7)] transition hover:-translate-y-px disabled:cursor-not-allowed disabled:translate-y-0 disabled:opacity-35 disabled:shadow-none"
                       type="button"
-                      disabled={(step === "kind" && lacksKindStepSignal(start)) || (step === "project" && blockedByExistingSource) || (step === "summary" && blockedByUnansweredDiscovery)}
+                      disabled={(step === "kind" && lacksKindStepSignal(start)) || (step === "project" && blockedByExistingSource) || (step === "stack" && stackSelectionBlocked) || (step === "summary" && blockedByUnansweredDiscovery)}
                       onClick={() => {
                         if (step === "summary") {
                           const confirmedUpdate = discoveryUpdateFromConfirmedAnswers(start);
@@ -3967,21 +3947,7 @@ function ReadableArea({ label, value, onChange }: { label: string; value: string
 }
 
 function defaultKindFor(id: TemplateId) {
-  const defaults: Record<TemplateId, string> = {
-    inventory: "Inventory management system",
-    commerce: "E-commerce store",
-    pos: "Point-of-sale app",
-    dashboard: "Operational dashboard",
-    website: "Responsive website",
-    mobile: "Mobile app",
-    game: "Playable game",
-    api: "API service",
-    ai: "AI application",
-    desktop: "Desktop application",
-    custom: "Custom software project",
-  };
-
-  return defaults[id];
+  return CERTIFIED_STARTER_KINDS[id];
 }
 
 function subtypesFor(id: TemplateId) {
@@ -4444,6 +4410,13 @@ function recommendationForStart(start: ProjectStart): StackRecommendation {
     };
   }
 
+  if (!start.stackOptions.length && !start.discovery?.recommendedStack) {
+    return {
+      name: "No certified stack selected",
+      defaults: [],
+      why: start.discovery?.architecture || "Foundry cannot honestly substitute a different technology. Revise the requested technology or add its certified implementation contract before building.",
+    };
+  }
   const options = start.stackOptions.length ? start.stackOptions : FALLBACK_STACK_OPTIONS;
   const matched = options.find((item) => item.name === start.stack) ?? options.find((item) => item.recommended) ?? options[0];
   return { name: matched.name, why: matched.why, recommended: matched.recommended, defaults: [] };
@@ -4469,6 +4442,7 @@ function explicitSurfaceFromBrief(brief: string, discovery?: ProjectDiscoveryRes
   if (/\b(?:ios|iphone|ipad)\b/i.test(brief)) return "iOS app";
   if (/\bmobile\s+(?:app|application)\b/i.test(brief)) return "Mobile app";
   if (/\b(?:desktop|windows|macos)\s+(?:app|application)\b/i.test(brief)) return "Desktop app";
+  if (/\b(?:2d|3d|survival|platformer|puzzle|strategy|card|board|educational|browser|mobile|desktop)?\s*games?\b/i.test(brief)) return "Game";
   if (/\b(?:command[- ]line|cli)\b/i.test(brief)) return "Command-line app";
   if (/\b(?:backend|server-only|microservice|rest\s+api|web\s+api|api\s+(?:service|server))\b/i.test(brief)) return "Backend service";
   if (/\b(?:web|browser)\s+(?:app|application|site|website|dashboard)\b/i.test(brief)) return "Web app";

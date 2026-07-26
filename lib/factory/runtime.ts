@@ -11,6 +11,8 @@ import { planMission } from "@/lib/ai/mission/mission-planner";
 import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiredDomFeaturesForTask, requiredVisibleTextsForTask, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
 import { closeRequirementLedger, openRequirementLedger, type RequirementGate } from "@/lib/ai/mission/requirement-accounting";
 import { assessAttachments } from "@/lib/ai/mission/attachment-intake";
+import { verifyAgainstReferences, visualRepairInstruction } from "@/lib/ai/mission/visual-acceptance";
+import { summarizeFromJournal } from "@/lib/ai/mission/mission-summary";
 import { assessCompletion } from "@/lib/ai/mission/requirement-ledger";
 import { appendJournalEntry, readJournal, shouldJournalEvent, writeJournal } from "@/lib/factory/execution-journal";
 import { hasRunnableProjectEntry, runMissionExecutor } from "@/lib/ai/mission/executor";
@@ -28,6 +30,7 @@ import type { VerificationProfile } from "@/lib/verification/types";
 import { assessMissionComplexity, shouldRunArchitectureReview, shouldRunVerify, tierForStage } from "@/lib/ai/mission/orchestration";
 import { createExecutionStrategy, tierForCapability, type ExecutionStrategy } from "@/lib/ai/mission/execution-strategy";
 import { DEFAULT_MISSION_QUALITY, type MissionQualityLevel } from "@/lib/ai/mission/quality-level";
+import { depthPolicy, tierWithinDepth } from "@/lib/ai/mission/execution-depth";
 import type { ProviderId } from "@/lib/ai/providers/types";
 import { apiKeyForProvider } from "@/lib/ai/providers/dispatch";
 import { describeAndroidToolchain, ensureAndroidGradleWrapper, launchAndroidEmulator, resolveAndroidTools, resolveJavaHome } from "@/lib/factory/android-emulator";
@@ -68,6 +71,7 @@ import { integrationProvidersFromEvidence, integrationRequirementPrompt, integra
 import { isPreviewRestartRequest } from "@/lib/factory/preview-intent";
 import { attachedAssetPlacement, attachedAssetPublicPath } from "@/lib/factory/asset-placement";
 import { buildUploadIntakeMarker, uploadIntakeMarkerFile, uploadIntakeMarkerMatches } from "@/lib/factory/upload-intake";
+import { unityScaffoldFiles } from "@/lib/factory/unity-scaffold";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 type EvidenceAttachments = NonNullable<FactoryExistingProjectRequest["evidenceAttachments"]>;
@@ -2102,6 +2106,15 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   if (readyBuiltWebPreview && preview?.previewUrl) {
     let browserEvidence = await validateGeneratedStaticPreview(preview.previewUrl, projectPath, execution, preview.previewOwnershipToken, task);
     browserEvidence = await enforceProductionIntegrationReadiness(browserEvidence, projectPath, projectId, task);
+    browserEvidence = await applyAttachedDesignAcceptance({
+      evidence: browserEvidence,
+      artifactRoot: projectPath,
+      references: evidenceImages,
+      request: task,
+      apiKey,
+      provider: initialModel.provider,
+      execution,
+    });
     // A broken asset reference is a path mistake in any stack, not a static-HTML quirk. Gating this
     // on one stack id sent every other stack straight into a paid repair loop for a fix Foundry can
     // make deterministically from what is already on disk.
@@ -2138,7 +2151,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     const browserRepairChangedFiles = new Set<string>();
     const attemptedBrowserRepairFingerprints = new Set<string>();
     const repeatedBrowserFindings = new Map<string, number>();
-    const maximumBrowserRepairStages = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 2);
+    const maximumBrowserRepairStages = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, depthPolicy(quality).retry.maxRepairStages);
     let browserVerificationConflict = false;
     for (let repairAttempt = 1; !browserEvidence.verified && !browserEvidence.infrastructureFailure && repairAttempt <= maximumBrowserRepairStages; repairAttempt += 1) {
       const findingFingerprint = verificationFindingFingerprint(browserEvidence.evidence);
@@ -2348,6 +2361,18 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     result.sessionSummary = carrier.sessionSummary;
   }
 
+  await applyJournalGroundedSummary({
+    projectId,
+    missionIds: requirementLedger?.plan.executionIds ?? [execution.costScopeId],
+    request: task,
+    status,
+    requirements: requirementLedger ? assessCompletion(requirementLedger.ledger) : undefined,
+    apiKey,
+    provider: initialModel.provider,
+    execution,
+    result,
+  });
+
   const files = await listProjectFiles(projectPath);
   completeChecklistItem(
     execution,
@@ -2440,6 +2465,65 @@ type BrowserPreviewEvidence = {
    * is honestly "verified but unproven", not a failed mission. */
   renderHealthy?: boolean;
 };
+
+/**
+ * Checks the rendered page against a design the user attached.
+ *
+ * Runs only on a page that already rendered cleanly: when the render itself is broken, that is the
+ * defect to fix, and asking whether a broken page matches a mockup would bury the real finding.
+ *
+ * A mismatch is folded back into the existing browser evidence rather than raising a parallel failure
+ * path, so the repair loop that already exists picks it up with the named differences as its
+ * instruction — no second loop, no second notion of what "not accepted" means.
+ */
+async function applyAttachedDesignAcceptance(input: {
+  evidence: BrowserPreviewEvidence;
+  artifactRoot: string;
+  references: Array<{ fileName: string; dataUrl: string; mediaType: string }>;
+  request: string;
+  apiKey?: string;
+  provider?: ProviderId;
+  execution: ExecutionContext;
+}): Promise<BrowserPreviewEvidence> {
+  if (!input.references.length || !input.evidence.verified) return input.evidence;
+
+  const screenshotPath = path.join(input.artifactRoot, ".foundry-artifacts", "validation", "generated-preview.png");
+  if (!existsSync(screenshotPath)) return input.evidence;
+
+  const rendered = await readFile(screenshotPath)
+    .then((buffer) => ({ dataUrl: `data:image/png;base64,${buffer.toString("base64")}`, mediaType: "image/png" }))
+    .catch(() => undefined);
+  if (!rendered) return input.evidence;
+
+  const verdict = await verifyAgainstReferences({
+    references: input.references,
+    rendered,
+    request: input.request,
+    apiKey: input.apiKey,
+    provider: input.provider,
+  });
+
+  await emitExecution(
+    input.execution,
+    "preview",
+    verdict.status === "mismatched" ? "warning" : "completed",
+    verdict.status === "mismatched" ? "Rendered page does not match the attached design" : "Checked the rendered page against the attached design",
+    {
+      tier: "decision",
+      rationale: verdict.summary,
+      details: { stage: "attached-design acceptance", status: verdict.status, mismatches: verdict.mismatches.join(" | ") || undefined },
+    },
+  );
+
+  if (verdict.status !== "mismatched") return input.evidence;
+  return {
+    ...input.evidence,
+    verified: false,
+    acceptanceVerified: false,
+    acceptanceApplicable: true,
+    evidence: `${input.evidence.evidence} ${visualRepairInstruction(verdict)}`.trim(),
+  };
+}
 
 async function enforceProductionIntegrationReadiness(evidence: BrowserPreviewEvidence, projectPath: string, projectId: string, task: string): Promise<BrowserPreviewEvidence> {
   const requestsAuth = /\b(?:auth(?:entication)?|sign\s*up|signup|sign\s*in|login|forgot password|reset password|magic[- ]link|oauth)\b/i.test(task);
@@ -6470,7 +6554,13 @@ Mandatory existing-source contract: preserve this project's established multi-fi
     });
   }
 
-  const strategyImplementationTier = tierForCapability(missionStrategy, classification.intent === "debug" ? "debug" : "implement", tierForStage("implement", quality, complexity));
+  // The chosen depth is a real ceiling, not a hint: a Quick mission that lands on a stage wanting
+  // architect reasoning gets builder, because trading depth for speed and cost is what Quick means.
+  // Never a floor — a cheap stage stays cheap however deep the mission.
+  const strategyImplementationTier = tierWithinDepth(
+    tierForCapability(missionStrategy, classification.intent === "debug" ? "debug" : "implement", tierForStage("implement", quality, complexity)),
+    quality,
+  );
   const implementationTier = preModelBuildFailure
     ? "fast"
     : preModelBrowserEvidence
@@ -6709,7 +6799,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
     // Generated-project continuation shares one deliberately small ledger across every batch.
     // Deterministic scaffold/build/browser work is unmetered; source generation cannot silently
     // expand one Retry click into an enterprise-tier 40-call mission.
-    routingBudget: preModelBuildFailure ? { estimatedCostUsd: 0.08 } : preModelBrowserEvidence ? { estimatedCostUsd: 0.8 } : boundedCompilerRepair ? { estimatedCostUsd: 0.08 } : boundedSmallEdit ? boundedSmallEditBudget : boundedCoordinatedEdit ? { estimatedCostUsd: 1 } : resumingIncompleteProject ? generatedRecoveryBudgetForTier(routingBudgetForTier(implementationModel.tier)) : undefined,
+    routingBudget: preModelBuildFailure ? { estimatedCostUsd: 0.08 } : preModelBrowserEvidence ? { estimatedCostUsd: 0.8 } : boundedCompilerRepair ? { estimatedCostUsd: 0.08 } : boundedSmallEdit ? boundedSmallEditBudget : boundedCoordinatedEdit ? { estimatedCostUsd: 1 } : resumingIncompleteProject ? generatedRecoveryBudgetForTier(routingBudgetForTier(implementationModel.tier)) : depthPolicy(quality).budget,
   });
     if (recoveryPreflight) {
       result.changedFiles = Array.from(new Set([...recoveryPreflight.changedFiles, ...result.changedFiles]));
@@ -6924,7 +7014,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
   // A substantial greenfield product can legitimately need more than one bounded executor batch.
   // Preserve one routing/cost identity across continuation batches. On-disk progress can continue,
   // but a batch boundary must never reset the amount the user authorized this mission to spend.
-  const maxContinuationBatches = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 20);
+  const maxContinuationBatches = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, depthPolicy(quality).retry.maxContinuationBatches);
   let consecutiveStagnantContinuationBatches = 0;
   // Churn-proof stagnation. `evidenceProgressed` below counts ANY changed file as progress, so a model
   // that edits a config file every batch while the SAME production build keeps failing (observed live:
@@ -7278,6 +7368,15 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       } else {
         let browserEvidence = await validateGeneratedStaticPreview(managedPreview.previewUrl, previewArtifactRoot(previewTarget!), execution, managedPreview.previewOwnershipToken, browserAcceptanceTask);
         browserEvidence = await includeStaticTopologyEvidence(access, staticSourceTopology, browserEvidence);
+        browserEvidence = await applyAttachedDesignAcceptance({
+          evidence: browserEvidence,
+          artifactRoot: previewArtifactRoot(previewTarget!),
+          references: evidenceImages,
+          request: browserAcceptanceTask,
+          apiKey,
+          provider: initialModel.provider,
+          execution,
+        });
         // A refused connection is owned preview infrastructure, not evidence that product source is
         // defective. Restart the exact preview generation and retry deterministically before either
         // rebuilding framework assets or spending another model call.
@@ -7318,7 +7417,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
         const browserRepairChangedFiles = new Set<string>();
         const attemptedBrowserRepairFingerprints = new Set<string>();
         const repeatedBrowserFindings = new Map<string, number>();
-        const maximumBrowserRepairStages = boundedSmallEdit || boundedStaticFollowUp ? 1 : autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 2);
+        const maximumBrowserRepairStages = boundedSmallEdit || boundedStaticFollowUp ? 1 : autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, depthPolicy(quality).retry.maxRepairStages);
         let browserVerificationConflict = false;
         const browserRepairSourcePaths = () => [...new Set([
           ...workingSet.likelyFiles,
@@ -8011,6 +8110,17 @@ Mandatory existing-source contract: preserve this project's established multi-fi
     });
     await applyRequirementGate(gate, execution, result);
   }
+  await applyJournalGroundedSummary({
+    projectId: execution.projectId,
+    missionIds: requirementLedger?.plan.executionIds ?? [execution.costScopeId],
+    request: acceptedRequirementTask,
+    status: result.status,
+    requirements: requirementLedger ? assessCompletion(requirementLedger.ledger) : undefined,
+    apiKey,
+    provider: initialModel.provider,
+    execution,
+    result,
+  });
   execution.checklist.splice(0, execution.checklist.length, ...result.checklist);
   finishObjectiveChecklist(execution, result.status, result.blocker);
   return { status: result.status, blocker: result.blocker, changedFiles: result.changedFiles, commands: result.commands, sessionSummary: result.sessionSummary, verification: result.verification, events: [], stackLabel: stackProfile.label };
@@ -8027,6 +8137,50 @@ Mandatory existing-source contract: preserve this project's established multi-fi
  * reintroduce exactly the false-failure noise that made earlier gates untrustworthy. And when
  * accounting could not run at all, it changes nothing — silence is not evidence in either direction.
  */
+/**
+ * Replaces the mission's closing outcome with one written from the Execution Journal.
+ *
+ * Only ever applied to a mission that succeeded. A failed mission already carries the four-part blocked
+ * report, which states what succeeded, what is blocked, why, and what is needed — replacing that with a
+ * narrative summary would lose the parts the user actually needs.
+ *
+ * Never overwrites with nothing: if the journal has no record, or the summary stage cannot run, the
+ * existing summary stands.
+ */
+async function applyJournalGroundedSummary(input: {
+  projectId?: string;
+  missionIds?: string[];
+  request: string;
+  status: FactoryProjectResult["status"];
+  requirements?: { finalized: number; total: number };
+  apiKey?: string;
+  provider?: ProviderId;
+  execution: ExecutionContext;
+  result: { sessionSummary?: FactorySessionSummary };
+}) {
+  if (input.status !== "passed" || !input.projectId) return;
+
+  const summary = await summarizeFromJournal({
+    projectId: input.projectId,
+    missionIds: input.missionIds,
+    request: input.request,
+    requirements: input.requirements,
+    status: input.status,
+    apiKey: input.apiKey,
+    provider: input.provider,
+  });
+  if (!summary) return;
+
+  input.result.sessionSummary = input.result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
+  input.result.sessionSummary.outcome = summary.outcome;
+  await emitExecution(input.execution, "summary", "completed", "Outcome reported from the recorded evidence", {
+    internal: true,
+    tier: "decision",
+    rationale: summary.outcome,
+    details: { stage: "final summary", grounding: "execution-journal" },
+  });
+}
+
 async function applyRequirementGate(
   gate: RequirementGate,
   execution: ExecutionContext,
@@ -10710,6 +10864,20 @@ class MainActivity : ComponentActivity() {
     await writeMissing(`${assemblyName}.csproj`, `<Project Sdk="Microsoft.NET.Sdk.Web">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n    <Nullable>enable</Nullable>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n`);
     await writeMissing("Program.cs", `var builder = WebApplication.CreateBuilder(args);\nvar app = builder.Build();\napp.MapGet("/health", () => Results.Ok(new { status = "ok" }));\napp.Run();\n`);
     return finish("Created verified ASP.NET Core scaffold", "The selected .NET service starts with a compilable SDK project and a runnable health endpoint before domain behavior is added.");
+  }
+  if (stack.id === "dotnet-desktop") {
+    const assemblyName = safeName.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("") || "FoundryDesktopApp";
+    await writeMissing(`${assemblyName}.csproj`, `<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup>\n    <OutputType>WinExe</OutputType>\n    <TargetFramework>net8.0-windows</TargetFramework>\n    <UseWPF>true</UseWPF>\n    <Nullable>enable</Nullable>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n`);
+    await writeMissing("App.xaml", `<Application x:Class="${assemblyName}.App"\n  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"\n  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"\n  StartupUri="MainWindow.xaml">\n  <Application.Resources />\n</Application>\n`);
+    await writeMissing("App.xaml.cs", `using System.Windows;\n\nnamespace ${assemblyName};\n\npublic partial class App : Application { }\n`);
+    await writeMissing("MainWindow.xaml", `<Window x:Class="${assemblyName}.MainWindow"\n  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"\n  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"\n  Title=${JSON.stringify(projectName.replace(/["\r\n]/g, " "))} Height="640" Width="1000" MinHeight="480" MinWidth="720">\n  <Grid Margin="32">\n    <StackPanel VerticalAlignment="Center">\n      <TextBlock Text=${JSON.stringify(projectName.replace(/["\r\n]/g, " "))} FontSize="32" FontWeight="SemiBold" />\n      <TextBlock Margin="0,12,0,0" Text="The native Windows application foundation is ready." FontSize="16" />\n    </StackPanel>\n  </Grid>\n</Window>\n`);
+    await writeMissing("MainWindow.xaml.cs", `using System.Windows;\n\nnamespace ${assemblyName};\n\npublic partial class MainWindow : Window\n{\n    public MainWindow()\n    {\n        InitializeComponent();\n    }\n}\n`);
+    return finish("Created verified .NET WPF scaffold", "The selected Windows desktop stack starts with a compilable SDK project, WPF application lifecycle, native window, and publishable executable foundation.");
+  }
+  if (stack.id === "unity") {
+    const files = unityScaffoldFiles(projectName);
+    for (const [relativePath, content] of Object.entries(files)) await writeMissing(relativePath, content);
+    return finish("Created verified Unity project scaffold", "The Unity build starts with pinned project metadata, a playable 3D runtime bootstrap, an EditMode test assembly, and the Foundry.Build batch packaging entry point used by the certified adapter.");
   }
   if (stack.id !== "astro") return [];
   const manifest = `${JSON.stringify({

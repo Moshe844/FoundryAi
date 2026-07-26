@@ -285,8 +285,10 @@ function certifiedDecision(prompt: string, discovery: ProjectDiscoveryResult) {
   const productProfile = extractProductProfile(prompt, discovery);
   const stackRecommendation = recommendStack(productProfile, defaultEnvironmentCapabilities());
   const selected = stackRecommendation.selectedStack;
-  const selectedName = selected?.displayName ?? discovery.recommendedStack;
-  const nextDiscovery = discoveryWithSelectedStack(discovery, discovery.recommendedStack, selectedName);
+  const selectedName = selected?.displayName;
+  const nextDiscovery = selectedName
+    ? discoveryWithSelectedStack(discovery, discovery.recommendedStack, selectedName)
+    : { ...discovery, recommendedStack: "", architecture: stackRecommendation.question ?? discovery.architecture };
   const stackOptions = selected
     ? [{ name: selected.displayName, why: stackRecommendation.reasons.join(" "), recommended: true }]
     : [];
@@ -294,7 +296,7 @@ function certifiedDecision(prompt: string, discovery: ProjectDiscoveryResult) {
 }
 
 function certifiedPlatformContract(starterId: string, discovery: ProjectDiscoveryResult, stackOptions: Array<{ name: string; why: string; recommended: boolean }>) {
-  return { stackOptions, recommendedStack: stackOptions[0]?.name ?? discovery.recommendedStack, repaired: discovery.recommendedStack !== stackOptions[0]?.name, family: platformFamilyForProject(starterId, discovery) };
+  return { stackOptions, recommendedStack: stackOptions[0]?.name ?? "", repaired: discovery.recommendedStack !== stackOptions[0]?.name, family: platformFamilyForProject(starterId, discovery) };
 }
 
 function compactContext(context: DiscoveryRefinementContext | undefined): DiscoveryRefinementContext {

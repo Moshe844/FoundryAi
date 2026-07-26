@@ -1,9 +1,47 @@
 import { explicitPersistenceFromPrompt, explicitStackFromPrompt, type ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { taxonomyEntryFor } from "./taxonomy";
 import type { Platform, ProductCapabilities, ProductProfile } from "./types";
+import { technologyConstraintFromPrompt } from "./technology-constraint";
 
 const matches = (text: string, pattern: RegExp) => pattern.test(text);
 const allPlatforms = (): Record<Platform, boolean> => ({ web:false, api:false, android:false, ios:false, windows:false, macos:false, linux:false, game:false, cli:false });
+
+function authoritativeFamilyFromPrompt(text: string) {
+  if (/\bdesktop (?:app|application)\b/.test(text)) return "desktop-applications";
+  if (/\bmobile app\b/.test(text)) return "mobile-applications";
+  if (/\bplayable game\b/.test(text)) return "games-interactive";
+  if (/\bapi service\b/.test(text)) return "backend-services";
+  if (/\bai application\b/.test(text)) return "data-ai";
+  if (/\bresponsive website\b/.test(text)) return "websites-content";
+  if (/\boperational dashboard\b/.test(text)) return "web-applications-saas";
+  if (/\bpoint-of-sale app\b|\be-commerce store\b/.test(text)) return "commerce-payments";
+  if (/\binventory management system\b/.test(text)) return "inventory-logistics";
+  return undefined;
+}
+
+function platformsForTaxonomy(family: string | undefined, subtype: string | undefined): Platform[] {
+  const value = subtype?.toLowerCase() ?? "";
+  if (family === "mobile-applications") {
+    if (/\bandroid\b/.test(value) && !/\b(?:ios|cross-platform)\b/.test(value)) return ["android"];
+    if (/\b(?:ios|iphone|ipad)\b/.test(value) && !/\b(?:android|cross-platform)\b/.test(value)) return ["ios"];
+    return ["android", "ios"];
+  }
+  if (family === "desktop-applications") {
+    if (/\b(?:windows|wpf|winforms)\b/.test(value)) return ["windows"];
+    if (/\bmacos\b|\bmac app\b/.test(value)) return ["macos"];
+    return ["windows", "macos", "linux"];
+  }
+  if (family === "developer-tools") {
+    if (/\bbrowser extension\b/.test(value)) return ["web"];
+    if (/\b(?:desktop helper|log viewer)\b/.test(value)) return ["windows", "macos", "linux"];
+    return ["cli"];
+  }
+  if (family === "infrastructure-operations") {
+    if (/\b(?:dashboard|monitoring system|logging stack)\b/.test(value)) return ["web", "api"];
+    return ["cli"];
+  }
+  return [];
+}
 
 export function extractProductProfile(prompt: string, discovery?: ProjectDiscoveryResult): ProductProfile {
   // Only user-originated evidence may create architecture-changing requirements. Discovery features
@@ -13,9 +51,14 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
   // user's prompt alone.
   const taxonomyText = [prompt, discovery?.projectType].filter(Boolean).join(" ").toLowerCase();
   const text = prompt.toLowerCase().replace(/\b(?:no|without|not|never)\s+(?:a\s+|an\s+|any\s+)?(?:login|authentication|auth|accounts?|database|backend|server|payments?)(?:\s+(?:or|and)\s+(?:a\s+|an\s+)?(?:login|authentication|auth|accounts?|database|backend|server|payments?))*/g, "");
-  const taxonomy = taxonomyEntryFor(taxonomyText);
+  const taxonomyMatch = taxonomyEntryFor(taxonomyText);
+  // A zero-score taxonomy result is not evidence. Treating the first catalogue entry as a match
+  // made vague custom requests silently become websites and poisoned every downstream stack score.
+  const taxonomy = taxonomyMatch && taxonomyMatch.score > 0 ? taxonomyMatch : undefined;
+  const authoritativeFamily = authoritativeFamilyFromPrompt(text);
   const platforms = allPlatforms();
-  for (const platform of taxonomy?.entry.platforms ?? ["web"]) platforms[platform] = true;
+  const taxonomyPlatforms = platformsForTaxonomy(taxonomy?.entry.family, taxonomy?.entry.subtype);
+  for (const platform of taxonomyPlatforms.length ? taxonomyPlatforms : taxonomy?.entry.platforms ?? []) platforms[platform] = true;
   if (matches(text, /\bandroid|rugged device|google play\b/)) platforms.android = true;
   if (matches(text, /\bios\b|iphone|ipad|apple platform/)) platforms.ios = true;
   if (matches(text, /\bwindows\b|wpf|winforms/)) platforms.windows = true;
@@ -23,10 +66,43 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
   if (matches(text, /\bapi\b|backend|webhook|microservice/)) platforms.api = true;
   if (matches(text, /\bgame\b|platformer|simulation/)) platforms.game = true;
   if (matches(text, /\bcli\b|command[- ]line/)) platforms.cli = true;
-  if (matches(text, /\bweb\b|website|browser|dashboard|portal|saas|store|marketplace/)) platforms.web = true;
-  if (platforms.ios && !matches(text, /\bandroid\b|both ios and android|cross[- ]platform/)) platforms.android = false;
-  if (platforms.android && !matches(text, /\bios\b|iphone|ipad|both ios and android|cross[- ]platform/)) platforms.ios = false;
-  if (platforms.api && !matches(text, /\bweb\b|website|browser|frontend|dashboard|portal/)) platforms.web = false;
+  const resetPlatforms = (...enabled: Platform[]) => {
+    Object.keys(platforms).forEach((platform) => { platforms[platform as Platform] = false; });
+    enabled.forEach((platform) => { platforms[platform] = true; });
+  };
+  if (authoritativeFamily === "websites-content") resetPlatforms("web");
+  if (authoritativeFamily === "web-applications-saas" || authoritativeFamily === "commerce-payments" || authoritativeFamily === "inventory-logistics" || authoritativeFamily === "data-ai") resetPlatforms("web","api");
+  if (authoritativeFamily === "backend-services") resetPlatforms("api");
+  if (authoritativeFamily === "games-interactive") resetPlatforms("game");
+  if (authoritativeFamily === "desktop-applications") {
+    resetPlatforms();
+    if (matches(text, /\bwindows\b|wpf|winforms|(?:^|[^\w])\.net\b|\bdotnet\b/)) platforms.windows = true;
+    else if (matches(text, /\bmacos\b|mac app/)) platforms.macos = true;
+    else { platforms.windows = true; platforms.macos = true; platforms.linux = true; }
+  }
+  if (authoritativeFamily === "mobile-applications") {
+    resetPlatforms();
+    if (matches(text, /\bandroid\b/) && !matches(text, /\bios\b|iphone|ipad|cross[- ]platform/)) platforms.android = true;
+    else if (matches(text, /\bios\b|iphone|ipad/) && !matches(text, /\bandroid\b|cross[- ]platform/)) platforms.ios = true;
+    else { platforms.android = true; platforms.ios = true; }
+  }
+  // Generic subtype nouns such as "dashboard app" must not add a web target to a mobile or desktop
+  // starter. Add platforms from the prompt only when they are explicit delivery-surface language.
+  if (matches(text, /\bweb\b(?!\s+api)|\bwebsite\b|\bweb\s+(?:app|application)\b|browser[- ]based|customer portal|saas|online store|marketplace/)) platforms.web = true;
+  const explicitlyAndroid = matches(text, /\bandroid\b|google play/);
+  const explicitlyIos = matches(text, /\bios\b|iphone|ipad|apple platform/);
+  if (explicitlyIos && !explicitlyAndroid && !matches(text, /both ios and android|cross[- ]platform/)) platforms.android = false;
+  if (explicitlyAndroid && !explicitlyIos && !matches(text, /both ios and android|cross[- ]platform/)) platforms.ios = false;
+  // An API capability inside a business product does not make the product API-only. Previously every
+  // inventory, commerce, POS, and SaaS taxonomy entry lost its web surface here because those families
+  // quite correctly include an API. Only explicit service-only language may remove a known UI.
+  const explicitServiceOnly = matches(text, /\bapi[- ]only\b|\bbackend[- ]only\b|\bservice[- ]only\b|\bno (?:web )?(?:ui|frontend)\b/)
+    || (matches(text, /\bservice\b/) && !matches(text, /\bweb\b|website|browser|frontend|dashboard|portal|\bui\b/));
+  const authoritativeUiProduct = authoritativeFamily === "web-applications-saas"
+    || authoritativeFamily === "commerce-payments"
+    || authoritativeFamily === "inventory-logistics"
+    || authoritativeFamily === "data-ai";
+  if (platforms.api && explicitServiceOnly && !authoritativeUiProduct) platforms.web = false;
 
   const capabilities: ProductCapabilities = {
     multiUser: matches(text, /multi[- ]user|team|staff|customer|employee|seller|admin/),
@@ -45,16 +121,27 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
   };
   const needsQuestion = (taxonomy?.score ?? 0) < 2 && !Object.values(platforms).some(Boolean);
   const explicitStack = explicitStackFromPrompt(prompt);
+  const technologyConstraint = technologyConstraintFromPrompt(prompt);
   const persistence = explicitPersistenceFromPrompt(prompt);
+  const authoritativeSubtype = authoritativeFamily === "desktop-applications"
+    ? platforms.windows && !platforms.macos && !platforms.linux ? "Windows desktop application"
+      : platforms.macos && !platforms.windows && !platforms.linux ? "macOS desktop application"
+        : "cross-platform desktop application"
+    : authoritativeFamily === "mobile-applications"
+      ? platforms.android && !platforms.ios ? "Android application"
+        : platforms.ios && !platforms.android ? "iOS application"
+          : "cross-platform mobile application"
+      : undefined;
   return {
-    projectFamily: taxonomy?.entry.family ?? "unclassified",
-    projectSubtype: taxonomy?.entry.subtype ?? discovery?.projectType ?? "unclassified project",
+    projectFamily: authoritativeFamily ?? taxonomy?.entry.family ?? "unclassified",
+    projectSubtype: authoritativeSubtype ?? taxonomy?.entry.subtype ?? discovery?.projectType ?? "unclassified project",
     primaryUsers: taxonomy?.entry.users ?? [], platforms, capabilities,
     scale: matches(text, /enterprise|global|large[- ]scale|millions/) ? "large" : matches(text, /single[- ]user|small|personal/) ? "small" : taxonomy?.entry.scale ?? "medium",
     securityRisk: capabilities.payments || matches(text, /health|medical|financial|identity/) ? "high" : capabilities.authentication ? "medium" : taxonomy?.entry.securityRisk ?? "low",
     dataSensitivity: capabilities.payments || matches(text, /medical|health|financial|personal data/) ? "high" : capabilities.authentication ? "medium" : "low",
     deploymentPreference: matches(text, /local[- ]only|desktop|offline/) ? "local" : matches(text, /self[- ]host/) ? "self-hosted" : matches(text, /cloud|hosted|saas/) ? "managed-cloud" : "unspecified",
     existingTechnologyConstraints: [explicitStack, persistence].filter((item): item is string => Boolean(item)),
+    technologyConstraint,
     userPreferences: explicitStack ? [explicitStack] : [],
     ambiguities: needsQuestion ? ["The target product and platform are not specific enough to choose an architecture safely."] : [],
     confidence: Math.max(0.35, Math.min(0.98, 0.5 + (taxonomy?.score ?? 0) / 20 + (explicitStack ? 0.15 : 0))),

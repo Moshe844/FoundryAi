@@ -8,12 +8,27 @@ import { implementationContractStatus } from "./certification";
 import { composeProjectArchitecture } from "./architecture";
 import { buildWorkspaceExecutionPlan } from "./workspace-orchestrator";
 import type { EnvironmentCapabilities } from "./types";
+import { CERTIFIED_STARTER_KINDS, CERTIFIED_STARTER_SUBTYPES, certifiedStarterSeed, type CertifiedStarterId } from "./starter-contracts";
 
 const webEnv:EnvironmentCapabilities={os:"windows",availableToolchains:["node","npm"],unavailableToolchains:[],remoteMacBuilder:false};
 const recommend=(brief:string)=>recommendStack(extractProductProfile(brief),webEnv);
 
 describe("Foundry certified build policy",()=>{
   it("ships a broad data-driven taxonomy",()=>{expect(PROJECT_TAXONOMY.length).toBeGreaterThan(150);expect(new Set(PROJECT_TAXONOMY.map(x=>x.family)).size).toBeGreaterThanOrEqual(11);});
+  it("returns only fully certified implementations for registered project subtypes and identifies honest gaps",()=>{
+    const unsupported:string[]=[];
+    for(const entry of PROJECT_TAXONOMY){
+      const result=recommend(entry.subtype);
+      if(!result.selectedStackId){
+        unsupported.push(entry.subtype);
+        expect(result.question,entry.subtype).toMatch(/cannot honestly substitute|not a fully certified/i);
+        continue;
+      }
+      expect(result.selectedStack?.supportLevel,entry.subtype).toBe(4);
+      expect(implementationContractStatus(result.selectedStack!).missing,entry.subtype).toEqual([]);
+    }
+    expect(unsupported).toEqual(["winforms application"]);
+  });
   it("uses only Level 4 stacks for automatic selection",()=>{for(const brief of ["marketing website","multi-user SaaS dashboard","API-only webhook service","warehouse inventory with Android scanners"]){const r=recommend(brief);expect(r.selectedStack?.supportLevel??4).toBe(4);}});
   it("keeps a marketing website serverless",()=>{expect(recommend("simple marketing website with contact details; no login or database").selectedStackId).toBe("static-web-vite");});
   it("keeps the exact marketing-site starter on static HTML without model-added architecture",()=>{const profile=extractProductProfile("Marketing site",{prompt:"Marketing site",projectType:"Responsive Website. Subtype: Marketing Site",recommendedStack:"Next.js + PostgreSQL",architecture:"dashboard with a database",mainFeatures:["Admin dashboard","User accounts"],styleDirection:"",dataModel:["User","Record"],assumptions:[],questions:[],decisions:[],keyFacts:[],futureCapabilities:[]});const result=recommendStack(profile,webEnv);expect(result.selectedStackId).toBe("static-web-vite");expect(result.selectedStack?.displayName).toBe("Static HTML + CSS + JavaScript");});
@@ -24,6 +39,97 @@ describe("Foundry certified build policy",()=>{
   it("selects native Android while separating missing local tools from implementation support",()=>{const r=recommend("Android-only deep Bluetooth barcode scanner app that works offline");expect(r.selectedStackId).toBe("android-kotlin-compose");expect(r.environmentRequirements).toEqual(expect.arrayContaining(["java","android"]));expect(r.limitations.join(" ")).toMatch(/hardware|device/i);});
   it("blocks invalid overrides",()=>{const p=extractProductProfile("advanced 3D game");expect(validateStackOverride(p,webEnv,"static-web-vite").allowed).toBe(false);});
   it("does not use project name mappings",()=>{const a=recommend("Acme is a multi-user relational portal with roles");const b=recommend("Acme is a simple static brochure");expect(a.selectedStackId).not.toBe(b.selectedStackId);});
+  it.each([
+    ["retail inventory management with suppliers and purchase orders", "nextjs-typescript-postgres"],
+    ["e-commerce store with catalogue, checkout and order management", "nextjs-typescript-postgres"],
+    ["retail POS with receipts, payments and offline register workflows", "nextjs-typescript-postgres"],
+    ["operations dashboard with filters, alerts and exportable reports", "nextjs-typescript-postgres"],
+    ["portfolio website with responsive pages and SEO; no login or database", "static-web-vite"],
+    ["cross-platform consumer mobile app for iPhone and Android", "flutter-mobile"],
+    ["2D browser game with levels, score and keyboard controls", "phaser-typescript"],
+    ["REST API with webhooks, validation and background jobs", "node-typescript-api"],
+    ["document analysis AI service with RAG and file processing", "python-fastapi"],
+    ["cross-platform desktop productivity app for Windows, macOS and Linux", "electron-typescript"],
+  ])("selects a product-appropriate certified stack for %s", (brief, expected) => {
+    expect(recommend(brief).selectedStackId).toBe(expected);
+  });
+  it("honors an explicit certified technology choice",()=>{expect(recommend("REST API in Python with FastAPI").selectedStackId).toBe("python-fastapi");});
+  it.each([
+    ["3D game in Unreal Engine","Unreal Engine"],
+    ["desktop application in Qt and C++","Qt/C++"],
+    ["mobile app with React Native and Expo","React Native / Expo"],
+    ["web app in Vue and TypeScript","Vue / Nuxt"],
+    ["API using Ruby on Rails","Ruby on Rails"],
+    ["API using Laravel","Laravel"],
+  ])("refuses to silently replace an explicitly requested unsupported technology: %s",(brief,technology)=>{
+    const result=recommend(brief);
+    expect(result.selectedStackId).toBeNull();
+    expect(result.question).toContain(technology);
+    expect(result.alternatives).toEqual([]);
+  });
+  it.each([
+    ["iOS app built with WPF","wpf-dotnet"],
+    ["Android app built with SwiftUI","ios-swiftui"],
+    ["API-only service built with Electron","electron-typescript"],
+  ])("rejects a certified technology when it cannot deliver the requested surface: %s",(brief,stackId)=>{
+    const result=recommend(brief);
+    expect(result.selectedStackId).toBeNull();
+    expect(result.candidates.find(candidate=>candidate.manifest.stackId===stackId)?.eligible).toBe(false);
+  });
+  it("does not invent a website taxonomy for an ambiguous custom prompt",()=>{const profile=extractProductProfile("build something useful for Acme");expect(profile.projectFamily).toBe("unclassified");expect(recommendStack(profile,webEnv).selectedStackId).toBeNull();});
+  it("keeps the desktop starter authoritative over an ambiguous business-tool subtype",()=>{
+    const result=recommend("Desktop application. Subtype: Internal business tool");
+    expect(result.selectedStackId).toBe("electron-typescript");
+    expect(result.selectedStack?.supportedPlatforms).toEqual(expect.arrayContaining(["windows","macos","linux"]));
+  });
+  it.each([
+    [".NET Framework register desktop app","wpf-dotnet"],
+    [".NET desktop application for Windows","wpf-dotnet"],
+    ["ASP.NET Core Web API","dotnet-web-api"],
+    ["Electron React desktop app","electron-typescript"],
+    ["Tauri React Rust desktop app","tauri-rust"],
+    ["Python FastAPI backend service","python-fastapi"],
+    ["Kotlin Jetpack Compose Android app","android-kotlin-compose"],
+    ["SwiftUI iPhone app","ios-swiftui"],
+  ])("honors the named technology in custom flow: %s",(brief,expected)=>{
+    expect(recommend(brief).selectedStackId).toBe(expected);
+  });
+  it("describes an explicit .NET desktop request as Windows-only",()=>{
+    const result=recommend(".NET Framework register desktop app");
+    expect(result.reasons.join(" ")).toMatch(/Windows desktop application/i);
+    expect(result.reasons.join(" ")).not.toMatch(/cross-platform desktop/i);
+  });
+  it("tests the exact seed used by every visible starter and subtype",()=>{
+    const allowed: Record<Exclude<CertifiedStarterId,"custom">,string[]> = {
+      inventory:["nextjs-typescript-postgres"], commerce:["nextjs-typescript-postgres"], pos:["nextjs-typescript-postgres"],
+      dashboard:["nextjs-typescript-postgres"], website:["static-web-vite","nextjs-typescript-postgres"],
+      mobile:["flutter-mobile","android-kotlin-compose","ios-swiftui"], game:["phaser-typescript","godot","unity"],
+      api:["node-typescript-api","python-fastapi","dotnet-web-api"], ai:["nextjs-typescript-postgres","python-fastapi"],
+      desktop:["electron-typescript","tauri-rust","wpf-dotnet"],
+    };
+    for(const id of Object.keys(CERTIFIED_STARTER_KINDS) as CertifiedStarterId[]){
+      if(id==="custom") continue;
+      for(const subtype of CERTIFIED_STARTER_SUBTYPES[id]){
+        const result=recommend(certifiedStarterSeed(id,subtype));
+        expect(allowed[id],`${id}: ${subtype}`).toContain(result.selectedStackId);
+        expect(result.selectedStack?.supportLevel,`${id}: ${subtype}`).toBe(4);
+      }
+    }
+  });
+  it.each([
+    ["financial dashboard mobile app", "flutter-mobile"],
+    ["Android scanner app", "android-kotlin-compose"],
+    ["iPhone camera app", "ios-swiftui"],
+    ["WPF application", "wpf-dotnet"],
+    ["cross-platform desktop app", "electron-typescript"],
+    ["advanced 3D training simulation", "unity"],
+    ["Survival Exploration 3d Games", "unity"],
+    ["small indie 3D puzzle game", "godot"],
+    ["2D educational game", "phaser-typescript"],
+    ["service-status dashboard", "nextjs-typescript-postgres"],
+  ])("keeps subtype-specific platform requirements for %s", (brief, expected) => {
+    expect(recommend(brief).selectedStackId).toBe(expected);
+  });
   it("publishes honest manifests",()=>{expect(STACK_MANIFESTS.filter(x=>x.supportLevel===4).every(x=>x.status==="certified"&&x.certification.passRate===1)).toBe(true);expect(STACK_MANIFESTS.filter(x=>x.supportLevel<4).every(x=>x.status!=="certified")).toBe(true);});
   it("gives every curated Level 4 stack a complete runtime contract",()=>{expect(assertManifestAdapterCoverage(STACK_MANIFESTS).filter(x=>!x.covered)).toEqual([]);expect(STACK_MANIFESTS.filter(x=>x.supportLevel===4).flatMap(x=>implementationContractStatus(x).missing.map(operation=>`${x.stackId}:${operation}`))).toEqual([]);});
   it("composes and plans a web plus native Android warehouse system",()=>{const profile=extractProductProfile("warehouse inventory web management system with an offline Android barcode scanner app and Bluetooth");const recommendation=recommendStack(profile,webEnv);const architecture=composeProjectArchitecture(profile,recommendation);expect(architecture?.applications.map(app=>app.stackId)).toEqual(expect.arrayContaining(["nextjs-typescript-postgres","android-kotlin-compose"]));expect(buildWorkspaceExecutionPlan(architecture!).applications).toHaveLength(2);});
