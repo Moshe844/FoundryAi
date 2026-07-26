@@ -25,6 +25,7 @@ export const PROJECT_TAXONOMY: TaxonomyEntry[] = seeds.flatMap(({ subtypes, ...c
 
 export function taxonomyEntryFor(text: string): { entry: TaxonomyEntry; score: number } | undefined {
   const normalized = text.toLowerCase();
-  return PROJECT_TAXONOMY.map((entry) => ({ entry, score: entry.keywords.reduce((sum, word) => sum + (normalized.includes(word) ? Math.min(3, word.length / 3) : 0), normalized.includes(entry.subtype) ? 8 : 0) }))
+  const containsTerm = (term: string) => new RegExp(`(?:^|[^a-z0-9])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")}(?=$|[^a-z0-9])`, "i").test(normalized);
+  return PROJECT_TAXONOMY.map((entry) => ({ entry, score: entry.keywords.reduce((sum, word) => sum + (containsTerm(word) ? Math.min(3, word.length / 3) : 0), containsTerm(entry.subtype) ? 8 : 0) }))
     .sort((a, b) => b.score - a.score)[0];
 }

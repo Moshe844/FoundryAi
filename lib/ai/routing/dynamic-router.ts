@@ -1,10 +1,12 @@
 import { CapabilityRegistry, discoverProviderModels } from "@/lib/ai/routing/capability-registry";
 import { selectModel } from "@/lib/ai/routing/selector";
 import { profileTask, type TaskContext } from "@/lib/ai/routing/task-profiler";
-import type { ModelTier, RoutingBudget, RoutingDecision, RoutingPreference } from "@/lib/ai/routing/types";
+import type { ModelTier, RegisteredModel, RoutingBudget, RoutingDecision, RoutingPreference } from "@/lib/ai/routing/types";
 import type { ProviderId } from "@/lib/ai/providers/types";
 import { recordRoutingDecision } from "@/lib/ai/routing/telemetry";
 import { getLiveRegistry, liveRegistryRefreshedAt, liveRegistrySnapshot, setLiveRegistry } from "@/lib/ai/routing/registry-state";
+import { applyObservedEvidence, observedSignals } from "@/lib/ai/routing/model-evidence";
+import { routingFeedbackSnapshot } from "@/lib/ai/routing/telemetry";
 
 const REFRESH_MS = 10 * 60 * 1000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -25,7 +27,7 @@ export async function refreshModelRegistry(force = false): Promise<CapabilityReg
     { openai: process.env.OPENAI_API_KEY, anthropic: process.env.ANTHROPIC_API_KEY, google: process.env.GEMINI_API_KEY },
     AbortSignal.timeout(discoveryTimeoutMs),
   )
-    .then((models) => {
+    .then(async (models) => {
       for (const model of models) {
         const previous = current.get(model.provider, model.modelId);
         if (previous) {
@@ -42,7 +44,10 @@ export async function refreshModelRegistry(force = false): Promise<CapabilityReg
           }
         }
       }
-      const registry = new CapabilityRegistry(models);
+      // Rate every discovered model by what it has actually done before it is used to route
+      // anything. Discovery says a model exists; the recorded outcomes say whether it delivers.
+      const rated = await rateModelsFromEvidence(models);
+      const registry = new CapabilityRegistry(rated);
       setLiveRegistry(registry);
       return registry;
     })
@@ -100,4 +105,20 @@ export async function routePayloadDynamically(payload: unknown, tier: ModelTier,
     preferredProvider,
     disabledProviders: preferredProvider ? (["openai", "anthropic", "google"] as ProviderId[]).filter((provider) => provider !== preferredProvider) : undefined,
   });
+}
+
+/**
+ * Applies recorded behavior to a freshly discovered catalogue.
+ *
+ * Best-effort by design: a model's rating falling back to its prior is a worse route, not a broken one,
+ * so an unreadable telemetry file must never stop the registry from refreshing.
+ */
+async function rateModelsFromEvidence(models: RegisteredModel[]): Promise<RegisteredModel[]> {
+  try {
+    const signals = observedSignals(await routingFeedbackSnapshot());
+    if (!signals.size) return models;
+    return models.map((model) => applyObservedEvidence(model, signals.get(`${model.provider}:${model.modelId}`)));
+  } catch {
+    return models;
+  }
 }

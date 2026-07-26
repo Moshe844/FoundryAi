@@ -118,8 +118,12 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
   let lastResult: ManagedModelResult | undefined;
   const candidateFailures: CandidateFailure[] = [];
 
+  // Which candidate produced the answer. Anything past the first means a fallback was necessary,
+  // which is a fact about the primary model that routing should be able to learn from.
+  let attemptIndex = 0;
   for (const candidate of candidates) {
     if (overallSignal.aborted) break;
+    attemptIndex += 1;
     const provider = candidate.provider;
     const apiKey = apiKeyForProvider(provider);
     if (!apiKey) continue;
@@ -166,6 +170,9 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
     const candidateSignal = AbortSignal.any([overallSignal, AbortSignal.timeout(candidateTimeoutMs)]);
     const candidateOptions = { ...options, apiKey, signal: candidateSignal, timeoutMs: candidateTimeoutMs, maxAttempts: 1 };
     let result: ManagedModelResult;
+    // Measured around the provider call itself rather than the surrounding bookkeeping, so the recorded
+    // number is the model's own responsiveness and stays comparable across providers.
+    const startedAt = Date.now();
     try {
       result = redactSensitiveData(await callProvider(candidateRequest, candidateOptions));
       settleModelCall(reservation, result.usage);
@@ -173,15 +180,23 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
       releaseModelCall(reservation);
       throw error;
     }
+    const latencyMs = Date.now() - startedAt;
+    // Judge the result before recording it. Writing the telemetry first meant every call was filed as
+    // though it had succeeded, so the record could never show which models actually deliver.
+    const requiredTool = typeof request.toolChoice === "object" ? request.toolChoice.name : undefined;
+    const obeyedToolChoice = !requiredTool || result.toolCalls.some((call) => call.name === requiredTool);
+    const successful = result.stopReason !== "error" && obeyedToolChoice;
     await recordProviderCall({
       requestId, missionId: request.routing?.missionId, stage: request.routing?.stage ?? "unspecified", tier,
       provider, model: candidate.modelId,
       reason: freshDecision?.reason ?? `Explicit ${tier} provider call with same-tier fallback.`,
       estimatedCostUsd: reservation.estimatedCostUsd, usage: result.usage,
+      latencyMs,
+      // A model that ignored a required tool is unsuitable for this work; one that errored is
+      // unavailable. Recording them apart is what lets routing learn a different lesson from each.
+      outcome: successful ? "accepted" : result.stopReason === "error" ? "provider-error" : "wrong-shape",
+      attempt: attemptIndex,
     });
-    const requiredTool = typeof request.toolChoice === "object" ? request.toolChoice.name : undefined;
-    const obeyedToolChoice = !requiredTool || result.toolCalls.some((call) => call.name === requiredTool);
-    const successful = result.stopReason !== "error" && obeyedToolChoice;
     // A forced tool response with no such tool cannot advance this executor at all. Suppress that
     // model for the current registry window so the executor's bounded recovery turn routes to a
     // different healthy provider instead of paying the same model for the same unusable behavior.

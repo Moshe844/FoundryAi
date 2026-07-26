@@ -1,4 +1,5 @@
 import type { ModelCapabilities, ModelStatus, ProviderId, RegisteredModel } from "./types";
+import { normalizeFreshness } from "./model-evidence";
 
 const PROVIDERS: ProviderId[] = ["openai", "anthropic", "google"];
 const ALIAS = /(^|[-_.])(latest|sonnet|opus|haiku|pro)([-_.]|$)/i;
@@ -37,13 +38,36 @@ export async function discoverProviderModels(apiKeys: Partial<Record<ProviderId,
       return configuredForProvider(provider).map((model) => ({ ...model, status, available: false, lastVerifiedAt: new Date().toISOString() }));
     }
   }));
-  return discovered.flat();
+  return normalizeFreshness(discovered.flat());
 }
 
-function isRoutableGenerativeModel(provider: ProviderId, id: string) {
-  if (provider === "openai") return /^(gpt-5|o[1-9])/.test(id) && !/(chat-latest|search|audio|image|transcribe|tts)/i.test(id);
-  if (provider === "anthropic") return /^claude-/i.test(id);
-  return /^gemini-/i.test(id) && !/(image|tts|embedding|aqa)/i.test(id);
+/**
+ * Non-generative endpoints, excluded by what they do rather than what they are called.
+ *
+ * This used to be an allowlist of family prefixes — `gpt-5`, `claude-`, `gemini-` — which meant a model
+ * family with a new name was filtered out before routing ever saw it, however capable it was. Naming
+ * the things Foundry cannot use is a closed set (embeddings, speech, images, moderation); naming the
+ * things it can use is an open one that goes stale the moment a provider ships a new line.
+ */
+const NON_GENERATIVE_PURPOSE = new RegExp([
+  // Named by what they do.
+  "embedding|embed|moderation|rerank|search|vision-only|audio|speech|transcribe|realtime|aqa|guard",
+  // Named only by product, so the purpose has to be recognised from the family itself. These are
+  // image, video and speech generators — a closed set that grows slowly, unlike the set of text
+  // models, which is why exclusion is safe to enumerate and inclusion is not.
+  "image|tts|whisper|dall-?e|imagen|sora|veo|flux|stable-?diffusion|midjourney|riffusion|musicgen",
+].join("|"), "i");
+
+/** Superseded generations, which the provider still lists long after they should be routed to. */
+const SUPERSEDED_GENERATION = /(^|[-.])(gpt-3|gpt-4(?!\.\d*[5-9])|davinci|babbage|curie|ada|claude-1|claude-2|claude-3(?!-[5-9])|gemini-1|gemini-pro-vision)($|[-.])/i;
+
+export function isRoutableGenerativeModel(provider: ProviderId, id: string) {
+  void provider;
+  if (NON_GENERATIVE_PURPOSE.test(id)) return false;
+  if (SUPERSEDED_GENERATION.test(id)) return false;
+  // A chat alias that the provider repoints without notice is excluded: routing needs a model whose
+  // behavior is stable for the length of a mission.
+  return !/chat-latest/i.test(id);
 }
 
 async function listProviderModelIds(provider: ProviderId, key: string, signal?: AbortSignal): Promise<string[]> {

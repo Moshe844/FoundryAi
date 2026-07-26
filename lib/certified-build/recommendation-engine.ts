@@ -3,6 +3,9 @@ import { STACK_MANIFESTS } from "./manifests";
 import type { EnvironmentCapabilities, ProductProfile, ScoreBreakdown, StackCandidate, StackManifest, StackRecommendation } from "./types";
 
 const cap = (n: number) => Math.max(0, Math.min(1, n));
+const requiresAiRuntime = (profile: ProductProfile) => profile.sourceEvidence.some((evidence) =>
+  /\b(?:ai application|ai-powered|artificial intelligence|chatbot|chat assistant|ai assistant|agentic|ai agent|rag|semantic search|embeddings?|llm|model provider|content generation|multimodal|document q&a|prompt testing|model evaluation)\b/i.test(evidence)
+);
 
 const FAMILY_STACK_AFFINITY: Record<string, Record<string, number>> = {
   "websites-content": { "static-web-vite": 1, "react-vite-typescript": .55, "nextjs-typescript-postgres": .35 },
@@ -12,13 +15,19 @@ const FAMILY_STACK_AFFINITY: Record<string, Record<string, number>> = {
   "mobile-applications": { "flutter-mobile": 1, "android-kotlin-compose": .9, "ios-swiftui": .9 },
   "desktop-applications": { "electron-typescript": 1, "tauri-rust": .92, "wpf-dotnet": .88 },
   "backend-services": { "node-typescript-api": 1, "python-fastapi": .82, "dotnet-web-api": .8 },
-  "data-ai": { "python-fastapi": 1, "nextjs-typescript-postgres": .82, "react-vite-typescript": .45 },
+  "data-ai": { "nextjs-ai-postgres": 1, "python-fastapi": .9 },
   "games-interactive": { "phaser-typescript": 1, godot: .88, unity: .72 },
   "developer-tools": { "node-typescript-api": .8, "tauri-rust": .65 },
   "infrastructure-operations": { "python-fastapi": .78, "node-typescript-api": .75, "dotnet-web-api": .7 },
 };
 
 function familyAffinity(profile: ProductProfile, stack: StackManifest) {
+  if (profile.sourceEvidence.some((evidence)=>/\b(?:etl|data pipeline|data cleaning|batch processing|data-processing pipeline)\b/i.test(evidence))) {
+    return stack.stackId === "python-fastapi" ? 1 : stack.stackId === "node-typescript-api" ? .45 : .2;
+  }
+  if (profile.projectFamily === "data-ai" && !requiresAiRuntime(profile)) {
+    return stack.stackId === "python-fastapi" ? 1 : stack.stackId === "nextjs-ai-postgres" ? .25 : .35;
+  }
   if (profile.projectFamily === "mobile-applications") {
     if (profile.platforms.ios && !profile.platforms.android) return stack.stackId === "ios-swiftui" ? 1 : stack.supportedPlatforms.includes("ios") ? .65 : .2;
     if (profile.platforms.android && !profile.platforms.ios) return stack.stackId === "android-kotlin-compose" ? 1 : stack.supportedPlatforms.includes("android") ? .65 : .2;
@@ -70,6 +79,9 @@ function disqualifiers(profile: ProductProfile, stack: StackManifest): string[] 
   if (p.cli && !stack.supportedPlatforms.includes("cli")) out.push("A CLI cannot be delivered as a browser application.");
   if (p.web && (p.android || p.ios) && !stack.supportedPlatforms.includes("web")) out.push("A multi-application product uses the certified web platform as its primary system and adds native companion applications separately.");
   if (p.api && !p.web && stack.supportedPlatforms.includes("web")) out.push("An API-only project must not receive a browser application as its primary artifact.");
+  const aiRuntimeRequired = requiresAiRuntime(profile);
+  if (aiRuntimeRequired && p.web && !traits.has("ai-runtime")) out.push("A user-facing AI product requires a certified model runtime, provider boundary, evaluation path, and retrieval/agent architecture—not only a web framework.");
+  if (!aiRuntimeRequired && traits.has("ai-runtime")) out.push("A non-AI data product should not receive model-provider, agent, and embedding infrastructure it does not require.");
   const explicitlyAdvanced3d = profile.sourceEvidence.some((evidence) =>
     /\badvanced\s+3d\b|\bvirtual showroom\b|\badvanced simulation\b|\b(?:3d\b[^.\n]{0,80}\b(?:survival|open[- ]world|large[- ]world|photorealistic|realistic exploration|multiplayer)|(?:survival|open[- ]world|large[- ]world|photorealistic|realistic exploration|multiplayer)\b[^.\n]{0,80}\b3d)\b/i.test(evidence)
   );

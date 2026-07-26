@@ -55,6 +55,19 @@ describe("Foundry certified build policy",()=>{
   });
   it("honors an explicit certified technology choice",()=>{expect(recommend("REST API in Python with FastAPI").selectedStackId).toBe("python-fastapi");});
   it.each([
+    ["AI application. Subtype: Chat assistant","nextjs-ai-postgres"],
+    ["AI application. Subtype: Document Q&A / RAG","nextjs-ai-postgres"],
+    ["AI application. Subtype: Agentic workflow","nextjs-ai-postgres"],
+    ["AI application. Subtype: Content generation tool","nextjs-ai-postgres"],
+    ["AI application. Subtype: AI-powered internal tool","nextjs-ai-postgres"],
+    ["AI application. Subtype: Voice/multimodal app","nextjs-ai-postgres"],
+    ["AI-only FastAPI service for document classification","python-fastapi"],
+  ])("uses a complete AI architecture for %s",(brief,expected)=>{
+    const result=recommend(brief);
+    expect(result.selectedStackId).toBe(expected);
+    if(expected==="nextjs-ai-postgres") expect(result.selectedStack?.traits).toEqual(expect.arrayContaining(["ai-runtime","model-provider","evaluation"]));
+  });
+  it.each([
     ["3D game in Unreal Engine","Unreal Engine"],
     ["desktop application in Qt and C++","Qt/C++"],
     ["mobile app with React Native and Expo","React Native / Expo"],
@@ -77,6 +90,24 @@ describe("Foundry certified build policy",()=>{
     expect(result.candidates.find(candidate=>candidate.manifest.stackId===stackId)?.eligible).toBe(false);
   });
   it("does not invent a website taxonomy for an ambiguous custom prompt",()=>{const profile=extractProductProfile("build something useful for Acme");expect(profile.projectFamily).toBe("unclassified");expect(recommendStack(profile,webEnv).selectedStackId).toBeNull();});
+  it.each([
+    ["a local Windows expense tracker in .NET with SQLite","wpf-dotnet"],
+    ["a macOS and Windows markdown editor that stores files locally","electron-typescript"],
+    ["an Android warehouse scanner using Bluetooth and offline sync","android-kotlin-compose"],
+    ["an iPhone field inspection app using the camera","ios-swiftui"],
+    ["a cross-platform habit tracking mobile app","flutter-mobile"],
+    ["a public webhook API for shipping integrations","node-typescript-api"],
+    ["an ETL data pipeline that cleans nightly CSV imports","python-fastapi"],
+    ["a customer support RAG assistant over uploaded manuals","nextjs-ai-postgres"],
+    ["an internal AI agent that summarizes tickets and drafts replies","nextjs-ai-postgres"],
+    ["a small 3D museum exploration game","godot"],
+    ["a realistic open-world survival game in 3D","unity"],
+    ["a browser-based 2D rhythm game","phaser-typescript"],
+    ["a portfolio for a photographer with no accounts or database","static-web-vite"],
+    ["a multi-tenant booking portal with accounts, roles and payments","nextjs-typescript-postgres"],
+  ])("routes arbitrary free-form projects through the same certified contract: %s",(brief,expected)=>{
+    expect(recommend(brief).selectedStackId).toBe(expected);
+  });
   it("keeps the desktop starter authoritative over an ambiguous business-tool subtype",()=>{
     const result=recommend("Desktop application. Subtype: Internal business tool");
     expect(result.selectedStackId).toBe("electron-typescript");
@@ -104,7 +135,7 @@ describe("Foundry certified build policy",()=>{
       inventory:["nextjs-typescript-postgres"], commerce:["nextjs-typescript-postgres"], pos:["nextjs-typescript-postgres"],
       dashboard:["nextjs-typescript-postgres"], website:["static-web-vite","nextjs-typescript-postgres"],
       mobile:["flutter-mobile","android-kotlin-compose","ios-swiftui"], game:["phaser-typescript","godot","unity"],
-      api:["node-typescript-api","python-fastapi","dotnet-web-api"], ai:["nextjs-typescript-postgres","python-fastapi"],
+      api:["node-typescript-api","python-fastapi","dotnet-web-api"], ai:["nextjs-ai-postgres","python-fastapi"],
       desktop:["electron-typescript","tauri-rust","wpf-dotnet"],
     };
     for(const id of Object.keys(CERTIFIED_STARTER_KINDS) as CertifiedStarterId[]){

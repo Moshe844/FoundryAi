@@ -7,15 +7,15 @@ const matches = (text: string, pattern: RegExp) => pattern.test(text);
 const allPlatforms = (): Record<Platform, boolean> => ({ web:false, api:false, android:false, ios:false, windows:false, macos:false, linux:false, game:false, cli:false });
 
 function authoritativeFamilyFromPrompt(text: string) {
-  if (/\bdesktop (?:app|application)\b/.test(text)) return "desktop-applications";
-  if (/\bmobile app\b/.test(text)) return "mobile-applications";
-  if (/\bplayable game\b/.test(text)) return "games-interactive";
-  if (/\bapi service\b/.test(text)) return "backend-services";
-  if (/\bai application\b/.test(text)) return "data-ai";
+  if (/\bdesktop (?:app|application)\b|\b(?:windows|macos)\s+(?:app|application)\b/.test(text)) return "desktop-applications";
+  if (/\bmobile app\b|\b(?:android|ios|iphone|ipad)\b[^.\n]{0,50}\b(?:app|application|scanner)\b/.test(text)) return "mobile-applications";
+  if (/\bplayable games?\b|\b(?:2d|3d|survival|platformer|puzzle|strategy|rhythm|open[- ]world)\b[^.\n]{0,60}\bgames?\b|\bgames?\b[^.\n]{0,60}\b(?:2d|3d|survival|platformer|puzzle|strategy|rhythm|open[- ]world)\b/.test(text)) return "games-interactive";
+  if (/\bapi service\b|\b(?:rest|graphql|public|private|internal)?\s*api\b|\bwebhook service\b|\bmicroservice\b/.test(text)) return "backend-services";
+  if (/\bai application\b|\bai-powered\b|\b(?:rag|ai|llm)\s+(?:assistant|agent|app|application|tool)\b/.test(text)) return "data-ai";
   if (/\bresponsive website\b/.test(text)) return "websites-content";
   if (/\boperational dashboard\b/.test(text)) return "web-applications-saas";
-  if (/\bpoint-of-sale app\b|\be-commerce store\b/.test(text)) return "commerce-payments";
-  if (/\binventory management system\b/.test(text)) return "inventory-logistics";
+  if (/\bpoint-of-sale app\b|\be-commerce store\b|\bpos\b|\bcheckout\b/.test(text)) return "commerce-payments";
+  if (/\binventory management system\b|\bwarehouse inventory\b|\binventory system\b/.test(text)) return "inventory-logistics";
   return undefined;
 }
 
@@ -64,7 +64,7 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
   if (matches(text, /\bwindows\b|wpf|winforms/)) platforms.windows = true;
   if (matches(text, /\bmacos\b|mac app/)) platforms.macos = true;
   if (matches(text, /\bapi\b|backend|webhook|microservice/)) platforms.api = true;
-  if (matches(text, /\bgame\b|platformer|simulation/)) platforms.game = true;
+  if (matches(text, /\bgames?\b|platformer|simulation/)) platforms.game = true;
   if (matches(text, /\bcli\b|command[- ]line/)) platforms.cli = true;
   const resetPlatforms = (...enabled: Platform[]) => {
     Object.keys(platforms).forEach((platform) => { platforms[platform as Platform] = false; });
@@ -91,6 +91,11 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
   if (matches(text, /\bweb\b(?!\s+api)|\bwebsite\b|\bweb\s+(?:app|application)\b|browser[- ]based|customer portal|saas|online store|marketplace/)) platforms.web = true;
   const explicitlyAndroid = matches(text, /\bandroid\b|google play/);
   const explicitlyIos = matches(text, /\bios\b|iphone|ipad|apple platform/);
+  const explicitWebSurface = matches(text, /\bweb\b(?!\s+api)|\bwebsite\b|\bweb\s+(?:app|application)\b|browser[- ]based|customer portal|saas|online store|marketplace/);
+  const explicitApiSurface = matches(text, /\b(?:rest|graphql|public|private|internal)?\s*api\b|\bwebhook\b|\bmicroservice\b|\bbackend\b/);
+  if (explicitlyAndroid && !explicitlyIos && !explicitWebSurface && matches(text, /\b(?:scanner|mobile|handheld|device|field|warehouse)\b/)) resetPlatforms("android");
+  if (explicitlyIos && !explicitlyAndroid && !explicitWebSurface) resetPlatforms("ios");
+  if (explicitApiSurface && !explicitWebSurface && !matches(text, /\b(?:mobile|android|ios|iphone|desktop|game)\b/)) resetPlatforms("api");
   if (explicitlyIos && !explicitlyAndroid && !matches(text, /both ios and android|cross[- ]platform/)) platforms.android = false;
   if (explicitlyAndroid && !explicitlyIos && !matches(text, /both ios and android|cross[- ]platform/)) platforms.ios = false;
   // An API capability inside a business product does not make the product API-only. Previously every
@@ -100,9 +105,11 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
     || (matches(text, /\bservice\b/) && !matches(text, /\bweb\b|website|browser|frontend|dashboard|portal|\bui\b/));
   const authoritativeUiProduct = authoritativeFamily === "web-applications-saas"
     || authoritativeFamily === "commerce-payments"
-    || authoritativeFamily === "inventory-logistics"
-    || authoritativeFamily === "data-ai";
+    || authoritativeFamily === "inventory-logistics";
   if (platforms.api && explicitServiceOnly && !authoritativeUiProduct) platforms.web = false;
+  const dataServiceWithoutUi = matches(text, /\b(?:etl|data pipeline|data cleaning|batch processing|import[- ]export)\b/)
+    && !matches(text, /\b(?:dashboard|portal|web app|website|browser|frontend|\bui\b|ai|assistant|agent|rag|semantic|model|llm)\b/);
+  if (dataServiceWithoutUi) resetPlatforms("api");
 
   const capabilities: ProductCapabilities = {
     multiUser: matches(text, /multi[- ]user|team|staff|customer|employee|seller|admin/),

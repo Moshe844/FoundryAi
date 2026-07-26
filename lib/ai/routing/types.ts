@@ -64,6 +64,13 @@ export type RegisteredModel = {
   tierFit: Record<ModelTier, number>;
   /** Stable recency score used to avoid arbitrary catalogue-order tie breaking. */
   freshness: number;
+  /**
+   * Measured spend per call, once this model has been used. A real figure beats the cost class inferred
+   * from the model's name, which cannot tell two differently-priced frontier models apart.
+   */
+  observedCostUsdPerCall?: number;
+  /** How many recorded calls back this model's ratings. Zero means the ratings are still a prior. */
+  observations?: number;
   deprecated: boolean;
   lastVerifiedAt?: string;
   runtimeValidatedAt?: string;

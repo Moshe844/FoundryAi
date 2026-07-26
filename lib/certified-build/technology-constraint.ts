@@ -3,6 +3,7 @@ export type TechnologyConstraint =
   | { kind: "unsupported"; technology: string };
 
 const CERTIFIED: Array<[RegExp, string, string]> = [
+  [/\bnext\.?js\b[^.\n]{0,80}\b(?:ai application|ai-powered|rag|agentic|chat assistant|multimodal)\b|\b(?:ai application|ai-powered|rag|agentic|chat assistant|multimodal)\b[^.\n]{0,80}\bnext\.?js\b/i, "nextjs-ai-postgres", "Next.js AI product stack"],
   [/\b(?:plain|static|vanilla)\s+html\b|\bhtml\s*(?:\+|\/|,|and)\s*css\b/i, "static-web-vite", "Static HTML + CSS + JavaScript"],
   [/\bnext\.?js\b/i, "nextjs-typescript-postgres", "Next.js"],
   [/\breact\b[^.\n]{0,40}\bvite\b|\bvite\b[^.\n]{0,40}\breact\b/i, "react-vite-typescript", "React + Vite"],

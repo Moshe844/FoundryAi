@@ -11,6 +11,10 @@ import { planMission } from "@/lib/ai/mission/mission-planner";
 import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCompletionReuse, observableBrowserContractForTask, reportsCurrentBehaviorFailure, requiredDomFeaturesForTask, requiredVisibleTextsForTask, requiresFreshBehavioralAcceptance, requiresPolishedUiAcceptance, requiresPresentationLayerChange, requiresSubstantialUiAcceptance, type ObservableBrowserCapability } from "@/lib/ai/mission/requirement-contract";
 import { closeRequirementLedger, openRequirementLedger, type RequirementGate } from "@/lib/ai/mission/requirement-accounting";
 import { assessAttachments } from "@/lib/ai/mission/attachment-intake";
+import { recordStageOutcome } from "@/lib/ai/routing/telemetry";
+import { deriveMissionOutcome, formatMissionOutcome } from "@/lib/ai/mission/mission-outcome";
+import { recordedDecisions } from "@/lib/factory/execution-journal";
+import type { ModelTier as RoutingDecisionTier } from "@/lib/ai/model-router";
 import { verifyAgainstReferences, visualRepairInstruction } from "@/lib/ai/mission/visual-acceptance";
 import { summarizeFromJournal } from "@/lib/ai/mission/mission-summary";
 import { assessCompletion } from "@/lib/ai/mission/requirement-ledger";
@@ -810,7 +814,7 @@ async function emitModelSelection(execution: ExecutionContext, stage: string, se
   if (!selection) return;
   const alreadyEmitted = execution.timeline.some((event) => event.details?.stage === stage && event.details?.provider === selection.provider && event.details?.model === selection.model);
   if (alreadyEmitted) return;
-  await emitExecution(execution, "planning", "completed", `Model route selected for ${stage}`, {
+  await emitExecution(execution, "planning", "completed", "Model route selected", {
     internal: true,
     // A routing choice is a decision with a reason, and the spec requires that reason to be recorded.
     // Carrying it as `rationale` (not only inside details) is what puts it in the durable journal and
@@ -1149,6 +1153,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // complete implementation contract rather than a loose prompt. Creation therefore always opens a
   // Requirement Ledger: the brief carries every named feature, constraint and data requirement the user
   // signed off on, and none of them may quietly go missing on the way to "Done".
+  let requirementGateOutcome: RequirementGate["outcome"] | undefined;
   const requirementLedger = await openRequirementLedger({
     // The project is the mission thread here, so its id keys the ledger across execution windows.
     // execution.costScopeId identifies only this run and would start a fresh ledger every turn.
@@ -2356,11 +2361,27 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     });
     const carrier = { status, blocker, verification: result.verification, sessionSummary: result.sessionSummary };
     await applyRequirementGate(gate, execution, carrier);
+    requirementGateOutcome = gate.outcome;
     status = carrier.status;
     blocker = carrier.blocker;
     result.sessionSummary = carrier.sessionSummary;
   }
 
+  await reportMissionOutcome({
+    execution,
+    passed: status === "passed",
+    blocker,
+    requirementGate: requirementGateOutcome,
+    recovered: status === "passed" && result.verification.some((item) => item.result === "fail"),
+    warnings: result.sessionSummary?.flags ?? [],
+    result,
+  });
+  await recordMissionStageOutcomes({
+    projectId,
+    missionIds: requirementLedger?.plan.executionIds ?? [execution.costScopeId],
+    status,
+    execution,
+  });
   await applyJournalGroundedSummary({
     projectId,
     missionIds: requirementLedger?.plan.executionIds ?? [execution.costScopeId],
@@ -6314,6 +6335,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
   // tracked to a final status and the mission cannot report completion while any of them is unaccounted
   // for. This deliberately reuses requiresRequirementContract as the substantiality signal rather than
   // inventing a second notion of "big enough to track" that could disagree with the acceptance contract.
+  let requirementGateOutcome: RequirementGate["outcome"] | undefined;
   const requirementLedger = requiresRequirementContract && mutatingOutcomeRequired
     ? await openRequirementLedger({
       // Stable across turns so a continued specification finds the ledger the last window left.
@@ -8109,7 +8131,24 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       },
     });
     await applyRequirementGate(gate, execution, result);
+    requirementGateOutcome = gate.outcome;
   }
+  await reportMissionOutcome({
+    execution,
+    passed: result.status === "passed",
+    blocker: result.blocker,
+    requirementGate: requirementGateOutcome,
+    // A verification gate that failed and then finished passing is recovery that worked.
+    recovered: result.status === "passed" && result.verification.some((item) => item.result === "fail"),
+    warnings: result.sessionSummary?.flags ?? [],
+    result,
+  });
+  await recordMissionStageOutcomes({
+    projectId: execution.projectId,
+    missionIds: requirementLedger?.plan.executionIds ?? [execution.costScopeId],
+    status: result.status,
+    execution,
+  });
   await applyJournalGroundedSummary({
     projectId: execution.projectId,
     missionIds: requirementLedger?.plan.executionIds ?? [execution.costScopeId],
@@ -8179,6 +8218,107 @@ async function applyJournalGroundedSummary(input: {
     rationale: summary.outcome,
     details: { stage: "final summary", grounding: "execution-journal" },
   });
+}
+
+/**
+ * Records, per stage, whether that stage's work survived into the finished mission.
+ *
+ * Per-call cost tells you what a stage charged; only the mission's end tells you whether the charge
+ * bought anything. A cheap stage whose output was discarded and redone at a stronger tier cost more in
+ * total than the stronger call would have, and that is invisible until now.
+ *
+ * Derived from the routing decisions already journaled for this mission, so it reports what actually
+ * happened rather than a second guess at it.
+ */
+/**
+ * Reports which of the eight truthful outcome states this mission reached.
+ *
+ * The coarse passed/failed verdict stays exactly as it was — the client contract depends on it — but it
+ * no longer has to carry the whole meaning on its own. A mission that delivered four of five
+ * requirements and one that is waiting on a credential were both simply "failed"; now each says what it
+ * actually is, and the headline leads the session summary so the user reads the accurate thing first.
+ */
+async function reportMissionOutcome(input: {
+  execution: ExecutionContext;
+  passed: boolean;
+  blocker?: string;
+  requirementGate?: RequirementGate["outcome"];
+  recovered: boolean;
+  warnings: string[];
+  result: { sessionSummary?: FactorySessionSummary };
+}) {
+  const disposition = input.blocker ? assessAutonomousBlocker(input.blocker) : undefined;
+  const outcome = deriveMissionOutcome({
+    passed: input.passed,
+    blockerDisposition: disposition?.disposition,
+    // A platform or SDK that is simply absent here is a different answer from a credential the user can
+    // supply, and the user's next step differs accordingly.
+    environmentLimited: Boolean(input.blocker && /platform|operating system|emulator|device|sdk|xcode|macos|windows|linux/i.test(input.blocker)),
+    requirementGate: input.requirementGate === "satisfied" || input.requirementGate === "unproven" || input.requirementGate === "unmet" || input.requirementGate === "unchecked"
+      ? input.requirementGate
+      : undefined,
+    recovered: input.recovered,
+    warnings: input.warnings,
+  });
+
+  await emitExecution(input.execution, "summary", outcome.delivered ? "completed" : outcome.needsUser ? "warning" : "error", outcome.headline, {
+    tier: "decision",
+    rationale: outcome.headline,
+    details: { stage: "mission outcome", state: outcome.state, delivered: outcome.delivered, needsUser: outcome.needsUser },
+  });
+
+  input.result.sessionSummary = input.result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
+  input.result.sessionSummary.outcome = formatMissionOutcome(outcome, input.result.sessionSummary.outcome);
+  return outcome;
+}
+
+async function recordMissionStageOutcomes(input: {
+  projectId?: string;
+  missionIds: string[];
+  status: FactoryProjectResult["status"];
+  execution: ExecutionContext;
+}) {
+  if (!input.projectId) return;
+
+  try {
+    const decisions = await recordedDecisions(input.projectId, { missionIds: input.missionIds });
+    const routes = decisions.filter((decision) => decision.title.startsWith("Model route selected"));
+    if (!routes.length) return;
+
+    // A tier appearing after a weaker one for the same stage means the earlier attempt was not enough.
+    const strongestSeen = new Map<string, number>();
+    const rank: Record<string, number> = { fast: 1, builder: 2, architect: 3, "enterprise-architect": 4, "super-reasoning": 5 };
+
+    for (const route of routes) {
+      const stage = String(route.evidence[0] ?? "") || stageFromRationale(route.rationale);
+      const tier = String(route.rationale.match(/\(([a-z-]+)\)/)?.[1] ?? "");
+      const provider = String(route.rationale.match(/Routed \S+ to (\S+)/)?.[1] ?? "");
+      const model = String(route.rationale.match(/Routed \S+ to \S+ (\S+)/)?.[1] ?? "");
+      if (!tier || !provider || !model) continue;
+
+      const previous = strongestSeen.get(stage) ?? 0;
+      const escalated = previous > 0 && (rank[tier] ?? 0) > previous;
+      strongestSeen.set(stage, Math.max(previous, rank[tier] ?? 0));
+
+      await recordStageOutcome({
+        missionId: input.missionIds[input.missionIds.length - 1] ?? "unknown",
+        stage,
+        tier: tier as RoutingDecisionTier,
+        provider: provider as ProviderId,
+        model,
+        // Work only counts as contributing when the mission actually delivered.
+        contributed: input.status === "passed",
+        escalated,
+        quality: input.status === "passed" ? (escalated ? "superseded" : "accepted") : "discarded",
+      });
+    }
+  } catch {
+    // Telemetry is an observation of the mission, never a participant in it.
+  }
+}
+
+function stageFromRationale(rationale: string): string {
+  return rationale.match(/^Routed (\S+) to/)?.[1] ?? "unspecified";
 }
 
 async function applyRequirementGate(
@@ -10633,12 +10773,13 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
   };
   if (stack.id === "nextjs") {
     const usesPrisma = /\bprisma\b/i.test(`${selectedStack} ${requirementsText}`);
+    const isAiProduct = /\b(?:ai sdk|artificial intelligence|ai application|ai-powered|rag|agentic|chat assistant|multimodal)\b/i.test(`${selectedStack} ${requirementsText}`);
     const manifest = `${JSON.stringify({
       name: safeName,
       version: "0.1.0",
       private: true,
       scripts: { dev: "next dev", build: "next build", start: "next start", typecheck: "tsc --noEmit", test: "node --test" },
-      dependencies: { next: "^15.5.0", react: "^19.0.0", "react-dom": "^19.0.0", ...(usesPrisma ? { "@prisma/client": "^6.0.0" } : {}) },
+      dependencies: { next: "^15.5.0", react: "^19.0.0", "react-dom": "^19.0.0", ...(usesPrisma ? { "@prisma/client": "^6.0.0" } : {}), ...(isAiProduct ? { ai: "^5.0.0", "@ai-sdk/openai": "^2.0.0", "@ai-sdk/anthropic": "^2.0.0", "@ai-sdk/google": "^2.0.0", zod: "^4.0.0", pg: "^8.0.0", pgvector: "^0.2.0" } : {}) },
       devDependencies: { typescript: "^5.0.0", "@types/node": "^20.0.0", "@types/react": "^19.0.0", "@types/react-dom": "^19.0.0", tailwindcss: "^3.4.0", postcss: "^8.0.0", autoprefixer: "^10.0.0", ...(usesPrisma ? { prisma: "^6.0.0" } : {}) },
     }, null, 2)}\n`;
     const tsconfig = `${JSON.stringify({
@@ -10662,6 +10803,13 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
     await writeMissing("tailwind.config.ts", `import type { Config } from "tailwindcss";\n\nconst config: Config = {\n  content: ["./src/**/*.{js,ts,jsx,tsx,mdx}"],\n  theme: { extend: {} },\n  plugins: [],\n};\n\nexport default config;\n`);
     await writeMissing("postcss.config.mjs", `const config = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n\nexport default config;\n`);
     await writeMissing("src/app/globals.css", "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n* { box-sizing: border-box; }\nbody { margin: 0; font-family: system-ui, sans-serif; }\n");
+    if (isAiProduct) {
+      await writeMissing("src/lib/ai/provider.ts", `import { createOpenAI } from "@ai-sdk/openai";\nimport { createAnthropic } from "@ai-sdk/anthropic";\nimport { createGoogleGenerativeAI } from "@ai-sdk/google";\n\nexport function configuredModel() {\n  if (process.env.OPENAI_API_KEY) return createOpenAI({ apiKey: process.env.OPENAI_API_KEY })(process.env.AI_MODEL || "gpt-4.1-mini");\n  if (process.env.ANTHROPIC_API_KEY) return createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY })(process.env.AI_MODEL || "claude-sonnet-4-5");\n  if (process.env.GOOGLE_GENERATIVE_AI_API_KEY) return createGoogleGenerativeAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY })(process.env.AI_MODEL || "gemini-2.5-flash");\n  throw new Error("Configure one supported server-side model provider credential.");\n}\n`);
+      await writeMissing("src/lib/ai/retrieval.ts", `export type RetrievedContext = { id: string; content: string; score: number };\n\nexport async function retrieveContext(_query: string): Promise<RetrievedContext[]> {\n  // Product implementation replaces this boundary with parameterized pgvector similarity search.\n  return [];\n}\n`);
+      await writeMissing("src/lib/ai/evaluation.ts", `export type EvaluationResult = { passed: boolean; score: number; reasons: string[] };\n\nexport function evaluateAnswer(answer: string): EvaluationResult {\n  const complete = answer.trim().length > 0;\n  return { passed: complete, score: complete ? 1 : 0, reasons: complete ? [] : ["The model returned an empty answer."] };\n}\n`);
+      await writeMissing("src/app/api/ai/route.ts", `import { streamText } from "ai";\nimport { configuredModel } from "@/lib/ai/provider";\nimport { retrieveContext } from "@/lib/ai/retrieval";\n\nexport async function POST(request: Request) {\n  const body = await request.json() as { prompt?: string };\n  const prompt = body.prompt?.trim();\n  if (!prompt) return Response.json({ error: "A prompt is required." }, { status: 400 });\n  const context = await retrieveContext(prompt);\n  const result = streamText({ model: configuredModel(), system: "Use supplied context when relevant. Never invent unavailable evidence.", prompt: \`Context:\\n\${context.map(item => item.content).join("\\n\\n")}\\n\\nUser:\\n\${prompt}\` });\n  return result.toTextStreamResponse();\n}\n`);
+      await writeMissing(".env.example", "OPENAI_API_KEY=\n# ANTHROPIC_API_KEY=\n# GOOGLE_GENERATIVE_AI_API_KEY=\nAI_MODEL=\nDATABASE_URL=postgresql://user:password@localhost:5432/app\n");
+    }
     return finish("Created verified Next.js project scaffold", "The selected stack requires a manifest, typed configuration, a configured Tailwind/PostCSS pipeline, and a renderable App Router entry before product implementation begins.");
   }
   if (stack.id === "react") {
