@@ -11,7 +11,6 @@ export async function POST(request: Request) {
       projectSnapshot?: string;
       provider?: ProviderId;
       tier?: ModelTier;
-      allowCompatibilityFallback?: boolean;
     };
     if (!body.request?.task || !body.request?.brief) {
       return NextResponse.json({ error: "A complete existing-project request is required." }, { status: 400 });
@@ -25,7 +24,6 @@ export async function POST(request: Request) {
       provider: body.provider,
       tier: body.tier,
       signal: request.signal,
-      allowCompatibilityFallback: body.allowCompatibilityFallback,
     });
     return NextResponse.json(execution);
   } catch (error) {
