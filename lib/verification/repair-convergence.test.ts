@@ -3,68 +3,53 @@ import { describe, expect, it } from "vitest";
 import { describeRepairSequence, shouldContinueRepair, type RepairAttempt } from "./repair-convergence";
 
 const attempt = (fingerprint: string, changedFiles = 2): RepairAttempt => ({ fingerprint, changedFiles });
-
 const verdict = (attempts: RepairAttempt[], currentFingerprint: string, maxAttempts = 4) =>
   shouldContinueRepair({ attempts, currentFingerprint, maxAttempts });
 
-describe("keep going while repairs are landing", () => {
-  it("attempts a repair the first time the build fails", () => {
+describe("autonomous deterministic repair", () => {
+  it("starts a repair when a concrete check first fails", () => {
     const result = verdict([], "type-error-a");
     expect(result.proceed).toBe(true);
-    expect(result.reason).toContain("no repair has been attempted yet");
+    expect(result.reason).toContain("concrete problem");
   });
 
-  it("continues when the failure moved on", () => {
-    // A different error each pass means the edits are reaching real causes. One attempt per batch was
-    // never enough — every live run died on a different type error, none of them retried.
+  it("continues when the diagnostic moves", () => {
     const result = verdict([attempt("type-error-a")], "type-error-b");
     expect(result.proceed).toBe(true);
-    expect(result.reason).toContain("repairs are landing");
+    expect(result.reason).toContain("new diagnostic");
   });
 
-  it("keeps going across several distinct failures", () => {
-    const attempts = [attempt("a"), attempt("b"), attempt("c")];
-    expect(verdict(attempts, "d", 6).proceed).toBe(true);
-  });
-});
-
-describe("stop when another attempt would repeat the last", () => {
-  it("stops when the repair wrote nothing", () => {
+  it("switches approach when the prior strategy wrote nothing", () => {
     const result = verdict([attempt("type-error-a", 0)], "type-error-a");
-    expect(result.proceed).toBe(false);
-    expect(result.reason).toContain("changed no files");
+    expect(result.proceed).toBe(true);
+    expect(result.reason).toContain("switching approaches");
+    expect(result.reason).toContain("file named by the diagnostic");
   });
 
-  it("stops when files changed but the failure is identical", () => {
-    // The edit missed the cause. Buying the same evidence again is the retry loop being avoided.
+  it("changes strategy when an edit leaves the identical failure", () => {
     const result = verdict([attempt("type-error-a", 3)], "type-error-a");
-    expect(result.proceed).toBe(false);
-    expect(result.reason).toContain("left the identical failure");
+    expect(result.proceed).toBe(true);
+    expect(result.reason).toContain("changing the repair strategy");
   });
 
-  it("stops at the attempt ceiling even while progress continues", () => {
+  it("stops only at the bounded attempt ceiling", () => {
     const attempts = [attempt("a"), attempt("b"), attempt("c"), attempt("d")];
     const result = verdict(attempts, "e", 4);
     expect(result.proceed).toBe(false);
-    expect(result.reason).toContain("4 repair attempts");
-  });
-
-  it("prefers the ceiling over the sameness reason when both apply", () => {
-    // The clearest reason wins: a mission that used its whole allowance should say so.
-    const attempts = [attempt("a"), attempt("a")];
-    expect(verdict(attempts, "a", 2).reason).toContain("2 repair attempts");
+    expect(result.reason).toContain("4 different bounded repairs");
+    expect(result.reason).toContain("diagnostic is preserved");
   });
 });
 
-describe("accounting for the record", () => {
-  it("distinguishes real headway from spinning", () => {
+describe("user-readable repair accounting", () => {
+  it("describes progress without internal retry jargon", () => {
     expect(describeRepairSequence([attempt("a"), attempt("b"), attempt("c")]))
-      .toBe("3 repair attempts, 3 of which changed files, against 3 distinct failures.");
-    expect(describeRepairSequence([attempt("a"), attempt("a"), attempt("a", 0)]))
-      .toBe("3 repair attempts, 2 of which changed files, against 1 distinct failure.");
+      .toBe("Foundry tried 3 bounded repair approaches; 3 changed source and the checks exposed 3 different diagnostics.");
+    expect(describeRepairSequence([attempt("a", 0)]))
+      .toBe("The first strategy made no source change, so Foundry switched approaches.");
   });
 
-  it("says plainly when nothing was tried", () => {
-    expect(describeRepairSequence([])).toBe("No repair was attempted.");
+  it("says plainly when no repair was needed", () => {
+    expect(describeRepairSequence([])).toBe("No repair was needed yet.");
   });
 });
