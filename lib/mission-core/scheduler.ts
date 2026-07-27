@@ -1,5 +1,6 @@
 import type { MissionRecord, OperationResult, PlannedOperation } from "./model";
 import { allOperationsSettled, readyOperations, validateOperationPlan } from "./operation-plan";
+import type { PermissionCoordinator } from "./permission-coordinator";
 
 export type OperationExecutionResult = {
   status: "succeeded" | "failed" | "awaiting_approval" | "skipped";
@@ -24,12 +25,34 @@ export type SchedulerTickResult = {
 };
 
 export class ExecutionScheduler {
-  constructor(private readonly executor: OperationExecutor) {}
+  constructor(
+    private readonly executor: OperationExecutor,
+    private readonly permissions?: PermissionCoordinator,
+  ) {}
 
   async tick(mission: MissionRecord, signal?: AbortSignal): Promise<SchedulerTickResult> {
     validateOperationPlan(mission.operations);
     const next = readyOperations(mission.operations)[0];
     if (!next) return { mission, progressed: false, waiting: !allOperationsSettled(mission.operations) };
+
+    const onceApproved = mission.approvals.some((request) => request.operationId === next.id && request.status === "approved" && request.selectedScope === "once");
+    if (this.permissions && !onceApproved) {
+      const authorization = await this.permissions.authorize(mission, next, categoryForOperation(next));
+      if (!authorization.allowed) {
+        const now = new Date().toISOString();
+        const alreadyPending = mission.approvals.some((request) => request.id === authorization.request.id && request.status === "pending");
+        const waitingMission = replaceOperation(mission, next.id, { ...next, status: "awaiting_approval", updatedAt: now });
+        const withApproval = {
+          ...waitingMission,
+          approvals: alreadyPending ? waitingMission.approvals : [...waitingMission.approvals, authorization.request],
+        };
+        return {
+          mission: increment(withApproval, next, "awaiting_approval", authorization.request.reason),
+          progressed: !alreadyPending,
+          waiting: true,
+        };
+      }
+    }
 
     if (next.attempt >= next.maxAttempts) {
       const exhausted = replaceOperation(mission, next.id, {
@@ -90,6 +113,17 @@ export class ExecutionScheduler {
       waiting: result.status === "awaiting_approval",
     };
   }
+}
+
+export function categoryForOperation(operation: PlannedOperation): string {
+  if (operation.kind === "delete_file") return "deletes";
+  if (operation.kind === "write_file" || operation.kind === "patch_file") return operation.target?.match(/(^|\/)\.env(\.|$)/i) ? "environment-changes" : "writes";
+  if (operation.kind === "run_command" || operation.kind === "start_process" || operation.kind === "stop_process") {
+    if (/\b(?:npm|pnpm|yarn|bun|pip|poetry|cargo|dotnet)\s+(?:install|add|i|restore)\b/i.test(operation.command ?? "")) return "dependencies";
+    return "commands";
+  }
+  if (operation.kind === "browser_action") return "browser";
+  return "safe";
 }
 
 function increment(mission: MissionRecord, operation: PlannedOperation, status: string, summary: string): MissionRecord {
