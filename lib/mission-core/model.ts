@@ -43,6 +43,35 @@ export type MissionRequirement = {
   evidenceIds: string[];
 };
 
+export type OperationInput = {
+  content?: string;
+  patch?: string;
+  cwd?: string;
+  approvedCommands?: string[];
+  approvedCategories?: string[];
+  standingApprovedCommands?: string[];
+  browser?: {
+    url: string;
+    actions?: Array<{ action: string; selector?: string; value?: string; text?: string; key?: string; ms?: number; exact?: boolean; expected?: number }>;
+    viewport?: { width: number; height: number };
+    screenshotName?: string;
+    baselineScreenshot?: string;
+  };
+  metadata?: Record<string, unknown>;
+};
+
+export type OperationResult = {
+  summary: string;
+  evidence: string[];
+  output?: string;
+  error?: string;
+  exitCode?: number | null;
+  durationMs?: number;
+  contentHash?: string;
+  changed?: boolean;
+  completedAt: string;
+};
+
 export type PlannedOperation = {
   id: string;
   missionId: string;
@@ -50,6 +79,8 @@ export type PlannedOperation = {
   title: string;
   target?: string;
   command?: string;
+  input?: OperationInput;
+  result?: OperationResult;
   dependsOn: string[];
   requirementIds: string[];
   risk: "safe" | "development" | "modification" | "high_risk";
