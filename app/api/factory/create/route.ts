@@ -178,6 +178,7 @@ export async function POST(request: Request) {
               const normalizedEvent: FactoryExecutionEvent = changedPaths.length
                 ? {
                     ...event,
+                    title: /changed|updated|saved|written/i.test(event.title) ? `${changedPaths.length} files saved in this step` : event.title,
                     details: {
                       ...event.details,
                       changedFilesThisStep: changedPaths.length,
@@ -215,6 +216,19 @@ export async function POST(request: Request) {
           )
             .then(async (result) => {
               const recoveredResult = await recoverFalseRoot404(result, emit);
+              emit({
+                id: "project-file-inventory",
+                timestamp: new Date().toISOString(),
+                kind: "inspection",
+                status: "completed",
+                title: `${recoveredResult.files.length} files currently in the project · ${observedProjectFiles.size} changed during this mission`,
+                details: {
+                  projectFileCount: recoveredResult.files.length,
+                  missionChangedFileCount: observedProjectFiles.size,
+                  projectFilePaths: recoveredResult.files.map((file) => file.path),
+                  countScope: "authoritative-final-inventory",
+                },
+              });
               completeExecution(body.controlId, recoveredResult);
               send({ type: "result", result: recoveredResult });
               if (!disconnected) controller.close();
