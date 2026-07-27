@@ -6,6 +6,8 @@ import { clearFailedCommand, commandRepeatKey, createCommandRepeatState, evaluat
 import { createWriteScope, evaluateWrite, type WriteScope } from "@/lib/ai/mission/write-scope";
 import { guidanceForRejectedWrite } from "@/lib/ai/mission/rejected-write-strategy";
 import { forcedToolAfterTruncation, guidanceForTruncatedWrite } from "@/lib/ai/mission/truncated-write-recovery";
+import { inBatchCorrectnessGate, inBatchRepairNote, shouldRepairInBatch, type InBatchCheck } from "@/lib/verification/in-batch-typecheck";
+import { normalizeVerificationEvidence } from "@/lib/factory/recovery-policy";
 import { approvalScopeLabel, type CommandApprovalScope } from "@/lib/ai/mission/command-permissions";
 import { isEmptySourceWrite } from "@/lib/ai/mission/write-verification";
 import type { ManagedToolCall, NeutralContentPart, NeutralMessage, NeutralTool, ProviderId } from "@/lib/ai/providers/types";
@@ -934,6 +936,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   // Commands are guarded the same way writes already were: a failed command may not be reissued
   // unchanged until the project has actually changed.
   const commandRepeatState = createCommandRepeatState();
+  // Correctness failures corrected inside this batch, so the same one is never handed back twice.
+  const inBatchChecks: InBatchCheck[] = [];
+  const inBatchGate = inBatchCorrectnessGate(input.verificationProfile);
   // The accepted follow-up resolution already tells the model "modify only these files". Deriving the
   // scope here makes that a boundary rather than a request: relevantFiles is populated only when the
   // resolver judged the request bounded (a clarify or open-ended resolution leaves it empty), so its
@@ -2000,10 +2005,53 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
               generatedWriteCounts.set(key, (generatedWriteCounts.get(key) ?? 0) + 1);
             });
             if (input.newProject && call.name === "write_files") {
+              // Check the source before ending the batch. Ending first meant a batch could hand ten
+              // files carrying eight independent errors to a repair loop that then fixed them one paid
+              // call at a time, having lost all the context that made them cheap to fix.
+              if (inBatchGate && input.access.runCommand) {
+                const check = await input.access.runCommand(inBatchGate.command, "", {
+                  approvedCommands: input.preApprovedCommands,
+                  approvedCategories: input.approvedCategories,
+                  standingApprovedCommands: input.standingApprovedCommands,
+                });
+                if (!check.skipped && check.exitCode !== 0) {
+                  const diagnostic = `${check.stderr}\n${check.stdout}`.trim().slice(0, 6_000);
+                  const fingerprint = normalizeVerificationEvidence(diagnostic);
+                  const verdict = shouldRepairInBatch({ checks: inBatchChecks, currentFingerprint: fingerprint, maxChecks: 3 });
+
+                  if (verdict.repairInBatch) {
+                    inBatchChecks.push({ fingerprint, addressed: false });
+                    await emit("inspection", "warning", `The files just written do not pass ${inBatchGate.stage} — correcting them now`, {
+                      tier: "finding",
+                      rationale: verdict.reason,
+                      details: { stage: inBatchGate.stage, command: inBatchGate.command, correction: inBatchChecks.length },
+                    });
+                    (toolResult as Record<string, unknown>).note = inBatchRepairNote({
+                      command: inBatchGate.command,
+                      diagnostic,
+                      attempt: inBatchChecks.length,
+                    });
+                    // Deliberately no return: the batch continues so the model repairs its own work on
+                    // the next turn, while the files are still what it was thinking about.
+                    lastFailedWriteSignature = "";
+                    repeatedWriteFailures = 0;
+                    toolResultParts.push({ type: "tool_result", toolUseId: callId, content: JSON.stringify(toolResult) });
+                    continue;
+                  }
+
+                  await emit("inspection", "warning", "Handing the remaining failure to the mission's repair stages", {
+                    internal: true,
+                    tier: "flag",
+                    rationale: verdict.reason,
+                    details: { stage: inBatchGate.stage, corrections: inBatchChecks.length },
+                  });
+                }
+              }
+
               const reason = "SOURCE_BATCH_READY_FOR_DETERMINISTIC_VERIFICATION: The coordinated source batch is on disk. Run the stack's required compile, lint, tests, and build before requesting another generated batch.";
               await emit("planning", "completed", "Source batch ready for deterministic verification", {
                 internal: true,
-                details: { reason, changedFiles: generatedMutationPaths, paidModelCallsBeforeVerification: paidModelCallsThisBatch },
+                details: { reason, changedFiles: generatedMutationPaths, paidModelCallsBeforeVerification: paidModelCallsThisBatch, inBatchCorrections: inBatchChecks.length },
               });
               return finalize("failed", reason, turn);
             }

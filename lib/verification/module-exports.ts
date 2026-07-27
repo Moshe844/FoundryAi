@@ -90,7 +90,10 @@ export function missingExports(diagnostic: string): MissingExport[] {
     found.set(`${match[2]}::${match[1]}`, { symbol: match[1], module: match[2] });
   }
 
-  const typescript = /error\s+TS2305:\s*Module\s+'"?([^'"]+)"?'\s*has no exported member\s*'([^']+)'/g;
+  // Next.js reformats tsc's output as "Type error: …" and drops the TS2305 code, so requiring the code
+  // missed it entirely — observed live, a build died on `Module '"./types"' has no exported member
+  // 'Role'` and the repair never received the targeted instruction. The code is optional here.
+  const typescript = /Module\s+'"?([^'"]+)"?'\s*has no exported member\s*'([^']+)'/g;
   for (const match of diagnostic.matchAll(typescript)) {
     found.set(`${match[1]}::${match[2]}`, { symbol: match[2], module: match[1] });
   }

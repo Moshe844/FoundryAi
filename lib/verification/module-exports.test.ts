@@ -73,6 +73,13 @@ describe("reading the mismatch back out of a failed build", () => {
     ]);
   });
 
+  it("reads Next.js's reformatted phrasing, which drops the TS code", () => {
+    // Observed live: a build died on this exact line and the repair never got a targeted instruction,
+    // because the matcher required the TS2305 code that Next.js strips.
+    const diagnostic = `Failed to compile. Type error: Module '"./types"' has no exported member 'Role'.`;
+    expect(missingExports(diagnostic)).toEqual([{ symbol: "Role", module: "./types" }]);
+  });
+
   it("reads TypeScript's phrasing", () => {
     const diagnostic = `__tests__/auth.test.ts(2,40): error TS2305: Module '"@/lib/auth"' has no exported member 'signToken'.`;
     expect(missingExports(diagnostic)).toEqual([{ symbol: "signToken", module: "@/lib/auth" }]);

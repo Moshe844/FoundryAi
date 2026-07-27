@@ -13,6 +13,7 @@ import { extractAtomicUserRequirements, isUserFacingUiOutcome, mayAttemptPriorCo
 import { closeRequirementLedger, openRequirementLedger, unbuiltRequirements, type RequirementGate } from "@/lib/ai/mission/requirement-accounting";
 import { assessAttachments } from "@/lib/ai/mission/attachment-intake";
 import { recordStageOutcome } from "@/lib/ai/routing/telemetry";
+import { tierForRequirementScale } from "@/lib/ai/routing/requirement-scale";
 import { deriveMissionOutcome, formatMissionOutcome } from "@/lib/ai/mission/mission-outcome";
 import { decideContinuation } from "@/lib/ai/mission/continuation-authority";
 import { DEFAULT_ROUTING_BUDGET, routingBudgetSnapshot } from "@/lib/ai/routing/cost-guard";
@@ -35,6 +36,8 @@ import { deterministicCompilerSourceRepair } from "@/lib/verification/determinis
 import { planDependencyRepair } from "@/lib/verification/deterministic-dependency-repair";
 import { missingModuleImports, resolveProjectModulePath } from "@/lib/verification/missing-module-diagnostic";
 import { describeModuleExports, exportedSymbols, missingExportInstruction, missingExports } from "@/lib/verification/module-exports";
+import { describeRepairSequence, shouldContinueRepair, type RepairAttempt } from "@/lib/verification/repair-convergence";
+import { inBatchCorrectnessGate } from "@/lib/verification/in-batch-typecheck";
 import { hasDisposableFrameworkAssetFailure } from "@/lib/verification/browser-infrastructure";
 import type { VerificationProfile } from "@/lib/verification/types";
 import { assessMissionComplexity, shouldRunArchitectureReview, shouldRunVerify, tierForStage } from "@/lib/ai/mission/orchestration";
@@ -922,6 +925,9 @@ async function brieflyAssessUnusedAttachments(input: {
   return intake.briefing;
 }
 
+/** How many outstanding requirements one implementation batch takes on. */
+const IMPLEMENTATION_SLICE_SIZE = 3;
+
 async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitter, discovery?: StructuredDiscovery, modelMode: ModelMode = "auto", quality: MissionQualityLevel = DEFAULT_MISSION_QUALITY, signal?: AbortSignal, evidenceAttachments: EvidenceAttachments = []): Promise<FactoryProjectResult> {
   brief = redactSensitiveText(brief);
   discovery = discovery ? redactSensitiveData(discovery) : discovery;
@@ -1269,7 +1275,39 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // Establish the selected stack's minimum runnable contract before any model edit. edit_file
   // cannot create a missing manifest, and build/preview must never guess one later.
   await ensureRequestedStackScaffold(projectPath, stackProfile, spec.projectName, execution, events, spec.stack, task);
-  const implementationModel = await modelForMissionStage(task, modelMode, tierForCapability(creationStrategy, "implement", tierForCapability(creationStrategy, "generate", creationProfile.recommendedIntelligenceTier)), undefined, 0, creationAssessment) ?? initialModel!;
+
+  // Detected AFTER the scaffold exists — the stack's checks are read from the files it just wrote, and
+  // an earlier read found an empty folder and armed nothing. The executor needs this before
+  // implementation so a batch can check its own work while the files are still cheap to fix.
+  const creationVerificationProfile = await detectStackProfileAndEntriesForAccess(access)
+    .then((detected) => detected.verificationProfile)
+    .catch(() => undefined);
+  const inBatchGateCommand = inBatchCorrectnessGate(creationVerificationProfile)?.command;
+  await emitExecution(execution, "planning", "completed", inBatchGateCommand
+    ? `In-batch correctness gate armed: ${inBatchGateCommand}`
+    : "No in-batch correctness gate is available for this stack", {
+    internal: true,
+    tier: "decision",
+    rationale: inBatchGateCommand
+      ? `Each generated batch will run ${inBatchGateCommand} against its own files before the batch ends.`
+      : "This stack declares no fast typecheck or compile step, so generated batches are verified only after they finish.",
+    details: { stage: "in-batch verification", command: inBatchGateCommand, commands: creationVerificationProfile?.commands.length ?? 0 },
+  });
+  // The router picked a tier before the request had been read. The ledger has read it, so let its count
+  // correct an undercount — this is how a full application stops being written by the balanced tier and
+  // then spending its whole budget repairing what that produced.
+  const estimatedTier = tierForCapability(creationStrategy, "implement", tierForCapability(creationStrategy, "generate", creationProfile.recommendedIntelligenceTier));
+  const scaleRouting = tierForRequirementScale({ estimatedTier, requirementCount: requirementLedger?.requirementCount ?? 0 });
+  const implementationTier = tierWithinDepth(scaleRouting.tier, quality);
+  if (scaleRouting.raised) {
+    await emitExecution(execution, "planning", "completed", `Routing implementation at ${implementationTier} — this brief carries ${requirementLedger?.requirementCount} separate requirements`, {
+      internal: true,
+      tier: "decision",
+      rationale: scaleRouting.reason,
+      details: { stage: "implementation routing", from: estimatedTier, to: implementationTier, requirements: requirementLedger?.requirementCount },
+    });
+  }
+  const implementationModel = await modelForMissionStage(task, modelMode, implementationTier, undefined, 0, creationAssessment) ?? initialModel!;
   await emitModelSelection(execution, "implementation", implementationModel);
   await emitExecution(execution, "reasoning", "completed", "The plan is set. I’m building the first coherent working version now, then I’ll verify the result against the brief instead of stopping at file generation.");
   let result = await runMissionExecutor({
@@ -1279,6 +1317,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     checklist,
     costScopeId: execution.costScopeId,
     access,
+    verificationProfile: creationVerificationProfile,
     apiKey: implementationModel.apiKey,
     provider: implementationModel.provider,
     tier: implementationModel.tier,
@@ -1352,6 +1391,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       checklist: result.checklist,
       costScopeId: execution.costScopeId,
       access,
+      verificationProfile: creationVerificationProfile,
       apiKey: implementationModel.apiKey,
       provider: implementationModel.provider,
       tier: implementationModel.tier,
@@ -2193,7 +2233,13 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // Deterministic gates prove the code is valid. Only the Requirement Ledger knows whether the product
   // exists. So before acceptance begins, ask it — and keep implementing while it says work remains.
   if (requirementLedger && status !== "awaiting-approval" && status !== "awaiting-mock-approval" && !signal?.aborted) {
-    const implementationBatches = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 4);
+    // Batches are now slices, so the ceiling has to cover the whole ledger rather than a fixed few
+    // passes — otherwise building carefully would simply mean shipping less. It still ends: the loop
+    // stops the moment nothing is outstanding, and the ledger reports whatever it could not reach.
+    const implementationBatches = autonomousRepairStageLimit(
+      process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES,
+      Math.max(4, Math.ceil((requirementLedger.requirementCount || 0) / IMPLEMENTATION_SLICE_SIZE) + 2),
+    );
     for (let batch = 1; batch <= implementationBatches; batch += 1) {
       const outstanding = await unbuiltRequirements({
         opened: requirementLedger,
@@ -2203,6 +2249,14 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         provider: initialModel.provider,
       });
       if (!outstanding.length) break;
+
+      // Build a few features at a time, not all of them at once.
+      //
+      // Asking for nine features in one batch is what produced eight independent type errors in one
+      // batch, and repairing those cost far more than writing them carefully would have. A small slice
+      // is small enough for the in-batch typecheck to keep clean, and the loop simply runs again for
+      // the rest — the ledger already tracks what is left, so nothing is dropped by going slower.
+      const slice = outstanding.slice(0, IMPLEMENTATION_SLICE_SIZE);
 
       // Read from disk each pass: the previous batch's files are what this one must build on rather
       // than reproduce. Configuration and lockfiles are omitted — they are not what gets rewritten.
@@ -2223,10 +2277,10 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
           return read?.exists ? describeModuleExports(file, exportedSymbols(read.content)) : undefined;
         }))).filter((line): line is string => Boolean(line));
 
-      await emitExecution(execution, "reasoning", "completed", `${outstanding.length} requested feature${outstanding.length === 1 ? " has" : "s have"} no implementation yet. I’m building ${outstanding.length === 1 ? "it" : "them"} before verifying the finished experience.`, {
+      await emitExecution(execution, "reasoning", "completed", `${outstanding.length} requested feature${outstanding.length === 1 ? " has" : "s have"} no implementation yet. I’m building ${slice.length === outstanding.length ? (slice.length === 1 ? "it" : "them") : `${slice.length} of them now`} before verifying the finished experience.`, {
         tier: "decision",
-        rationale: `Deterministic gates passed on a project that does not yet implement: ${outstanding.join("; ")}.`,
-        details: { outstanding, batch, stage: "requirement-driven implementation" },
+        rationale: `Deterministic gates passed on a project that does not yet implement: ${outstanding.join("; ")}. This batch builds: ${slice.join("; ")}.`,
+        details: { outstanding, building: slice, batch, stage: "requirement-driven implementation" },
       });
 
       const featureBatch = await runMissionExecutor({
@@ -2235,9 +2289,10 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         // already exists, every batch restarts from the shared foundation: observed live, four
         // consecutive batches rewrote the same types/validation/auth/store modules and never reached
         // the routes that were actually 404ing. The file list is what turns repetition into progress.
-        task: `Continue this new project. It already has a working scaffold, configuration, and the source files listed below, and its production build passes.\n\nSource files that ALREADY EXIST — do not recreate, rewrite, or reorganise these:\n${existingSourceInventory.map((file) => `- ${file}`).join("\n") || "- (none yet)"}\n\nWhat those modules actually export. Import ONLY these names from them — if you need something else, add it to that module in the same batch rather than assuming it is already there:\n${moduleContracts.map((line) => `- ${line}`).join("\n") || "- (nothing yet)"}\n\nImplement these requested features, which have no implementation yet:\n${outstanding.map((item) => `- ${item}`).join("\n")}\n\nBuild the user-facing entry points these features need — the pages, routes and API handlers a person actually visits — using the existing modules above rather than rewriting them. A feature with no reachable route does not exist. Do not write placeholders, markers, or documentation in place of working code.\n\nOriginal project request:\n${task}`,
+        task: `Continue this new project. It already has a working scaffold, configuration, and the source files listed below, and its production build passes.\n\nSource files that ALREADY EXIST — do not recreate, rewrite, or reorganise these:\n${existingSourceInventory.map((file) => `- ${file}`).join("\n") || "- (none yet)"}\n\nWhat those modules actually export. Import ONLY these names from them — if you need something else, add it to that module in the same batch rather than assuming it is already there:\n${moduleContracts.map((line) => `- ${line}`).join("\n") || "- (nothing yet)"}\n\nImplement these requested features, which have no implementation yet:\n${slice.map((item) => `- ${item}`).join("\n")}\n\nBuild only these. ${outstanding.length > slice.length ? `${outstanding.length - slice.length} other requested feature${outstanding.length - slice.length === 1 ? " is" : "s are"} tracked separately and will be built in the next batch — do not start ${outstanding.length - slice.length === 1 ? "it" : "them"} here.` : ""}\n\nBuild the user-facing entry points these features need — the pages, routes and API handlers a person actually visits — using the existing modules above rather than rewriting them. A feature with no reachable route does not exist. Do not write placeholders, markers, or documentation in place of working code.\n\nOriginal project request:\n${task}`,
         missionContext: requirementLedger.missionContext,
         checklist: result.checklist,
+        verificationProfile: creationVerificationProfile,
         costScopeId: execution.costScopeId,
         access,
         apiKey: implementationModel.apiKey,
@@ -2271,10 +2326,32 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       // kept adding features on top of a broken build — observed live, the build failed on batch 3 and
       // every later batch, and the mission reached its browser gate with a project that could not
       // compile. The compiler-repair stage runs earlier in the mission, so it never sees these.
-      if (rebuild.exitCode !== 0) {
+      // Repair until the build is green, or until another attempt would repeat the last one.
+      //
+      // A single attempt was not enough. Live, every run since the routes started appearing died on an
+      // ordinary type error that one repair pass did not clear, and the mission carried on stacking
+      // features onto a project that could not compile. Repeating blindly is the opposite mistake, so
+      // the loop continues only while the failure keeps *changing* — that is what separates repairs
+      // that are landing from an attempt being bought twice.
+      // The ceiling was 4 and a live run hit it having made real headway on every attempt — four
+      // repairs, four distinct failures, still converging. The no-progress rule above is the real stop;
+      // this only bounds a run that keeps finding genuinely new errors.
+      const repairAttempts: RepairAttempt[] = [];
+      while (rebuild.exitCode !== 0 && !signal?.aborted) {
         const diagnostic = compilerDiagnosticOutput(rebuild);
+        const fingerprint = compilerFailureFingerprint(rebuild, projectPath);
 
-        // Free repairs first: an install the package manager can do, and the exact export mismatch the
+        const verdict = shouldContinueRepair({ attempts: repairAttempts, currentFingerprint: fingerprint, maxAttempts: 8 });
+        if (!verdict.proceed) {
+          await emitExecution(execution, "reasoning", "warning", "Stopping build repair — another attempt would repeat the last one", {
+            tier: "flag",
+            rationale: `${verdict.reason} ${describeRepairSequence(repairAttempts)}`,
+            details: { batch, stage: "post-batch build repair", attempts: repairAttempts.length },
+          });
+          break;
+        }
+
+        // Free repairs first: an install the package manager can do, and the export mismatch the
         // compiler already named. Neither needs a model.
         const dependencyPlan = planDependencyRepair({
           diagnostic,
@@ -2285,16 +2362,18 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         }
 
         const mismatch = missingExportInstruction(missingExports(diagnostic));
-        await emitExecution(execution, "reasoning", "completed", "That batch broke the build. I’m repairing it before adding anything else.", {
+        await emitExecution(execution, "reasoning", "completed", repairAttempts.length
+          ? `The build still fails after ${repairAttempts.length} repair${repairAttempts.length === 1 ? "" : "s"}, but the error moved. Continuing.`
+          : "That batch broke the build. I’m repairing it before adding anything else.", {
           tier: "decision",
           rationale: mismatch || summarizeCommandFailure(rebuild),
-          details: { batch, stage: "post-batch build repair" },
+          details: { batch, stage: "post-batch build repair", attempt: repairAttempts.length + 1 },
         });
 
         const buildFix = await runMissionExecutor({
           objective,
           task: `The production build fails after the last change. Repair exactly this failure and change nothing unrelated.${mismatch ? `\n\n${mismatch}` : ""}\n\nAuthoritative compiler output:\n${diagnostic}`,
-          checklist: [{ id: "feature-batch-build-repair", label: "Repair the production build", status: "pending" }],
+          checklist: [{ id: `feature-batch-build-repair-${repairAttempts.length + 1}`, label: "Repair the production build", status: "pending" }],
           costScopeId: execution.costScopeId,
           access,
           apiKey: implementationModel.apiKey,
@@ -2316,15 +2395,19 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         mergeExecutionTimeline(result.timeline, buildFix.timeline);
         result.usage.push(...buildFix.usage);
         result.turnsUsed += buildFix.turnsUsed;
+        repairAttempts.push({ fingerprint, changedFiles: buildFix.changedFiles.length });
 
         rebuild = await runCommand(projectPath, "npm.cmd", ["run", "build"], events, execution);
         result.commands.push(rebuild);
+      }
+
+      if (repairAttempts.length) {
         result.verification.push({
           check_type: "build",
           result: rebuild.exitCode === 0 ? "pass" : "fail",
           evidence: rebuild.exitCode === 0
-            ? "The production build was repaired after the feature batch that broke it."
-            : `The feature batch left the production build failing: ${summarizeCommandFailure(rebuild)}`,
+            ? `The production build was repaired after the feature batch that broke it. ${describeRepairSequence(repairAttempts)}`
+            : `The feature batch left the production build failing. ${describeRepairSequence(repairAttempts)} Latest: ${summarizeCommandFailure(rebuild)}`,
         });
       }
 
