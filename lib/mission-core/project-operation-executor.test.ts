@@ -6,10 +6,7 @@ import { ProjectOperationExecutor } from "./project-operation-executor";
 function operation(input: Partial<PlannedOperation> & Pick<PlannedOperation, "id" | "kind" | "title">): PlannedOperation {
   const now = "2026-07-27T12:00:00.000Z";
   return {
-    id: input.id,
     missionId: "m1",
-    kind: input.kind,
-    title: input.title,
     dependsOn: [],
     requirementIds: [],
     risk: "safe",
@@ -19,6 +16,9 @@ function operation(input: Partial<PlannedOperation> & Pick<PlannedOperation, "id
     createdAt: now,
     updatedAt: now,
     ...input,
+    id: input.id,
+    kind: input.kind,
+    title: input.title,
   };
 }
 
