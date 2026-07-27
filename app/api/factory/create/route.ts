@@ -1,8 +1,32 @@
+import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { createFactoryProject } from "@/lib/factory/runtime";
 import { completeExecution, failExecution, recordExecutionEvent, registerExecution } from "@/lib/factory/execution-control";
 import type { FactoryCreateRequest, FactoryExecutionEvent } from "@/lib/factory/types";
 import { stackManifest } from "@/lib/certified-build";
+
+/**
+ * One active build per normalized project request. The browser control id is intentionally not part
+ * of this key because a double click, reconnect, or duplicated submit creates a different control id
+ * while still representing the same paid work. Completed runs are removed so an intentional later
+ * rebuild remains possible.
+ */
+const activeCreationRequests = new Set<string>();
+
+function creationRequestFingerprint(body: Partial<FactoryCreateRequest>) {
+  return createHash("sha256").update(JSON.stringify({
+    brief: body.brief?.trim() ?? "",
+    discovery: body.discovery ?? null,
+    modelMode: body.modelMode ?? null,
+    quality: body.quality ?? null,
+    attachments: (body.evidenceAttachments ?? []).map((attachment) => ({
+      fileName: attachment.fileName,
+      mediaType: attachment.mediaType,
+      uploadStatus: attachment.uploadStatus,
+      bytes: attachment.dataUrl?.length ?? attachment.rawText?.length ?? 0,
+    })),
+  })).digest("hex");
+}
 
 export async function POST(request: Request) {
   try {
@@ -35,6 +59,15 @@ export async function POST(request: Request) {
       }
     }
 
+    const requestFingerprint = creationRequestFingerprint(body);
+    if (activeCreationRequests.has(requestFingerprint)) {
+      return NextResponse.json({
+        error: "This exact project build is already running. Foundry did not start or bill a duplicate execution.",
+        code: "DUPLICATE_BUILD_IN_PROGRESS",
+      }, { status: 409, headers: { "Retry-After": "5" } });
+    }
+    activeCreationRequests.add(requestFingerprint);
+
     if (url.searchParams.get("stream") === "1") {
       const encoder = new TextEncoder();
       const runtimeController = new AbortController();
@@ -48,12 +81,6 @@ export async function POST(request: Request) {
             if (!disconnected) controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
           };
 
-          // A single model call generating the first batch — or a long install/build — can legitimately
-          // emit no events for minutes. Without a keepalive the client's 150s inactivity watchdog kills
-          // the mission mid-work (observed: "Generating the first runnable source batch" → stopped at
-          // 150s). This heartbeat only signals the server is still alive and working; genuine hangs stay
-          // bounded by the per-operation server timeouts, and if the server process dies the heartbeat
-          // stops so the client watchdog still fires correctly. The client ignores unknown message types.
           heartbeat = setInterval(() => send({ type: "heartbeat", at: Date.now() }), 30_000);
 
           void createFactoryProject(
@@ -83,6 +110,7 @@ export async function POST(request: Request) {
               if (!disconnected) controller.close();
             })
             .finally(() => {
+              activeCreationRequests.delete(requestFingerprint);
               if (heartbeat) clearInterval(heartbeat);
               unregisterExecution();
             });
@@ -90,8 +118,8 @@ export async function POST(request: Request) {
         cancel() {
           disconnected = true;
           if (heartbeat) clearInterval(heartbeat);
-          // Reload/navigation disconnects only this stream subscriber. The
-          // build remains active until completion or an explicit Stop request.
+          // Disconnecting the browser does not start another execution and does not cancel the paid work.
+          // The existing execution remains recoverable by its control snapshot until completion or Stop.
         },
       });
 
@@ -103,8 +131,12 @@ export async function POST(request: Request) {
       });
     }
 
-    const result = await createFactoryProject(body.brief, undefined, body.discovery, body.modelMode, body.quality, undefined, body.evidenceAttachments ?? []);
-    return NextResponse.json(result);
+    try {
+      const result = await createFactoryProject(body.brief, undefined, body.discovery, body.modelMode, body.quality, undefined, body.evidenceAttachments ?? []);
+      return NextResponse.json(result);
+    } finally {
+      activeCreationRequests.delete(requestFingerprint);
+    }
   } catch (error) {
     return NextResponse.json(
       {
