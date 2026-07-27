@@ -13,10 +13,24 @@ import { useEffect, useState } from "react";
 export const SILENCE_AFTER_MS = 5_000;
 export const ATTENTION_AFTER_MS = 30_000;
 export const STALL_AFTER_MS = 180_000;
+const durableMissionEventName = "foundry:durable-mission";
 
-/** Seconds since `timestamp`, ticking once a second while `active`. */
+/**
+ * Seconds since `timestamp`, ticking once a second while `active`.
+ *
+ * This hook is also the Mission Canvas's durable revision subscription boundary. The canvas already
+ * calls it once per render, so listening here lets the canonical status selector re-read the latest
+ * server-owned mission state without adding another competing lifecycle store to the large canvas.
+ */
 export function useElapsedSince(timestamp: string | undefined, active: boolean): number {
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [, setDurableRevision] = useState(0);
+
+  useEffect(() => {
+    const handleDurableRevision = () => setDurableRevision((current) => current + 1);
+    window.addEventListener(durableMissionEventName, handleDurableRevision);
+    return () => window.removeEventListener(durableMissionEventName, handleDurableRevision);
+  }, []);
 
   useEffect(() => {
     if (!active || !timestamp) {
