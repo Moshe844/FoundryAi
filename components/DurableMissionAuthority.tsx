@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { DurableMissionClient } from "@/lib/mission-core/browser-client";
+import { registerAuthoritativeWorkspaceMission } from "@/lib/mission-core/browser-authority-registry";
 import type { ApprovalScope, MissionRecord } from "@/lib/mission-core/model";
 import { latestDurableMission } from "@/lib/mission-core/browser-projection";
 import {
@@ -58,6 +59,7 @@ export function DurableMissionAuthority({ children }: { children: ReactNode }) {
     const handleBinding = (event: Event) => {
       const detail = (event as CustomEvent<DurableMissionBindingEvent>).detail;
       if (!detail?.workspaceMissionId || !detail.mission) return;
+      registerAuthoritativeWorkspaceMission(detail.workspaceMissionId, detail.mission);
       setSnapshot((current) => bindWorkspaceMission(current, detail.workspaceMissionId, detail.mission));
     };
     window.addEventListener(durableMissionBindingEventName, handleBinding);
@@ -77,7 +79,10 @@ export function DurableMissionAuthority({ children }: { children: ReactNode }) {
           if (existing?.durableMissionId === binding.durableMissionId && existing.revision >= binding.revision) continue;
           try {
             const mission = await clientRef.current.get(binding.durableMissionId);
-            if (!cancelled) setSnapshot((current) => bindWorkspaceMission(current, binding.workspaceMissionId, mission));
+            if (!cancelled) {
+              registerAuthoritativeWorkspaceMission(binding.workspaceMissionId, mission);
+              setSnapshot((current) => bindWorkspaceMission(current, binding.workspaceMissionId, mission));
+            }
           } catch {
             // The mission may still be committing; the next discovery pass retries without changing UI state.
           }
@@ -101,15 +106,18 @@ export function DurableMissionAuthority({ children }: { children: ReactNode }) {
       // The in-memory server projection remains authoritative for this browser session.
     }
 
-    for (const binding of Object.values(snapshot.bindings)) {
+    for (const [workspaceMissionId, binding] of Object.entries(snapshot.bindings)) {
+      const currentMission = snapshot.missions[binding.durableMissionId];
+      if (currentMission) registerAuthoritativeWorkspaceMission(workspaceMissionId, currentMission);
       if (subscriptionsRef.current.has(binding.durableMissionId)) continue;
       const stop = clientRef.current.subscribe(binding.durableMissionId, (mission) => {
+        registerAuthoritativeWorkspaceMission(workspaceMissionId, mission);
         setSnapshot((current) => applyAuthoritativeMission(current, mission));
         window.dispatchEvent(new CustomEvent(durableMissionEventName, { detail: mission }));
       });
       subscriptionsRef.current.set(binding.durableMissionId, stop);
     }
-  }, [snapshot.bindings]);
+  }, [snapshot.bindings, snapshot.missions]);
 
   useEffect(() => () => {
     for (const stop of subscriptionsRef.current.values()) stop();
