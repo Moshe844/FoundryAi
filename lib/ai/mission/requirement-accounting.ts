@@ -2,6 +2,7 @@ import type { ModelTier } from "@/lib/ai/model-router";
 import { extractRequirements, type OpenQuestion } from "@/lib/ai/mission/requirement-extraction";
 import { isMultiPartRequest } from "@/lib/ai/mission/mission-planner";
 import {
+  activeRequirements,
   assessCompletion,
   createLedger,
   type LedgerRequirement,
@@ -11,6 +12,7 @@ import { loadRequirementLedger, saveRequirementLedger } from "@/lib/ai/mission/r
 import { buildStagePlan, formatStagePlanForModel, loadStagePlan, saveStagePlan, stagePlanProgress, type MissionStagePlan } from "@/lib/ai/mission/mission-stages";
 import { reconcileRequirements, type MissionEvidence } from "@/lib/ai/mission/requirement-reconciliation";
 import { journalDigest } from "@/lib/factory/execution-journal";
+import { hasProductImplementationEvidence } from "@/lib/factory/product-evidence";
 import type { ProviderId } from "@/lib/ai/providers/types";
 
 /**
@@ -245,8 +247,12 @@ export async function unbuiltRequirements(input: {
   provider?: ProviderId;
   workspaceId?: string;
   userId?: string;
+  requireProductImplementation?: boolean;
 }): Promise<string[]> {
   if (!input.opened.gating) return [];
+  if (input.requireProductImplementation && !hasProductImplementationEvidence(input.result.changedFiles)) {
+    return activeRequirementsForBuild(input.opened.ledger).map((requirement) => requirement.text);
+  }
 
   try {
     const reconciliation = await reconcileRequirements({
@@ -297,8 +303,19 @@ export async function closeRequirementLedger(input: {
   workspaceId?: string;
   userId?: string;
   tier?: ModelTier;
+  requireProductImplementation?: boolean;
 }): Promise<RequirementGate> {
   try {
+    if (input.requireProductImplementation && !hasProductImplementationEvidence(input.evidence.changedFiles)) {
+      const unattempted = activeRequirementsForBuild(input.opened.ledger);
+      return {
+        outcome: "unmet",
+        ledger: input.opened.ledger,
+        unattempted,
+        unrequested: [],
+        blocker: `No application source was created, so ${unattempted.length} requested item(s) remain unbuilt. Foundry must continue the same mission autonomously from the saved specification.`,
+      };
+    }
     const reconciliation = await reconcileRequirements({
       ledger: input.opened.ledger,
       request: input.request,
@@ -349,4 +366,9 @@ export async function closeRequirementLedger(input: {
   } catch {
     return { outcome: "unchecked", note: "Requirement-level completion could not be checked for this mission." };
   }
+}
+
+function activeRequirementsForBuild(ledger: RequirementLedger): LedgerRequirement[] {
+  return activeRequirements(ledger).filter((requirement) =>
+    requirement.kind === "deliverable" || requirement.kind === "constraint");
 }

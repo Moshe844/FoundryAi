@@ -1,5 +1,5 @@
 import { integrationCatalog } from "@/lib/integrations/catalog";
-import type { IntegrationDefinition } from "@/lib/integrations/types";
+import type { DetectedIntegration, IntegrationDefinition } from "@/lib/integrations/types";
 
 export type IntegrationRequirement = {
   id: string;
@@ -104,7 +104,40 @@ export function blockingIntegrationRequirements(requirements: IntegrationRequire
 export function deferredProductionIntegrationNames(requirements: IntegrationRequirement[]) {
   return [...new Set(requirements
     .filter((requirement) => !requirement.candidates.some((candidate) => candidate.executionKind === "hardware"))
-    .flatMap((requirement) => requirement.candidates.map((candidate) => candidate.name)))];
+    .map((requirement) => requirement.candidates.length === 1
+      ? requirement.candidates[0].name
+      : deferredCapabilityLabel(requirement)))];
+}
+
+function deferredCapabilityLabel(requirement: IntegrationRequirement): string {
+  const labels: Record<string, string> = {
+    "ai-provider": "Hosted AI provider",
+    authentication: "Production identity provider",
+    "cloud-platform": "Cloud hosting provider",
+    "hosted-database": "Production database",
+    monitoring: "Production monitoring",
+    payments: "Payment processor",
+    "push-notifications": "Push notification provider",
+    "source-control": "Source-control provider",
+    sms: "SMS provider",
+    "transactional-email": "Transactional email provider",
+  };
+  return labels[requirement.id] ?? `Production ${requirement.category.replace(/-/g, " ")}`;
+}
+
+/**
+ * A local build is blocked only by a real hardware dependency that cannot be exercised without the
+ * device/SDK. Software services are production connections: Foundry builds against a safe local
+ * substitute and exposes the provider connection after the product works.
+ */
+export function blockingDetectedIntegrationFailures(detected: DetectedIntegration[]) {
+  return detected
+    .filter((item) => item.required && item.used && item.definition.executionKind === "hardware")
+    .flatMap((item) => {
+      if (item.definition.maturity !== "adapter") return [`${item.definition.name} hardware is detected but has no executable verified adapter`];
+      if (item.missingEnvironment.length) return [`${item.definition.name} hardware is missing verified configuration: ${item.missingEnvironment.join(", ")}`];
+      return [];
+    });
 }
 
 /** Finds hardware providers backed by actual imported SDK/specification evidence. A workflow

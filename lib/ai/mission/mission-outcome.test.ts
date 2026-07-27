@@ -74,7 +74,10 @@ describe("a passing verdict is not the whole story", () => {
 describe("a failure says which kind of failure", () => {
   it("separates a missing credential from an engineering dead end", () => {
     expect(outcome({ passed: false, blockerDisposition: "external-dependency" }).state).toBe("blocked-by-missing-access");
-    expect(outcome({ passed: false, blockerDisposition: "recoverable-engineering" }).state).toBe("failed-after-recovery");
+    const engineeringFailure = outcome({ passed: false, blockerDisposition: "recoverable-engineering" });
+    expect(engineeringFailure.state).toBe("failed-after-recovery");
+    expect(engineeringFailure.headline).toContain("requested product is incomplete");
+    expect(engineeringFailure.headline).not.toContain("stronger model");
   });
 
   it("separates a machine that cannot run the work from a credential the user can supply", () => {

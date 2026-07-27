@@ -239,7 +239,7 @@ assert.match(runtime, /installing only that exact evidence before any repair mod
 assert.match(runtime, /browser preflight compiler identified/);
 assert.match(executor, /tools: pendingEvidenceRepairReadPath/);
 assert.match(runtime, /Compiler-authorized repair files/);
-assert.match(runtime, /strategyReset:\s*true/, "Repeated repair evidence must change strategy without presenting a terminal blocker.");
+assert.match(runtime, /Recorded unchanged browser evidence without buying another identical repair/, "Repeated browser evidence must not buy another identical repair.");
 assert.match(runtime, /applicationCompilerSourcePaths\(output, projectPath\)/, "Compiler working sets must route through the application-owned source filter and framework-contract mapper.");
 assert.match(runtime, /generatedVerificationProfile/);
 assert.match(runtime, /\$\{generatedVerificationProfile\.ecosystem\} verification passed after evidence-driven recovery/);

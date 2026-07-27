@@ -106,7 +106,7 @@ export function deriveMissionOutcome(signals: MissionOutcomeSignals): MissionOut
     // the detail line carries the defect, so the headline's job is to be accurate about the effort.
     return {
       state: "failed-after-recovery",
-      headline: "Foundry repaired, escalated to a stronger model, and re-verified until it ran out of approaches. What is still failing is below.",
+      headline: "The requested product is incomplete. Foundry preserved the verified work and listed every unresolved requirement below.",
       delivered: false,
       needsUser: false,
     };

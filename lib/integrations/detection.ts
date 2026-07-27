@@ -22,6 +22,22 @@ function manifestDependencies(files:ProjectEvidenceFile[]){const dependencies=ne
 function evidenceKind(path:string):DetectionEvidence["kind"]{if(/(?:dockerfile|compose\.ya?ml)$/i.test(path))return"docker";if(/(?:^|\/)(?:\.github\/workflows|\.gitlab-ci|azure-pipelines|Jenkinsfile|\.circleci)/i.test(path))return"ci";if(/(?:vercel|netlify|render|fly)\.(?:json|toml|ya?ml)$/i.test(path))return"deployment";if(/\.(?:tf|tfvars)$/i.test(path)||/(?:^|\/)(?:Chart\.yaml|kustomization\.yaml|pulumi\.)/i.test(path))return"infrastructure";if(/\.(?:log|out)$/i.test(path))return"runtime";return"config";}
 function genericDefinition(packageName:string,env:string[]):IntegrationDefinition{const id=`project-${slug(packageName)}`;return{id,name:packageName,category:"unknown",pack:"project",auth:env.length?"api-key":"none",authenticationMethods:env.length?["api-key"]:["none"],preferredAuthenticationMethod:env.length?"api-key":"none",fields:env.map(name=>({key:slug(name),label:name.replace(/_/g," "),env:[name],required:true,secret:/(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)/.test(name)})),packages:[packageName],imports:[packageName],sourcePatterns:env,configFiles:[],conventions:[],help:"Foundry detected a service that does not yet have a built-in setup guide.",deploymentMappings:Object.fromEntries(env.map(name=>[name,name])),troubleshooting:["Inspect the SDK initialization and project documentation.","Provide an optional safe test command that does not mutate provider data."],maturity:"metadata"};}
 
+function sourcePatternMatches(content: string, normalizedPath: string, pattern: string) {
+  const needle = pattern.trim();
+  if (!needle) return false;
+  const haystacks = [content, normalizedPath];
+  // Ecosystem metadata includes short provider names such as SES, SAP, S3, Ecto, npm, and Expo.
+  // Plain substring matching detected those inside ordinary application words like sessions,
+  // disappears, vector, and export. Treat simple names as tokens/path segments; keep exact substring
+  // matching for URLs, environment prefixes, and code-shaped patterns.
+  if (/^[A-Za-z0-9][A-Za-z0-9 ._/@+-]{0,31}$/.test(needle)) {
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+    const token = new RegExp(`(?:^|[^A-Za-z0-9])${escaped}(?=$|[^A-Za-z0-9])`, "i");
+    return haystacks.some((value) => token.test(value));
+  }
+  return haystacks.some((value) => value.toLowerCase().includes(needle.toLowerCase()));
+}
+
 export function detectProjectIntegrations(files: ProjectEvidenceFile[], environment: Record<string, string | undefined> = {}) {
   const usable = files.filter((file) => !ignored.test(file.path.replace(/\\/g, "/"))).slice(0, 5000);
   const dependencySources=manifestDependencies(usable);const dependencies=new Set(dependencySources.keys());
@@ -39,10 +55,10 @@ export function detectProjectIntegrations(files: ProjectEvidenceFile[], environm
     definition.packages.filter((value) => dependencies.has(value)).forEach((value) => {const source=dependencySources.get(value);evidence.push({ kind:source&&/(?:lock|pnpm|yarn)/i.test(source)?"lockfile":"dependency", value, path:source });});
     for (const file of usable) {
       const content = file.content || ""; const normalized = file.path.replace(/\\/g, "/");
-      definition.imports.filter((value) => content.includes(value)).forEach((value) => evidence.push({ kind:"import", value, path:normalized }));
-      definition.sourcePatterns.filter((value) => content.toLowerCase().includes(value.toLowerCase()) || normalized.toLowerCase().includes(value.toLowerCase())).forEach((value) => evidence.push({ kind:evidenceKind(normalized)==="runtime"?"runtime":"source", value, path:normalized }));
+      definition.imports.filter((value) => sourcePatternMatches(content, normalized, value)).forEach((value) => evidence.push({ kind:"import", value, path:normalized }));
+      definition.sourcePatterns.filter((value) => sourcePatternMatches(content, normalized, value)).forEach((value) => evidence.push({ kind:evidenceKind(normalized)==="runtime"?"runtime":"source", value, path:normalized }));
       definition.configFiles.filter((value) => normalized === value || normalized.endsWith(`/${value}`) || (value.startsWith(".")&&normalized.endsWith(value)) || normalized.startsWith(`${value}/`)).forEach((value) => evidence.push({ kind:evidenceKind(normalized), value, path:normalized }));
-      definition.conventions.filter((value) => content.includes(value)).forEach((value) => evidence.push({ kind:"convention", value, path:normalized }));
+      definition.conventions.filter((value) => sourcePatternMatches(content, normalized, value)).forEach((value) => evidence.push({ kind:"convention", value, path:normalized }));
     }
     const knownEnv = definition.fields.flatMap((field) => field.env);
     knownEnv.filter((name) => envReferences.has(name)).forEach((name) => evidence.push({ kind:"environment", value:name }));

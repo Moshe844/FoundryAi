@@ -82,11 +82,12 @@ import { isStaticSourceSeparationRequest, planStaticSourceSeparation, type Stati
 import { acceptanceWorkflowTemplate, parseAcceptanceWorkflowManifest, type AcceptanceWorkflowManifest } from "@/lib/verification/acceptance-workflow";
 import { projectIntegrationEnvironment } from "@/lib/integrations/runtime-environment";
 import { detectProjectIntegrations } from "@/lib/integrations/detection";
-import { blockingIntegrationRequirements, deferredProductionIntegrationNames, integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "@/lib/integrations/requirements";
+import { blockingDetectedIntegrationFailures, blockingIntegrationRequirements, deferredProductionIntegrationNames, integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "@/lib/integrations/requirements";
 import { isPreviewRestartRequest } from "@/lib/factory/preview-intent";
 import { attachedAssetPlacement, attachedAssetPublicPath } from "@/lib/factory/asset-placement";
 import { buildUploadIntakeMarker, uploadIntakeMarkerFile, uploadIntakeMarkerMatches } from "@/lib/factory/upload-intake";
 import { unityScaffoldFiles } from "@/lib/factory/unity-scaffold";
+import { browserRepairStrategy } from "@/lib/factory/browser-repair-strategy";
 
 type ApprovalResponse = FactoryExistingProjectRequest["approvalResponse"];
 type EvidenceAttachments = NonNullable<FactoryExistingProjectRequest["evidenceAttachments"]>;
@@ -689,7 +690,19 @@ function compactNewProjectChecklist(projectType: string): FactoryObjectiveCheckl
 }
 
 const projectsRoot = path.join(process.cwd(), "projects");
-type PreviewProcessRecord = { port: number; processId?: number; lastUsedAt: number; previewUrl: string; projectPath: string; kind: "static" | "app"; ownershipToken?: string; runtimeLog?: string; runtimeVersion?: string };
+type PreviewProcessRecord = {
+  port: number;
+  processId?: number;
+  lastUsedAt: number;
+  previewUrl: string;
+  projectPath: string;
+  kind: "static" | "app";
+  /** The URL passed its route-level readiness check, not merely that a process was spawned. */
+  verifiedReady?: boolean;
+  ownershipToken?: string;
+  runtimeLog?: string;
+  runtimeVersion?: string;
+};
 type PreviewStatusOutcome = { previewState: FactoryPreviewState; previewUrl?: string; previewReason?: string; previewPlatform?: FactoryPreviewPlatform };
 const previewProcessGlobal = globalThis as typeof globalThis & {
   __foundryPreviewProcesses?: Map<string, PreviewProcessRecord>;
@@ -1321,9 +1334,33 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   const implementationModel = await modelForMissionStage(task, modelMode, implementationTier, undefined, 0, creationAssessment) ?? initialModel!;
   await emitModelSelection(execution, "implementation", implementationModel);
   await emitExecution(execution, "reasoning", "completed", "The plan is set. I’m building the first coherent working version now, then I’ll verify the result against the brief instead of stopping at file generation.");
+  const ledgerBuildRequirements = requirementLedger?.ledger.requirements
+    .filter((requirement) =>
+      !requirement.supersededBy
+      && (requirement.kind === "deliverable" || requirement.kind === "constraint")
+      && !["verified", "excluded"].includes(requirement.status),
+    )
+    .map((requirement) => requirement.text) ?? [];
+  const deterministicBuildRequirements = [...new Set([
+    ...(discovery?.mainFeatures ?? []),
+    ...extractAtomicUserRequirements(task),
+  ])].filter(Boolean);
+  // Requirement extraction is a safeguard, not a single point of failure. If that model is
+  // unavailable, the explicit discovery features and atomic user clauses still stage the build;
+  // Foundry must never fall back from "complete application" to one oversized all-or-nothing call.
+  const initialBuildRequirements = ledgerBuildRequirements.length
+    ? ledgerBuildRequirements
+    : deterministicBuildRequirements;
+  const initialSlice = initialBuildRequirements.slice(0, IMPLEMENTATION_SLICE_SIZE);
+  let deterministicRequirementCursor = initialBuildRequirements.length > IMPLEMENTATION_SLICE_SIZE
+    ? initialSlice.length
+    : initialBuildRequirements.length;
+  const stagedInitialTask = initialBuildRequirements.length > IMPLEMENTATION_SLICE_SIZE
+    ? `Build the first coherent product slice for this new project now. Implement only these first ${initialSlice.length} requirements in one coordinated write_files action:\n${initialSlice.map((item) => `- ${item}`).join("\n")}\n\nThe same batch must create the reachable user-facing entry route/screens needed to use those requirements, connected state/domain behavior, safe local persistence or an adapter boundary, and meaningful tests. Do not create placeholder copy, setup-only files, or a page that merely says the foundation is ready. The remaining ${initialBuildRequirements.length - initialSlice.length} requirements stay in Foundry's ledger and will be implemented in subsequent batches before browser acceptance.\n\nAuthoritative full project request:\n${task}`
+    : task;
   let result = await runMissionExecutor({
     objective,
-    task,
+    task: stagedInitialTask,
     missionContext: requirementLedger?.missionContext,
     checklist,
     costScopeId: execution.costScopeId,
@@ -2243,22 +2280,25 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   //
   // Deterministic gates prove the code is valid. Only the Requirement Ledger knows whether the product
   // exists. So before acceptance begins, ask it — and keep implementing while it says work remains.
-  if (requirementLedger && status !== "awaiting-approval" && status !== "awaiting-mock-approval" && !signal?.aborted) {
+  if ((requirementLedger || deterministicBuildRequirements.length) && status !== "awaiting-approval" && status !== "awaiting-mock-approval" && !signal?.aborted) {
     // Batches are now slices, so the ceiling has to cover the whole ledger rather than a fixed few
     // passes — otherwise building carefully would simply mean shipping less. It still ends: the loop
     // stops the moment nothing is outstanding, and the ledger reports whatever it could not reach.
     const implementationBatches = autonomousRepairStageLimit(
       process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES,
-      Math.max(4, Math.ceil((requirementLedger.requirementCount || 0) / IMPLEMENTATION_SLICE_SIZE) + 2),
+      Math.max(4, Math.ceil((requirementLedger?.requirementCount ?? deterministicBuildRequirements.length) / IMPLEMENTATION_SLICE_SIZE) + 2),
     );
     for (let batch = 1; batch <= implementationBatches; batch += 1) {
-      const outstanding = await unbuiltRequirements({
-        opened: requirementLedger,
-        request: task,
-        result,
-        apiKey,
-        provider: initialModel.provider,
-      });
+      const outstanding = requirementLedger
+        ? await unbuiltRequirements({
+          opened: requirementLedger,
+          request: task,
+          result,
+          apiKey,
+          provider: initialModel.provider,
+          requireProductImplementation: true,
+        })
+        : deterministicBuildRequirements.slice(deterministicRequirementCursor);
       if (!outstanding.length) break;
 
       // Build a few features at a time, not all of them at once.
@@ -2301,7 +2341,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         // consecutive batches rewrote the same types/validation/auth/store modules and never reached
         // the routes that were actually 404ing. The file list is what turns repetition into progress.
         task: `Continue this new project. It already has a working scaffold, configuration, and the source files listed below, and its production build passes.\n\nSource files that ALREADY EXIST — do not recreate, rewrite, or reorganise these:\n${existingSourceInventory.map((file) => `- ${file}`).join("\n") || "- (none yet)"}\n\nWhat those modules actually export. Import ONLY these names from them — if you need something else, add it to that module in the same batch rather than assuming it is already there:\n${moduleContracts.map((line) => `- ${line}`).join("\n") || "- (nothing yet)"}\n\nImplement these requested features, which have no implementation yet:\n${slice.map((item) => `- ${item}`).join("\n")}\n\nBuild only these. ${outstanding.length > slice.length ? `${outstanding.length - slice.length} other requested feature${outstanding.length - slice.length === 1 ? " is" : "s are"} tracked separately and will be built in the next batch — do not start ${outstanding.length - slice.length === 1 ? "it" : "them"} here.` : ""}\n\nBuild the user-facing entry points these features need — the pages, routes and API handlers a person actually visits — using the existing modules above rather than rewriting them. A feature with no reachable route does not exist. Do not write placeholders, markers, or documentation in place of working code.\n\nOriginal project request:\n${task}`,
-        missionContext: requirementLedger.missionContext,
+        missionContext: requirementLedger?.missionContext,
         checklist: result.checklist,
         verificationProfile: creationVerificationProfile,
         costScopeId: execution.costScopeId,
@@ -2329,6 +2369,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
 
       // A batch that wrote nothing will not write anything next time either; stop rather than pay again.
       if (!featureBatch.changedFiles.length) break;
+      if (!requirementLedger) deterministicRequirementCursor += slice.length;
 
       let rebuild = await runCommand(projectPath, "npm.cmd", ["run", "build"], events, execution);
       result.commands.push(rebuild);
@@ -2561,20 +2602,24 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         if (browserEvidence.verified) break;
         const repeatedFingerprint = semanticRepairFingerprint(browserEvidence.evidence, sourceFingerprint);
         if (attemptedBrowserRepairFingerprints.has(repeatedFingerprint)) {
-          attemptedBrowserRepairFingerprints.clear();
-          await emitExecution(execution, "planning", "warning", "Changing generated-project repair strategy after unchanged source and evidence", {
+          browserGateAttempts.push({ fingerprint: repeatedFingerprint, changedFiles: 0, escalated: escalateBrowserRepair });
+          await emitExecution(execution, "planning", "warning", "Recorded unchanged generated-project evidence without buying another identical repair", {
             internal: true,
-            details: { evidenceFingerprint: repeatedFingerprint, sourceFingerprint, strategyReset: true, terminal: false, repairAttempt },
+            details: { evidenceFingerprint: repeatedFingerprint, sourceFingerprint, paidCallPrevented: true, terminal: false, repairAttempt },
           });
           continue;
         }
         continue;
       }
       attemptedBrowserRepairFingerprints.add(evidenceFingerprint);
-      await emitExecution(execution, "reasoning", "completed", repairAttempt === 1
-        ? "The rendered project exposed concrete browser failures. I’m repairing all verified evidence, rebuilding, restarting its owned preview, and running the same checks again."
-        : `The generated project still has verified browser failures after repair ${repairAttempt - 1}. I’m continuing from the changed source with the remaining evidence.`, { internal: true });
       const staticBrowserRepair = stackProfile.id === "static-html";
+      const repairStrategy = staticBrowserRepair ? "targeted-source-repair" : browserRepairStrategy(browserEvidence.evidence);
+      const coordinatedProductRepair = repairStrategy === "coordinated-product-slice";
+      await emitExecution(execution, "reasoning", "completed", repairAttempt === 1
+        ? coordinatedProductRepair
+          ? "The browser proved that required routes or workflows are missing. I’m returning to coordinated product implementation before rebuilding; a one-line repair cannot create a missing product."
+          : "The rendered project exposed concrete browser failures. I’m repairing all verified evidence, rebuilding, restarting its owned preview, and running the same checks again."
+        : `The generated project still has verified browser failures after repair ${repairAttempt - 1}. I’m continuing from the changed source with the remaining evidence.`, { internal: true });
       // Escalation is the whole point of not stopping: the same evidence, read by something stronger.
       // Handing it back to the tier that already failed on it would just be the retry loop again.
       const repairTier: ModelTier = escalateBrowserRepair
@@ -2591,7 +2636,9 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       const entryWiringDefect = staticBrowserRepair ? undefined : await unwiredEntryEvidence(projectPath).catch(() => undefined);
       const repair = await runMissionExecutor({
         objective,
-        task: `Repair every remaining verified failure in this generated ${staticBrowserRepair ? "static" : "framework"} web project so it passes the real desktop and mobile browser preview check. Preserve the requested product, architecture, pages, and working interactions. Resolve every distinct missing route, failed request, console error, interaction defect, and responsive problem below; do not stop after the first symptom${staticBrowserRepair ? ". Use self-contained CSS/data placeholders instead of unreliable remote assets when images are broken" : ". Coordinate source, routes, and styling changes across the existing framework project"}.\n\nOriginal user request:\n${task}\n${entryWiringDefect ? `\n${entryWiringDefect}\n` : ""}\nRemaining verified browser failure:\n${browserEvidence.evidence}`,
+        task: coordinatedProductRepair
+          ? `Continue the unfinished generated product from its saved requirements. The browser proved that required user-facing routes or workflows do not exist, so create a substantial coordinated product slice now. Include the missing reachable routes/screens, their connected state and domain behavior, safe local persistence or adapter boundary, and meaningful tests in one write_files action. Do not edit only CSS, package metadata, the brief, or the existing placeholder entry. Do not report completion until the routes named by the evidence exist and are usable.\n\nOriginal user request:\n${task}\n${entryWiringDefect ? `\n${entryWiringDefect}\n` : ""}\nRemaining verified browser failure:\n${browserEvidence.evidence}`
+          : `Repair every remaining verified failure in this generated ${staticBrowserRepair ? "static" : "framework"} web project so it passes the real desktop and mobile browser preview check. Preserve the requested product, architecture, pages, and working interactions. Resolve every distinct failed request, console error, interaction defect, and responsive problem below; do not stop after the first symptom${staticBrowserRepair ? ". Use self-contained CSS/data substitutes instead of unreliable remote assets when images are broken" : ". Coordinate the targeted source and styling changes across the existing framework project"}.\n\nOriginal user request:\n${task}\n${entryWiringDefect ? `\n${entryWiringDefect}\n` : ""}\nRemaining verified browser failure:\n${browserEvidence.evidence}`,
         checklist: [{ id: `generated-browser-repair-${repairAttempt}`, label: "Repair every remaining browser-verified product failure", status: "pending" }],
         costScopeId: execution.costScopeId,
         access,
@@ -2602,18 +2649,19 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         signal,
         approvedCategories: ["dependencies", "package-runner"],
         hasBuildTooling: !staticBrowserRepair,
-        newProject: false,
+        newProject: coordinatedProductRepair,
+        continuableBatch: coordinatedProductRepair,
         multiFileRepair: !staticBrowserRepair,
         staticProject: staticBrowserRepair,
         staticRewrite: staticBrowserRepair,
-        evidenceFirstRepair: !staticBrowserRepair,
-        evidenceRepairReadPaths: staticBrowserRepair ? undefined : repairReadPaths,
+        evidenceFirstRepair: !staticBrowserRepair && !coordinatedProductRepair,
+        evidenceRepairReadPaths: staticBrowserRepair || coordinatedProductRepair ? undefined : repairReadPaths,
         executionStrategy: creationStrategy,
         routingAssessment: creationAssessment,
         evidenceImages,
-        maxTurns: staticBrowserRepair ? 3 : 8,
+        maxTurns: staticBrowserRepair ? 3 : coordinatedProductRepair ? 10 : 8,
         maxNudges: 1,
-        maxOutputTokens: staticBrowserRepair ? undefined : 5_000,
+        maxOutputTokens: staticBrowserRepair ? undefined : coordinatedProductRepair ? 16_000 : 5_000,
         routingBudget: staticBrowserRepair ? undefined : { maximumModelCalls: 10, estimatedCostUsd: 1 },
       });
       result.usage.push(...repair.usage);
@@ -2632,10 +2680,9 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         if (browserEvidence.verified) break;
         const repeatedFingerprint = semanticRepairFingerprint(browserEvidence.evidence, sourceFingerprint);
         if (attemptedBrowserRepairFingerprints.has(repeatedFingerprint)) {
-          attemptedBrowserRepairFingerprints.clear();
-          await emitExecution(execution, "planning", "warning", "Changing generated-project repair strategy after a zero-change attempt", {
+          await emitExecution(execution, "planning", "warning", "Recorded zero-change generated-project repair; an identical paid retry will not run", {
             internal: true,
-            details: { evidenceFingerprint: repeatedFingerprint, sourceFingerprint, strategyReset: true, terminal: false, repairAttempt },
+            details: { evidenceFingerprint: repeatedFingerprint, sourceFingerprint, paidCallPrevented: true, terminal: false, repairAttempt },
           });
           continue;
         }
@@ -2745,6 +2792,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       request: task,
       apiKey,
       provider: initialModel.provider,
+      requireProductImplementation: true,
       evidence: {
         changedFiles: result.changedFiles,
         commands: commands.map((command) => ({ command: command.command, exitCode: command.exitCode })),
@@ -2800,7 +2848,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     execution,
     "summary",
     status === "passed" ? "completed" : mockGateReached ? "completed" : status === "needs-clarification" ? "warning" : "error",
-    status === "passed" ? "Behavior verified" : mockGateReached ? "First working mock ready for review" : status === "needs-clarification" ? "Work preserved and ready to continue" : "Execution finished with blocker",
+    status === "passed" ? "Behavior verified" : mockGateReached ? "First working mock ready for review" : status === "needs-clarification" ? "Waiting for a required project decision" : "Build incomplete",
     { details: { files: files.length, previewUrl: preview?.previewUrl } },
   );
 
@@ -2959,13 +3007,7 @@ async function enforceProductionIntegrationReadiness(evidence: BrowserPreviewEvi
   });
   const configured = await projectIntegrationEnvironment({ projectId, environment: "development", location: "local" });
   const detected = detectProjectIntegrations(projectEvidence, configured.environment);
-  const integrationFailures = detected.detected.filter((item) => item.required && item.used).flatMap((item) => {
-    const needsCredential = item.definition.auth === "oauth" || item.definition.auth === "oidc" || item.definition.fields.some((field) => field.secret);
-    if (!needsCredential) return [];
-    if (item.definition.maturity !== "adapter") return [`${item.definition.name} is detected but has no executable verified adapter`];
-    if (item.missingEnvironment.length) return [`${item.definition.name} is missing verified configuration: ${item.missingEnvironment.join(", ")}`];
-    return [];
-  });
+  const integrationFailures = blockingDetectedIntegrationFailures(detected.detected);
   const source = sourceParts.join("\n");
   const failures: string[] = [...integrationFailures];
   if (requestsAuth && !/\b(?:mock|prototype|wireframe)\b/i.test(task)) {
@@ -7924,10 +7966,10 @@ Mandatory existing-source contract: preserve this project's established multi-fi
             if (rechecked.verified) break;
             const recheckedFingerprint = semanticRepairFingerprint(rechecked.evidence, sourceFingerprint);
             if (attemptedBrowserRepairFingerprints.has(recheckedFingerprint)) {
-              attemptedBrowserRepairFingerprints.clear();
-              await emitExecution(execution, "planning", "warning", "Changing browser repair strategy after unchanged source and evidence", {
+              browserGateAttempts.push({ fingerprint: recheckedFingerprint, changedFiles: 0, escalated: escalateBrowserRepair });
+              await emitExecution(execution, "planning", "warning", "Recorded unchanged browser evidence without buying another identical repair", {
                 internal: true,
-                details: { evidenceFingerprint: recheckedFingerprint, sourceFingerprint, strategyReset: true, terminal: false, repairAttempt },
+                details: { evidenceFingerprint: recheckedFingerprint, sourceFingerprint, paidCallPrevented: true, terminal: false, repairAttempt },
               });
               continue;
             }
@@ -7935,14 +7977,20 @@ Mandatory existing-source contract: preserve this project's established multi-fi
           }
           attemptedBrowserRepairFingerprints.add(evidenceFingerprint);
           const staticBrowserRepair = stackProfile.id === "static-html";
+          const repairStrategy = staticBrowserRepair ? "targeted-source-repair" : browserRepairStrategy(browserEvidence.evidence);
+          const coordinatedProductRepair = repairStrategy === "coordinated-product-slice";
           await emitExecution(execution, "reasoning", "completed", repairAttempt === 1
-            ? "The real desktop/mobile preview exposed concrete failures. I’m repairing all verified evidence, rebuilding, restarting the owned preview, and exercising the same routes again."
+            ? coordinatedProductRepair
+              ? "The browser proved that required routes or workflows are missing. I’m returning to coordinated product implementation before rebuilding; a one-line repair cannot create a missing product."
+              : "The real desktop/mobile preview exposed a concrete defect in implemented source. I’m applying a targeted repair, rebuilding, restarting the owned preview, and exercising the same route again."
             : `Browser acceptance still has verified failures after repair ${repairAttempt - 1}. I’m continuing from the changed source with only the remaining evidence.`, { internal: true });
           const repairModel = await modelForMissionStage(inheritedOperationRequest, modelMode, escalateBrowserRepair ? "architect" : "builder", workingSet, parentMission?.state === "failed" ? repairAttempt : repairAttempt - 1, routingAssessment) ?? initialModel!;
           await emitModelSelection(execution, `browser repair ${repairAttempt}`, repairModel);
           const repair = await runMissionExecutor({
             objective,
-            task: `Repair every remaining verified failure in this existing ${staticBrowserRepair ? "static" : "framework"} web project. Preserve the saved product requirements and every working route or interaction. Resolve every distinct item in the evidence below, including missing routes, failed requests, console errors, and responsive defects; do not stop after the first symptom. Then run the smallest relevant source check. If the product behavior is real but Foundry has no built-in deterministic driver for it, add a safe declarative acceptance workflow so the runtime can execute the behavior instead of trusting a claim.\n\n${acceptanceWorkflowTemplate()}\n\nSaved and current requirements:\n${inheritedOperationRequest}\n\nRemaining verified browser failure:\n${browserEvidence.evidence}`,
+            task: coordinatedProductRepair
+              ? `Continue the unfinished generated product from its saved requirements. The browser proved that required user-facing routes or workflows do not exist, so create a substantial coordinated product slice now. Include the missing reachable routes/screens, their connected state and domain behavior, safe local persistence or adapter boundary, and meaningful tests in one write_files action. Do not edit only CSS, package metadata, the brief, or the existing placeholder entry. Do not report completion until the routes named by the evidence exist and are usable.\n\n${acceptanceWorkflowTemplate()}\n\nSaved and current requirements:\n${inheritedOperationRequest}\n\nRemaining verified browser failure:\n${browserEvidence.evidence}`
+              : `Repair every remaining verified failure in this existing ${staticBrowserRepair ? "static" : "framework"} web project. Preserve the saved product requirements and every working route or interaction. Resolve every distinct item in the evidence below, including failed requests, console errors, and responsive defects; do not stop after the first symptom. Then run the smallest relevant source check. If the product behavior is real but Foundry has no built-in deterministic driver for it, add a safe declarative acceptance workflow so the runtime can execute the behavior instead of trusting a claim.\n\n${acceptanceWorkflowTemplate()}\n\nSaved and current requirements:\n${inheritedOperationRequest}\n\nRemaining verified browser failure:\n${browserEvidence.evidence}`,
             checklist: [{ id: `browser-evidenced-repair-${repairAttempt}`, label: "Repair every remaining real desktop/mobile preview failure", status: "pending" }],
             costScopeId: execution.costScopeId,
             access: capabilityAccess,
@@ -7954,16 +8002,17 @@ Mandatory existing-source contract: preserve this project's established multi-fi
             approvedCategories: effectiveApprovedCategories,
             preApprovedCommands,
             hasBuildTooling: !staticBrowserRepair,
-            newProject: false,
+            newProject: coordinatedProductRepair,
+            continuableBatch: coordinatedProductRepair,
             staticProject: staticBrowserRepair,
             staticRewrite: staticBrowserRepair,
-            evidenceFirstRepair: !staticBrowserRepair,
-            evidenceRepairReadPaths: staticBrowserRepair ? undefined : await verifiedBrowserRepairReadPaths(capabilityAccess, browserEvidence.evidence),
+            evidenceFirstRepair: !staticBrowserRepair && !coordinatedProductRepair,
+            evidenceRepairReadPaths: staticBrowserRepair || coordinatedProductRepair ? undefined : await verifiedBrowserRepairReadPaths(capabilityAccess, browserEvidence.evidence),
             executionStrategy: missionStrategy,
             routingAssessment,
-            maxTurns: staticBrowserRepair ? 3 : 8,
+            maxTurns: staticBrowserRepair ? 3 : coordinatedProductRepair ? 10 : 8,
             maxNudges: 1,
-            maxOutputTokens: staticBrowserRepair ? undefined : 5_000,
+            maxOutputTokens: staticBrowserRepair ? undefined : coordinatedProductRepair ? 16_000 : 5_000,
             routingBudget: boundedSmallEdit ? boundedSmallEditBudget : staticBrowserRepair ? undefined : { maximumModelCalls: 10, estimatedCostUsd: 1 },
           });
           result.changedFiles = [...new Set([...result.changedFiles, ...repair.changedFiles])];
@@ -7985,10 +8034,9 @@ Mandatory existing-source contract: preserve this project's established multi-fi
             if (browserEvidence.verified) break;
             const repeatedFingerprint = semanticRepairFingerprint(browserEvidence.evidence, sourceFingerprint);
             if (attemptedBrowserRepairFingerprints.has(repeatedFingerprint)) {
-              attemptedBrowserRepairFingerprints.clear();
-              await emitExecution(execution, "planning", "warning", "Changing browser repair strategy after a zero-change attempt", {
+              await emitExecution(execution, "planning", "warning", "Recorded zero-change browser repair; an identical paid retry will not run", {
                 internal: true,
-                details: { evidenceFingerprint: repeatedFingerprint, sourceFingerprint, strategyReset: true, terminal: false, repairAttempt },
+                details: { evidenceFingerprint: repeatedFingerprint, sourceFingerprint, paidCallPrevented: true, terminal: false, repairAttempt },
               });
               continue;
             }
@@ -8091,7 +8139,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
         } else if (!browserEvidence.verified) {
           result.status = "failed";
           result.blocker = browserVerificationConflict
-            ? `Foundry preserved the unfinished implementation after every configured browser-repair strategy returned unchanged source and evidence. Continue recovery from this exact browser gate.\n\n${browserEvidence.evidence}`
+            ? `Foundry preserved the unfinished implementation after every configured browser-repair strategy returned unchanged source and evidence. The unresolved browser evidence is recorded below.\n\n${browserEvidence.evidence}`
             : browserEvidence.evidence;
           result.clarificationQuestions = undefined;
           result.sessionSummary = result.sessionSummary ?? { outcome: "", changes: [], preserved: [], flags: [] };
@@ -11294,7 +11342,9 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
     await writeMissing("tsconfig.json", tsconfig);
     await writeMissing("next-env.d.ts", "/// <reference types=\"next\" />\n/// <reference types=\"next/image-types/global\" />\n");
     await writeMissing("src/app/layout.tsx", `import type { ReactNode } from "react";\nimport "./globals.css";\n\nexport default function RootLayout({ children }: { children: ReactNode }) {\n  return <html lang="en"><body>{children}</body></html>;\n}\n`);
-    await writeMissing("src/app/page.tsx", `export default function Home() {\n  return <main><h1>${projectName.replace(/[<>`]/g, "")}</h1><p>The runnable foundation is ready for the requested workflows.</p></main>;\n}\n`);
+    // Do not create a fake product page here. A two-line route makes Next.js build successfully and
+    // gives preview a URL, but it is not the requested application. Leaving the product entry absent
+    // forces the coordinated implementation batch to create a real screen before preview can start.
     // The manifest ships tailwind/postcss/autoprefixer, so the config must exist too — without a
     // tailwind.config with `content` globs and a postcss.config, every build warns "content option is
     // missing" and emits EMPTY CSS, so a Tailwind-styled app renders unstyled. Ship them configured.
@@ -11308,7 +11358,7 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
       await writeMissing("src/app/api/ai/route.ts", `import { streamText } from "ai";\nimport { configuredModel } from "@/lib/ai/provider";\nimport { retrieveContext } from "@/lib/ai/retrieval";\n\nexport async function POST(request: Request) {\n  const body = await request.json() as { prompt?: string };\n  const prompt = body.prompt?.trim();\n  if (!prompt) return Response.json({ error: "A prompt is required." }, { status: 400 });\n  const context = await retrieveContext(prompt);\n  const result = streamText({ model: configuredModel(), system: "Use supplied context when relevant. Never invent unavailable evidence.", prompt: \`Context:\\n\${context.map(item => item.content).join("\\n\\n")}\\n\\nUser:\\n\${prompt}\` });\n  return result.toTextStreamResponse();\n}\n`);
       await writeMissing(".env.example", "OPENAI_API_KEY=\n# ANTHROPIC_API_KEY=\n# GOOGLE_GENERATIVE_AI_API_KEY=\nAI_MODEL=\nDATABASE_URL=postgresql://user:password@localhost:5432/app\n");
     }
-    return finish("Created verified Next.js project scaffold", "The selected stack requires a manifest, typed configuration, a configured Tailwind/PostCSS pipeline, and a renderable App Router entry before product implementation begins.");
+    return finish("Prepared the Next.js build foundation", "The selected stack requires a manifest, typed configuration, and configured styling pipeline. User-facing routes are deliberately left to the verified product implementation batch so setup cannot masquerade as delivered software.");
   }
   if (stack.id === "react") {
     const manifest = `${JSON.stringify({
@@ -11326,9 +11376,10 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
     await writeMissing("tsconfig.node.json", `${JSON.stringify({ compilerOptions: { composite: true, skipLibCheck: true, module: "ESNext", moduleResolution: "Bundler", allowImportingTsExtensions: true }, include: ["vite.config.ts"] }, null, 2)}\n`);
     await writeMissing("vite.config.ts", `import { defineConfig } from "vite";\nimport react from "@vitejs/plugin-react";\n\nexport default defineConfig({ plugins: [react()] });\n`);
     await writeMissing("src/main.tsx", `import { StrictMode } from "react";\nimport { createRoot } from "react-dom/client";\nimport App from "./App";\nimport "./styles.css";\n\ncreateRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);\n`);
-    await writeMissing("src/App.tsx", `export default function App() {\n  return <main><h1>${projectName.replace(/[<>`]/g, "")}</h1><p>The runnable foundation is ready for the requested workflows.</p></main>;\n}\n`);
+    // App.tsx is intentionally not scaffolded with placeholder copy. The first coordinated product
+    // batch must supply a real application surface before this foundation can build or preview.
     await writeMissing("src/styles.css", "* { box-sizing: border-box; }\nbody { margin: 0; font-family: system-ui, sans-serif; }\nmain { max-width: 72rem; margin: 0 auto; padding: 2rem; }\n");
-    return finish("Created verified Vite + React project scaffold", "React creation now starts with a complete manifest, TypeScript/Vite configuration, renderable entry, and build/test scripts rather than relying on the model to guess missing infrastructure.");
+    return finish("Prepared the Vite + React build foundation", "React creation starts with its manifest, TypeScript/Vite configuration, and build/test scripts. The user-facing App remains an explicit implementation deliverable rather than a placeholder scaffold.");
   }
   if (stack.id === "node-express" || stack.id === "node") {
     const manifest = `${JSON.stringify({ name: safeName, version: "0.1.0", private: true, type: "module", scripts: { dev: "tsx watch src/index.ts", build: "tsc", start: "node dist/index.js", typecheck: "tsc --noEmit", test: "node --test" }, dependencies: { express: "^5.0.0" }, devDependencies: { "@types/express": "^5.0.0", "@types/node": "^22.0.0", tsx: "^4.0.0", typescript: "^5.7.0" } }, null, 2)}\n`;
@@ -11655,7 +11706,7 @@ async function startPythonPreview(
   child.unref();
   const previewPath = entry.kind === "asgi" ? "/docs" : "/";
   const previewUrl = `http://127.0.0.1:${port}${previewPath}`;
-  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", runtimeLog });
+  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", verifiedReady: false, runtimeLog });
   // A cold Python service (uvicorn/gunicorn importing a large app, or Django's first-request setup)
   // can take well past the old 6s budget. Wait the same generous dev-server window and also probe
   // whatever port the framework reports it bound (Django prints "Starting development server at
@@ -11671,7 +11722,7 @@ async function startPythonPreview(
   const readyUrl = child.exitCode == null ? await waitForDevServerReady(candidateUrls, () => child.exitCode == null) : null;
   if (readyUrl) {
     const boundPort = Number(new URL(readyUrl).port) || port;
-    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
+    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", verifiedReady: true, runtimeLog });
     events.push(`Python service preview ready: ${readyUrl}`);
     if (execution) await emitExecution(execution, "preview", "completed", "Python service is live", { details: { previewUrl: readyUrl, port: boundPort, entry: entry.module, framework: entry.kind, ready: true, paidModelCalls: 0 } });
     return { previewUrl: readyUrl, previewState: "ready", previewPlatform: "api" };
@@ -12053,9 +12104,10 @@ async function startStaticPreview(projectId: string, projectPath: string, entryF
     // verified SPA exports mount at the server root.
     const encodedEntryPath = entryFile.replace(/\\/g, "/").split("/").map(encodeURIComponent).join("/");
     const previewUrl = useRootUrl ? `http://127.0.0.1:${port}/` : `http://127.0.0.1:${port}/${encodedEntryPath}`;
-    registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "static", ownershipToken, runtimeVersion });
+    registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "static", verifiedReady: false, ownershipToken, runtimeVersion });
     const ready = await waitForStaticPreviewReady(previewUrl, ownershipToken);
     if (ready) {
+      registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "static", verifiedReady: true, ownershipToken, runtimeVersion });
       events.push(`Interactive preview ready: ${previewUrl}`);
       if (execution) await emitExecution(execution, "preview", "completed", "Interactive preview ready", { details: { previewUrl, port, entryFile, ready, attempt } });
       return { previewUrl, previewState: "ready", previewPlatform: "web", previewOwnershipToken: ownershipToken };
@@ -12158,7 +12210,7 @@ async function startNextPreview(projectId: string, projectPath: string, events: 
   child.stderr?.on("data", capture);
   if (process.platform !== "win32") child.unref();
   const previewUrl = `http://127.0.0.1:${port}`;
-  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", runtimeLog });
+  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl, projectPath, kind: "app", verifiedReady: false, runtimeLog });
   // A different process can occupy a port between the availability probe and spawn. Give npm a
   // moment to fail before accepting any HTTP response on that port as this project's preview.
   await new Promise((resolve) => setTimeout(resolve, 250));
@@ -12170,17 +12222,20 @@ async function startNextPreview(projectId: string, projectPath: string, events: 
     }
     return urls;
   };
-  const readyUrl = child.exitCode == null
-    ? await waitForDevServerReady(candidateUrls, () => child.exitCode == null, startScript === "start" ? 50 : 90, 500)
-    : null;
-  if (readyUrl) {
+  const readiness = child.exitCode == null
+    ? await waitForApplicationRouteReady(candidateUrls, () => child.exitCode == null, startScript === "start" ? 50 : 90, 500)
+    : { readyUrl: null, missingRoute: false };
+  if (readiness.readyUrl) {
+    const readyUrl = readiness.readyUrl;
     const boundPort = Number(new URL(readyUrl).port) || port;
-    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
+    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", verifiedReady: true, runtimeLog });
     events.push(`Preview process reachable: ${readyUrl}; browser smoke verification is pending.`);
     if (execution) await emitExecution(execution, "preview", "running", "Preview process reachable; running browser smoke verification", { details: { previewUrl: readyUrl, port: boundPort, processReachable: true, browserVerified: false } });
     return { previewUrl: readyUrl, previewState: "ready", previewPlatform: platform };
   }
-  const reason = runtimeLog.trim()
+  const reason = readiness.missingRoute
+    ? "The preview process started, but the application root returned HTTP 404 because no runnable product route exists."
+    : runtimeLog.trim()
     ? `Preview failed to start: ${trimOutput(runtimeLog)}`
     : await previewRuntimeFailureReason(port);
   stopPreview(projectId);
@@ -12351,7 +12406,7 @@ async function startGenericNodePreview(
   child.stderr?.on("data", capture);
   if (process.platform !== "win32") child.unref();
   const requestedUrl = `http://127.0.0.1:${port}`;
-  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl: requestedUrl, projectPath, kind: "app", runtimeLog });
+  registerPreviewProcess(projectId, { port, processId: child.pid, lastUsedAt: Date.now(), previewUrl: requestedUrl, projectPath, kind: "app", verifiedReady: false, runtimeLog });
   // A cold dev server (Vite/Svelte/Vue/Astro first run does an esbuild dependency optimize, and on
   // Windows the command goes cmd → npm → the bundler) routinely needs 10–30s before it serves — the
   // old 8×400ms ≈ 3s budget expired first and wrongly reported the app "not ready", driving working
@@ -12370,7 +12425,7 @@ async function startGenericNodePreview(
   if (readyUrl) {
     // Re-register under the port the server actually bound so later reuse/verification targets it.
     const boundPort = Number(new URL(readyUrl).port) || port;
-    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", runtimeLog });
+    registerPreviewProcess(projectId, { port: boundPort, processId: child.pid, lastUsedAt: Date.now(), previewUrl: readyUrl, projectPath, kind: "app", verifiedReady: true, runtimeLog });
     events.push(`Preview process reachable: ${readyUrl}; browser smoke verification is pending.`);
     if (execution) await emitExecution(execution, "preview", "running", "Preview process reachable; running browser smoke verification", { details: { previewUrl: readyUrl, port: boundPort, processReachable: true, browserVerified: false, script } });
     return { previewUrl: readyUrl, previewState: "ready", previewPlatform: platform };
@@ -12426,6 +12481,58 @@ async function urlResponds(url: string, timeoutMs = 1500): Promise<boolean> {
     return response.ok;
   } catch {
     return false;
+  }
+}
+
+type ApplicationRouteReadiness = { readyUrl: string | null; missingRoute: boolean };
+
+/**
+ * Next can start successfully without an application route. Process reachability is therefore only
+ * the first half of preview readiness: the root route must return a real non-error surface too.
+ */
+async function waitForApplicationRouteReady(
+  getCandidateUrls: () => string[],
+  isAlive: () => boolean,
+  attempts: number,
+  delayMs: number,
+): Promise<ApplicationRouteReadiness> {
+  const missingCounts = new Map<string, number>();
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (!isAlive()) return { readyUrl: null, missingRoute: false };
+    for (const url of getCandidateUrls()) {
+      const probe = await applicationRouteProbe(url);
+      if (probe === "ready") return { readyUrl: url, missingRoute: false };
+      if (probe === "missing") {
+        const misses = (missingCounts.get(url) ?? 0) + 1;
+        missingCounts.set(url, misses);
+        // Allow a couple of cold-compilation responses, then stop presenting a permanent 404 as a
+        // server that merely needs more time.
+        if (misses >= 3) return { readyUrl: null, missingRoute: true };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return { readyUrl: null, missingRoute: [...missingCounts.values()].some((count) => count > 0) };
+}
+
+async function applicationRouteProbe(url: string): Promise<"ready" | "missing" | "pending"> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    const response = await fetch(url, { signal: controller.signal });
+    const body = (response.headers.get("content-type") ?? "").includes("text/html")
+      ? (await response.text()).slice(0, 120_000)
+      : "";
+    clearTimeout(timeout);
+    if (response.status === 404) return "missing";
+    if (!response.ok) return "pending";
+    if (
+      /NEXT_HTTP_ERROR_FALLBACK;404|This page could not be found/i.test(body)
+      || /<title>\s*404(?::|<|\s)/i.test(body)
+    ) return "missing";
+    return "ready";
+  } catch {
+    return "pending";
   }
 }
 
@@ -12691,7 +12798,7 @@ export async function getPreviewStatus(projectId: string): Promise<{ previewStat
   if (previewRefreshes.has(projectId)) {
     const active = previewProcesses.get(projectId);
     const previous = previewRefreshOutcomes.get(projectId);
-    if (active?.previewUrl) return { previewState: "ready", previewUrl: active.previewUrl };
+    if (active?.verifiedReady && active.previewUrl) return { previewState: "ready", previewUrl: active.previewUrl };
     if (previous?.previewState === "ready") return previous;
     return { previewState: "starting" };
   }
@@ -12699,6 +12806,7 @@ export async function getPreviewStatus(projectId: string): Promise<{ previewStat
   const connector = connectorPreviews.get(projectId);
   if (!preview && connector) return connectorPreviewStatus(connector);
   if (!preview) return previewRefreshOutcomes.get(projectId) ?? { previewState: "unavailable" };
+  if (!preview.verifiedReady) return { previewState: "starting" };
   const reachable = await waitForUrlReady(preview.previewUrl, 1, 0);
   if (!reachable) {
     const previewReason = preview.runtimeLog?.trim()
@@ -12788,13 +12896,13 @@ export function beginPreviewRefreshForProject(projectId: string, localConnector?
   const active = previewProcesses.get(projectId);
   const previous = previewRefreshOutcomes.get(projectId);
   if (previewRefreshes.has(projectId)) {
-    if (active?.previewUrl) return { previewState: "ready", previewUrl: active.previewUrl, previewPlatform: "web" };
+    if (active?.verifiedReady && active.previewUrl) return { previewState: "ready", previewUrl: active.previewUrl, previewPlatform: "web" };
     if (previous?.previewState === "ready") return previous;
     return { previewState: "starting", previewPlatform: "web" };
   }
   // Static servers already serve current disk contents and framework servers hot-reload. Restarting
   // a healthy owned process during React reconciliation blanked and reloaded the iframe repeatedly.
-  if (active?.previewUrl) {
+  if (active?.verifiedReady && active.previewUrl) {
     active.lastUsedAt = Date.now();
     return { previewState: "ready", previewUrl: active.previewUrl, previewPlatform: "web" };
   }

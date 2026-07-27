@@ -390,4 +390,48 @@ describe("asking what is unbuilt, while there is still time to build it", () => 
     // The following batch should see what is already done rather than rediscovering it.
     expect(ledger.ledger.revision).toBe(99);
   });
+
+  it("keeps every product requirement open when only framework scaffolding exists", async () => {
+    const ledger = await opened(["add authentication", "add a catalogue", "add checkout"]);
+    reconcileAllVerified();
+    const scaffold = {
+      changedFiles: [
+        "package.json",
+        "package-lock.json",
+        "tsconfig.json",
+        "next-env.d.ts",
+        "src/app/layout.tsx",
+        "src/app/globals.css",
+      ],
+      commands: [{ command: "npm.cmd run build", exitCode: 0 }],
+      verification: [{ check_type: "build", result: "pass", evidence: "Build exited 0." }],
+    };
+
+    expect(await unbuiltRequirements({
+      opened: ledger,
+      request: "build the product",
+      result: scaffold,
+      apiKey: "test",
+      requireProductImplementation: true,
+    })).toEqual(["add authentication", "add a catalogue", "add checkout"]);
+    expect(reconcileMock).not.toHaveBeenCalled();
+
+    const gate = await closeRequirementLedger({
+      opened: ledger,
+      request: "build the product",
+      evidence: {
+        ...scaffold,
+        checklist: [],
+        verification: scaffold.verification.map(({ check_type, ...entry }) => ({
+          ...entry,
+          checkType: check_type,
+        })),
+      },
+      apiKey: "test",
+      requireProductImplementation: true,
+    });
+    expect(gate.outcome).toBe("unmet");
+    if (gate.outcome === "unmet") expect(gate.blocker).toContain("No application source was created");
+    expect(reconcileMock).not.toHaveBeenCalled();
+  });
 });

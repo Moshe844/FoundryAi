@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { blockingIntegrationRequirements, deferredProductionIntegrationNames, integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "./requirements";
+import { integrationCatalog } from "./catalog";
+import type { DetectedIntegration } from "./types";
+import { blockingDetectedIntegrationFailures, blockingIntegrationRequirements, deferredProductionIntegrationNames, integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "./requirements";
 
 describe("integration requirements", () => {
   it("requires a real email provider for password reset", () => {
@@ -65,5 +67,30 @@ describe("integration requirements", () => {
 
     const hardware = integrationRequirementsForBrief("Build a real Verifone payment terminal app.");
     expect(blockingIntegrationRequirements(hardware).some((item) => item.candidates.some((candidate) => candidate.id === "verifone"))).toBe(true);
+  });
+
+  it("keeps an unnamed future capability generic instead of inventing several vendors", () => {
+    const generic = integrationRequirementsForBrief("Use local persistence now with an adapter for a hosted production database later.");
+    expect(deferredProductionIntegrationNames(generic)).toEqual(["Production database"]);
+  });
+
+  it("never turns detected software names into local-build blockers", () => {
+    const detected = (id: string): DetectedIntegration => ({
+      definition: integrationCatalog.find((item) => item.id === id)!,
+      evidence: [],
+      required: true,
+      missingEnvironment: [],
+      state: "configuration-required" as const,
+      confidence: 1,
+      used: true,
+    });
+    expect(blockingDetectedIntegrationFailures([
+      detected("stripe"),
+      detected("postgresql"),
+    ])).toEqual([]);
+
+    const verifone = detected("verifone");
+    verifone.missingEnvironment = ["VERIFONE_SDK"];
+    expect(blockingDetectedIntegrationFailures([verifone])).toEqual(["Verifone hardware is missing verified configuration: VERIFONE_SDK"]);
   });
 });

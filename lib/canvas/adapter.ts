@@ -6,6 +6,7 @@ import { browserStepsOf, groupTimeline, hasVerificationConflict, needsRepairActi
 import { stripTerminalFormatting } from "@/lib/text/terminal";
 import { customInstructionsFromProjectBrief } from "@/lib/factory/project-brief";
 import { compactEvidenceText } from "@/lib/factory/event-contract";
+import { customerChargeForMission } from "@/lib/ai/routing/customer-billing";
 
 /**
  * Builds the Mission Canvas view-model from real engine output. This is the seam the
@@ -163,7 +164,15 @@ export function questionQueueOf(blocking: Extract<CanvasBlocking, { kind: "quest
 
 /** §9: terminal block built only from recorded evidence. */
 function summaryOf(execution: ExecutionMission): CanvasSummary {
-  const heading = execution.state === "complete" ? "Done" : execution.state === "cancelled" ? "Stopped" : execution.state === "blocked" ? "Blocked" : hasVerificationConflict(execution) ? "Ready to continue" : needsRepairAction(execution) ? "Ready to continue" : "Failed";
+  const heading = execution.state === "complete"
+    ? "Done"
+    : execution.state === "cancelled"
+      ? "Stopped"
+      : execution.state === "blocked"
+        ? "Blocked"
+        : hasVerificationConflict(execution) || needsRepairAction(execution)
+          ? "Incomplete"
+          : "Failed";
 
   const behaviorChanges: CanvasSummaryLine[] = execution.timeline
     .filter((event) => event.tier === "decision" && Boolean(event.rationale?.trim()))
@@ -206,8 +215,12 @@ function summaryOf(execution: ExecutionMission): CanvasSummary {
   const started = eventTimes.length >= 2 ? eventTimes[0] : Date.parse(execution.created_at);
   const ended = eventTimes.length >= 2 ? eventTimes.at(-1)! : Date.parse(execution.updated_at);
   const elapsedMs = Number.isFinite(started) && Number.isFinite(ended) && ended > started ? ended - started : undefined;
+  const estimatedCostUsd = execution.model_usage?.reduce((sum, item) => sum + item.estimatedCostUsd, 0) ?? 0;
+  const customerChargeUsd = customerChargeForMission(execution.state, estimatedCostUsd);
   const modelUsage = execution.model_usage?.length ? {
-    estimatedCostUsd: execution.model_usage.reduce((sum, item) => sum + item.estimatedCostUsd, 0),
+    estimatedCostUsd,
+    customerChargeUsd,
+    nonBillableProviderUsageUsd: Math.max(0, estimatedCostUsd - customerChargeUsd),
     paidCalls: execution.model_usage.reduce((sum, item) => sum + item.calls, 0),
     inputTokens: execution.model_usage.reduce((sum, item) => sum + item.inputTokens, 0),
     outputTokens: execution.model_usage.reduce((sum, item) => sum + item.outputTokens, 0),

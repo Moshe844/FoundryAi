@@ -97,6 +97,13 @@ assert(
   "The server does not reject invalid ready-without-URL responses from an outdated connector.",
 );
 assert(
+  runtime.includes("verifiedReady?: boolean")
+    && runtime.includes("active?.verifiedReady && active.previewUrl")
+    && runtime.includes("waitForApplicationRouteReady")
+    && runtime.includes("application root returned HTTP 404 because no runnable product route exists"),
+  "A spawned process or framework 404 can still be published as a ready application preview.",
+);
+assert(
   runtime.includes("canonicalConnectorPreviewUrl") && runtime.includes('url.hostname = "127.0.0.1"'),
   "Legacy connector localhost URLs can still resolve to an unrelated IPv6 preview.",
 );
@@ -117,10 +124,10 @@ assert(
   "The dedicated retry control can still be overridden by classification, buy a fresh architecture plan, or skip deterministic preflight.",
 );
 assert(
-  workspaceShell.includes("standaloneMutationIntent")
-    && workspaceShell.includes('currentStandaloneMutation && !isMutatingProjectIntent(resolvedIntent.currentIntent)')
-    && workspaceShell.includes("a non-mutating model classification cannot turn it into a status answer")
-    && workspaceShell.includes('continuity: "fresh_plan"')
+  workspaceShell.includes("const exactMissionRetry = Boolean(retryExecution)")
+    && workspaceShell.includes("control?.retryExecutionId")
+    && workspaceShell.includes("entry.id === control.retryExecutionId")
+    && workspaceShell.includes('? "fresh_plan" as const')
     && workspaceShell.includes("retryExecutionId")
     && existingRoute.includes("body.retryExecutionId"),
   "A fresh standalone change can still be misreported as status, inherit an older failed task, or enter retry recovery without the dedicated Retry control.",
@@ -132,8 +139,8 @@ assert(
     && runtime.includes("sourceProgressFingerprint")
     && runtime.includes("FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES")
     && runtime.includes("Repair reported no source change; repeating the exact browser gate without another model call")
-    && runtime.includes("Changing browser repair strategy after unchanged source and evidence")
-    && runtime.includes("strategyReset: true, terminal: false")
+    && runtime.includes("Recorded unchanged browser evidence without buying another identical repair")
+    && runtime.includes("paidCallPrevented: true, terminal: false")
     && runtime.includes("await stopProjectPreview(previewTarget!)")
     && runtime.includes("restarted its owned preview")
     && runtime.includes("real browser gate still has unresolved product defects"),
@@ -147,6 +154,15 @@ assert(
     && runtime.includes('Foundry built ${spec.projectName} as a ${stackProfile.label} project')
     && runtime.includes("resolved the concrete issues found by browser verification"),
   "Fresh generated projects still use a one-shot browser repair or recheck a stale production preview after source changes.",
+);
+assert(
+  !runtime.includes("The runnable foundation is ready for the requested workflows.")
+    && !runtime.includes('path: "src/app/page.tsx"')
+    && !runtime.includes('path: "src/App.tsx"')
+    && runtime.includes("stagedInitialTask")
+    && runtime.includes("deterministicBuildRequirements")
+    && runtime.includes("Continue the unfinished generated product from its saved requirements"),
+  "Framework scaffolding can still manufacture a placeholder page or skip staged product implementation when discovery requirements degrade.",
 );
 assert(
   runtime.includes("access.searchFiles(query")
@@ -208,12 +224,11 @@ assert(
   // The repair affordance must stay distinct from the recheck one, and must not promise autonomous
   // work that has already been spent — by this point the gate has repaired and escalated. It has to
   // name the check that survived instead.
-  missionCanvas.includes("Run this again")
-    && !missionCanvas.includes("Continue autonomous repair")
-    && missionCanvas.includes("unresolvedChecks")
-    && missionCanvas.includes("Foundry repaired and escalated until its attempts ran out")
-    && missionCanvas.includes("Recheck verification")
-    && canvasAdapter.includes('hasVerificationConflict(execution) ? "Ready to continue"')
+  missionCanvas.includes('activeExecution.state === "cancelled"')
+    && missionCanvas.includes("Resume stopped task")
+    && !missionCanvas.includes("Run this again")
+    && !missionCanvas.includes("Retry this task")
+    && canvasAdapter.includes('? "Incomplete"')
     && canvasModel.includes("[FOUNDRY_VERIFICATION_CONFLICT]")
     && canvasModel.includes("Missions persisted before structured verification was mandatory")
     && !missionCanvas.includes("Fix verified issues")
@@ -251,7 +266,9 @@ assert(
 assert(
   dashboard.includes("localConnector={connectorInfo ?")
     && missionCanvas.includes('action: "refresh", localConnector: previewConnector')
-    && missionCanvas.includes("if (missionStatus.isBusy && hasExecution) return")
+    && missionCanvas.includes('if (missionStatus.isBusy && effectiveExecution?.previewState !== "ready")')
+    && missionCanvas.includes("after Foundry writes and verifies the first runnable product surface")
+    && missionCanvas.includes("if (missionStatus.isBusy) return")
     && missionCanvas.includes("Preview is an always-available engineering workspace")
     && missionCanvas.includes("setPreviewOpen(true)")
     && missionCanvas.includes("const dockOpen = previewOpen && Boolean(effectiveExecution || recoveredExecutionBase)")
@@ -392,8 +409,9 @@ assert(
 );
 assert(
   runtime.includes("verificationFindingFingerprint(browserEvidence.evidence)")
-    && runtime.includes("findingCount > 1")
-    && runtime.includes("Stopped repeated repair on unchanged browser findings"),
+    && runtime.includes("nextGateAction({ attempts: browserGateAttempts")
+    && runtime.includes("paidCallPrevented: true")
+    && runtime.includes("Stopped repeated generated-project repair on unchanged browser findings"),
   "Repeated identical browser findings can still consume the full autonomous repair budget.",
 );
 assert(

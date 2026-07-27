@@ -11,7 +11,7 @@ import type { MissionState } from "@/lib/mission-engine";
 import { deriveMissionDisplayStatus, projectBriefFromMission, projectTitleFor } from "@/lib/mission/status";
 import { answerTaskFor, buildMissionVM } from "@/lib/canvas/adapter";
 import type { CanvasDotState, CanvasMissionVM } from "@/lib/canvas/model";
-import { currentActivityOf, currentFocusOf, dotStateOf, hasVerificationConflict, latestLiveEvent, needsRepairAction } from "@/lib/canvas/model";
+import { currentActivityOf, currentFocusOf, dotStateOf, latestLiveEvent } from "@/lib/canvas/model";
 import type { BlockedCommandAction } from "@/components/execution/ApprovalPrompt";
 import { CanvasComposer } from "@/components/canvas/CanvasComposer";
 import { CollapsedMissionRow } from "@/components/canvas/CollapsedMissionRow";
@@ -126,20 +126,14 @@ export function MissionCanvas({
   // the composer alone reads as a dead end after a provider failure (test A08).
   const retryableTask = !missionStatus.isBusy
     && activeExecution
-    && (activeExecution.state === "failed" || activeExecution.state === "cancelled")
+    && activeExecution.state === "cancelled"
     && !projectDeleted
     ? (activeExecution.source_requirements[0] || activeExecution.title || "").trim() || null
     : null;
-  const retryWillRepair = Boolean(activeExecution && needsRepairAction(activeExecution));
-  const retryWillRecheck = Boolean(activeExecution && hasVerificationConflict(activeExecution));
   // Name what is actually still failing. The strip used to promise "continue autonomous repair",
   // which read as though Foundry had held something back — and clicking it bought another run with
   // no idea what it was up against. The gate has already repaired and escalated by this point, so
   // the only useful thing left to say is which check survived all of it.
-  const unresolvedChecks = useMemo(
-    () => [...new Set((activeExecution?.verification ?? []).filter((item) => item.result === "fail").map((item) => item.check_type))],
-    [activeExecution],
-  );
 
   const silenceMs = useElapsedSince(liveEvent?.timestamp, missionStatus.isBusy);
   const stalled = missionStatus.isBusy && isStalled(silenceMs);
@@ -176,7 +170,7 @@ export function MissionCanvas({
     : execution;
   const previewAvailable = effectiveExecution?.previewState === "ready"
     && Boolean(effectiveExecution.previewUrl || effectiveExecution.artifact || effectiveExecution.previewPlatform === "desktop");
-  const previewFailureReason = effectiveExecution?.previewState === "error"
+  const previewFailureReason = !missionStatus.isBusy && effectiveExecution?.previewState === "error"
     ? effectiveExecution.previewReason || "The real preview failed its readiness check."
     : undefined;
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -206,7 +200,6 @@ export function MissionCanvas({
     token: undefined,
     rootLabel: sdkProjectRoot,
   } : undefined), [localConnector, sdkProjectRoot]);
-  const hasExecution = Boolean(execution);
   const onPreviewStateChangeRef = useRef(onPreviewStateChange);
   useEffect(() => {
     onPreviewStateChangeRef.current = onPreviewStateChange;
@@ -223,6 +216,14 @@ export function MissionCanvas({
     // Open the dock immediately so the user can watch starting/error/readiness state while the
     // background refresh attaches the best currently runnable surface.
     setPreviewOpen(true);
+    if (missionStatus.isBusy && effectiveExecution?.previewState !== "ready") {
+      setRecoveredPreview({
+        projectId: connectedProjectId,
+        previewState: "unavailable",
+        previewReason: "The preview will appear after Foundry writes and verifies the first runnable product surface.",
+      });
+      return;
+    }
     if (effectiveExecution?.previewState === "ready" && (effectiveExecution.artifact || effectiveExecution.previewPlatform === "desktop")) {
       return;
     }
@@ -255,7 +256,7 @@ export function MissionCanvas({
     if (projectDeleted || !connectedProjectId) return;
     // Keep the last proven preview mounted while an edit is running. Clearing it here made the app
     // disappear exactly when users need to watch their changes land, then reappear only at completion.
-    if (missionStatus.isBusy && hasExecution) return;
+    if (missionStatus.isBusy) return;
     let cancelled = false;
     setPreviewLoading(true);
     void fetch("/api/factory/preview", {
@@ -271,7 +272,7 @@ export function MissionCanvas({
       if (!cancelled) setPreviewLoading(false);
     });
     return () => { cancelled = true; };
-  }, [connectedProjectId, execution?.previewState, hasExecution, previewConnector, missionStatus.isBusy, projectDeleted]);
+  }, [connectedProjectId, execution?.previewState, previewConnector, missionStatus.isBusy, projectDeleted]);
 
   // "refresh" returns previewState:"starting" IMMEDIATELY and resolves the real outcome in the
   // background, so a single POST leaves the dock reading "Starting the preview server…" forever. During a
@@ -731,20 +732,14 @@ export function MissionCanvas({
         {retryableTask ? (
           <div className="flex flex-wrap items-center gap-2.5 border-t border-overlay/8 bg-shade/20 px-4 py-2 sm:px-6">
             <span className="text-[12px] text-foundry-muted">
-              {activeExecution?.state === "cancelled"
-                ? "The last run was interrupted before it finished."
-                : retryWillRecheck
-                  ? "The same verifier result repeated on unchanged source. Foundry stopped duplicate paid repair calls; recheck runs the exact gate first."
-                : retryWillRepair
-                  ? `Foundry repaired and escalated until its attempts ran out. Still failing: ${unresolvedChecks.join(", ") || "the browser gate"}. Running again starts a fresh attempt at the same gate.`
-                  : "The last run didn't finish."}
+              The last run was stopped before it finished.
             </span>
             <button
               type="button"
               className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-2.5 py-1 text-[12px] font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
               onClick={() => activeExecution && (onRetry ? onRetry(retryableTask, activeExecution.id) : onExecute(retryableTask))}
             >
-              {retryWillRecheck ? "Recheck verification" : retryWillRepair ? "Run this again" : "Retry this task"}
+              Resume stopped task
             </button>
           </div>
         ) : null}

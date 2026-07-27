@@ -44,7 +44,7 @@ export function nextGateAction(input: {
   currentFingerprint: string;
   maxAttempts: number;
 }): GateAction {
-  const { attempts, currentFingerprint, maxAttempts } = input;
+  const { attempts, maxAttempts } = input;
 
   if (!attempts.length) {
     return { action: "repair", reason: "The gate is failing and no repair has been attempted yet." };
@@ -56,16 +56,17 @@ export function nextGateAction(input: {
 
   const last = attempts[attempts.length - 1];
   const escalationSpent = attempts.some((attempt) => attempt.escalated);
-  const stalled = last.changedFiles === 0 || last.fingerprint === currentFingerprint;
+  // A broad browser finding can remain textually identical while a coordinated product
+  // slice lands across several files. Real disk progress is convergence, not a reason
+  // to buy a stronger model. Escalation is reserved for a no-write attempt.
+  const stalled = last.changedFiles === 0;
 
   if (!stalled) {
     // The finding changed, so the last repair landed and the next one has something to build on.
     return { action: "repair", reason: "The last repair changed the failure, so the repairs are landing and the next one is worth making." };
   }
 
-  const stallReason = last.changedFiles === 0
-    ? "The last repair changed no files"
-    : "The same finding survived the last repair";
+  const stallReason = "The last repair changed no files";
 
   if (!escalationSpent) {
     return { action: "escalate", reason: `${stallReason}, so a stronger model takes the same evidence rather than the mission ending here.` };

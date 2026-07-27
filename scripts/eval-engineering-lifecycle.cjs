@@ -26,8 +26,10 @@ function loadTypeScriptModule(relativePath, aliases = {}) {
 }
 
 const permissions = loadTypeScriptModule("lib/ai/mission/command-permissions.ts");
+const productEvidence = loadTypeScriptModule("lib/factory/product-evidence.ts");
 const reports = loadTypeScriptModule("lib/factory/engineering-report.ts", {
   "@/lib/ai/mission/command-permissions": permissions,
+  "@/lib/factory/product-evidence": productEvidence,
 });
 
 function event(id, kind, status, title, extra = {}) {
@@ -99,19 +101,30 @@ incompleteCreation.previewState = "stopped";
 incompleteCreation.previewUrl = undefined;
 incompleteCreation.verification = incompleteCreation.verification.filter((item) => item.check_type !== "preview");
 const guardedCreation = reports.finalizeFactoryProjectResult(incompleteCreation, "Create a complete application");
-// An incomplete created project must never cross the public completion boundary. It is held in
-// autonomous recovery ("needs-clarification" with a Continue-recovery checkpoint), never reported as
-// passed/production-ready, and carries an honest completion blocker.
+// An incomplete created project must never cross the public completion boundary. It stays failed
+// inside the mission runtime rather than manufacturing a "Ready to continue" user checkpoint.
 assert.notEqual(guardedCreation.status, "passed", "A created project without a ready preview or runnable artifact crossed the public completion boundary.");
-assert.equal(guardedCreation.status, "needs-clarification", "An incomplete created project was not held in autonomous recovery.");
+assert.equal(guardedCreation.status, "failed", "An incomplete created project was disguised as a user clarification.");
 assert.match(guardedCreation.blocker, /cannot mark this created project complete/i);
-assert.ok(Array.isArray(guardedCreation.clarificationQuestions) && guardedCreation.clarificationQuestions.length > 0, "The recovery checkpoint offered no way to continue autonomous repair.");
+assert.equal(guardedCreation.clarificationQuestions, undefined, "An internal recovery failure still produced a user continuation prompt.");
 
 const completeCreation = verifiedResult();
 completeCreation.sourceMode = "new-project";
 completeCreation.template = "Generated Project";
 const acceptedCreation = reports.finalizeFactoryProjectResult(completeCreation, "Create a complete application");
 assert.equal(acceptedCreation.status, "passed", "A created project with settled checklist, passing build/preview evidence, and a ready runtime was rejected.");
+
+const emptyScaffold = verifiedResult();
+emptyScaffold.sourceMode = "new-project";
+emptyScaffold.template = "Generated Project";
+emptyScaffold.files = [
+  { path: "package.json", status: "created", size: 20, contentHash: "pkg" },
+  { path: "src/app/layout.tsx", status: "created", size: 20, contentHash: "layout" },
+  { path: "src/app/globals.css", status: "created", size: 20, contentHash: "css" },
+];
+const rejectedScaffold = reports.finalizeFactoryProjectResult(emptyScaffold, "Create a complete application");
+assert.notEqual(rejectedScaffold.status, "passed", "A passing package build promoted an empty framework scaffold to a completed product.");
+assert.equal(rejectedScaffold.engineeringReport.completion.highest, "not-saved", "An empty scaffold was labeled built.");
 
 const staticSite = verifiedResult();
 staticSite.stack = "Static HTML/CSS/JS";

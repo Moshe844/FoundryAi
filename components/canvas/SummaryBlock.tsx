@@ -39,9 +39,14 @@ export function SummaryBlock({
 
       {summary.modelUsage ? (
         <p className="font-mono text-[11px] leading-5 text-foundry-subtle">
-          Estimated model usage for this mission · ${summary.modelUsage.estimatedCostUsd.toFixed(2)} · {summary.modelUsage.paidCalls} paid call{summary.modelUsage.paidCalls === 1 ? "" : "s"} · {summary.modelUsage.inputTokens.toLocaleString()} input / {summary.modelUsage.outputTokens.toLocaleString()} output tokens
+          Foundry provider usage · ${summary.modelUsage.estimatedCostUsd.toFixed(2)} · {summary.modelUsage.paidCalls} provider call{summary.modelUsage.paidCalls === 1 ? "" : "s"} · {summary.modelUsage.inputTokens.toLocaleString()} input / {summary.modelUsage.outputTokens.toLocaleString()} output tokens
           {summary.modelUsage.executionTurns ? ` · ${summary.modelUsage.executionTurns} execution turns` : ""}
-          <span className="block">Calculated from provider-reported tokens and Foundry&apos;s configured rates; this is not a provider invoice.</span>
+          <span className="block">
+            Customer charge · ${summary.modelUsage.customerChargeUsd.toFixed(2)}
+            {summary.modelUsage.nonBillableProviderUsageUsd > 0
+              ? " — this incomplete mission is not billable by Foundry. Provider usage is shown separately and may still be billed by the model account that supplied the API key."
+              : " — based on provider-reported tokens and Foundry's configured rates."}
+          </span>
         </p>
       ) : null}
 

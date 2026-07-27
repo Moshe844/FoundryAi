@@ -6,7 +6,7 @@
  * project folder, but their assets were written under `public/` while the model was told the URL
  * was `/foundry-uploads/<file>`. Every generated page then 404'd on the user's own uploaded logo,
  * which surfaced as "visibly broken image(s)", failed browser verification, and ended otherwise
- * healthy missions in "Ready to continue". The directory and the served URL must be decided
+ * healthy missions in an incomplete terminal state. The directory and the served URL must be decided
  * together, by the same rule, which is why they live in one function.
  */
 export type AttachedAssetPlacement = {

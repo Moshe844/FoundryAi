@@ -84,12 +84,17 @@ assert(
   "Connection failures are not distinguished from timeouts.",
 );
 assert(
-  executor.includes('timedOut ? "AI provider attempts timed out" : "AI providers unavailable"'),
-  "The mission terminal title still labels every transport failure as provider unavailability.",
+  executor.includes("Provider outage blocked autonomous recovery")
+    && executor.includes("transportRecovery: true")
+    && executor.includes("continuing the same implementation step automatically"),
+  "A first cross-provider transport timeout can still terminate a recoverable mission.",
 );
 assert(
-  executor.includes("input.staticProject ? 60_000 : input.fastLane ? 60_000 : 160_000"),
-  "Existing static implementation calls do not receive a full coding-model attempt window.",
+  executor.includes("consecutiveProviderFailures > 0")
+    && executor.includes("? 75_000")
+    && executor.includes(": 105_000")
+    && dispatch.includes("MAX_LOGICAL_FALLBACK_WINDOW_MS = 240_000"),
+  "Provider fallback windows still let the primary starve the alternate or leave recovery unbounded.",
 );
 assert(
   adapter.includes("const eventTimes = execution.timeline") && adapter.includes("eventTimes.length >= 2"),
@@ -160,7 +165,7 @@ assert(
   executor.includes("Verified static edit ready for browser validation")
     && executor.includes('return finalize("passed", undefined, turn)')
     && executor.includes("redesign|overhaul|rewrite|rebuild|replace")
-    && factoryRuntime.includes("const boundedStaticWriteAwaitingBrowser = boundedStaticFollowUp")
+    && factoryRuntime.includes("const boundedStaticWriteAwaitingBrowser = (boundedStaticFollowUp || executorInteractionEvidenceAwaitingBrowser)")
     && factoryRuntime.includes("boundedStaticWholeRewrite ? 16_000 : boundedSmallEdit ? 3_500 : boundedStaticFollowUp ? 3_000")
     && factoryRuntime.includes("Verified static edit handed to browser validation"),
   "A localized static visual edit can still buy narration/server turns or become a false terminal failure after a verified write.",

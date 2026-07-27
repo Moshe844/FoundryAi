@@ -1,4 +1,5 @@
 import { decideCommandPermission } from "@/lib/ai/mission/command-permissions";
+import { hasProductImplementationEvidence } from "@/lib/factory/product-evidence";
 import type {
   ExecutionMissionVerification,
   FactoryEngineeringReport,
@@ -55,6 +56,10 @@ export function finalizeFactoryProjectResult(result: FactoryProjectResult, reque
 /** A generated project crosses the public completion boundary only with current executable proof. */
 export function enforceCreationCompletionContract(result: FactoryProjectResult): FactoryProjectResult {
   if (result.sourceMode !== "new-project" || result.status !== "passed") return result;
+  const productFiles = result.files
+    .filter((file) => file.status === "created" || file.status === "edited")
+    .map((file) => file.path);
+  const productImplemented = hasProductImplementationEvidence(productFiles);
   const latest = latestVerification(result.verification ?? []);
   const failedChecks = latest.filter((item) => item.result === "fail");
   const unprovenBehaviorChecks = latest.filter((item) => item.check_type === "preview" && item.result === "skipped");
@@ -64,6 +69,7 @@ export function enforceCreationCompletionContract(result: FactoryProjectResult):
   const launchProven = result.previewState === "ready" || Boolean(result.artifact?.buildStatus === "verified");
   const verificationProven = latest.some((item) => item.result === "pass");
   const missing = [
+    !productImplemented ? "no application source or executable product surface was created" : "",
     unsettled.length ? `${unsettled.length} objective item${unsettled.length === 1 ? " is" : "s are"} unfinished` : "",
     failedChecks.length ? `${failedChecks.length} latest verification check${failedChecks.length === 1 ? " is" : "s are"} failing` : "",
     unprovenBehaviorChecks.length ? "requested runtime behavior is still unproven" : "",
@@ -267,10 +273,11 @@ function completionMilestones(
 ): FactoryEngineeringReport["completion"] {
   const passed = (kind: ExecutionMissionVerification["check_type"]) => verification.some((item) => item.check_type === kind && item.result === "pass");
   const failed = verification.some((item) => item.result === "fail");
-  const saved = changedFiles.length > 0 || passed("file-read");
-  const built = passed("build") || Boolean(result.artifact?.buildStatus === "verified");
-  const tested = passed("test");
-  const verified = result.status === "passed" && !failed && verification.some((item) => item.result === "pass");
+  const productImplemented = result.sourceMode !== "new-project" || hasProductImplementationEvidence(changedFiles);
+  const saved = productImplemented && (changedFiles.length > 0 || passed("file-read"));
+  const built = productImplemented && (passed("build") || Boolean(result.artifact?.buildStatus === "verified"));
+  const tested = productImplemented && passed("test");
+  const verified = productImplemented && result.status === "passed" && !failed && verification.some((item) => item.result === "pass");
   const browserValidated = verified && browser.status === "verified";
   const productionReady = verified && publication.status === "verified" && monitoring.status === "verified";
   const highest = productionReady ? "production-ready" : browserValidated ? "browser-validated" : verified ? "verified" : tested ? "tested" : built ? "built" : saved ? "saved" : "not-saved";

@@ -105,5 +105,5 @@ function defaultNarrative(state: ExecutionMission["state"], current?: string) {
   if (state === "complete") return "The requested work is complete.";
   if (state === "failed" || state === "blocked") return "I stopped at a concrete blocker rather than claiming the work is complete.";
   if (state === "cancelled") return "This mission was stopped. Its history and completed changes remain available.";
-  return "I’m ready to continue this project.";
+  return "No active implementation or verification step is running.";
 }

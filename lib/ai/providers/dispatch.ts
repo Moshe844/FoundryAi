@@ -40,7 +40,7 @@ const MIN_PROVIDER_ATTEMPT_TIMEOUT_MS = 45_000;
 const MAX_PROVIDER_ATTEMPT_TIMEOUT_MS = 160_000;
 // Hard ceiling on how long ONE logical model call may block. 300s meant a pathological pair of hanging
 // providers could freeze a mission for five minutes; nothing healthy ever approaches this bound.
-const MAX_LOGICAL_FALLBACK_WINDOW_MS = 210_000;
+const MAX_LOGICAL_FALLBACK_WINDOW_MS = 240_000;
 
 /** Picks the best configured provider for a tier and falls back cleanly when a key is absent. */
 export function providerForTier(tier: ModelTier, preferred?: ProviderId): { provider: ProviderId; apiKey: string } | undefined {

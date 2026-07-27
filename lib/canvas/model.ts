@@ -82,7 +82,7 @@ export type CanvasSummaryLine = {
 
 /** Terminal block. Rendered only after the real final event. */
 export type CanvasSummary = {
-  heading: "Done" | "Failed" | "Stopped" | "Blocked" | "Verification blocked" | "Ready to continue";
+  heading: "Done" | "Incomplete" | "Failed" | "Stopped" | "Blocked" | "Verification blocked";
   verificationStatus: ExecutionMissionVerificationStatus;
   /** Product-specific final handoff, preserved from the executor rather than replaced by a status word. */
   outcome?: string;
@@ -96,6 +96,8 @@ export type CanvasSummary = {
   elapsedMs?: number;
   modelUsage?: {
     estimatedCostUsd: number;
+    customerChargeUsd: number;
+    nonBillableProviderUsageUsd: number;
     paidCalls: number;
     inputTokens: number;
     outputTokens: number;

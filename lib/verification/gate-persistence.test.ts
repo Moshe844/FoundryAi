@@ -16,11 +16,10 @@ describe("what a failing gate does next", () => {
     expect(action.reason).toContain("repairs are landing");
   });
 
-  it("escalates rather than ending the mission when a finding survives", () => {
-    // This is the case that used to end the run outright, after a single attempt.
+  it("keeps the same tier while real source progress is landing", () => {
     const action = nextGateAction({ attempts: [attempt({ fingerprint: "a" })], currentFingerprint: "a", maxAttempts: 5 });
-    expect(action.action).toBe("escalate");
-    expect(action.reason).toContain("stronger model");
+    expect(action.action).toBe("repair");
+    expect(action.reason).toContain("repairs are landing");
   });
 
   it("escalates when a repair wrote nothing at all", () => {
@@ -29,9 +28,9 @@ describe("what a failing gate does next", () => {
     expect(action.reason).toContain("changed no files");
   });
 
-  it("stops only once escalation has also failed to move the finding", () => {
+  it("stops only once escalation has also failed to write source", () => {
     const action = nextGateAction({
-      attempts: [attempt({ fingerprint: "a" }), attempt({ fingerprint: "a", escalated: true })],
+      attempts: [attempt({ fingerprint: "a", changedFiles: 0 }), attempt({ fingerprint: "a", changedFiles: 0, escalated: true })],
       currentFingerprint: "a",
       maxAttempts: 5,
     });
@@ -40,7 +39,7 @@ describe("what a failing gate does next", () => {
   });
 
   it("does not escalate twice", () => {
-    const attempts = [attempt({ fingerprint: "a", escalated: true }), attempt({ fingerprint: "b" })];
+    const attempts = [attempt({ fingerprint: "a", changedFiles: 0, escalated: true }), attempt({ fingerprint: "b", changedFiles: 0 })];
     expect(nextGateAction({ attempts, currentFingerprint: "b", maxAttempts: 5 }).action).toBe("stop");
   });
 

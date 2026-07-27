@@ -1321,7 +1321,13 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             : "Still generating — the model was slow to answer and Foundry is continuing with what it has.",
             { internal: false, details: { model, kind, message, nextCandidate, paidCallPrevented: false, handledAutomatically: true } });
         },
-        timeoutMs: input.staticProject && (input.newProject || input.staticRewrite || (input.fastLane && input.tier && input.tier !== "fast")) ? 45_000 : input.staticProject ? 60_000 : input.fastLane ? 60_000 : 160_000 },
+        timeoutMs: input.staticProject && (input.newProject || input.staticRewrite || (input.fastLane && input.tier && input.tier !== "fast"))
+          ? 45_000
+          : input.staticProject || input.fastLane
+            ? 60_000
+            : consecutiveProviderFailures > 0
+              ? 75_000
+              : 105_000 },
     );
     if (result.usage.requestCount > 0) {
       modelCallsSinceDurableProgress += 1;
@@ -1390,13 +1396,40 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         return finalize("failed", reason, turn);
       }
       if (result.failureKind === "transport") {
+        // A zero-output network timeout is not a user decision and it is not evidence that the
+        // product cannot be built. Keep recovery inside this mission: refresh routing on the next
+        // executor turn and require the same concrete action again. Only a second complete
+        // cross-provider transport failure may leave the mission with an external outage blocker.
+        if ((input.newProject || input.continuableBatch) && consecutiveProviderFailures === 0 && !input.signal?.aborted) {
+          consecutiveProviderFailures += 1;
+          await emit("reasoning", "running", "The provider route timed out before returning work. Foundry is refreshing model health and continuing the same implementation step automatically.", {
+            details: {
+              handledAutomatically: true,
+              transportRecovery: true,
+              changedFiles: changedFiles.size,
+              paidModelCalls: paidModelCallsThisBatch,
+            },
+          });
+          conversation.push({
+            role: "user",
+            content: [{
+              type: "text",
+              text: changedFiles.size
+                ? "The previous provider route timed out. Continue from the verified files already on disk and perform the next required executable project action now. Do not summarize or ask the user to retry."
+                : "The previous provider route timed out before creating application source. Continue the same mission now and call the required write tool with a substantial runnable product slice. Do not summarize or ask the user to retry.",
+            }],
+          });
+          continue;
+        }
         const preservedWork = changedFiles.size
           ? `${changedFiles.size} changed file${changedFiles.size === 1 ? " was" : "s were"} preserved, but Foundry could not finish and verify the request.`
           : "No project files were changed.";
         const providerFailure = result.errorMessage || "The configured provider attempts failed during transport.";
         const timedOut = /timed?\s*out|timeout/i.test(providerFailure);
         const reason = `${timedOut ? "AI provider attempts timed out." : "AI providers could not be reached."} ${preservedWork} ${providerFailure}`;
-        await emit("summary", "error", timedOut ? "AI provider attempts timed out" : "AI providers unavailable", { details: { reason, retryable: true, changedFiles: changedFiles.size } });
+        await emit("summary", "error", timedOut ? "Provider outage blocked autonomous recovery" : "Providers unavailable after autonomous recovery", {
+          details: { reason, retryable: false, changedFiles: changedFiles.size, autonomousRecoveryExhausted: true },
+        });
         return finalize("failed", reason, turn);
       }
       const recoveredStaticHtml = input.staticProject && input.newProject && /did not call required tool write_file/i.test(result.errorMessage ?? "")
@@ -1886,9 +1919,13 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       let toolResult: unknown;
       if (staticWriteIssue ?? evidenceRepairWriteIssue ?? modelOwnedPreviewCommandIssue) {
         const rejectedWriteReason = staticWriteIssue ?? evidenceRepairWriteIssue ?? modelOwnedPreviewCommandIssue!;
-        await emit(modelOwnedPreviewCommandIssue ? "command" : "edit", "warning", modelOwnedPreviewCommandIssue ? "Model-owned preview command rejected" : "Incomplete page write rejected before touching disk", {
-          filePath: String(args.path ?? ""),
-          details: { reason: rejectedWriteReason },
+        const rejectedPaths = proposedGeneratedFiles.map((file) => String(file.path ?? "")).filter(Boolean);
+        await emit(modelOwnedPreviewCommandIssue ? "command" : "inspection", "warning", modelOwnedPreviewCommandIssue
+          ? "Model-owned preview command rejected"
+          : input.newProject
+            ? "Rejected setup-only source batch; no application files were written"
+            : "Rejected incomplete source change before disk write", {
+          details: { reason: rejectedWriteReason, rejectedPaths },
         });
         toolResult = { verified: false, reason: rejectedWriteReason };
         // A rejected backup-shadow write leaves the mission with no durable change and only inflates
@@ -2153,7 +2190,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         }
       }
       if (input.evidenceFirstRepair && call.name === "replace_in_file" && (toolResult as { verified?: boolean; contentChanged?: boolean }).verified && (toolResult as { contentChanged?: boolean }).contentChanged) {
-        await emit("reasoning", "completed", "The evidence-backed source repair is on disk. Foundry is rebuilding and repeating the same browser gate now; no paid wrap-up call is needed.");
+        await emit("reasoning", "completed", `Updated ${String(args.path ?? "the targeted source file")} on disk. Foundry is rebuilding and rerunning the browser check now; this write is not yet proof that the browser defect is fixed.`);
         return finalize("passed", undefined, turn);
       }
       if (
