@@ -1,4 +1,4 @@
-import type { MissionRecord, OperationResult, PlannedOperation } from "./model";
+import type { ApprovalRequest, MissionRecord, OperationResult, PlannedOperation } from "./model";
 import { allOperationsSettled, readyOperations, validateOperationPlan } from "./operation-plan";
 import type { PermissionCoordinator } from "./permission-coordinator";
 
@@ -106,6 +106,10 @@ export class ExecutionScheduler {
       result: durableResult,
       updatedAt: completedAt,
     });
+    if (result.status === "awaiting_approval" && !working.approvals.some((request) => request.operationId === next.id && request.status === "pending")) {
+      const request = approvalRequestForExecutorPause(working, next, result.summary, completedAt);
+      working = { ...working, approvals: [...working.approvals, request] };
+    }
 
     return {
       mission: increment(working, next, result.status, result.summary),
@@ -113,6 +117,32 @@ export class ExecutionScheduler {
       waiting: result.status === "awaiting_approval",
     };
   }
+}
+
+/** The project-access adapter can discover a permission boundary only when it attempts the command.
+ * That late pause must still produce the same durable approval object as preflight authorization;
+ * an awaiting_approval status without a request leaves the UI in an impossible, buttonless state. */
+function approvalRequestForExecutorPause(
+  mission: MissionRecord,
+  operation: PlannedOperation,
+  reason: string,
+  createdAt: string,
+): ApprovalRequest {
+  const exactAction = operation.command ?? `${operation.kind}:${operation.target ?? operation.title}`;
+  return {
+    id: `approval-${operation.id}-${operation.attempt + 1}-runtime`,
+    missionId: mission.id,
+    operationId: operation.id,
+    projectId: mission.projectId,
+    category: categoryForOperation(operation),
+    exactAction,
+    reason,
+    impact: operation.target ? `Affects ${operation.target}` : "May modify the connected project or environment.",
+    affectedFiles: operation.target ? [operation.target] : [],
+    allowedScopes: operation.risk === "high_risk" ? ["once"] : ["once", "mission", "project", "exact_action"],
+    status: "pending",
+    createdAt,
+  };
 }
 
 export function categoryForOperation(operation: PlannedOperation): string {

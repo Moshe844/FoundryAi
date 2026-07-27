@@ -39,10 +39,14 @@ export function translateTools(tools: NeutralTool[] | undefined, provider: Provi
 function sanitizeSchemaForGoogle(schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(sanitizeSchemaForGoogle);
   if (schema === null || typeof schema !== "object") return schema;
-  const { additionalProperties, ...rest } = schema as Record<string, unknown>;
+  const { additionalProperties, const: constantValue, $schema, ...rest } = schema as Record<string, unknown>;
   void additionalProperties;
+  void $schema;
 
   const result: Record<string, unknown> = {};
+  // JSON Schema's `const` is not part of Gemini's accepted function-schema
+  // subset. A one-value enum preserves the same constraint on the wire.
+  if (constantValue !== undefined) result.enum = [constantValue];
   if (Array.isArray(rest.type)) {
     const types = rest.type.filter((t): t is string => typeof t === "string");
     const nonNullType = types.find((t) => t !== "null") ?? "string";

@@ -1,4 +1,4 @@
-import { explicitPersistenceFromPrompt, explicitStackFromPrompt, type ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
+import { explicitPersistenceFromPrompt, explicitStackFromPrompt, positiveIntentFromPrompt, type ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { taxonomyEntryFor } from "./taxonomy";
 import type { Platform, ProductCapabilities, ProductProfile } from "./types";
 import { technologyConstraintFromPrompt } from "./technology-constraint";
@@ -12,7 +12,7 @@ function authoritativeFamilyFromPrompt(text: string) {
   if (/\bplayable games?\b|\b(?:2d|3d|survival|platformer|puzzle|strategy|rhythm|open[- ]world)\b[^.\n]{0,60}\bgames?\b|\bgames?\b[^.\n]{0,60}\b(?:2d|3d|survival|platformer|puzzle|strategy|rhythm|open[- ]world)\b/.test(text)) return "games-interactive";
   if (/\bapi service\b|\b(?:rest|graphql|public|private|internal)?\s*api\b|\bwebhook service\b|\bmicroservice\b/.test(text)) return "backend-services";
   if (/\bai application\b|\bai-powered\b|\b(?:rag|ai|llm)\s+(?:assistant|agent|app|application|tool)\b/.test(text)) return "data-ai";
-  if (/\bresponsive website\b/.test(text)) return "websites-content";
+  if (/\b(?:responsive\s+)?(?:one-page\s+)?website\b|\blanding page\b|\bmarketing site\b|\bbrochure site\b|\bportfolio website\b/.test(text)) return "websites-content";
   if (/\boperational dashboard\b/.test(text)) return "web-applications-saas";
   if (/\bpoint-of-sale app\b|\be-commerce store\b|\bpos\b|\bcheckout\b/.test(text)) return "commerce-payments";
   if (/\binventory management system\b|\bwarehouse inventory\b|\binventory system\b/.test(text)) return "inventory-logistics";
@@ -49,8 +49,9 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
   // classifier made a model-invented dashboard/database self-confirm and escalated a marketing site
   // to Next.js + PostgreSQL. The project type may help taxonomy matching; capabilities come from the
   // user's prompt alone.
-  const taxonomyText = [prompt, discovery?.projectType].filter(Boolean).join(" ").toLowerCase();
-  const text = prompt.toLowerCase().replace(/\b(?:no|without|not|never)\s+(?:a\s+|an\s+|any\s+)?(?:login|authentication|auth|accounts?|database|backend|server|payments?)(?:\s+(?:or|and)\s+(?:a\s+|an\s+)?(?:login|authentication|auth|accounts?|database|backend|server|payments?))*/g, "");
+  const positivePrompt = positiveIntentFromPrompt(prompt);
+  const taxonomyText = [positivePrompt, discovery?.projectType].filter(Boolean).join(" ").toLowerCase();
+  const text = positivePrompt.toLowerCase();
   const taxonomyMatch = taxonomyEntryFor(taxonomyText);
   // A zero-score taxonomy result is not evidence. Treating the first catalogue entry as a match
   // made vague custom requests silently become websites and poisoned every downstream stack score.
@@ -119,12 +120,14 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
     offlineMode: matches(text, /offline|local[- ]first|without (?:a )?connection|sync queue/),
     realTime: matches(text, /real[- ]time|websocket|presence|live collaboration/),
     barcodeScanning: matches(text, /barcode|scanner|qr code/), camera: matches(text, /camera|photo|video/),
-    bluetooth: matches(text, /bluetooth|ble\b/), nfc: matches(text, /\bnfc\b/),
+    bluetooth: matches(text, /\bbluetooth\b|\bble\b/), nfc: matches(text, /\bnfc\b/),
     notifications: matches(text, /notification|push|alert/), payments: matches(text, /payment|checkout|billing|subscription|pos\b|merchant/),
-    reporting: matches(text, /report|analytics|dashboard|kpi/), fileUploads: matches(text, /upload|document|media|file/),
+    reporting: matches(text, /report|analytics|dashboard|kpi/), fileUploads: matches(text, /\buploads?\b|\bfile uploads?\b|\battachments?\b/),
     auditHistory: matches(text, /audit|history|transaction|inventory|payment/), backgroundJobs: matches(text, /background|scheduled|queue|worker|etl|pipeline/),
     threeDimensional: matches(text, /\b3d\b|vr\b|virtual showroom|advanced simulation/),
-    ...taxonomy?.entry.capabilities,
+    // Once the user explicitly names a product family, a fuzzy taxonomy hit may
+    // enrich wording but cannot smuggle in architecture-changing capabilities.
+    ...(authoritativeFamily ? {} : taxonomy?.entry.capabilities),
   };
   const needsQuestion = (taxonomy?.score ?? 0) < 2 && !Object.values(platforms).some(Boolean);
   const explicitStack = explicitStackFromPrompt(prompt);
@@ -138,6 +141,12 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
       ? platforms.android && !platforms.ios ? "Android application"
         : platforms.ios && !platforms.android ? "iOS application"
           : "cross-platform mobile application"
+      : authoritativeFamily === "websites-content"
+        ? "content website"
+        : authoritativeFamily === "backend-services"
+          ? "backend service"
+          : authoritativeFamily === "web-applications-saas"
+            ? "web application"
       : undefined;
   return {
     projectFamily: authoritativeFamily ?? taxonomy?.entry.family ?? "unclassified",

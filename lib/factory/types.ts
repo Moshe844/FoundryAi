@@ -137,6 +137,21 @@ export type FactoryArtifact = {
   downloadUrl: string;
 };
 
+export type FactoryDeployment = {
+  provider: "vercel" | "netlify";
+  deploymentId: string;
+  projectId?: string;
+  siteId?: string;
+  state: "queued" | "building" | "ready" | "failed";
+  production: true;
+  url: string;
+  dashboardUrl?: string;
+  createdAt: string;
+  verifiedAt?: string;
+  verificationStatus: "pending" | "verified" | "failed";
+  verificationEvidence?: string;
+};
+
 export type FactoryLifecyclePhaseId =
   | "understand"
   | "plan"
@@ -242,6 +257,8 @@ export type FactoryProjectResult = {
   previewEmulator?: "android";
   /** Server-derived metadata for an artifact that exists on disk. Never synthesize this client-side. */
   artifact?: FactoryArtifact;
+  /** Production publication returned and then independently verified by Foundry. */
+  deployment?: FactoryDeployment;
   /** True only when a separately approved atomic action verified that the connected project root no longer exists. */
   projectDeleted?: boolean;
   exportUrl?: string;
@@ -269,6 +286,9 @@ export type FactoryProjectResult = {
  * /api/factory/create that only ever sent a brief keep working unchanged.
  */
 export type StructuredDiscovery = {
+  /** Verbatim user-authored product request. Inferred discovery fields may guide design, but only
+   * this text and explicit user-confirmed decisions may become completion requirements. */
+  userRequest?: string;
   projectType: string;
   architecture: string;
   styleDirection: string;
@@ -277,7 +297,7 @@ export type StructuredDiscovery = {
   keyFacts: string[];
   futureCapabilities: string[];
   recommendedStack: string;
-  decisions: Array<{ dimension: string; hypothesis: string; rationale: string }>;
+  decisions: Array<{ dimension: string; hypothesis: string; rationale: string; source?: string }>;
 };
 
 export type FactoryCreateRequest = {

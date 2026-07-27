@@ -651,15 +651,20 @@ type ProjectSpec = {
 };
 
 function compactDiscoveryTask(discovery: StructuredDiscovery, additionalInstructions: string) {
+  const userConfirmed = new Set(discovery.decisions
+    .filter((decision) => decision.source === "user-confirmed")
+    .map((decision) => decision.dimension));
   const lines = [
+    discovery.userRequest ? `Authoritative user request:\n${conciseRequirement(discovery.userRequest, 2_000)}` : "",
+    "Scope rule: build the authoritative user request exactly. Inferred discovery values are design guidance only; do not turn them into extra pages, entities, persistence, authentication, APIs, or completion requirements unless the user explicitly requested them.",
     `Build ${conciseRequirement(discovery.projectType, 180)}.`,
     `Use ${conciseRequirement(discovery.recommendedStack || discovery.architecture, 180)}.`,
-    discovery.mainFeatures.length ? `Required behavior:\n${discovery.mainFeatures.map((item) => `- ${conciseRequirement(item, 180)}`).join("\n")}` : "",
-    discovery.dataModel.length ? `Data: ${discovery.dataModel.map((item) => conciseRequirement(item, 140)).join("; ")}` : "",
+    discovery.mainFeatures.length ? `${userConfirmed.has("features") ? "User-confirmed behavior" : "Optional design guidance"}:\n${discovery.mainFeatures.map((item) => `- ${conciseRequirement(item, 180)}`).join("\n")}` : "",
+    discovery.dataModel.length ? `${userConfirmed.has("data-shape") ? "User-confirmed data" : "Do not create persistence solely from these inferred content concepts"}: ${discovery.dataModel.map((item) => conciseRequirement(item, 140)).join("; ")}` : "",
     discovery.styleDirection ? `Design: ${conciseRequirement(discovery.styleDirection, 220)}` : "",
     discovery.keyFacts.length ? `Constraints:\n${discovery.keyFacts.map((item) => `- ${conciseRequirement(item, 160)}`).join("\n")}` : "",
     discovery.decisions.length
-      ? `Accepted decisions:\n${discovery.decisions.map((item) => `- ${conciseRequirement(item.dimension, 50)}: ${conciseRequirement(item.hypothesis, 150)}`).join("\n")}`
+      ? `Discovery guidance with provenance:\n${discovery.decisions.map((item) => `- ${conciseRequirement(item.dimension, 50)} (${item.source || "inferred"}): ${conciseRequirement(item.hypothesis, 150)}`).join("\n")}`
       : "",
     additionalInstructions ? `Additional instructions: ${conciseRequirement(additionalInstructions, 500)}` : "",
   ];
@@ -1169,6 +1174,11 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         "Build the project in the authoritative Foundry brief below. Preserve every named feature, constraint, data requirement, interaction, and design requirement; do not reduce it to a generic interpretation.",
         brief.trim(),
       ].filter(Boolean).join("\n\n");
+  const authoritativeUserRequest = [
+    discovery?.userRequest?.trim(),
+    spec.projectDescription.trim(),
+    spec.instructions.trim(),
+  ].filter(Boolean).join("\n\n") || brief.trim();
   const readableAttachmentContext = evidenceAttachments
     .filter((attachment) => attachment.uploadStatus === "readable" && Boolean(attachment.rawText))
     .map((attachment) => `### ${attachment.fileName}\n${redactSensitiveText(attachment.rawText ?? "").slice(0, 100_000)}`)
@@ -1181,7 +1191,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     : "";
   const attachmentBriefing = await brieflyAssessUnusedAttachments({
     attachments: evidenceAttachments,
-    request: task,
+    request: authoritativeUserRequest,
     projectFiles: attachedAssetWrite.assets.map((asset) => asset.projectPath),
     apiKey,
     provider: initialModel.provider,
@@ -1342,8 +1352,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     )
     .map((requirement) => requirement.text) ?? [];
   const deterministicBuildRequirements = [...new Set([
-    ...(discovery?.mainFeatures ?? []),
-    ...extractAtomicUserRequirements(task),
+    ...extractAtomicUserRequirements(authoritativeUserRequest),
   ])].filter(Boolean);
   // Requirement extraction is a safeguard, not a single point of failure. If that model is
   // unavailable, the explicit discovery features and atomic user clauses still stage the build;
@@ -2280,7 +2289,14 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   //
   // Deterministic gates prove the code is valid. Only the Requirement Ledger knows whether the product
   // exists. So before acceptance begins, ask it — and keep implementing while it says work remains.
-  if ((requirementLedger || deterministicBuildRequirements.length) && status !== "awaiting-approval" && status !== "awaiting-mock-approval" && !signal?.aborted) {
+  // Requirement batches may continue verified implementation, but they must not
+  // turn a zero-output provider failure into another paid attempt. A brief,
+  // package manifest, or passing empty scaffold is not application source.
+  const hasInitialApplicationWrite = result.changedFiles.some((file) =>
+    /\.(?:html?|css|scss|[cm]?[jt]sx?|vue|svelte|astro|py|cs|java|kt|swift)$/i.test(file)
+    && !/(?:^|\/)(?:foundry-brief\.md|package(?:-lock)?\.json|tsconfig\.json|next-env\.d\.ts|.*\.config\.[cm]?[jt]s)$/i.test(file),
+  );
+  if ((requirementLedger || deterministicBuildRequirements.length) && hasInitialApplicationWrite && status !== "awaiting-approval" && status !== "awaiting-mock-approval" && !signal?.aborted) {
     // Batches are now slices, so the ceiling has to cover the whole ledger rather than a fixed few
     // passes — otherwise building carefully would simply mean shipping less. It still ends: the loop
     // stops the moment nothing is outstanding, and the ledger reports whatever it could not reach.
@@ -2313,7 +2329,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       // than reproduce. Configuration and lockfiles are omitted — they are not what gets rewritten.
       const existingSourceInventory = (await listProjectFiles(projectPath))
         .map((file) => (typeof file === "string" ? file : file.path))
-        .filter((file) => /\.(?:[cm]?[jt]sx?|css|scss|json)$/i.test(file))
+        .filter((file) => /\.(?:html?|[cm]?[jt]sx?|css|scss|json)$/i.test(file))
         .filter((file) => !/(?:^|\/)(?:package(?:-lock)?\.json|tsconfig\.json|next-env\.d\.ts|.*\.config\.[cm]?[jt]s)$/i.test(file))
         .slice(0, 120);
 
@@ -11339,6 +11355,11 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
       exclude: ["node_modules"],
     }, null, 2)}\n`;
     await reconcilePackageManifest(manifest);
+    // Every generated Next.js project owns its framework configuration. Without a local config,
+    // Next walks up into Foundry's repository, inherits Foundry's production distDir, and can build
+    // one artifact while `next start` serves a different/missing one. A project-local config makes
+    // build, verification, preview, packaging, and later deployment refer to the same output.
+    await writeMissing("next.config.mjs", `/** @type {import("next").NextConfig} */\nconst nextConfig = { distDir: ".next" };\n\nexport default nextConfig;\n`);
     await writeMissing("tsconfig.json", tsconfig);
     await writeMissing("next-env.d.ts", "/// <reference types=\"next\" />\n/// <reference types=\"next/image-types/global\" />\n");
     await writeMissing("src/app/layout.tsx", `import type { ReactNode } from "react";\nimport "./globals.css";\n\nexport default function RootLayout({ children }: { children: ReactNode }) {\n  return <html lang="en"><body>{children}</body></html>;\n}\n`);

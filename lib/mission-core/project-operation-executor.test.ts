@@ -47,6 +47,17 @@ describe("ProjectOperationExecutor", () => {
     expect(result.changed).toBe(true);
   });
 
+  it("treats a root-directory read as project inspection instead of a missing file", async () => {
+    const executor = new ProjectOperationExecutor(access({
+      listDir: async () => [{ name: "package.json", kind: "file", size: 100 }],
+      readFile: async () => ({ exists: false, content: "", truncated: false, totalBytes: 0 }),
+    }));
+    const result = await executor.execute(operation({ id: "inspect", kind: "read_file", title: "Inspect root", target: "." }), mission);
+    expect(result.status).toBe("succeeded");
+    expect(result.summary).toContain("Inspected project root");
+    expect(result.evidence).toContain("file:package.json");
+  });
+
   it("preserves permission-required as an approval wait", async () => {
     const executor = new ProjectOperationExecutor(access({
       runCommand: async () => ({ exitCode: null, stdout: "", stderr: "", durationMs: 0, timedOut: false, skipped: "permission-required", reason: "approval required", category: "dependencies" }),

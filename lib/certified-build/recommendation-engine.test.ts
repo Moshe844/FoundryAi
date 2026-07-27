@@ -32,6 +32,27 @@ describe("Foundry certified build policy",()=>{
   });
   it("uses only Level 4 stacks for automatic selection",()=>{for(const brief of ["marketing website","multi-user SaaS dashboard","API-only webhook service","warehouse inventory with Android scanners"]){const r=recommend(brief);expect(r.selectedStack?.supportLevel??4).toBe(4);}});
   it("keeps a marketing website serverless",()=>{expect(recommend("simple marketing website with contact details; no login or database").selectedStackId).toBe("static-web-vite");});
+  it("keeps an ordinary one-page business website free of invented application infrastructure",()=>{
+    const brief="Build a polished responsive one-page website for a neighborhood bakery with a hero, featured pastries, about, opening hours, address, and contact call-to-action.";
+    const discovery=discoverProject(brief,"custom");
+    const profile=extractProductProfile(brief,discovery);
+    expect(recommendStack(profile,webEnv).selectedStackId).toBe("static-web-vite");
+    expect(profile.capabilities.bluetooth).toBe(false);
+    expect(profile.capabilities.fileUploads).toBe(false);
+    expect(discovery.recommendedStack).toBe("Static HTML + CSS + JavaScript");
+    expect(discovery.mainFeatures.join(" ")).not.toMatch(/blog|detail page|database|author|category|mdx/i);
+    expect(discovery.dataModel).toEqual([]);
+  });
+  it("treats a comma-separated rejection list as negative constraints, not backend evidence",()=>{
+    const brief="Build and publish a polished responsive one-page website for a neighborhood florist. Do not add a database, backend, blog, authentication, CMS, or extra pages.";
+    const discovery=discoverProject(brief,"custom");
+    expect(discovery.decisions.find(item=>item.dimension==="platform")?.hypothesis).toBe("Web");
+    expect(discovery.decisions.find(item=>item.dimension==="auth-database-api")?.hypothesis).toMatch(/^No database/);
+    expect(discovery.decisions.find(item=>item.dimension==="navigation")?.hypothesis).toMatch(/^One-page section navigation/);
+    expect(recommendStack(extractProductProfile(brief,discovery),webEnv).selectedStackId).toBe("static-web-vite");
+    expect(discovery.recommendedStack).toBe("Static HTML + CSS + JavaScript");
+    expect(discovery.dataModel).toEqual([]);
+  });
   it("keeps the exact marketing-site starter on static HTML without model-added architecture",()=>{const profile=extractProductProfile("Marketing site",{prompt:"Marketing site",projectType:"Responsive Website. Subtype: Marketing Site",recommendedStack:"Next.js + PostgreSQL",architecture:"dashboard with a database",mainFeatures:["Admin dashboard","User accounts"],styleDirection:"",dataModel:["User","Record"],assumptions:[],questions:[],decisions:[],keyFacts:[],futureCapabilities:[]});const result=recommendStack(profile,webEnv);expect(result.selectedStackId).toBe("static-web-vite");expect(result.selectedStack?.displayName).toBe("Static HTML + CSS + JavaScript");});
   it("chooses relational full stack for SaaS",()=>{expect(recommend("multi-user SaaS dashboard with login, roles and reports").selectedStackId).toBe("nextjs-typescript-postgres");});
   it("describes the business stack without falsely requiring an unconfigured production database",()=>{

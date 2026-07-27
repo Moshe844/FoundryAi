@@ -33,6 +33,16 @@ export class ProjectOperationExecutor implements OperationExecutor {
 
   private async read(operation: PlannedOperation): Promise<OperationExecutionResult> {
     if (!operation.target) return invalid("Read operation has no target path.");
+    const normalizedTarget = operation.target.replace(/\\/g, "/").trim();
+    if (normalizedTarget === "." || normalizedTarget === "./" || normalizedTarget === "/") {
+      const entries = await this.access.listDir("");
+      return {
+        status: "succeeded",
+        summary: `Inspected project root (${entries.length} item${entries.length === 1 ? "" : "s"}).`,
+        evidence: entries.map((entry) => `${entry.kind}:${entry.name}`),
+        output: JSON.stringify(entries),
+      };
+    }
     const result = await this.access.readFile(operation.target);
     if (!result.exists) return { status: "failed", summary: `File not found: ${operation.target}`, error: "not-found" };
     return {

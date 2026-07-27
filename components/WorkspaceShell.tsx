@@ -2998,7 +2998,13 @@ function projectExecutionPathFromMission(mission: MissionState) {
   if (artifact) {
     try {
       const result = JSON.parse(artifact.body) as FactoryProjectResult;
-      if (result.projectPath) return result.projectPath;
+      const hasApplicationSource = result.files.some((file) =>
+        /\.(?:html?|css|scss|[cm]?[jt]sx?|vue|svelte|astro|py|cs|java|kt|swift)$/i.test(file.path)
+        && !/(?:^|[\\/])(?:foundry-brief\.md|package(?:-lock)?\.json|tsconfig\.json|next-env\.d\.ts|.*\.config\.[cm]?[jt]s)$/i.test(file.path),
+      );
+      // A failed follow-up that accidentally allocated a sibling folder containing
+      // only foundry-brief.md must not replace the durable project identity.
+      if (result.projectPath && (result.status !== "failed" || hasApplicationSource)) return result.projectPath;
     } catch {
       // An interrupted first build may not have a final result artifact yet. Fall
       // through to the durable live timeline, which records the created folder.

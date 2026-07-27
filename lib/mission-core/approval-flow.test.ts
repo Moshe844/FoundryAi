@@ -69,4 +69,19 @@ describe("mission approval flow", () => {
     expect(mission.operations[0].status).toBe("skipped");
     expect(executions).toBe(0);
   });
+
+  it("creates a durable approval request when project access discovers permission late", async () => {
+    const repository = new InMemoryMissionRepository();
+    const scheduler = new ExecutionScheduler({
+      execute: async () => ({ status: "awaiting_approval", summary: "Local runtime requires approval." }),
+    });
+    const coordinator = new MissionCoordinator(repository, scheduler);
+    await repository.create(createMissionRecord({ id: "m1", projectId: "p1", objective: "run command" }));
+    await coordinator.understand("m1");
+    await coordinator.plan("m1", [operation()]);
+    const mission = await coordinator.runNext("m1");
+    expect(mission.status).toBe("awaiting_approval");
+    expect(mission.approvals).toHaveLength(1);
+    expect(mission.approvals[0]).toMatchObject({ operationId: "install", status: "pending", exactAction: "npm install dayjs" });
+  });
 });

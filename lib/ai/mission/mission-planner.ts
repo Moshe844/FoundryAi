@@ -1,12 +1,13 @@
 import type { RuntimeUsageRecord } from "@/lib/ai/foundry-runtime";
 import { callManagedModel } from "@/lib/ai/providers/dispatch";
-import { resolveModelForTier, type ModelTier } from "@/lib/ai/model-router";
+import type { ModelTier } from "@/lib/ai/model-router";
 import type { NeutralTool, ProviderId } from "@/lib/ai/providers/types";
 import type { FactoryObjectiveChecklistItem } from "@/lib/factory/types";
 import { isConcreteDebugRequest } from "@/lib/ai/mission/debug-intent";
 import { extractAtomicUserRequirements, requiresPolishedUiAcceptance } from "@/lib/ai/mission/requirement-contract";
 import { routingContext } from "@/lib/ai/routing/request-context";
 import type { DynamicTaskAssessment } from "@/lib/ai/routing/types";
+import { routePayloadDynamically } from "@/lib/ai/routing/dynamic-router";
 
 export type MissionPlan = {
   checklist: FactoryObjectiveChecklistItem[];
@@ -94,7 +95,15 @@ export async function planMission(input: {
   // existed; the caller (lib/factory/runtime.ts) doesn't pass one yet.
   const provider: ProviderId = input.provider ?? "openai";
   const planningTier = input.tier ?? "builder";
-  const { model, effort } = resolveModelForTier(planningTier, { provider });
+  // Planning is often the first route invoked when resuming a saved mission.
+  // Refresh the live registry here instead of assuming another API route already
+  // populated module-local model state.
+  const routed = await routePayloadDynamically(
+    { task: input.task, objective: input.objective, projectSnapshot: input.projectSnapshot },
+    planningTier,
+    provider,
+  );
+  const { model, effort } = routed.decision;
 
   const system = [
     multiPart

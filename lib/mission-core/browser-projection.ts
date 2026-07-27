@@ -36,7 +36,7 @@ function labelForStatus(status: MissionRecord["status"], pendingApproval?: Appro
     case "understanding": return "Understanding request";
     case "awaiting_clarification": return "Waiting for clarification";
     case "planned": return "Plan ready";
-    case "awaiting_approval": return "Waiting for approval";
+    case "awaiting_approval": return pendingApproval ? "Waiting for approval" : "Blocked: approval request unavailable";
     case "executing": return "Working";
     case "verifying": return "Verifying";
     case "repairing": return "Repairing";

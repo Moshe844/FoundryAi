@@ -39,7 +39,7 @@ import { runDiscoveryEngine } from "@/lib/discovery/engine";
 import { FALLBACK_STACK_OPTIONS, type StackOption } from "@/lib/ai/project-discovery-llm";
 import { platformStackOptionsForProject } from "@/lib/discovery/platform-stack-policy";
 import { genericHistoryRecommendation, type HistoryRecommendation } from "@/lib/discovery/history-recommendations";
-import { deriveQuestionsAndAssumptions, discoverProject, explicitPlatformFromPrompt, explicitProjectNameFromPrompt, explicitStackFromPrompt, isGenericPlaceholderValue, reconcileDiscoveryWithExplicitBrief } from "@/lib/ai/project-discovery";
+import { deriveQuestionsAndAssumptions, discoverProject, explicitPlatformFromPrompt, explicitProjectNameFromPrompt, explicitStackFromPrompt, isGenericPlaceholderValue, positiveIntentFromPrompt, reconcileDiscoveryWithExplicitBrief } from "@/lib/ai/project-discovery";
 import type { DiscoveryDecision, DiscoveryDimension, ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import { pickBrowserFolder, readBrowserFolderFiles, supportsBrowserFolderAccess } from "@/lib/factory/browser-folder";
 import { generatedWorkspaceForMission } from "@/lib/factory/live-project";
@@ -1660,8 +1660,9 @@ function discoverySeedText(start: ProjectStart) {
 
 function deterministicDiscoveryIsSufficient(brief: string) {
   const words = brief.trim().split(/\s+/).filter(Boolean).length;
-  if (/\b(?:portfolio|product page|landing page|marketing site|brochure site|documentation site|docs site|business website)\b/i.test(brief)
-    && !/\b(?:auth|login|sign[- ]?up|account|checkout|payment|database|admin|dashboard|api)\b/i.test(brief)) return true;
+  const positiveBrief = positiveIntentFromPrompt(brief);
+  if (/\b(?:website|one-page site|portfolio|product page|landing page|marketing site|brochure site|documentation site|docs site|business website)\b/i.test(positiveBrief)
+    && !/\b(?:auth|login|sign[- ]?up|account|checkout|payment|database|admin|dashboard|api)\b/i.test(positiveBrief)) return true;
   if (explicitStackFromPrompt(brief)) return words >= 5;
   // Require more than a bare "Android app"-style label: platform plus a concrete product/workflow
   // is enough for the local policy, while genuinely underspecified requests still get refinement.
@@ -1746,7 +1747,9 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           ...reconcileKnownStarterDiscovery(heuristic, start),
           // A broad commerce keyword such as "checkout" must not rename a specifically described
           // PAX/Android product to the generic catalog profile "E-commerce store".
-          projectType: cleanProjectName(seedText) || heuristic.projectType,
+          // A readable workspace name is not a product taxonomy. Replacing "Content website"
+          // with the first words of the entire brief poisoned the certified classifier.
+          projectType: explicitProjectNameFromPrompt(seedText) || heuristic.projectType,
           prompt: seedText,
         }, seedText);
         const certifiedRecommendation = recommendStack(extractProductProfile(seedText, resolvedDiscovery), defaultEnvironmentCapabilities());
@@ -4443,14 +4446,15 @@ function cleanProjectName(value: string) {
 
 /** A customer-facing surface label derived only from current evidence, never a starter default. */
 function explicitSurfaceFromBrief(brief: string, discovery?: ProjectDiscoveryResult | null) {
-  if (/\bandroid\b/i.test(brief)) return "Android app";
-  if (/\b(?:ios|iphone|ipad)\b/i.test(brief)) return "iOS app";
-  if (/\bmobile\s+(?:app|application)\b/i.test(brief)) return "Mobile app";
-  if (/\b(?:desktop|windows|macos)\s+(?:app|application)\b/i.test(brief)) return "Desktop app";
-  if (/\b(?:2d|3d|survival|platformer|puzzle|strategy|card|board|educational|browser|mobile|desktop)?\s*games?\b/i.test(brief)) return "Game";
-  if (/\b(?:command[- ]line|cli)\b/i.test(brief)) return "Command-line app";
-  if (/\b(?:backend|server-only|microservice|rest\s+api|web\s+api|api\s+(?:service|server))\b/i.test(brief)) return "Backend service";
-  if (/\b(?:web|browser)\s+(?:app|application|site|website|dashboard)\b/i.test(brief)) return "Web app";
+  const positiveBrief = positiveIntentFromPrompt(brief);
+  if (/\bandroid\b/i.test(positiveBrief)) return "Android app";
+  if (/\b(?:ios|iphone|ipad)\b/i.test(positiveBrief)) return "iOS app";
+  if (/\bmobile\s+(?:app|application)\b/i.test(positiveBrief)) return "Mobile app";
+  if (/\b(?:desktop|windows|macos)\s+(?:app|application)\b/i.test(positiveBrief)) return "Desktop app";
+  if (/\b(?:2d|3d|survival|platformer|puzzle|strategy|card|board|educational|browser|mobile|desktop)?\s*games?\b/i.test(positiveBrief)) return "Game";
+  if (/\b(?:command[- ]line|cli)\b/i.test(positiveBrief)) return "Command-line app";
+  if (/\b(?:backend|server-only|microservice|rest\s+api|web\s+api|api\s+(?:service|server))\b/i.test(positiveBrief)) return "Backend service";
+  if (/\bwebsite\b|\blanding page\b|\bone-page (?:site|website)\b|\b(?:web|browser)\s+(?:app|application|site|website|dashboard)\b/i.test(positiveBrief)) return "Web app";
   const platformDecision = discovery?.decisions.find((decision) => decision.dimension === "platform")?.hypothesis?.trim();
   return platformDecision || "";
 }
@@ -4691,6 +4695,7 @@ function structuredDiscoveryFor(start: ProjectStart): StructuredDiscovery | unde
   if (!start.discovery) return undefined;
   const discovery = start.discovery;
   return {
+    userRequest: start.projectDescription.trim(),
     projectType: discovery.projectType,
     architecture: discovery.architecture,
     styleDirection: discovery.styleDirection,
@@ -4699,7 +4704,7 @@ function structuredDiscoveryFor(start: ProjectStart): StructuredDiscovery | unde
     keyFacts: discovery.keyFacts,
     futureCapabilities: discovery.futureCapabilities,
     recommendedStack: selectedStackFor(start) || discovery.recommendedStack,
-    decisions: discovery.decisions.map((decision) => ({ dimension: decision.dimension, hypothesis: decision.hypothesis, rationale: decision.rationale })),
+    decisions: discovery.decisions.map((decision) => ({ dimension: decision.dimension, hypothesis: decision.hypothesis, rationale: decision.rationale, source: decision.source })),
   };
 }
 

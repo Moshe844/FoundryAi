@@ -130,9 +130,13 @@ function profileFromDynamicAssessment(input: TaskContext, assessment: DynamicTas
   const critical = assessment.independentReviewNeeded && difficulty >= 0.85 && risk >= 0.8 && ambiguity >= 0.65 && (estimatedSubsystems >= 4 || failureHistory >= 2);
   const broadMigration = assessment.migration && (projectWide || estimatedFiles >= 15 || estimatedSubsystems >= 3);
   const boundedFacts = !assessment.securityOrPayment && !assessment.migration && !crossLayer && !projectWide && estimatedFiles <= 12 && estimatedSubsystems <= 2;
+  const hardDebug = assessment.taskType === "debug" && difficulty >= 0.8 && ambiguity >= 0.7 && risk >= 0.5;
+  const repeatedFailure = assessment.taskType === "debug" && failureHistory >= 2;
   const architectureRisk = assessment.securityOrPayment
     || crossLayer
     || risk >= 0.7
+    || hardDebug
+    || repeatedFailure
     || ((difficulty >= 0.82 || ambiguity >= 0.8) && (estimatedFiles >= 15 || estimatedSubsystems >= 3 || projectWide));
   const clearlyCheap = boundedFacts && failureHistory === 0 && estimatedFiles <= 3 && difficulty <= 0.5 && ambiguity <= 0.55 && risk <= 0.3;
   const boundedBuild = boundedFacts && difficulty <= 0.75 && risk <= 0.5;
@@ -144,7 +148,7 @@ function profileFromDynamicAssessment(input: TaskContext, assessment: DynamicTas
   else if (boundedBuild) tier = assessment.projectCreation && estimatedFiles <= 3 ? "fast" : "builder";
   else tier = "builder";
 
-  if (boundedFacts && (tier === "architect" || tier === "enterprise-architect" || tier === "super-reasoning")) {
+  if (boundedFacts && !hardDebug && !repeatedFailure && (tier === "architect" || tier === "enterprise-architect" || tier === "super-reasoning")) {
     tier = "builder";
     reasons.push("deterministic scope sanity check capped a bounded, non-sensitive, single-layer task at Builder");
   }
@@ -181,7 +185,7 @@ function profileFromDynamicAssessment(input: TaskContext, assessment: DynamicTas
 function stripNegatedRiskClaims(text: string) {
   return text.replace(
     /\b(?:no|without|does(?:n't| not) (?:need|use|have)|do not (?:need|use|have))\b(?:(?!\b(?:but|however|although|requires?|including|with)\b)[^.!?\n]){0,160}/g,
-    (clause) => clause.replace(/\b(?:backend|database|authentication|auth|payments?|security|login|accounts?|framework|(?:external\s+)?integrations?)\b/g, ""),
+    (clause) => clause.replace(/\b(?:backend|database|authentication|auth|payments?|security|login|accounts?|framework|api|server|(?:external\s+|third-party\s+)?integrations?)\b/g, ""),
   );
 }
 

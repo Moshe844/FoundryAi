@@ -87,17 +87,32 @@ export function explicitStackFromPrompt(prompt: string): string | undefined {
   return choices.find(([pattern]) => pattern.test(prompt))?.[1];
 }
 
+/**
+ * Removes explicitly rejected terms before positive-intent classification.
+ * The authoritative brief still retains the negative constraints.
+ */
+export function positiveIntentFromPrompt(prompt: string): string {
+  const rejected = "(?:auth(?:entication)?|login|sign[- ]?up|accounts?|database|backend|server|api|payments?|checkout|blog|cms|extra pages?|additional pages?)";
+  return prompt
+    .replace(new RegExp(`\\b(?:do\\s+not|don't|dont|never)\\s+(?:add|include|use|create|build|require|need|make)?\\s*(?:a\\s+|an\\s+|any\\s+)?${rejected}(?:\\s*(?:,|\\/|\\bor\\b|\\band\\b)\\s*(?:a\\s+|an\\s+|any\\s+)?${rejected})*`, "gi"), " ")
+    .replace(new RegExp(`\\b(?:no|without)\\s+(?:a\\s+|an\\s+|any\\s+)?${rejected}(?:\\s*(?:,|\\/|\\bor\\b|\\band\\b)\\s*(?:a\\s+|an\\s+|any\\s+)?${rejected})*`, "gi"), " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function explicitPlatformFromPrompt(prompt: string): string | undefined {
-  if (/\b(?:static|plain|vanilla)\s+(?:web|website|site|html)|\bbrowser(?:-based)?\b|\bweb\s+(?:app|application|site|website|dashboard)\b/i.test(prompt)) return "Web app";
-  if (/\bdesktop\s+(?:app|application)|\bwindows\s+(?:app|application)|\bmacos\s+(?:app|application)\b/i.test(prompt)) return "Desktop app";
-  if (/\bmobile\s+(?:app|application)|\b(?:ios|iphone|ipad|android)\b[^.\n]{0,60}\b(?:app|application)\b/i.test(prompt)) return "Mobile app";
-  if (/\b(?:backend|server-only|microservice|rest\s+api|web\s+api|api\s+(?:service|server))\b/i.test(prompt)) return "Backend service";
-  if (/\b(?:browser\s+game|web\s+game|desktop\s+game|mobile\s+game|game)\b/i.test(prompt)) return "Game";
+  const positive = positiveIntentFromPrompt(prompt);
+  if (/\b(?:static|plain|vanilla)\s+(?:web|website|site|html)|\bbrowser(?:-based)?\b|\bweb\s+(?:app|application|site|website|dashboard)\b|\bwebsite\b|\blanding page\b|\bone-page (?:site|website)\b/i.test(positive)) return "Web app";
+  if (/\bdesktop\s+(?:app|application)|\bwindows\s+(?:app|application)|\bmacos\s+(?:app|application)\b/i.test(positive)) return "Desktop app";
+  if (/\bmobile\s+(?:app|application)|\b(?:ios|iphone|ipad|android)\b[^.\n]{0,60}\b(?:app|application)\b/i.test(positive)) return "Mobile app";
+  if (/\b(?:backend|server-only|microservice|rest\s+api|web\s+api|api\s+(?:service|server))\b/i.test(positive)) return "Backend service";
+  if (/\b(?:browser\s+game|web\s+game|desktop\s+game|mobile\s+game|game)\b/i.test(positive)) return "Game";
   return undefined;
 }
 
 /** Returns a datastore explicitly selected by the user. It is a build constraint, not a suggestion. */
 export function explicitPersistenceFromPrompt(prompt: string): string | undefined {
+  const positive = positiveIntentFromPrompt(prompt);
   const choices: Array<[RegExp, string]> = [
     [/\bpostgres(?:ql)?\b/i, "PostgreSQL"],
     [/\bmysql\b/i, "MySQL"],
@@ -107,7 +122,7 @@ export function explicitPersistenceFromPrompt(prompt: string): string | undefine
     [/\bsupabase\b/i, "Supabase"],
     [/\b(?:localstorage|local storage)\b/i, "localStorage"],
   ];
-  return choices.find(([pattern]) => pattern.test(prompt))?.[1];
+  return choices.find(([pattern]) => pattern.test(positive))?.[1];
 }
 
 function normalizedBriefItem(value: string): string {
@@ -453,17 +468,17 @@ const profiles: SignalProfile[] = [
     // creative-agency brief to the generic CRUD fallback. "Portfolio" alone stays ambiguous
     // (creative vs. investment portfolio) and still needs site/website/personal to disambiguate.
     patterns: [/\b(blog|website|web site|portfolio (site|website)|personal portfolio|landing page|marketing site|docs site|content site|agency (?:site|website|portfolio)|studio (?:site|website|portfolio)|brochure|showcase|case stud(y|ies)|our work)\b/i],
-    stack: "Next.js",
+    stack: "Static HTML + CSS + JavaScript",
     architecture:
-      "Next.js content site with static generation for pages and posts, MDX-based content authoring, and a component library of reusable sections (hero, feature grid, testimonials, CTA).",
-    architectureRationale: "Static generation means every page loads instantly and ranks well, with no server cost per visitor.",
+      "Static-first presentation website with semantic HTML, responsive CSS, accessible navigation, and only the pages and interactions named in the brief.",
+    architectureRationale: "A content-only website should ship without an application server, database, CMS, or authoring model unless the user explicitly requests one.",
     style: "Editorial, brand-forward responsive design: a strong type scale, generous whitespace, scroll-triggered reveals, and consistent section rhythm across pages.",
     styleRationale: "Generous whitespace and a strong type scale read as credibility — visitors judge a brand's quality from the page before they read a word of copy.",
-    features: ["Homepage with hero + feature sections", "Content listing (blog/portfolio grid)", "Detail page with rich content rendering", "Primary + footer navigation", "Responsive images with lazy loading", "SEO metadata per page"],
-    entities: ["Page", "Post/project", "Author", "Category/tag", "Media asset"],
+    features: ["Responsive presentation page", "Accessible primary navigation", "Contact path"],
+    entities: [],
     users: "Visitors and content readers.",
     platform: "Web",
-    complexity: "Multi-page website",
+    complexity: "Focused presentation website",
     growth: ["CMS-backed authoring for non-developers", "Newsletter/email capture", "Multi-language content", "Deeper analytics and SEO tooling"],
   },
   {
@@ -629,6 +644,7 @@ export function discoverProject(prompt: string, starterId?: string): ProjectDisc
 }
 
 function chooseProfile(prompt: string) {
+  prompt = positiveIntentFromPrompt(prompt);
   const rankedMatches = (value: string) => profiles
     .map((profile) => ({ profile, score: profile.patterns.reduce((score, pattern) => score + (pattern.test(value) ? 1 : 0), 0) }))
     .filter((item) => item.score > 0)
@@ -757,7 +773,7 @@ function ambiguityScore(prompt: string, profile?: SignalProfile) {
 }
 
 function authConfidence(prompt: string, profile: SignalProfile) {
-  if (/\b(login|auth|account|user accounts?|database|db|api|backend|server|persist|save data|local\s*storage|localstorage|payments?|checkout|prisma|postgres(?:ql)?|mysql|sqlite|mongodb)\b/i.test(prompt)) return 92;
+  if (/\b(login|auth|account|user accounts?|database|db|api|backend|server|persist|save data|local\s*storage|localstorage|payments?|checkout|prisma|postgres(?:ql)?|mysql|sqlite|mongodb)\b/i.test(positiveIntentFromPrompt(prompt))) return 92;
   // A recognized domain profile is enough for Foundry to commit to a sensible default
   // without asking — only a genuinely unmatched (custom) domain stays uncertain here.
   if (profile.id === "custom") return 58;
@@ -765,23 +781,25 @@ function authConfidence(prompt: string, profile: SignalProfile) {
 }
 
 function authSource(prompt: string): DiscoverySource {
-  return /\b(login|auth|account|database|api|backend|server|persist|save data|local\s*storage|localstorage|prisma|postgres(?:ql)?|mysql|sqlite|mongodb)\b/i.test(prompt) ? "observed" : "defaulted";
+  return /\b(login|auth|account|database|api|backend|server|persist|save data|local\s*storage|localstorage|prisma|postgres(?:ql)?|mysql|sqlite|mongodb)\b/i.test(positiveIntentFromPrompt(prompt)) ? "observed" : "defaulted";
 }
 
 function authDataApiFor(prompt: string, profile: SignalProfile) {
+  prompt = positiveIntentFromPrompt(prompt);
   if (profile.id === "auth-page") return "Email/password authentication with hashed credentials and secure httpOnly session cookies. OAuth, magic links, verification email, password reset, and MFA remain optional until requested.";
   if (/\b(?:pax|poslink|payment terminal|licensed sdk|sandbox transaction|do not simulate (?:hardware|payments?))\b/i.test(prompt)) return "Durable local catalog/cart state plus a real licensed terminal-SDK boundary; payment, device discovery, and transaction outcomes must be verified rather than mocked.";
   if (/\b(login|auth|account)\b/i.test(prompt)) return "Account/auth-ready UI wired to a real session model, not just a static form.";
   if (/\b(?:local\s*storage|localstorage)\b/i.test(prompt)) return "Browser-local persistence for the first version, with serialization isolated from the UI so it can be replaced by a service later.";
   if (/\b(database|db|persist|save data|prisma|postgres(?:ql)?|mysql|sqlite|mongodb)\b/i.test(prompt)) return "A persistent data boundary (typed models, migration-ready) rather than local-only state.";
   if (/\b(api|backend|server)\b/i.test(prompt)) return "An explicit API/backend boundary with validated request/response contracts.";
+  if (profile.id === "content") return "No database, authentication, CMS, or API is required for this static presentation site.";
   if (profile.id === "inventory" || profile.id === "commerce" || profile.id === "dashboard") return "Start with local/mock data and keep the database/auth/API seams explicit so they're easy to wire in later.";
   return "Local state/mock data for the first version, with clear seams for a real database or auth once needed.";
 }
 
 function navigationFor(profile: SignalProfile) {
   if (profile.id === "game") return "Start screen, play scene, results/retry screen.";
-  if (profile.id === "content") return "Home, listing, detail, about/contact as needed.";
+  if (profile.id === "content") return "One-page section navigation using only the sections named in the brief.";
   if (profile.id === "auth-page") return "Single auth surface with secondary account links.";
   if (profile.id === "commerce") return "Storefront, product detail, cart, checkout, account, and order history.";
   if (profile.id === "pos") return "Register, held carts, transaction history, refunds, and shift controls.";
