@@ -1,12 +1,9 @@
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import { executeExistingProjectTask } from "@/lib/factory/runtime";
 import type { FactoryExecutionEvent, FactoryExistingProjectRequest, FactoryProjectResult } from "@/lib/factory/types";
-import { FileMissionRepository } from "./file-repository";
 import { createMissionRecord, type MissionRecord, type PlannedOperation } from "./model";
 import { transitionMission } from "./state-machine";
-
-const repository = new FileMissionRepository(path.join(process.cwd(), ".foundry-data", "missions-v2"));
+import { durableMissionRepository as repository } from "./stores";
 
 export type MissionCoreExecutionResult = {
   result: FactoryProjectResult;
@@ -70,8 +67,6 @@ export async function executeExistingProjectThroughMissionCore(
       await options.onEvent?.(event);
     }).catch((error) => {
       journalError = journalError ?? error;
-      // Evidence persistence failure is recorded after the legacy runtime settles; it must not create
-      // concurrent revision retries or interrupt the runtime while it may hold project processes open.
     });
   };
 
