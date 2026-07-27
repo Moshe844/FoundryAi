@@ -1,5 +1,8 @@
 import type { ExecutionMission, ExecutionMissionState, MissionState } from "@/lib/mission-engine";
 import { busyMissionStates, missionStateLabel } from "@/lib/mission/model";
+import { authoritativeMissionForWorkspace } from "@/lib/mission-core/browser-authority-registry";
+import { projectDurableMission } from "@/lib/mission-core/browser-projection";
+import type { MissionRecord } from "@/lib/mission-core/model";
 
 export { missionStateLabel } from "@/lib/mission/model";
 
@@ -25,16 +28,35 @@ export type MissionDisplayStatus = {
   /** True when paused on a command approval — a hard pause; only the approval gate's buttons (or Stop) may proceed. */
   isPausedForApproval: boolean;
   activeExecutionMission: ExecutionMission | undefined;
+  /** Server-owned blocker. Local execution history remains presentation-only once this is present. */
+  blocker?: string;
+  /** Present when the browser has a durable server mission bound to this workspace. */
+  durableMission?: MissionRecord;
 };
 
 /**
  * The one function every status display in the UI must call — header pill, footer status bar,
- * composer "Working/Ready" indicator, previous-mission labels. Derives everything purely from the
- * active ExecutionMission's canonical `state`; never re-infers busy-ness from regex-matching
- * `lastResult`/`liveWorkEvents` strings, which is what let those surfaces drift out of sync before.
+ * composer "Working/Ready" indicator, previous-mission labels. Durable mission state wins whenever
+ * a workspace binding exists; the older ExecutionMission remains only the detailed presentation
+ * history until every canvas block has moved to typed operations and durable journal entries.
  */
 export function deriveMissionDisplayStatus(mission: MissionState): MissionDisplayStatus {
   const activeExecutionMission = getActiveExecutionMission(mission);
+  const durableMission = authoritativeMissionForWorkspace(mission.missionId);
+  const durableView = projectDurableMission(durableMission);
+
+  if (durableMission && durableView) {
+    return {
+      state: legacyStateForDurable(durableMission.status),
+      label: durableView.label,
+      isBusy: durableView.isBusy,
+      isPausedForUser: durableMission.status === "awaiting_clarification",
+      isPausedForApproval: durableMission.status === "awaiting_approval" || Boolean(durableView.pendingApproval),
+      activeExecutionMission,
+      blocker: durableView.blocker,
+      durableMission,
+    };
+  }
 
   if (!activeExecutionMission) {
     return {
@@ -56,7 +78,27 @@ export function deriveMissionDisplayStatus(mission: MissionState): MissionDispla
     isPausedForUser: state === "waiting_for_user",
     isPausedForApproval: state === "waiting_for_approval",
     activeExecutionMission,
+    blocker: activeExecutionMission.blocked_reason,
   };
+}
+
+function legacyStateForDurable(status: MissionRecord["status"]): ExecutionMissionState {
+  switch (status) {
+    case "draft": return "idle";
+    case "understanding": return "understanding";
+    case "awaiting_clarification": return "waiting_for_user";
+    case "planned": return "planning";
+    case "awaiting_approval": return "waiting_for_approval";
+    case "executing": return "executing";
+    case "verifying": return "verifying";
+    case "repairing": return "executing";
+    case "previewing": return "verifying";
+    case "completed":
+    case "completed_with_warnings": return "complete";
+    case "blocked": return "blocked";
+    case "failed": return "failed";
+    case "canceled": return "cancelled";
+  }
 }
 
 /** Human label for a single ExecutionMission's state — used by the header pill, the footer, and Previous Missions alike. */
@@ -79,12 +121,6 @@ export function projectTitleFor(mission: MissionState) {
   const stored = (mission.title || mission.conversationTitle || "")
     .replace(/^Create Project:\s*/i, "")
     .trim();
-  // The stored title is usually just the flow's generic label — "Open Existing Project" for an opened
-  // project, or the bare template/domain name ("E-commerce Store") for a created one — neither of which
-  // says what THIS workspace actually is. Prefer a specific title derived from the durable brief the
-  // mission carries (the opened folder's name, or what the user described building). Only fall back to
-  // the stored label when the brief yields nothing more specific. Runs at render time, so it also fixes
-  // workspaces that were saved before this change.
   const derived = deriveTitleFromBrief(mission.objective ?? "");
   if (derived) return derived;
   if (stored && !isGenericProjectTitle(stored)) return stored;
@@ -134,15 +170,12 @@ function humanizeName(value: string): string {
 /** Derive a specific, human title from the durable project brief the mission stores as its objective. */
 function deriveTitleFromBrief(brief: string): string {
   if (!brief.trim()) return "";
-  // Opened/existing projects: the real identity is the folder or upload being worked on.
   const folder = briefField(brief, "Local connector root")
     || briefField(brief, "Local project path")
     || briefField(brief, "Browser folder name");
   if (folder) return humanizeName(baseName(folder));
   const selection = briefField(brief, "Existing project selection");
   if (selection && !/^\d+\s/.test(selection)) return humanizeName(selection);
-  // Created projects: the resolved type/name is the canonical identity. The full description is a
-  // requirements document and must never become a truncated six-word workspace title.
   const type = briefField(brief, "Project type");
   if (type) return humanizeName(type);
   const name = briefField(brief, "Project name");
