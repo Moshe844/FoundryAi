@@ -54,16 +54,24 @@ export class MissionCoordinator {
     return this.repository.save(next, mission.revision);
   }
 
-  async runUntilPause(id: string, input: { signal?: AbortSignal; maxOperations?: number } = {}): Promise<MissionRecord> {
+  async runUntilPause(id: string, input: {
+    signal?: AbortSignal;
+    maxOperations?: number;
+    onUpdate?: (mission: MissionRecord) => void | Promise<void>;
+  } = {}): Promise<MissionRecord> {
     const maxOperations = Math.max(1, Math.min(input.maxOperations ?? 100, 1_000));
     let mission = await this.required(id);
+    await input.onUpdate?.(mission);
     for (let index = 0; index < maxOperations; index += 1) {
       if (["awaiting_approval", "completed", "completed_with_warnings", "failed", "canceled"].includes(mission.status)) return mission;
       const beforeRevision = mission.revision;
       mission = await this.runNext(id, input.signal);
+      await input.onUpdate?.(mission);
       if (mission.revision === beforeRevision || input.signal?.aborted) return mission;
     }
-    return this.mutate(id, (current) => transitionMission(current, "blocked", { reason: `Execution paused after ${maxOperations} operations to prevent an unbounded scheduler loop.` }));
+    mission = await this.mutate(id, (current) => transitionMission(current, "blocked", { reason: `Execution paused after ${maxOperations} operations to prevent an unbounded scheduler loop.` }));
+    await input.onUpdate?.(mission);
+    return mission;
   }
 
   async decideApproval(id: string, approvalId: string, decision: "approve" | "deny", scope: ApprovalScope = "once"): Promise<MissionRecord> {
