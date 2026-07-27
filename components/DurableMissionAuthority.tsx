@@ -3,7 +3,8 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { DurableMissionClient } from "@/lib/mission-core/browser-client";
-import type { MissionRecord } from "@/lib/mission-core/model";
+import type { ApprovalScope, MissionRecord } from "@/lib/mission-core/model";
+import { latestDurableMission } from "@/lib/mission-core/browser-projection";
 import {
   applyAuthoritativeMission,
   bindWorkspaceMission,
@@ -26,8 +27,15 @@ export type DurableMissionBindingEvent = {
 
 export type DurableMissionAuthorityValue = {
   snapshot: DurableWorkspaceSnapshot;
+  latestMission?: MissionRecord;
   missionForWorkspace(workspaceMissionId: string): MissionRecord | undefined;
   refresh(durableMissionId: string): Promise<MissionRecord>;
+  decideApproval(input: {
+    missionId: string;
+    approvalId: string;
+    decision: "approve" | "deny";
+    scope?: ApprovalScope;
+  }): Promise<MissionRecord>;
 };
 
 const DurableMissionAuthorityContext = createContext<DurableMissionAuthorityValue | undefined>(undefined);
@@ -110,10 +118,17 @@ export function DurableMissionAuthority({ children }: { children: ReactNode }) {
 
   const value = useMemo<DurableMissionAuthorityValue>(() => ({
     snapshot,
+    latestMission: latestDurableMission(snapshot.missions),
     missionForWorkspace: (workspaceMissionId) => durableMissionForWorkspace(snapshot, workspaceMissionId),
     refresh: async (durableMissionId) => {
       const mission = await clientRef.current.get(durableMissionId);
       setSnapshot((current) => applyAuthoritativeMission(current, mission));
+      return mission;
+    },
+    decideApproval: async (input) => {
+      const mission = await clientRef.current.decideApproval(input);
+      setSnapshot((current) => applyAuthoritativeMission(current, mission));
+      window.dispatchEvent(new CustomEvent(durableMissionEventName, { detail: mission }));
       return mission;
     },
   }), [snapshot]);
