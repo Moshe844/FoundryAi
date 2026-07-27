@@ -5,13 +5,8 @@ import { completeExecution, failExecution, recordExecutionEvent, registerExecuti
 import type { FactoryCreateRequest, FactoryExecutionEvent, FactoryProjectResult } from "@/lib/factory/types";
 import { stackManifest } from "@/lib/certified-build";
 
-/**
- * One active build per normalized project request. The browser control id is intentionally not part
- * of this key because a double click, reconnect, or duplicated submit creates a different control id
- * while still representing the same paid work. Completed runs are removed so an intentional later
- * rebuild remains possible.
- */
 const activeCreationRequests = new Set<string>();
+const FIRST_SOURCE_OUTPUT_DEADLINE_MS = Math.max(45_000, Math.min(180_000, Number(process.env.FOUNDRY_FIRST_SOURCE_OUTPUT_DEADLINE_MS) || 120_000));
 
 function creationRequestFingerprint(body: Partial<FactoryCreateRequest>) {
   return createHash("sha256").update(JSON.stringify({
@@ -55,7 +50,7 @@ async function recoverFalseRoot404(result: FactoryProjectResult, emit: (event: F
     status: "running",
     title: "The build passed and a root route exists — restarting the preview from the verified project",
     transient: true,
-    details: { paidModelCalls: 0, recovery: "verified-root-preview-restart", projectPath: result.projectPath },
+    details: { paidModelCalls: 0, recovery: "verified-root-preview-restart", projectPath: result.projectPath, transientKey: "preview-root-recovery" },
   });
 
   try {
@@ -142,11 +137,13 @@ export async function POST(request: Request) {
       const unregisterExecution = registerExecution(body.controlId, runtimeController);
       let disconnected = false;
       let heartbeat: ReturnType<typeof setInterval> | undefined;
+      let firstOutputDeadline: ReturnType<typeof setTimeout> | undefined;
       const stream = new ReadableStream({
         start(controller) {
           const sentEvents = new Set<string>();
           const observedProjectFiles = new Set<string>();
           const startedAt = Date.now();
+          let firstSourceOutputObserved = false;
           const send = (payload: unknown) => {
             if (!disconnected) controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
           };
@@ -154,19 +151,43 @@ export async function POST(request: Request) {
             recordExecutionEvent(body.controlId, event);
             send({ type: "event", event });
           };
+          const markSourceOutput = () => {
+            if (firstSourceOutputObserved) return;
+            firstSourceOutputObserved = true;
+            if (firstOutputDeadline) clearTimeout(firstOutputDeadline);
+          };
+
+          firstOutputDeadline = setTimeout(() => {
+            if (firstSourceOutputObserved || runtimeController.signal.aborted) return;
+            emit({
+              id: "first-source-output-deadline",
+              timestamp: new Date().toISOString(),
+              kind: "blocked",
+              status: "error",
+              title: "Foundry stopped additional model attempts because no application file was created in time",
+              details: {
+                elapsedMs: Date.now() - startedAt,
+                deadlineMs: FIRST_SOURCE_OUTPUT_DEADLINE_MS,
+                costProtection: true,
+                externalBlocker: false,
+              },
+            });
+            runtimeController.abort(new Error("FIRST_SOURCE_OUTPUT_DEADLINE_EXCEEDED"));
+          }, FIRST_SOURCE_OUTPUT_DEADLINE_MS);
 
           heartbeat = setInterval(() => {
+            if (firstSourceOutputObserved) return;
             const elapsedSeconds = Math.max(1, Math.floor((Date.now() - startedAt) / 1_000));
             emit({
               id: "creation-live-heartbeat",
               timestamp: new Date().toISOString(),
               kind: "reasoning",
               status: "running",
-              title: `Still building the coordinated source batch · ${elapsedSeconds}s elapsed`,
+              title: `Waiting for the current model action · ${elapsedSeconds}s elapsed`,
               transient: true,
-              details: { elapsedSeconds, modelWorkInProgress: true, paidModelCallsAdded: 0 },
+              details: { elapsedSeconds, modelWorkInProgress: true, paidModelCallsAdded: 0, transientKey: "creation-live-heartbeat" },
             });
-          }, 15_000);
+          }, 30_000);
 
           void createFactoryProject(
             body.brief ?? "",
@@ -175,6 +196,7 @@ export async function POST(request: Request) {
               if (sentEvents.has(key)) return;
               sentEvents.add(key);
               const changedPaths = changedPathsFromEvent(event);
+              if (event.filePath || changedPaths.length) markSourceOutput();
               const normalizedEvent: FactoryExecutionEvent = changedPaths.length
                 ? {
                     ...event,
@@ -234,22 +256,25 @@ export async function POST(request: Request) {
               if (!disconnected) controller.close();
             })
             .catch((error) => {
-              const message = error instanceof Error ? error.message : "Factory project creation failed.";
+              const deadlineExceeded = runtimeController.signal.aborted && String(runtimeController.signal.reason).includes("FIRST_SOURCE_OUTPUT_DEADLINE_EXCEEDED");
+              const message = deadlineExceeded
+                ? "No application source was created before the first-output cost limit. Foundry stopped further model attempts instead of continuing to spend."
+                : error instanceof Error ? error.message : "Factory project creation failed.";
               failExecution(body.controlId, message);
-              send({ type: "error", error: message });
+              send({ type: "error", error: message, code: deadlineExceeded ? "FIRST_SOURCE_OUTPUT_DEADLINE_EXCEEDED" : undefined });
               if (!disconnected) controller.close();
             })
             .finally(() => {
               activeCreationRequests.delete(requestFingerprint);
               if (heartbeat) clearInterval(heartbeat);
+              if (firstOutputDeadline) clearTimeout(firstOutputDeadline);
               unregisterExecution();
             });
         },
         cancel() {
           disconnected = true;
           if (heartbeat) clearInterval(heartbeat);
-          // Disconnecting the browser does not start another execution and does not cancel the paid work.
-          // The existing execution remains recoverable by its control snapshot until completion or Stop.
+          if (firstOutputDeadline) clearTimeout(firstOutputDeadline);
         },
       });
 

@@ -17,14 +17,17 @@ export function SummaryBlock({
   onSuggestion: (recommendation: MissionRecommendation) => void;
   onOpenProductionConnections?: () => void;
 }) {
-  const completed = summary.whatChanged.map((line) => ({ ...line, text: humanize(line.text) }));
+  const completed = summary.whatChanged
+    .map((line) => ({ ...line, text: humanize(line.text) }))
+    .filter((line) => isDeliveredProjectWork(line.text));
   const verified = summary.verified.map(humanize);
   const failedChecks = summary.failedChecks.map(humanize);
   const remaining = unique([
     ...summary.watchFor,
     ...(summary.engineeringReport?.remainingIssues ?? []),
   ].map(humanize));
-  const status = statusPresentation(summary.heading);
+  const status = statusPresentation(summary.heading, completed.length);
+  const providerSpentWithoutOutput = completed.length === 0 && (summary.modelUsage?.estimatedCostUsd ?? 0) > 0;
 
   return (
     <section className="canvas-enter mt-5 grid max-w-4xl gap-4" aria-label="Mission result">
@@ -39,8 +42,17 @@ export function SummaryBlock({
         {summary.outcome ? <p className="mt-1.5 whitespace-pre-wrap text-[14px] leading-6 text-foundry-muted">{humanize(summary.outcome)}</p> : null}
       </header>
 
+      {providerSpentWithoutOutput ? (
+        <section className="rounded-xl border border-red-300/30 bg-red-300/[0.045] p-4" role="alert">
+          <h3 className="text-[14px] font-semibold text-foundry-ink">No project output was created</h3>
+          <p className="mt-1 text-[13px] leading-5 text-foundry-muted">
+            Model-provider usage was recorded, but Foundry did not create or edit an application file. Foundry will not present planning, routing, requirement extraction, or a saved brief as completed project work.
+          </p>
+        </section>
+      ) : null}
+
       <div className="grid gap-3 md:grid-cols-2">
-        <ResultSection title="Completed work" count={completed.length} tone="success" empty="No verified source change was recorded.">
+        <ResultSection title="Project output" count={completed.length} tone={completed.length ? "success" : "warning"} empty="No application source or user-facing feature was created.">
           {completed.map((line) => (
             <ResultRow key={line.text} icon="✓" tone="success">
               <button
@@ -56,7 +68,7 @@ export function SummaryBlock({
           ))}
         </ResultSection>
 
-        <ResultSection title="Verification" count={verified.length + failedChecks.length} tone={failedChecks.length ? "danger" : "success"} empty="No build, test, or browser check was completed.">
+        <ResultSection title="Verification" count={verified.length + failedChecks.length} tone={failedChecks.length ? "danger" : verified.length ? "success" : "warning"} empty="No build, test, or browser check was completed.">
           {verified.map((item, index) => <ResultRow key={`verified-${index}`} icon="✓" tone="success">{item}</ResultRow>)}
           {failedChecks.map((item, index) => <ResultRow key={`failed-${index}`} icon="!" tone="danger">{item}</ResultRow>)}
           {!verified.length && !failedChecks.length && summary.heading === "Done" ? (
@@ -179,7 +191,7 @@ function CostDetails({ usage }: { usage: NonNullable<CanvasSummary["modelUsage"]
         <Metric label="Tokens" value={`${usage.inputTokens.toLocaleString()} in / ${usage.outputTokens.toLocaleString()} out`} />
       </div>
       {usage.nonBillableProviderUsageUsd > 0 ? (
-        <p className="mt-3 text-[12px] leading-5 text-foundry-subtle">This incomplete mission is not billable by Foundry. Provider usage may still appear on the model account that supplied the API key.</p>
+        <p className="mt-3 text-[12px] leading-5 text-foundry-subtle">Foundry did not charge this incomplete mission. The model provider may still charge the account that supplied the API key for requests it processed.</p>
       ) : null}
     </details>
   );
@@ -203,11 +215,12 @@ function Metric({ label, value }: { label: string; value: string }) {
   return <div className="rounded-lg bg-overlay/[0.035] px-3 py-2"><p className="text-[11px] text-foundry-subtle">{label}</p><p className="mt-0.5 font-medium text-foundry-ink">{value}</p></div>;
 }
 
-function statusPresentation(heading: CanvasSummary["heading"]) {
+function statusPresentation(heading: CanvasSummary["heading"], completedCount: number) {
   if (heading === "Done") return { label: "Completed", title: "The requested work is complete.", container: "border-foundry-teal/25 bg-foundry-teal/[0.045]", badge: "bg-foundry-teal/15 text-foundry-teal" };
   if (heading === "Blocked" || heading === "Verification blocked") return { label: "Needs input", title: "Foundry preserved the work and needs one external decision.", container: "border-foundry-amber/25 bg-foundry-amber/[0.035]", badge: "bg-foundry-amber/15 text-foundry-amber" };
   if (heading === "Stopped") return { label: "Paused", title: "The work is saved and can continue from here.", container: "border-foundry-line bg-overlay/[0.02]", badge: "bg-overlay/[0.06] text-foundry-muted" };
-  return { label: "Needs repair", title: "Foundry completed part of the work, but the project checks are not green yet.", container: "border-red-300/25 bg-red-300/[0.035]", badge: "bg-red-300/10 text-red-300" };
+  if (completedCount === 0) return { label: "No output", title: "Foundry did not create usable project output.", container: "border-red-300/25 bg-red-300/[0.035]", badge: "bg-red-300/10 text-red-300" };
+  return { label: "Needs repair", title: "Foundry created part of the project, but the project checks are not green yet.", container: "border-red-300/25 bg-red-300/[0.035]", badge: "bg-red-300/10 text-red-300" };
 }
 
 function friendlyCheck(type: string) {
@@ -220,6 +233,13 @@ function friendlyOperationalStatus(value: NonNullable<CanvasSummary["engineering
   return `${status}${evidence}`;
 }
 
+function isDeliveredProjectWork(value: string) {
+  const text = value.toLowerCase();
+  if (/\b(?:planning|routed|model|requirements?|ledger|brief|assessment|deciding|approach|provider|token|stage)\b/.test(text)) return false;
+  return /\b(?:created|edited|updated|saved|wrote|written|implemented|added|removed|fixed|changed)\b/.test(text)
+    && /(?:\.[a-z0-9]{1,8}\b|\b(?:page|screen|route|component|feature|website|application|app|api|database|test|style|layout|form|navigation)\b)/.test(text);
+}
+
 function humanize(value: string) {
   return value
     .replace(/durable mutation/gi, "verified source change")
@@ -229,6 +249,7 @@ function humanize(value: string) {
     .replace(/deterministic verification gate/gi, "project check")
     .replace(/generated source was rejected/gi, "the generated code did not pass the project checks")
     .replace(/without a passing build/gi, "while the build was still failing")
+    .replace(/SOURCE_BATCH_READY_FOR_DETERMINISTIC_VERIFICATION/gi, "The source batch is ready for project checks")
     .replace(/\s+/g, " ")
     .trim();
 }

@@ -13,12 +13,6 @@ import { LiveExecutionPanel } from "@/components/canvas/LiveExecutionPanel";
 import { SummaryBlock } from "@/components/canvas/SummaryBlock";
 import { CanvasMarkdown } from "@/components/canvas/CanvasMarkdown";
 
-/**
- * §2/§3 — one mission on the canvas: the user's message (the only accent-bordered
- * element), Foundry's voice lines, the real work rows beneath each, phase digests for
- * large plans, then the blocking card / live activity row / terminal block. Older
- * event groups self-digest to keep the density budget (§14.8) without hiding anything.
- */
 export function MissionBlock({
   vm,
   recorded = false,
@@ -38,14 +32,10 @@ export function MissionBlock({
   onOpenProductionConnections,
 }: {
   vm: CanvasMissionVM;
-  /** True for a prior mission's trace: fully digested, nothing live. */
   recorded?: boolean;
-  /** Event ids to force-expand and scroll to (evidence links from the summary). */
   revealEventIds?: string[];
   liveActivity?: { id: string; text: string; elapsedMs: number } | null;
-  /** Concise phrase for the focus banner, which sits directly under the request/brief. */
   currentFocus?: string;
-  /** Short live state word for the current entry ("Editing page.tsx", "Running tests"). */
   currentStateLabel?: string;
   focusOpen?: boolean;
   onFocusToggle?: () => void;
@@ -115,27 +105,122 @@ export function MissionBlock({
   );
 }
 
+type BriefSection = { label: string; value: string };
+
 function RequestBrief({ brief }: { brief: NonNullable<CanvasMissionVM["requestBrief"]> }) {
+  const parsed = parseBrief(brief.content);
   return (
-    <details className="mt-3 max-w-[760px] overflow-hidden rounded-lg border border-overlay/10 bg-overlay/[0.025]">
-      <summary className="cursor-pointer select-none px-3.5 py-2.5 text-[12px] font-bold text-foundry-muted transition hover:bg-overlay/[0.04] hover:text-foundry-ink">
+    <details className="mt-3 max-w-[760px] overflow-hidden rounded-xl border border-overlay/10 bg-overlay/[0.025]">
+      <summary className="cursor-pointer select-none px-4 py-3 text-[12px] font-bold text-foundry-muted transition hover:bg-overlay/[0.04] hover:text-foundry-ink">
         Project brief{brief.customInstructions ? " · custom instructions included" : ""}
       </summary>
-      <div className="grid gap-3 border-t border-overlay/8 px-3.5 py-3">
-        {brief.customInstructions ? (
-          <div className="rounded-md border border-foundry-teal/20 bg-foundry-teal/[0.055] p-3">
-            <p className="font-mono text-[10px] font-bold uppercase tracking-[0.08em] text-foundry-teal">Your custom instructions</p>
-            <p className="mt-1.5 whitespace-pre-wrap text-[13px] leading-6 text-foundry-ink">{brief.customInstructions}</p>
-          </div>
+      <div className="grid gap-4 border-t border-overlay/8 px-4 py-4">
+        {parsed.overview ? (
+          <section>
+            <p className="text-[10px] font-bold uppercase tracking-[0.09em] text-foundry-subtle">Overview</p>
+            <p className="mt-1.5 text-[14px] leading-6 text-foundry-ink">{parsed.overview}</p>
+          </section>
         ) : null}
-        <div>
-          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Living requirements · saved as foundry-brief.md</p>
-          <p className="mb-2 text-[11px] leading-5 text-foundry-subtle">Accepted decisions and later project requirements are appended here; implementation progress is tracked separately below.</p>
-          <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 font-mono text-[11px] leading-5 text-foundry-muted">{brief.content}</pre>
-        </div>
+
+        {parsed.facts.length ? (
+          <dl className="grid gap-2 sm:grid-cols-2">
+            {parsed.facts.map((item) => (
+              <div key={`${item.label}-${item.value}`} className="rounded-lg border border-overlay/8 bg-overlay/[0.025] px-3 py-2.5">
+                <dt className="text-[10px] font-bold uppercase tracking-[0.08em] text-foundry-subtle">{item.label}</dt>
+                <dd className="mt-1 text-[13px] leading-5 text-foundry-ink">{item.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+
+        {parsed.requirements.length ? (
+          <section>
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-[10px] font-bold uppercase tracking-[0.09em] text-foundry-subtle">Requested outcome</p>
+              <span className="rounded-full bg-overlay/[0.05] px-2 py-0.5 text-[10px] text-foundry-subtle">{parsed.requirements.length} items</span>
+            </div>
+            <ul className="mt-2 grid gap-1.5 sm:grid-cols-2">
+              {parsed.requirements.slice(0, 18).map((item, index) => (
+                <li key={`${index}-${item}`} className="flex items-start gap-2 rounded-lg bg-overlay/[0.02] px-2.5 py-2 text-[12.5px] leading-5 text-foundry-muted">
+                  <span className="mt-[1px] text-foundry-teal" aria-hidden="true">✓</span>
+                  <span>{item}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+
+        {brief.customInstructions ? (
+          <section className="rounded-lg border border-foundry-teal/20 bg-foundry-teal/[0.055] p-3">
+            <p className="text-[10px] font-bold uppercase tracking-[0.08em] text-foundry-teal">Your instructions</p>
+            <p className="mt-1.5 whitespace-pre-wrap text-[13px] leading-6 text-foundry-ink">{brief.customInstructions}</p>
+          </section>
+        ) : null}
+
+        <details className="rounded-lg border border-overlay/8 bg-shade/20">
+          <summary className="cursor-pointer select-none px-3 py-2 text-[11px] font-semibold text-foundry-subtle hover:text-foundry-ink">Technical brief and internal requirement ledger</summary>
+          <pre className="max-h-72 overflow-auto whitespace-pre-wrap border-t border-overlay/8 p-3 font-mono text-[11px] leading-5 text-foundry-muted">{brief.content}</pre>
+        </details>
       </div>
     </details>
   );
+}
+
+function parseBrief(content: string): { overview: string; facts: BriefSection[]; requirements: string[] } {
+  const clean = content.replace(/\r/g, "").trim();
+  const lines = clean.split("\n").map((line) => line.trim()).filter(Boolean);
+  const facts: BriefSection[] = [];
+  const requirementCandidates: string[] = [];
+  let overview = "";
+
+  for (const line of lines) {
+    const match = line.match(/^([^:]{2,48}):\s*(.+)$/);
+    if (!match) {
+      requirementCandidates.push(line);
+      continue;
+    }
+    const label = match[1].trim();
+    const value = match[2].trim();
+    const normalized = label.toLowerCase();
+    if (/^(?:create project|project|project description|description|goal|request)$/.test(normalized)) {
+      overview ||= value;
+    } else if (/\b(?:stack|architecture|project type|mode|platform|framework|language|database)\b/.test(normalized)) {
+      if (!/project architecture/i.test(label) || value.length < 180) facts.push({ label: friendlyBriefLabel(label), value: compact(value, 180) });
+    } else if (/\b(?:requirements?|features?|scope|acceptance|deliverables?)\b/.test(normalized)) {
+      requirementCandidates.push(value);
+    }
+  }
+
+  if (!overview) {
+    overview = lines.find((line) => !/^\w[\w ]{1,48}:/.test(line)) ?? lines[0] ?? "";
+  }
+
+  const requirements = uniqueBriefItems(requirementCandidates
+    .flatMap((value) => value.split(/(?:;|\n|\u2022|\s+-\s+)/))
+    .map((value) => value.replace(/^[-*\d.)\s]+/, "").trim())
+    .filter((value) => value.length >= 8 && value.toLowerCase() !== overview.toLowerCase())
+    .filter((value) => !/^(?:mode|certified stack|project architecture|confidence map|alternative stacks)\b/i.test(value)));
+
+  return { overview: compact(overview, 360), facts: facts.slice(0, 6), requirements };
+}
+
+function friendlyBriefLabel(label: string) {
+  return label.replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function compact(value: string, max: number) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > max ? `${normalized.slice(0, max - 1).trimEnd()}…` : normalized;
+}
+
+function uniqueBriefItems(items: string[]) {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = item.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function MessageImages({ attachments }: { attachments: CanvasMissionVM["requestAttachments"] }) {
@@ -150,7 +235,6 @@ function MessageImages({ attachments }: { attachments: CanvasMissionVM["requestA
           className="group relative w-full max-w-[280px] overflow-hidden rounded-lg border border-overlay/12 bg-shade/30 transition hover:border-foundry-teal/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foundry-teal/50"
           title={`Open ${attachment.fileName}`}
         >
-          {/* Attachment data URLs are already-local persisted evidence, so Next image optimization cannot improve this render. */}
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={attachment.dataUrl}
@@ -167,11 +251,6 @@ function MessageImages({ attachments }: { attachments: CanvasMissionVM["requestA
   );
 }
 
-/**
- * The newest event has a dedicated live-status row while work is running. Remove that exact event
- * identity from the permanent trail until the mission settles; comparing text would incorrectly
- * collapse legitimate repeated commands or reads.
- */
 function groupsWithoutLiveEvent(groups: CanvasVoiceGroup[], liveEventId: string): CanvasVoiceGroup[] {
   return groups.flatMap((group) => {
     if (group.id === liveEventId) {
@@ -206,7 +285,6 @@ function DeliveredFiles({ files }: { files: CanvasMissionVM["deliveredFiles"] })
   );
 }
 
-/** §3.1/§13.4 — the real plan as phase rows: completed phases digest to one line, the live phase is the only expanded one. */
 function PhaseList({ phases, recorded }: { phases: CanvasPhase[]; recorded: boolean }) {
   const [openPhases, setOpenPhases] = useState<Record<number, boolean>>({});
 
@@ -253,10 +331,6 @@ function PhaseList({ phases, recorded }: { phases: CanvasPhase[]; recorded: bool
   );
 }
 
-/**
- * The Current-focus banner: sits directly under the request/brief and owns "what is happening right
- * now" — the live activity line and the live gates. Nothing here is duplicated further down the page.
- */
 function FocusBanner({
   focus, open, onToggle, liveActivity, checks, steps,
 }: {
@@ -304,12 +378,6 @@ function FocusBanner({
   );
 }
 
-/**
- * The engineering thread. Every entry except the current one compacts to a single quiet row
- * ("Foundry · Completed"); only the live entry stays fully open, with a "Previous progress" separator
- * above it. Clicking any compacted entry reopens it in place and re-compacts the others, so a long
- * mission stays readable after hundreds of runtime events instead of becoming a flat wall of text.
- */
 function VoiceTrail({
   groups, recorded, busy, currentStateLabel, revealEventIds,
 }: {
