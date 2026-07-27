@@ -65,6 +65,8 @@ export type TypedOperationPlanningRequest = {
   tier?: ModelTier;
   workspaceId?: string;
   userId?: string;
+  recoveryInstruction?: string;
+  maxOutputTokens?: number;
 };
 
 export type TypedOperationPlanningResult = {
@@ -88,23 +90,25 @@ export async function planTypedOperations(input: TypedOperationPlanningRequest):
       "Never use patch_file because this migration path deliberately requires complete read-modify-write operations with read-back verification.",
       "Every write_file must have a complete target path and full replacement content. Add a read_file dependency before editing an existing file.",
       "Commands must be exact shell commands and must depend on all source writes they validate.",
-      "Do not invent file contents when the project snapshot is insufficient. In that case return no operations and explain the unsupported reason.",
+      "Do not invent file contents when the project snapshot is insufficient. Prefer safe read operations that gather the missing evidence before editing.",
       "Use safe risk for reads and verification, development for commands/processes, modification for writes, and high_risk for deletes.",
       "End implementation plans with concrete verification operations. User-facing web work should include browser_action only when a real URL can be established by a prior start_process operation.",
       "Operation ids must be unique kebab-case strings. dependsOn must reference earlier operation ids only.",
+      input.recoveryInstruction ?? "Produce the safest complete executable plan within the available project evidence.",
       "Return only set_operation_plan.",
     ].join("\n"),
     messages: [{ role: "user", content: [{ type: "text", text: `Objective:\n${input.objective}\n\nCurrent project snapshot:\n${input.projectSnapshot || "(not available)"}` }] }],
     tools: [PLAN_OPERATIONS_TOOL],
     toolChoice: { name: "set_operation_plan" },
-    maxOutputTokens: 12000,
-  }, { apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 3 });
+    maxOutputTokens: Math.max(3000, Math.min(input.maxOutputTokens ?? 12000, 12000)),
+  }, { apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 1 });
 
   const call = result.toolCalls.find((item) => item.name === "set_operation_plan");
   const parsed = parsePlanArguments(call?.arguments);
   if (!parsed.operations.length) return { unsupportedReason: parsed.unsupportedReason || "The task could not be represented safely as typed operations." };
   const missionId = input.missionId || `mission-${randomUUID()}`;
   const operations = normalizeOperations(parsed.operations);
+  if (!operations.length) return { unsupportedReason: parsed.unsupportedReason || "The planner returned no valid executable typed operations." };
   return {
     request: {
       missionId,
@@ -133,6 +137,7 @@ export function parsePlanArguments(raw?: string): { operations: unknown[]; unsup
 export function normalizeOperations(rawOperations: unknown[]): DirectOperationRequest[] {
   const allowed = new Set<OperationKind>(operationKinds);
   const seen = new Set<string>();
+  const signatures = new Set<string>();
   const output: DirectOperationRequest[] = [];
   for (const raw of rawOperations) {
     if (!raw || typeof raw !== "object") continue;
@@ -147,6 +152,8 @@ export function normalizeOperations(rawOperations: unknown[]): DirectOperationRe
     if (["write_file", "delete_file", "read_file"].includes(kind) && !target) continue;
     if (["run_command", "start_process", "stop_process"].includes(kind) && !command) continue;
     if (kind === "write_file" && typeof item.content !== "string") continue;
+    const signature = JSON.stringify([kind, target ?? "", command?.replace(/\s+/g, " ").trim() ?? "", typeof item.content === "string" ? item.content : ""]);
+    if (signatures.has(signature)) continue;
     const risk = (["safe", "development", "modification", "high_risk"] as const).includes(item.risk as PlannedOperation["risk"])
       ? item.risk as PlannedOperation["risk"]
       : undefined;
@@ -167,6 +174,7 @@ export function normalizeOperations(rawOperations: unknown[]): DirectOperationRe
       risk,
       maxAttempts: Number.isFinite(Number(item.maxAttempts)) ? Math.max(1, Math.min(Number(item.maxAttempts), 3)) : 1,
     });
+    signatures.add(signature);
     seen.add(id);
   }
   return output;
