@@ -1,16 +1,13 @@
 import type { ProviderId } from "@/lib/ai/providers/types";
 import type { ModelTier } from "@/lib/ai/model-router";
-import type { FactoryExistingProjectRequest, FactoryProjectResult } from "@/lib/factory/types";
+import type { FactoryExistingProjectRequest } from "@/lib/factory/types";
 import type { MissionRecord } from "./model";
 import { executeDirectMission } from "./direct-execution";
-import { executeExistingProjectThroughMissionCore } from "./legacy-runtime-bridge";
 import { planTypedOperations } from "./typed-operation-planner";
 
 export type PlannerFirstExecutionResult = {
   mission: MissionRecord;
-  result?: FactoryProjectResult;
-  executionPath: "typed-operations" | "compatibility-runtime";
-  fallbackReason?: string;
+  executionPath: "typed-operations";
 };
 
 export async function executePlannerFirstMission(input: {
@@ -19,7 +16,6 @@ export async function executePlannerFirstMission(input: {
   provider?: ProviderId;
   tier?: ModelTier;
   signal?: AbortSignal;
-  allowCompatibilityFallback?: boolean;
 }): Promise<PlannerFirstExecutionResult> {
   const planned = await planTypedOperations({
     missionId: input.body.controlId,
@@ -32,20 +28,10 @@ export async function executePlannerFirstMission(input: {
     tier: input.tier,
   });
 
-  if (planned.request) {
-    const mission = await executeDirectMission(planned.request, input.signal);
-    return { mission, executionPath: "typed-operations" };
-  }
-
-  if (input.allowCompatibilityFallback === false) {
+  if (!planned.request) {
     throw new Error(planned.unsupportedReason || "Typed operation planning did not produce an executable plan.");
   }
 
-  const compatibility = await executeExistingProjectThroughMissionCore(input.body, { signal: input.signal });
-  return {
-    mission: compatibility.mission,
-    result: compatibility.result,
-    executionPath: "compatibility-runtime",
-    fallbackReason: planned.unsupportedReason,
-  };
+  const mission = await executeDirectMission(planned.request, input.signal);
+  return { mission, executionPath: "typed-operations" };
 }
