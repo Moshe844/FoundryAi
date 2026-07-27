@@ -30,7 +30,7 @@ export async function executeExistingProjectThroughMissionCore(
 ): Promise<MissionCoreExecutionResult> {
   const now = new Date().toISOString();
   const missionId = body.controlId || `mission-${randomUUID()}`;
-  const projectId = body.parentMission?.projectId || body.continuity?.projectId || body.localPath || body.brief?.projectName || "project";
+  const projectId = body.parentMission?.projectIdentity || body.localPath || body.localConnector?.rootLabel || `uploaded:${missionId}`;
   const operation: PlannedOperation = {
     id: `${missionId}:legacy-runtime`,
     missionId,
@@ -47,7 +47,7 @@ export async function executeExistingProjectThroughMissionCore(
     updatedAt: now,
   };
 
-  let mission = createMissionRecord({ id: missionId, projectId: String(projectId), objective: body.task, now });
+  let mission = createMissionRecord({ id: missionId, projectId, objective: body.task, now });
   mission = transitionMission(mission, "understanding", { now });
   mission = transitionMission(mission, "planned", { now });
   mission = { ...mission, operations: [operation], revision: mission.revision + 1, updatedAt: now };
@@ -62,6 +62,18 @@ export async function executeExistingProjectThroughMissionCore(
   }));
 
   const evidenceAttachments = body.evidenceAttachments ?? (body.evidenceImages ?? []).map((image) => ({ ...image, uploadStatus: "image" as const }));
+  let journalQueue = Promise.resolve();
+  let journalError: unknown;
+  const enqueueEvent = (event: FactoryExecutionEvent) => {
+    journalQueue = journalQueue.then(async () => {
+      mission = await appendRuntimeEvent(mission, event);
+      await options.onEvent?.(event);
+    }).catch((error) => {
+      journalError = journalError ?? error;
+      // Evidence persistence failure is recorded after the legacy runtime settles; it must not create
+      // concurrent revision retries or interrupt the runtime while it may hold project processes open.
+    });
+  };
 
   try {
     const result = await executeExistingProjectTask(
@@ -69,10 +81,7 @@ export async function executeExistingProjectThroughMissionCore(
       body.task,
       body.files ?? [],
       body.localPath,
-      async (event) => {
-        mission = await appendRuntimeEvent(mission, event);
-        await options.onEvent?.(event);
-      },
+      enqueueEvent,
       body.localConnector,
       options.signal,
       body.approvedCategories ?? [],
@@ -87,34 +96,53 @@ export async function executeExistingProjectThroughMissionCore(
       body.idempotencyCandidate,
       body.retryExecutionId,
     );
+    await journalQueue;
+    if (journalError) {
+      mission = await appendNote(mission, `Some streamed event evidence could not be persisted: ${journalError instanceof Error ? journalError.message : String(journalError)}`);
+    }
 
     const completedAt = new Date().toISOString();
+    const changedFiles = result.files.filter((file) => file.status === "created" || file.status === "edited").map((file) => file.path);
     mission = await updateMission(mission, (current) => ({
       ...current,
       operations: current.operations.map((item) => item.id === operation.id
         ? {
             ...item,
-            status: "succeeded",
+            status: result.status === "awaiting-approval" ? "awaiting_approval" : result.status === "failed" ? "failed" : "succeeded",
             updatedAt: completedAt,
             result: {
-              summary: "Compatibility runtime returned a project result.",
+              summary: `Compatibility runtime returned status ${result.status}.`,
               evidence: [
-                ...(result.changedFiles ?? []),
-                ...(result.commands ?? []).map((command) => `${command.command}: ${command.exitCode ?? "running"}`),
+                ...changedFiles,
+                ...result.commands.map((command) => `${command.command}: ${command.exitCode ?? "running"}`),
               ].slice(0, 100),
-              changed: Boolean(result.changedFiles?.length),
+              changed: changedFiles.length > 0,
               completedAt,
             },
           }
         : item),
     }));
 
+    if (result.status === "awaiting-approval") {
+      mission = await saveTransition(mission, "awaiting_approval", result.blocker);
+      return { result, mission };
+    }
+    if (result.status === "needs-clarification") {
+      mission = await saveTransition(mission, "blocked", result.blocker || "Mission requires clarification.");
+      return { result, mission };
+    }
+    if (result.status === "failed" || result.status === "unsupported" || result.status === "stopped") {
+      mission = await saveTransition(mission, "failed", result.blocker || `Runtime settled with ${result.status}.`);
+      return { result, mission };
+    }
+
     mission = await saveTransition(mission, "verifying");
-    const hasFailedVerification = Boolean(result.verification?.some((entry) => entry.status === "failed"));
-    const hasWarnings = hasFailedVerification || Boolean(result.engineeringReport?.limitations?.length);
+    const hasFailedVerification = result.verification?.some((entry) => entry.result === "fail") ?? false;
+    const hasWarnings = hasFailedVerification || Boolean(result.engineeringReport?.remainingIssues.length);
     mission = await saveTransition(mission, hasWarnings ? "completed_with_warnings" : "completed");
     return { result, mission };
   } catch (error) {
+    await journalQueue;
     const failedAt = new Date().toISOString();
     const message = error instanceof Error ? error.message : "Existing project execution failed.";
     mission = await updateMission(mission, (current) => ({
@@ -158,6 +186,13 @@ async function appendRuntimeEvent(mission: MissionRecord, event: FactoryExecutio
         },
       },
     ],
+  }));
+}
+
+async function appendNote(mission: MissionRecord, message: string) {
+  return updateMission(mission, (current) => ({
+    ...current,
+    journal: [...current.journal, { id: `${current.id}:note:${current.revision + 1}`, missionId: current.id, at: new Date().toISOString(), type: "note", message }],
   }));
 }
 
