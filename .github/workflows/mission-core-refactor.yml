@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [foundry-mission-core-rebuild]
+    branches: [foundry-mission-core-rebuild, fix-new-project-autonomy-and-cost]
 
 permissions:
   contents: read
@@ -21,8 +21,8 @@ jobs:
       - run: npm install --no-audit --no-fund
       - name: Typecheck
         run: npm run typecheck > typecheck.log 2>&1 || (tail -200 typecheck.log && exit 1)
-      - name: Mission core tests
-        run: npm run test:mission-core > mission-core-tests.log 2>&1 || (tail -200 mission-core-tests.log && exit 1)
+      - name: Mission and recovery tests
+        run: npx vitest run lib/mission-core lib/factory/recovery-policy.test.ts > mission-core-tests.log 2>&1 || (tail -200 mission-core-tests.log && exit 1)
       - name: Production build
         run: npm run build > build.log 2>&1 || (tail -200 build.log && exit 1)
       - name: Upload validation logs
