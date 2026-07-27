@@ -9,14 +9,21 @@ export type GeneratedRecoveryDecision = {
   deletesProject: boolean;
 };
 
-/** Recovery exists to continue unfinished work, never to convert an old green checklist into proof
- * for a new change. A runnable project with no open plan items goes through normal implementation
- * unless an independently fingerprinted retry was already returned before this policy is reached. */
+/**
+ * An unfinished generated project remains the same active mission even after its first runnable
+ * source slice exists. The old policy required a separate user continuation once a runnable entry
+ * had been written, which converted an internal batch boundary into a user-visible stop and caused
+ * large requests to finish with most requirements still open.
+ *
+ * A runnable entry is progress, not completion. Resume whenever the authoritative requirement plan
+ * still has open items. Browser-evidenced repair, undo, command-only work, and deletion remain on
+ * their dedicated paths.
+ */
 export function shouldResumeIncompleteGeneratedProject(input: GeneratedRecoveryDecision) {
   return input.isFoundryGeneratedProject
     && !input.hasPreModelBrowserEvidence
     && !input.isUndo
-    && (!input.hasRunnableEntry || (input.isControlContinuation && input.hasOpenPlanItems))
+    && (!input.hasRunnableEntry || input.hasOpenPlanItems)
     && !input.commandOnly
     && !input.deletesProject;
 }
@@ -89,18 +96,9 @@ export const GENERATED_RECOVERY_ROUTING_BUDGET = Object.freeze({
 });
 
 /**
- * Finishing an unfinished *generated project* is real build work, not a small repair. The flat $0.75
- * cap above starved genuine multi-file apps — a SwiftUI wellness app with Core Data and several views
- * wrote its files, then died mid-generation. A build is bounded on TWO axes, cost AND model-call count,
- * and both must match the tier or the mission just dies on whichever is tighter. The first version of
- * this fix raised the cost to the tier ceiling but derived the call count from cost (×6), which
- * silently halved Builder's real allowance to 12 calls — so the build then died on calls instead of
- * dollars. Pass the tier's ACTUAL budget through on both axes.
- *
- * Capped at the Architect tier so a resume still can't run away to enterprise, but a small project
- * resume stays cheap and a substantial one gets the room the tier was already sized to give.
- *
- * @param tierBudget the mission tier's own budget (e.g. Builder = 24 calls / $2, Architect = 32 / $4).
+ * Finishing an unfinished generated project is real build work. Keep both the model-call and dollar
+ * ceilings bounded by the mission tier; deterministic builds, tests, and browser checks do not spend
+ * this budget. Duplicate-plan and repeated-evidence guards remain responsible for stopping waste.
  */
 export function generatedRecoveryBudgetForTier(tierBudget: { maximumModelCalls: number; estimatedCostUsd: number }) {
   return {
@@ -111,11 +109,7 @@ export function generatedRecoveryBudgetForTier(tierBudget: { maximumModelCalls: 
 
 /**
  * A recovery lane retries work the primary route already failed to do — it is strictly narrower than the
- * mission that spawned it, so it must not inherit that mission's full ceiling. Left unbounded, the
- * action-recovery lane ran under the architect budget ($4) to redo a one-line reposition.
- *
- * Scaling from the mission's own cost ceiling keeps the relationship honest as tier budgets change,
- * rather than pinning another flat number that silently drifts out of proportion.
+ * mission that spawned it, so it must not inherit that mission's full ceiling.
  */
 export function recoveryRoutingBudget(missionCostCeilingUsd: number) {
   return {
