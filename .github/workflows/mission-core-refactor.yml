@@ -19,6 +19,9 @@ jobs:
         with:
           node-version: 22
       - run: npm install --no-audit --no-fund
-      - run: npm run typecheck
-      - run: npm run test:mission-core
-      - run: npm run build
+      - name: Typecheck
+        run: npm run typecheck > typecheck.log 2>&1 || (tail -200 typecheck.log && exit 1)
+      - name: Mission core tests
+        run: npm run test:mission-core > mission-core-tests.log 2>&1 || (tail -200 mission-core-tests.log && exit 1)
+      - name: Production build
+        run: npm run build > build.log 2>&1 || (tail -200 build.log && exit 1)
