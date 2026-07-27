@@ -27,19 +27,11 @@ export function profileTask(input: TaskContext): TaskProfile {
   if (input.dynamicAssessment) return profileFromDynamicAssessment(input, input.dynamicAssessment, failureHistory);
   const style = /\b(color|colour|blue|green|spacing|css|copy|typo|spelling|darker|lighter|rename|config value)\b/.test(text);
   const locate = /\b(where is|find|locate|defined)\b/.test(text);
-  // Ordinary read-only questions are Fast work even when they do not contain one of the old
-  // narrow phrases ("what is", "explain this"). Without this, natural questions such as
-  // "How do I ping an IP address?" fell through to the Builder default. Risk, migrations,
-  // concurrency, cross-layer scope, and failure history are still evaluated below and can
-  // independently escalate a genuinely difficult question.
   const ordinaryQuestion = /^(?:how\s+(?:do|can|should|would)\s+i\b|how\s+to\b|what\b|why\b|when\b|where\b|which\b|who\b|can\s+you\s+explain\b|could\s+you\s+explain\b|is\s+(?:it|this|that|there)\b|are\s+(?:there|these|those)\b|do\s+i\b|does\s+(?:it|this|that)\b)/.test(text.trim());
   const cheapOperation = style || locate || ordinaryQuestion || /\b(search|index|read|format|prettify|summari[sz]e|spellcheck|list files|what is|what does|simple question|explain this)\b/.test(text);
   const concurrency = /\b(concurr\w*|race condition|intermittent|los(?:e|es|t) transactions?|deadlock)\b/.test(text);
   const sensitive = /\b(auth\w*|payment|security|data loss|transactions?)\b/.test(riskText);
   const migration = /\b(migrat\w*|redesign\w*|whole design system|multi-service|shared infrastructure|winforms|wpf)\b/.test(text);
-  // A small backend that owns a few routes plus one database is still one bounded service. Escalate
-  // only when the mission actually crosses product layers/services, not merely because the words
-  // "API" and "database" appear together.
   const crossLayer = input.crossLayer ?? /\b(frontend.*api.*database|frontend.*backend|cross-layer|multi-service)\b/.test(text);
   const projectCreation = /\b(?:create|build|make|scaffold|generate)\b[\s\S]{0,100}\b(?:project|website|site|application|app|portfolio|api|backend|service|endpoint|game)\b/.test(text);
   const staticCreationShape = projectCreation && /\b(?:html|css|vanilla\s+(?:java\s*script|javascript|js)|static|portfolio|landing page)\b/.test(text);
@@ -97,6 +89,45 @@ export function profileTask(input: TaskContext): TaskProfile {
 }
 
 function profileFromDynamicAssessment(input: TaskContext, assessment: DynamicTaskAssessment, failureHistory: number): TaskProfile {
+  const activeText = activeTaskScope(input.message).toLowerCase();
+  const explicitStaticSite = /\b(?:static\s+(?:html|website|site)|html\s*\+\s*css\s*\+\s*(?:javascript|js)|vanilla\s+(?:javascript|js)|static html)\b/.test(activeText)
+    && !/\b(?:backend|database|authentication|auth|login|accounts?|payments?|api|server|external integration|third-party integration)\b/.test(stripNegatedRiskClaims(activeText));
+
+  // Dynamic assessment may estimate many content pages as many "subsystems" and escalate a plain
+  // static website to Architect. Explicit stack and risk facts outrank that estimate. A multi-page
+  // brochure site is still one bounded presentation subsystem and should receive a fast/builder model,
+  // not several long architect attempts.
+  if (explicitStaticSite && failureHistory === 0) {
+    const estimatedFiles = Math.max(3, Math.min(8, Math.round(assessment.estimatedFiles || 3)));
+    return {
+      intent: assessment.taskType,
+      taskType: assessment.taskType,
+      requestedOutcome: input.message,
+      scope: { estimatedFiles, estimatedSubsystems: 1, crossLayer: false, projectWide: false },
+      projectScale: clamp((input.projectFileCount ?? 0) / 100_000),
+      taskLocality: clamp(1 - estimatedFiles / 20),
+      difficulty: Math.min(0.5, clamp(assessment.difficulty)),
+      ambiguity: Math.min(0.45, clamp(assessment.uncertainty)),
+      risk: Math.min(0.2, clamp(assessment.risk)),
+      blastRadius: clamp(estimatedFiles / 20),
+      contextNeed: Math.min(0.5, clamp(assessment.contextRequired)),
+      reasoningNeed: Math.min(0.5, clamp(Math.max(assessment.difficulty, assessment.uncertainty))),
+      toolUseNeed: 0.7,
+      visualNeed: assessment.visualOutcome ? 1 : 0,
+      verificationNeed: 0.65,
+      reversibility: 0.9,
+      failureHistory,
+      recommendedIntelligenceTier: estimatedFiles <= 5 ? "fast" : "builder",
+      recommendedExecutionDepth: input.requestedDepth ?? "standard",
+      confidence: Math.max(0.9, clamp(assessment.confidence)),
+      reasons: ["explicit static HTML/CSS/JavaScript site with no backend or external services", `bounded static assessment: ${estimatedFiles} likely files, 1 subsystem`],
+      missionComplexity: 2,
+      repositoryComplexity: 1,
+      expectedFiles: estimatedFiles,
+      effectiveIntelligence: estimatedFiles <= 5 ? "fast" : "builder",
+    };
+  }
+
   const estimatedFiles = Math.max(1, Math.min(100, Math.round(assessment.estimatedFiles)));
   const estimatedSubsystems = Math.max(1, Math.min(10, Math.round(assessment.estimatedSubsystems)));
   const projectWide = assessment.affectedScope === "project-wide";
@@ -158,8 +189,6 @@ function stripNegatedRiskClaims(text: string) {
   );
 }
 
-/** Planning briefs deliberately mention alternatives and deferred integrations. They are context,
- * not current execution scope, and must never escalate routing or trigger credential/payment work. */
 function activeTaskScope(text: string) {
   return text
     .replace(/^Alternative stacks:.*$/gim, "")
