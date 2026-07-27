@@ -206,9 +206,32 @@ function summaryOf(execution: ExecutionMission): CanvasSummary {
   const started = eventTimes.length >= 2 ? eventTimes[0] : Date.parse(execution.created_at);
   const ended = eventTimes.length >= 2 ? eventTimes.at(-1)! : Date.parse(execution.updated_at);
   const elapsedMs = Number.isFinite(started) && Number.isFinite(ended) && ended > started ? ended - started : undefined;
+  const modelUsage = execution.model_usage?.length ? {
+    estimatedCostUsd: execution.model_usage.reduce((sum, item) => sum + item.estimatedCostUsd, 0),
+    paidCalls: execution.model_usage.reduce((sum, item) => sum + item.calls, 0),
+    inputTokens: execution.model_usage.reduce((sum, item) => sum + item.inputTokens, 0),
+    outputTokens: execution.model_usage.reduce((sum, item) => sum + item.outputTokens, 0),
+    executionTurns: execution.execution_turns,
+  } : undefined;
+  const productionConnections = [...new Set(execution.timeline.flatMap((event) =>
+    Array.isArray(event.details?.deferredIntegrations) ? event.details.deferredIntegrations : [],
+  ))];
 
   const outcome = execution.summary ? compactEvidenceText(stripTerminalFormatting(execution.summary)) : undefined;
-  return { heading, verificationStatus: execution.verification_status, outcome, whatChanged, verified, failedChecks, watchFor, elapsedMs, engineeringReport: execution.engineering_report, lifecycle: execution.lifecycle };
+  return {
+    heading,
+    verificationStatus: execution.verification_status,
+    outcome,
+    whatChanged,
+    verified,
+    failedChecks,
+    watchFor,
+    elapsedMs,
+    modelUsage,
+    productionConnections,
+    engineeringReport: execution.engineering_report,
+    lifecycle: execution.lifecycle,
+  };
 }
 
 function uniqueEvidence(items: string[]): string[] {

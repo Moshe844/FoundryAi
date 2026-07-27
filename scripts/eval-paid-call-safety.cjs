@@ -44,7 +44,13 @@ assert.match(runtime, /resumableBatchFailure[\s\S]{0,500}candidate\.changedFiles
 assert.match(executor, /8–12 complete coordinated files[\s\S]{0,500}100,000 characters[\s\S]{0,700}user-visible screen or workflow/, "Generated recovery still forces tiny utility batches that exhaust the model-call allowance before building the product.");
 assert.match(executor, /coordinatedAndroidProductSlice[\s\S]{0,500}androidProductLayers\.has\("experience"\)[\s\S]{0,300}androidProductLayers\.has\("behavior"\)/, "Android product progress is still measured only by file count instead of cross-layer behavior.");
 assert.match(executor, /insufficientAndroidSourceBatch[\s\S]{0,500}runnableEntryExistsNow \? 6 : 2[\s\S]{0,100}!coordinatedAndroidProductSlice/, "Android continuation does not allow a smaller, evidenced cross-layer product slice.");
-assert.match(executor, /consecutiveRejectedGeneratedWrites >= 2[\s\S]{0,500}paidCallPrevented: true/, "Repeated rejected generation can still consume paid calls without a durable mutation.");
+// The guarantee is that no paid call is spent REPEATING a refusal the model has already failed. A
+// refusal that says something genuinely new is a different attempt, not a repeat — and until the
+// product-slice refusal named the entry route and then asked for it alone, it never said anything new,
+// so two identical refusals ended a mission that had been told nothing it could act on.
+assert.match(executor, /rejectionInstructionChanged = rejectedWriteReason !== lastGeneratedRejectionReason/, "A rejected generation no longer distinguishes a repeated refusal from a genuinely different instruction.");
+assert.match(executor, /consecutiveRejectedGeneratedWrites >= 2 && \(!rejectionInstructionChanged \|\| consecutiveRejectedGeneratedWrites >= 3\)[\s\S]{0,600}paidCallPrevented: true/, "Repeated rejected generation can still consume paid calls without a durable mutation.");
+assert.match(executor, /productSliceInstruction\(\{ entryPath: await existingProductEntryPath/, "A product batch refused for having no screen is still refused without naming the file the screen belongs in.");
 assert.match(runtime, /continuation\.changedFiles\.length > 0[\s\S]{0,900}runRequiredVerificationProfile[\s\S]{0,500}existingCommands: \[\]/, "Generated continuation batches can still trigger another paid model call before deterministic compile, lint, test, and build verification.");
 assert.match(canvas, /localConnector \?\? \(sdkProjectRoot[\s\S]{0,180}127\.0\.0\.1:3917/, "Foundry-managed projects cannot use the installed Local Agent for SDK intake.");
 assert.match(canvas, /fetch\("\/api\/factory\/agent\/sdk-intake"/, "The browser still bypasses Foundry's same-origin SDK intake endpoint.");

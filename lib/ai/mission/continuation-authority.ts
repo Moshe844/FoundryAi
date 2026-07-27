@@ -36,7 +36,9 @@ export type ContinuationSignals = {
 
 export type ContinuationDecision =
   | { action: "continue"; rationale: string }
-  | { action: "ask"; question: string; options: string[]; blocker: string };
+  | { action: "ask"; question: string; options: string[]; blocker: string }
+  /** Nothing different is left to try. Foundry states the outcome; it does not ask to repeat itself. */
+  | { action: "report"; summary: string; blocker: string };
 
 /**
  * Continuing is the default; asking has to be earned.
@@ -58,12 +60,14 @@ export function decideContinuation(signals: ContinuationSignals): ContinuationDe
   }
 
   if (!signals.nextAction) {
-    // Repeating an attempt that produced nothing is the loop the contract forbids. Stopping honestly is
-    // the right answer, and the report says what was preserved rather than offering a blind retry.
+    // Nothing different is left to try, so there is no question here worth asking. Offering "try again
+    // anyway" was still a retry prompt: it put the decision to repeat a known-failed attempt on the
+    // user, dressed up as a choice, and pressing it bought exactly the run that had just failed. A
+    // senior engineer out of approaches reports what they found; they do not ask permission to repeat
+    // themselves. The user can always say something new — that is what the composer is for.
     return {
-      action: "ask",
-      question: `${signals.reason} Foundry has no different approach left to try, so continuing would repeat the last attempt. Everything completed so far is preserved — tell me how you'd like to proceed.`,
-      options: ["Try again anyway", "Leave it here"],
+      action: "report",
+      summary: `${signals.reason} Foundry tried every approach it has for this failure, including escalating to a stronger model, and none of them moved it. ${signals.madeProgress ? "Everything built so far is preserved on disk." : "Nothing was lost."}`,
       blocker: signals.reason,
     };
   }
@@ -96,7 +100,8 @@ export function decideContinuation(signals: ContinuationSignals): ContinuationDe
  * and what it costs. "Continue autonomous repair" answered none of those.
  */
 export function continuationPrompt(decision: ContinuationDecision): string {
-  return decision.action === "continue" ? "" : decision.question;
+  if (decision.action === "continue") return "";
+  return decision.action === "report" ? decision.summary : decision.question;
 }
 
 function lowerFirst(value: string): string {

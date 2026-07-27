@@ -822,11 +822,17 @@ export function WorkspaceShell() {
         const executionMissions = existingExecutionMission
           ? item.executionMissions.map((entry) => (entry.id === existingExecutionMission.id ? nextExecutionMission : entry))
           : [...item.executionMissions, nextExecutionMission];
+        const refreshedBrief = result.files.find((file) => /(?:^|[\\/])foundry-brief\.md$/i.test(file.path))?.content;
+        const retainedArtifacts = item.createdArtifacts
+          .filter((artifact) => artifact.title !== "Project Execution")
+          .map((artifact) => artifact.title === "Project Brief" && refreshedBrief
+            ? { ...artifact, body: refreshedBrief, description: "Living project requirements updated from foundry-brief.md." }
+            : artifact);
 
         return {
           ...item,
           messages: [...item.messages, resultNote],
-          createdArtifacts: [nextArtifact, ...item.createdArtifacts.filter((artifact) => artifact.title !== "Project Execution")],
+          createdArtifacts: [nextArtifact, ...retainedArtifacts],
           executionMissions,
           activeExecutionMissionId: nextExecutionMission.id,
           lastResult: factoryResultMessage(result),
@@ -2801,6 +2807,8 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
     summary: humanSummary,
     engineering_report: result.engineeringReport,
     lifecycle: result.lifecycle,
+    model_usage: mergeMissionModelUsage(existing?.model_usage, result.modelUsage),
+    execution_turns: (existing?.execution_turns ?? 0) + (result.executionTurns ?? 0),
     parent_mission_id: existing?.parent_mission_id,
     follow_up_resolution: existing?.follow_up_resolution,
     request_message_id: existing?.request_message_id,
@@ -2811,6 +2819,27 @@ function executionMissionFromResult(mission: MissionState, result: FactoryProjec
     created_at: existing?.created_at ?? now,
     updated_at: now,
   };
+}
+
+function mergeMissionModelUsage(
+  previous: ExecutionMission["model_usage"],
+  incoming: FactoryProjectResult["modelUsage"],
+): ExecutionMission["model_usage"] {
+  const grouped = new Map<string, NonNullable<ExecutionMission["model_usage"]>[number]>();
+  for (const item of [...(previous ?? []), ...(incoming ?? [])]) {
+    const key = `${item.provider}:${item.model}`;
+    const current = grouped.get(key);
+    if (!current) {
+      grouped.set(key, { ...item });
+      continue;
+    }
+    current.calls += item.calls;
+    current.inputTokens += item.inputTokens;
+    current.outputTokens += item.outputTokens;
+    current.estimatedCostUsd += item.estimatedCostUsd;
+    current.cachedCalls += item.cachedCalls;
+  }
+  return [...grouped.values()];
 }
 
 function mergeExecutionTimeline(existing: FactoryExecutionEvent[], incoming: FactoryExecutionEvent[]) {

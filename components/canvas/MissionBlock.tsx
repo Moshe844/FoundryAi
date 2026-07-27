@@ -35,6 +35,7 @@ export function MissionBlock({
   onLocateSdk,
   onEvidenceClick,
   onSuggestion,
+  onOpenProductionConnections,
 }: {
   vm: CanvasMissionVM;
   /** True for a prior mission's trace: fully digested, nothing live. */
@@ -55,6 +56,7 @@ export function MissionBlock({
   onLocateSdk?: () => void;
   onEvidenceClick?: (eventIds: string[]) => void;
   onSuggestion?: (recommendation: MissionRecommendation) => void;
+  onOpenProductionConnections?: () => void;
 }) {
   const showPhases = (vm.tier === "large" || vm.tier === "huge") && vm.phases.length > 0;
   const blocked = Boolean(vm.blocking);
@@ -105,6 +107,7 @@ export function MissionBlock({
             suggestions={recorded ? [] : suggestions}
             onEvidenceClick={onEvidenceClick ?? (() => {})}
             onSuggestion={onSuggestion ?? (() => {})}
+            onOpenProductionConnections={onOpenProductionConnections}
           />
         </div>
       ) : null}
@@ -126,7 +129,8 @@ function RequestBrief({ brief }: { brief: NonNullable<CanvasMissionVM["requestBr
           </div>
         ) : null}
         <div>
-          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Saved as foundry-brief.md</p>
+          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-foundry-subtle">Living requirements · saved as foundry-brief.md</p>
+          <p className="mb-2 text-[11px] leading-5 text-foundry-subtle">Accepted decisions and later project requirements are appended here; implementation progress is tracked separately below.</p>
           <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-shade/30 p-3 font-mono text-[11px] leading-5 text-foundry-muted">{brief.content}</pre>
         </div>
       </div>

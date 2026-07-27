@@ -97,6 +97,16 @@ export function missingIntegrationRequirements(requirements: IntegrationRequirem
   return requirements.filter((requirement) => !requirement.candidates.some((candidate) => verified.has(candidate.id)));
 }
 
+export function blockingIntegrationRequirements(requirements: IntegrationRequirement[]) {
+  return requirements.filter((requirement) => requirement.candidates.some((candidate) => candidate.executionKind === "hardware"));
+}
+
+export function deferredProductionIntegrationNames(requirements: IntegrationRequirement[]) {
+  return [...new Set(requirements
+    .filter((requirement) => !requirement.candidates.some((candidate) => candidate.executionKind === "hardware"))
+    .flatMap((requirement) => requirement.candidates.map((candidate) => candidate.name)))];
+}
+
 /** Finds hardware providers backed by actual imported SDK/specification evidence. A workflow
  * answer alone is intentionally insufficient; callers pass file paths/names or supplied content. */
 export function integrationProvidersFromEvidence(requirements: IntegrationRequirement[], evidenceItems: string[]) {

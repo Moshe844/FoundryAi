@@ -75,6 +75,16 @@ export type FactorySessionSummary = {
   flags: string[];
 };
 
+export type FactoryModelUsageEntry = {
+  provider: "openai" | "anthropic" | "google";
+  model: string;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCostUsd: number;
+  cachedCalls: number;
+};
+
 export type FactoryExecutionEvent = {
   id: string;
   timestamp: string;
@@ -242,15 +252,7 @@ export type FactoryProjectResult = {
   /** Real verification evidence backing this result, built from the same checks the executor's completion gate used. Empty when nothing could be verified — the client must show "unverified" rather than guessing at pass/fail itself. */
   verification?: ExecutionMissionVerification[];
   /** Provider-reported usage for the implementation loop. Discovery is reported by its own request. */
-  modelUsage?: Array<{
-    provider: "openai" | "anthropic" | "google";
-    model: string;
-    calls: number;
-    inputTokens: number;
-    outputTokens: number;
-    estimatedCostUsd: number;
-    cachedCalls: number;
-  }>;
+  modelUsage?: FactoryModelUsageEntry[];
   executionTurns?: number;
   /** Real local toolchain readiness plus trusted one-click setup recipes for this stack. */
   environment?: EnvironmentReadiness;

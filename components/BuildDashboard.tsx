@@ -647,6 +647,7 @@ export function BuildDashboard({ missions, activeMissionId, queuedTask, onSelect
             onPreviewStateChange={(preview) => onPreviewStateChange?.(connectedProject.missionId, preview)}
             onApproveCategory={onApproveCategory ? (category) => onApproveCategory(connectedProject.missionId, category) : undefined}
             onApproveCommand={onApproveCommand ? (command) => onApproveCommand(connectedProject.missionId, command) : undefined}
+            onOpenProductionConnections={() => setActiveView("settings")}
           />
         ) : (
           <FactoryHome

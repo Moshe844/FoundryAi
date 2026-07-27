@@ -26,6 +26,7 @@ export type CanvasWorkEvent = {
   timestamp: string;
   filePath?: string;
   command?: string;
+  cwd?: string;
   /** Raw stdout/stderr/diff payload, expandable in place. Never paraphrased away. */
   output?: string;
   durationMs?: number;
@@ -93,6 +94,14 @@ export type CanvasSummary = {
   /** Present only if real uncertainty exists (blocked reason, warnings, flags). */
   watchFor: string[];
   elapsedMs?: number;
+  modelUsage?: {
+    estimatedCostUsd: number;
+    paidCalls: number;
+    inputTokens: number;
+    outputTokens: number;
+    executionTurns?: number;
+  };
+  productionConnections?: string[];
   engineeringReport?: FactoryEngineeringReport;
   lifecycle?: FactoryLifecyclePhase[];
 };
@@ -233,7 +242,8 @@ export function workEventText(event: FactoryExecutionEvent): string {
   if (event.kind === "command" || event.kind === "build") {
     const command = event.command ?? event.title;
     const outcome = event.status === "running" ? "" : typeof event.exitCode === "number" ? ` → exit ${event.exitCode}` : event.status === "error" ? " → failed" : "";
-    return `ran ${command}${outcome}${duration}`;
+    const target = event.cwd ? ` in ${projectLabelFromPath(event.cwd)}` : "";
+    return `ran ${command}${target}${outcome}${duration}`;
   }
   if (event.kind === "file") return `${event.status === "running" ? "writing" : "wrote"} ${event.filePath ?? event.fileName ?? event.title}${duration}`;
   if (event.kind === "edit") return `${event.status === "running" ? "editing" : "edited"} ${event.filePath ?? event.fileName ?? event.title}${duration}`;
@@ -350,6 +360,7 @@ export function groupTimeline(timeline: FactoryExecutionEvent[]): CanvasVoiceGro
         timestamp: event.timestamp,
         filePath: event.filePath,
         command: event.command,
+        cwd: event.cwd,
         output: rawPayloadOf(event),
         durationMs: event.durationMs,
         lineRange: normalizeLineRange(typeof event.details?.lineRange === "string" ? event.details.lineRange : undefined),
@@ -430,6 +441,11 @@ function commandLabel(command: string): string {
   return command.replace(/^(?:cmd\.exe\s+\/c\s+|powershell\s+-command\s+)/i, "").replace(/\s+/g, " ").trim();
 }
 
+function projectLabelFromPath(cwd: string): string {
+  const normalized = cwd.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).at(-1) || cwd;
+}
+
 export function groupExecutionUnits(events: CanvasWorkEvent[]): CanvasExecutionUnit[] {
   const units: CanvasExecutionUnit[] = [];
   const fileUnits = new Map<string, CanvasExecutionUnit>();
@@ -456,10 +472,19 @@ export function groupExecutionUnits(events: CanvasWorkEvent[]): CanvasExecutionU
       continue;
     }
     if (event.kind === "command" || event.kind === "build") {
-      const key = event.command ?? event.text;
+      const key = `${event.cwd ?? ""}:${event.command ?? event.text}`;
       let unit = commandUnits.get(key);
       if (!unit) {
-        unit = { id: `unit-cmd-${key}`, kind: "command", label: commandLabel(event.command ?? event.text), status: event.status, command: event.command, durationMs: 0, subSteps: [] };
+        unit = {
+          id: `unit-cmd-${key}`,
+          kind: "command",
+          label: commandLabel(event.command ?? event.text),
+          status: event.status,
+          command: event.command,
+          detail: event.cwd ? `project: ${projectLabelFromPath(event.cwd)}` : undefined,
+          durationMs: 0,
+          subSteps: [],
+        };
         commandUnits.set(key, unit);
         units.push(unit);
       }
@@ -534,7 +559,13 @@ export function currentActivityOf(mission: ExecutionMission): { state: CanvasExe
   if (last.tier === "finding") return { state: "investigating", label: "Investigating" };
   if (last.kind === "fix") return { state: "recovering", label: "Recovering" };
   if (last.kind === "inspection") return { state: "investigating", label: basename ? `Reading ${basename}` : "Investigating" };
-  if (last.kind === "edit" || last.kind === "file" || last.kind === "folder") return { state: "editing", label: basename ? `Editing ${basename}` : "Editing files" };
+  if (last.kind === "edit" || last.kind === "file") {
+    if (!basename) return { state: "thinking", label: "Awaiting a verified source change" };
+    if (last.status === "running") return { state: "editing", label: `${last.kind === "file" ? "Creating" : "Editing"} ${basename}` };
+    if (last.status === "error") return { state: "recovering", label: `Write failed for ${basename}` };
+    return { state: "editing", label: `${last.kind === "file" ? "Created" : "Updated"} ${basename}` };
+  }
+  if (last.kind === "folder") return { state: "running", label: basename ? `Prepared ${basename}` : "Preparing project folder" };
   if (last.kind === "preview") return { state: "testing", label: "Testing in the browser" };
   if (last.kind === "command" || last.kind === "build") {
     if (isTest) return { state: "testing", label: "Running tests" };

@@ -58,12 +58,20 @@ describe("asking only when it is genuinely the user's call", () => {
     expect(decision.question).not.toContain("$");
   });
 
-  it("stops rather than repeating an attempt with nothing new to try", () => {
+  it("reports rather than asking permission to repeat an attempt with nothing new to try", () => {
+    // "Try again anyway" was still a retry prompt — it handed the user a button whose only effect was
+    // to re-buy the run that had just failed. With nothing different to try there is no question here.
     const decision = decideContinuation(signals({ nextAction: undefined }));
-    expect(decision.action).toBe("ask");
-    if (decision.action !== "ask") return;
-    expect(decision.question).toContain("no different approach left to try");
-    expect(decision.question).toContain("preserved");
+    expect(decision.action).toBe("report");
+    if (decision.action !== "report") return;
+    expect(decision.summary).toContain("tried every approach it has");
+    expect(decision.summary).toContain("escalating to a stronger model");
+    expect(decision).not.toHaveProperty("options");
+  });
+
+  it("offers no retry option anywhere in a report", () => {
+    const decision = decideContinuation(signals({ nextAction: undefined }));
+    expect(JSON.stringify(decision)).not.toMatch(/try again|retry|continue autonomous/i);
   });
 });
 

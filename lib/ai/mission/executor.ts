@@ -5,6 +5,7 @@ import { commandPermissionIdentity, isLongRunningServerCommand, isSensitiveFileP
 import { clearFailedCommand, commandRepeatKey, createCommandRepeatState, evaluateCommandRepeat, recordFailedCommand, type CommandRepeatState } from "@/lib/ai/mission/command-repeat-guard";
 import { createWriteScope, evaluateWrite, type WriteScope } from "@/lib/ai/mission/write-scope";
 import { guidanceForRejectedWrite } from "@/lib/ai/mission/rejected-write-strategy";
+import { productEntryPath, productSliceInstruction } from "@/lib/ai/mission/product-slice-recovery";
 import { forcedToolAfterTruncation, guidanceForTruncatedWrite } from "@/lib/ai/mission/truncated-write-recovery";
 import { inBatchCorrectnessGate, inBatchRepairNote, shouldRepairInBatch, type InBatchCheck } from "@/lib/verification/in-batch-typecheck";
 import { normalizeVerificationEvidence } from "@/lib/factory/recovery-policy";
@@ -222,6 +223,40 @@ export async function hasRunnableProjectEntry(access: ProjectAccess): Promise<bo
     return false;
   }
   return visit("", 0);
+}
+
+/**
+ * The entry route this project already has on disk, for naming in a refusal.
+ *
+ * Refusing a batch for having no screen is only actionable if it says where the screen goes, and the
+ * scaffold's own entry is the file the build already renders.
+ */
+export async function existingProductEntryPath(access: ProjectAccess): Promise<string | undefined> {
+  const found: string[] = [];
+  async function visit(relativePath: string, depth: number): Promise<void> {
+    if (depth > 4 || found.length > 400) return;
+    const entries = await access.listDir(relativePath).catch(() => []);
+    for (const entry of entries) {
+      const childPath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+      if (entry.kind === "directory") {
+        if (!IMPLEMENTATION_SCAN_EXCLUDED_DIRS.has(entry.name.toLowerCase())) await visit(childPath, depth + 1);
+      } else {
+        found.push(childPath);
+      }
+    }
+  }
+  await visit("", 0);
+  return productEntryPath(found);
+}
+
+export function firstUserFacingSourcePath(files: Array<Record<string, unknown>>): string | undefined {
+  const match = files.find((file) => {
+    const candidatePath = String(file.path ?? "").replace(/\\/g, "/");
+    if (/(?:^|\/)(?:__tests__|test|tests|spec)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(candidatePath)) return false;
+    return /\.(?:html?|[cm]?[jt]sx|vue|svelte)$/i.test(candidatePath)
+      && /(?:<main\b|<form\b|<button\b|<nav\b|return\s*\(|export\s+default\s+function|defineComponent|<template\b)/i.test(String(file.content ?? ""));
+  });
+  return match ? String(match.path ?? "") : undefined;
 }
 
 function projectManifestFamily(filePath: string) {
@@ -959,6 +994,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
   const completedEvidenceRepairReads = new Set<string>();
   let modelCallsSinceDurableProgress = 0;
   let consecutiveRejectedGeneratedWrites = 0;
+  // The instruction the last generated write was refused with. A paid call is only worth buying when
+  // this changes: the same refusal twice is the loop, a genuinely different ask is a new attempt.
+  let lastGeneratedRejectionReason = "";
   // How many times a whole-file write was cut off mid-content this batch; escalates the retry guidance.
   let truncatedWriteRecoveries = 0;
   let paidModelCallsThisBatch = 0;
@@ -1265,14 +1303,23 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         },
       },
       { apiKey: input.apiKey, workspaceId: input.workspaceId, userId: input.userId, maxAttempts: 1, signal: input.signal,
-        // A long provider call emits nothing on its own. When a candidate burns its window and the
-        // dispatcher falls back, say so — otherwise the status line sits frozen for minutes and the user
-        // cannot tell whether Foundry is working or hung.
+        // A long provider call emits nothing on its own, so a candidate burning its window has to say
+        // something or the status line sits frozen for minutes. But what it says matters.
+        //
+        // This used to surface the raw dispatcher failure as a user-facing warning — model id, failure
+        // kind and all. Observed live: a provider blipped once (that same model was succeeding on 209
+        // of 212 calls), Foundry fell back and finished the step exactly as designed, and the user was
+        // shown "did not return a usable response" in red. Nothing was wrong, and the product looked
+        // broken. Reporting a handled event as a warning is a truthfulness problem in both directions:
+        // it overstates this failure and devalues the warnings that do need attention.
+        //
+        // So the model identity and failure kind stay in the durable record, where debugging needs
+        // them, and the user gets what is actually true of their mission: it is still working.
         onAttemptFailure: async ({ model, kind, message, nextCandidate }) => {
-          await emit("reasoning", "warning", nextCandidate
-            ? `${model} did not return a usable response (${kind}). Switching to ${nextCandidate} and continuing the same step.`
-            : `${model} did not return a usable response (${kind}). No alternate provider is available for this step.`,
-            { details: { model, kind, message, nextCandidate, paidCallPrevented: false } });
+          await emit("reasoning", "running", nextCandidate
+            ? "Still generating — the first model was slow to answer, so Foundry moved to another and is continuing the same step."
+            : "Still generating — the model was slow to answer and Foundry is continuing with what it has.",
+            { internal: false, details: { model, kind, message, nextCandidate, paidCallPrevented: false, handledAutomatically: true } });
         },
         timeoutMs: input.staticProject && (input.newProject || input.staticRewrite || (input.fastLane && input.tier && input.tier !== "fast")) ? 45_000 : input.staticProject ? 60_000 : input.fastLane ? 60_000 : 160_000 },
     );
@@ -1689,6 +1736,18 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         && proposedGeneratedFiles.length < 3
         ? `A coordinated greenfield foundation requires at least 3 complete related files; this call supplied ${proposedGeneratedFiles.length}. The batch was rejected before disk write.`
         : undefined;
+      const firstUserFacingSource = firstUserFacingSourcePath(proposedGeneratedFiles);
+      const missingFirstUserFacingSlice = coordinatedNewProjectFoundation
+        && uiOutcomeRequested
+        && call.name === "write_files"
+        && generatedWriteCalls === 0
+        && !lastCommandFailed
+        && !firstUserFacingSource
+        // Name the file the screen belongs in, and change the shape of the ask on a repeat. The
+        // abstract version of this refusal cost a whole mission: the model could not tell what would
+        // be accepted, so it proposed another batch of supporting files and the run ended.
+        ? productSliceInstruction({ entryPath: await existingProductEntryPath(input.access).catch(() => undefined), occurrence: consecutiveRejectedGeneratedWrites + 1 })
+        : undefined;
       const generatedOrchestrationArtifactPath = generatedMutationPaths.find((candidate) => {
         const normalized = candidate.replace(/\\/g, "/");
         return /(?:^|\/)[^/]*(?:build[-_ ]?lock|verification[-_ ]?repair|compiler[-_ ]?repair|provider[-_ ]?fallback|scaffold[-_ ]?repair)[^/]*\.[^/]+$/i.test(normalized)
@@ -1760,7 +1819,8 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         && (writePath.toLowerCase() !== "index.html" || !isCompleteSelfContainedStaticEntry(writePath, String(args.content ?? "")))
         ? "The first static-project write must be the finished index.html, not a skeleton or initialization placeholder. Write at least 2,500 characters with the complete requested content, embedded responsive CSS, embedded interactive JavaScript, realistic seed data, accessible controls, and closing </script>, </body>, and </html> tags. This one coherent artifact lets Foundry verify the browser without buying several follow-up model turns."
         : undefined;
-      const coordinatedGeneratedWriteIssue = undersizedCoordinatedFoundation
+      const coordinatedGeneratedWriteIssue = missingFirstUserFacingSlice
+        ?? undersizedCoordinatedFoundation
         ?? (insufficientAndroidSourceBatch
         ? `${runnableEntryExistsNow ? "An Android continuation batch must implement a substantial product slice with at least six coordinated Kotlin/Java application and test files" : "An unfinished Android foundation must include at least two real Kotlin/Java application or test files"}. Tiny utility batches and XML resources alone do not implement the saved product brief.`
         : invalidAndroidProductPath
@@ -1839,7 +1899,14 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
         }
         if (input.newProject && ["write_file", "write_files", "replace_in_file"].includes(call.name ?? "")) {
           consecutiveRejectedGeneratedWrites += 1;
-          if (consecutiveRejectedGeneratedWrites >= 2) {
+          // Two refusals used to end the batch outright, which was right when both said the same
+          // thing and wrong when the second one asked for something new. The escalating refusal now
+          // names the entry route and then asks for it alone, so a changed instruction earns one more
+          // attempt — and an unchanged one still stops immediately, because repeating a refusal the
+          // model has already failed cannot succeed and must never be paid for.
+          const rejectionInstructionChanged = rejectedWriteReason !== lastGeneratedRejectionReason;
+          lastGeneratedRejectionReason = rejectedWriteReason;
+          if (consecutiveRejectedGeneratedWrites >= 2 && (!rejectionInstructionChanged || consecutiveRejectedGeneratedWrites >= 3)) {
             const reason = `Generated source was rejected twice without a durable mutation. Foundry stopped before buying another provider call. Latest rejection: ${rejectedWriteReason}`;
             await emit("planning", "warning", "Rejected generation stopped before another paid call", {
               internal: true,

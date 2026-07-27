@@ -15,11 +15,13 @@ export function SummaryBlock({
   suggestions,
   onEvidenceClick,
   onSuggestion,
+  onOpenProductionConnections,
 }: {
   summary: CanvasSummary;
   suggestions: MissionRecommendation[];
   onEvidenceClick: (eventIds: string[]) => void;
   onSuggestion: (recommendation: MissionRecommendation) => void;
+  onOpenProductionConnections?: () => void;
 }) {
   const headingColor =
     summary.heading === "Done" ? "text-foundry-teal" : summary.heading === "Stopped" ? "text-foundry-ink" : "text-red-300";
@@ -33,6 +35,14 @@ export function SummaryBlock({
 
       {summary.outcome ? (
         <p className="max-w-3xl whitespace-pre-wrap text-[14px] leading-6 text-foundry-ink">{summary.outcome}</p>
+      ) : null}
+
+      {summary.modelUsage ? (
+        <p className="font-mono text-[11px] leading-5 text-foundry-subtle">
+          Estimated model usage for this mission · ${summary.modelUsage.estimatedCostUsd.toFixed(2)} · {summary.modelUsage.paidCalls} paid call{summary.modelUsage.paidCalls === 1 ? "" : "s"} · {summary.modelUsage.inputTokens.toLocaleString()} input / {summary.modelUsage.outputTokens.toLocaleString()} output tokens
+          {summary.modelUsage.executionTurns ? ` · ${summary.modelUsage.executionTurns} execution turns` : ""}
+          <span className="block">Calculated from provider-reported tokens and Foundry&apos;s configured rates; this is not a provider invoice.</span>
+        </p>
       ) : null}
 
       {summary.whatChanged.length ? (
@@ -85,6 +95,21 @@ export function SummaryBlock({
 
       {summary.engineeringReport ? (
         <EngineeringReport report={summary.engineeringReport} lifecycle={summary.lifecycle ?? []} />
+      ) : null}
+
+      {summary.productionConnections?.length && onOpenProductionConnections ? (
+        <div className="max-w-3xl rounded-md border border-foundry-teal/20 bg-foundry-teal/[0.045] p-3">
+          <p className="text-[13px] leading-5 text-foundry-ink">
+            Local verification used safe development substitutes. Connect {summary.productionConnections.join(", ")} when you are ready to promote this project.
+          </p>
+          <button
+            type="button"
+            onClick={onOpenProductionConnections}
+            className="mt-2 rounded bg-foundry-teal px-3 py-2 text-xs font-extrabold text-slate-950"
+          >
+            Connect production services
+          </button>
+        </div>
       ) : null}
 
       {suggestions.length ? (

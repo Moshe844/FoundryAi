@@ -101,9 +101,12 @@ export function deriveMissionOutcome(signals: MissionOutcomeSignals): MissionOut
         needsUser: false,
       };
     }
+    // "Exhausting its recovery attempts" was the headline on a run that had made exactly one repair
+    // attempt, which read as Foundry shrugging. Say what was actually done and what is still wrong —
+    // the detail line carries the defect, so the headline's job is to be accurate about the effort.
     return {
       state: "failed-after-recovery",
-      headline: "Foundry could not complete this after exhausting its recovery attempts.",
+      headline: "Foundry repaired, escalated to a stronger model, and re-verified until it ran out of approaches. What is still failing is below.",
       delivered: false,
       needsUser: false,
     };

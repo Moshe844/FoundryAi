@@ -44,6 +44,7 @@ export function MissionCanvas({
   onPreviewStateChange,
   onApproveCategory,
   onApproveCommand,
+  onOpenProductionConnections,
 }: {
   mission: MissionState;
   brief: string;
@@ -60,6 +61,7 @@ export function MissionCanvas({
   onPreviewStateChange?: (preview: Pick<FactoryProjectResult, "previewState" | "previewUrl" | "previewPlatform" | "previewReason">) => void;
   onApproveCategory?: (category: string) => void;
   onApproveCommand?: (command: string) => void;
+  onOpenProductionConnections?: () => void;
 }) {
   const [task, setTask] = useState("");
   const [evidenceFiles, setEvidenceFiles] = useState<File[]>([]);
@@ -130,6 +132,14 @@ export function MissionCanvas({
     : null;
   const retryWillRepair = Boolean(activeExecution && needsRepairAction(activeExecution));
   const retryWillRecheck = Boolean(activeExecution && hasVerificationConflict(activeExecution));
+  // Name what is actually still failing. The strip used to promise "continue autonomous repair",
+  // which read as though Foundry had held something back — and clicking it bought another run with
+  // no idea what it was up against. The gate has already repaired and escalated by this point, so
+  // the only useful thing left to say is which check survived all of it.
+  const unresolvedChecks = useMemo(
+    () => [...new Set((activeExecution?.verification ?? []).filter((item) => item.result === "fail").map((item) => item.check_type))],
+    [activeExecution],
+  );
 
   const silenceMs = useElapsedSince(liveEvent?.timestamp, missionStatus.isBusy);
   const stalled = missionStatus.isBusy && isStalled(silenceMs);
@@ -653,6 +663,7 @@ export function MissionCanvas({
                   onLocateSdk={sdkConnector ? handleLocateSdk : undefined}
                   onEvidenceClick={handleEvidenceClick}
                   onSuggestion={handleSuggestion}
+                  onOpenProductionConnections={onOpenProductionConnections}
                 />
               ) : (
                 <IdleConnectLine brief={brief} editingTarget={editingTarget} fileCount={workspaceFiles.length || execution?.files.length || 0} />
@@ -725,7 +736,7 @@ export function MissionCanvas({
                 : retryWillRecheck
                   ? "The same verifier result repeated on unchanged source. Foundry stopped duplicate paid repair calls; recheck runs the exact gate first."
                 : retryWillRepair
-                  ? "Foundry preserved the implementation after the same source and verification evidence stopped changing. Continue resumes from that exact gate."
+                  ? `Foundry repaired and escalated until its attempts ran out. Still failing: ${unresolvedChecks.join(", ") || "the browser gate"}. Running again starts a fresh attempt at the same gate.`
                   : "The last run didn't finish."}
             </span>
             <button
@@ -733,7 +744,7 @@ export function MissionCanvas({
               className="rounded-md border border-foundry-teal/35 bg-foundry-teal/[0.14] px-2.5 py-1 text-[12px] font-extrabold text-foundry-ink transition hover:bg-foundry-teal/[0.2]"
               onClick={() => activeExecution && (onRetry ? onRetry(retryableTask, activeExecution.id) : onExecute(retryableTask))}
             >
-              {retryWillRecheck ? "Recheck verification" : retryWillRepair ? "Continue autonomous repair" : "Retry this task"}
+              {retryWillRecheck ? "Recheck verification" : retryWillRepair ? "Run this again" : "Retry this task"}
             </button>
           </div>
         ) : null}

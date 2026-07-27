@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "./requirements";
+import { blockingIntegrationRequirements, deferredProductionIntegrationNames, integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "./requirements";
 
 describe("integration requirements", () => {
   it("requires a real email provider for password reset", () => {
@@ -56,5 +56,14 @@ describe("integration requirements", () => {
     expect(verifone).toBeDefined();
     expect(integrationRequirementPrompt(verifone!).question).toContain("SDK/specifications");
     expect(requirements.some((item) => item.id === "payments")).toBe(false);
+  });
+
+  it("defers software services until promotion but keeps real hardware as a build prerequisite", () => {
+    const software = integrationRequirementsForBrief("Connect our existing production PostgreSQL through DATABASE_URL and accept real card payments with Stripe.");
+    expect(blockingIntegrationRequirements(software)).toEqual([]);
+    expect(deferredProductionIntegrationNames(software)).toEqual(expect.arrayContaining(["PostgreSQL", "Stripe"]));
+
+    const hardware = integrationRequirementsForBrief("Build a real Verifone payment terminal app.");
+    expect(blockingIntegrationRequirements(hardware).some((item) => item.candidates.some((candidate) => candidate.id === "verifone"))).toBe(true);
   });
 });

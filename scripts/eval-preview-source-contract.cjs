@@ -205,7 +205,13 @@ assert(
   "A source-scoped missing-export build failure can still spend repeated calls reading consumers instead of forcing the owning module repair first.",
 );
 assert(
-  missionCanvas.includes("Continue autonomous repair")
+  // The repair affordance must stay distinct from the recheck one, and must not promise autonomous
+  // work that has already been spent — by this point the gate has repaired and escalated. It has to
+  // name the check that survived instead.
+  missionCanvas.includes("Run this again")
+    && !missionCanvas.includes("Continue autonomous repair")
+    && missionCanvas.includes("unresolvedChecks")
+    && missionCanvas.includes("Foundry repaired and escalated until its attempts ran out")
     && missionCanvas.includes("Recheck verification")
     && canvasAdapter.includes('hasVerificationConflict(execution) ? "Ready to continue"')
     && canvasModel.includes("[FOUNDRY_VERIFICATION_CONFLICT]")

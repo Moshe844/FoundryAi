@@ -6,6 +6,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { capabilityLevelForStackChoice, checklistForRequest, detectStackProfile, isLikelySmallSingleFileRequest, isStructuralRelocationRequest, unsupportedCreationMessage, unsupportedEditingMessage, type StackCapabilityLevel, type StackProfile } from "@/lib/factory/language-adapters";
 import { externalRuntimeRequirementKeys } from "@/lib/factory/runtime-requirements";
+import { acceptedProjectBriefMemory } from "@/lib/factory/project-brief-memory";
 import { classifyIntent, deterministicMutationIntent, deterministicTaskAssessment } from "@/lib/ai/mission/intent-classifier";
 import { runReadOnlyInspection } from "@/lib/ai/mission/inspector";
 import { planMission } from "@/lib/ai/mission/mission-planner";
@@ -28,6 +29,7 @@ import { reviewArchitecture } from "@/lib/ai/mission/architecture-review";
 import { verifyMissionResult } from "@/lib/ai/mission/mission-verifier";
 import { verificationAction, verificationImproved, verificationRisk } from "@/lib/ai/mission/verification-policy";
 import { detectVerificationProfile } from "@/lib/verification/project-detector";
+import { gateRepairBudget, nextGateAction, type GateAttempt } from "@/lib/verification/gate-persistence";
 import { compilerDiagnosticOutput, compilerFailureFingerprint, compilerFailureSignature, extractCompilerSourcePaths, isCompilerSourcePath } from "@/lib/verification/compiler-evidence";
 import { complianceVerdict, correctionInstruction, deriveOutcomeAssertions, isDestructiveRewrite, type FileChange } from "@/lib/verification/outcome-compliance";
 import { evaluatePlacement, spatialRequirementForRequest, type ElementBox } from "@/lib/verification/dom-placement";
@@ -80,7 +82,7 @@ import { isStaticSourceSeparationRequest, planStaticSourceSeparation, type Stati
 import { acceptanceWorkflowTemplate, parseAcceptanceWorkflowManifest, type AcceptanceWorkflowManifest } from "@/lib/verification/acceptance-workflow";
 import { projectIntegrationEnvironment } from "@/lib/integrations/runtime-environment";
 import { detectProjectIntegrations } from "@/lib/integrations/detection";
-import { integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "@/lib/integrations/requirements";
+import { blockingIntegrationRequirements, deferredProductionIntegrationNames, integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "@/lib/integrations/requirements";
 import { isPreviewRestartRequest } from "@/lib/factory/preview-intent";
 import { attachedAssetPlacement, attachedAssetPublicPath } from "@/lib/factory/asset-placement";
 import { buildUploadIntakeMarker, uploadIntakeMarkerFile, uploadIntakeMarkerMatches } from "@/lib/factory/upload-intake";
@@ -1066,17 +1068,14 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   // persistence path and keeps the external database as a deployment upgrade.
   const explicitRuntimeRequirements = [spec.projectDescription, spec.instructions].filter(Boolean).join("\n");
   const missingRuntimeVariables = externalRuntimeRequirementKeys(explicitRuntimeRequirements).filter((key) => !process.env[key]?.trim());
+  const deferredProductionConnections = new Set<string>();
   if (missingRuntimeVariables.length) {
-    const names = missingRuntimeVariables.join(", ");
-    const question = `This selected stack requires ${names} before Foundry can build and verify it. Configure ${names} in Foundry's environment and retry, or return to the Stack step and choose a zero-setup SQLite/local-storage option.`;
-    const paused = await pauseForPlanConflicts(execution, [question]);
-    const files = await listProjectFiles(projectPath);
-    return {
-      projectId, projectName: spec.projectName, projectPath, briefPath, stack: stackProfile.label, template: spec.template,
-      sourceMode: "new-project", objective: `Create ${spec.projectName}`, checklist: execution.checklist,
-      status: paused.status, supported: true, blocker: paused.blocker, clarificationQuestions: paused.clarificationQuestions,
-      events: [...events, question], files, commands, timeline: execution.timeline,
-    };
+    missingRuntimeVariables.forEach((name) => deferredProductionConnections.add(name === "DATABASE_URL" ? "Production database" : name === "REDIS_URL" ? "Production Redis" : name));
+    await emitExecution(execution, "reasoning", "completed", "Production credentials are deferred until the local product is built and verified.", {
+      tier: "decision",
+      rationale: "Foundry will use a safe local development substitute and preserve a production adapter boundary. No external connection is claimed until the user configures and verifies it.",
+      details: { deferredIntegrations: [...deferredProductionConnections] },
+    });
   }
 
   // Resolve every externally credentialed dependency before the first paid generation call. Local
@@ -1094,9 +1093,11 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
   const attachedHardwareEvidence = integrationProvidersFromEvidence(requiredIntegrations,
     evidenceAttachments.map((attachment) => `${attachment.fileName} ${attachment.rawText ?? ""}`));
   const missingIntegrations = missingIntegrationRequirements(requiredIntegrations, [...configuredIntegrations.providers, ...attachedHardwareEvidence]);
-  if (missingIntegrations.length) {
-    const questions = missingIntegrations.map(integrationRequirementPrompt);
-    const blocker = `Foundry needs ${missingIntegrations.length} verified project integration${missingIntegrations.length === 1 ? "" : "s"} before implementation can begin. No generation model was called.`;
+  const blockingIntegrations = blockingIntegrationRequirements(missingIntegrations);
+  deferredProductionIntegrationNames(missingIntegrations).forEach((name) => deferredProductionConnections.add(name));
+  if (blockingIntegrations.length) {
+    const questions = blockingIntegrations.map(integrationRequirementPrompt);
+    const blocker = `Foundry needs ${blockingIntegrations.length} verified hardware integration${blockingIntegrations.length === 1 ? "" : "s"} before implementation can begin. No generation model was called.`;
     const paused = await pauseForPlanConflicts(execution, questions.map((question) => question.question));
     paused.clarificationQuestions = questions;
     const files = await listProjectFiles(projectPath);
@@ -1107,13 +1108,23 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       events: [...events, ...questions.map((question) => question.question)], files, commands, timeline: execution.timeline,
     };
   }
+  if (deferredProductionConnections.size) {
+    await emitExecution(execution, "reasoning", "completed", "Production services will be connected after the local build is verified.", {
+      tier: "decision",
+      rationale: `The first build will use safe local substitutes for ${[...deferredProductionConnections].join(", ")} and expose a one-click production connection step afterward.`,
+      details: { deferredIntegrations: [...deferredProductionConnections] },
+    });
+  }
 
   // The pasted/card brief is itself authoritative input. API clients are allowed to omit the
   // optional StructuredDiscovery object, so routing must not silently collapse a detailed brief to
   // only its description and Custom instructions line.
-  const routingSummary = discovery
+  let routingSummary = discovery
     ? [`Create project: ${spec.projectType}`, `Stack: ${spec.stack}`, spec.projectDescription, spec.instructions].filter(Boolean).join("\n")
     : brief.trim();
+  if (deferredProductionConnections.size) {
+    routingSummary += `\n\nProduction connections deferred until after local verification: ${[...deferredProductionConnections].join(", ")}. Build a complete locally runnable product now using safe development substitutes behind explicit provider/repository adapters. Do not claim any production service is connected.`;
+  }
   // Bootstrap with Fast. The first paid call dynamically assesses this current request before any
   // planning or implementation tier is selected.
   const initialModel = await modelForMissionStage(routingSummary, modelMode, "fast");
@@ -2483,19 +2494,60 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     const browserRepairChangedFiles = new Set<string>();
     const attemptedBrowserRepairFingerprints = new Set<string>();
     const repeatedBrowserFindings = new Map<string, number>();
-    const maximumBrowserRepairStages = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, depthPolicy(quality).retry.maxRepairStages);
+    // A real defect in a real browser gets enough attempts to converge on it, whatever depth was
+    // chosen — depth decides how much reasoning to buy, not whether a broken product is acceptable.
+    const maximumBrowserRepairStages = autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, gateRepairBudget(depthPolicy(quality).retry.maxRepairStages));
+    const browserGateAttempts: GateAttempt[] = [];
+    let escalateBrowserRepair = false;
     let browserVerificationConflict = false;
-    for (let repairAttempt = 1; !browserEvidence.verified && !browserEvidence.infrastructureFailure && repairAttempt <= maximumBrowserRepairStages; repairAttempt += 1) {
+    // A stage ceiling is a pacing device, not one of the reasons the reliability contract permits a
+    // pause. Crossing it asks the continuation authority whether to carry on, and while budget and a
+    // real next action remain the answer is yes — autonomously, with no control shown to the user.
+    // The gate stops for the two honest reasons only: nothing different left to try, or spending past
+    // what this mission was authorised for.
+    let browserRepairCeiling = maximumBrowserRepairStages;
+    for (let repairAttempt = 1; !browserEvidence.verified && !browserEvidence.infrastructureFailure; repairAttempt += 1) {
+      if (repairAttempt > browserRepairCeiling) {
+        const continuation = resolveContinuation({
+          execution,
+          reason: `The real browser gate still reports: ${browserEvidence.evidence}`,
+          nextAction: "Repair the remaining browser-verified defect from the preserved evidence",
+          nextAttemptUsd: compilerRepairBudgetUsd(),
+          madeProgress: browserRepairChangedFiles.size > 0,
+          result,
+        });
+        if (continuation.action !== "continue") break;
+        browserRepairCeiling += maximumBrowserRepairStages;
+        await emitExecution(execution, "planning", "running", "Continuing browser repair past the stage ceiling — budget and an approach both remain", {
+          internal: true,
+          rationale: continuation.rationale,
+          details: { repairAttempt, ceiling: browserRepairCeiling, autonomous: true },
+        });
+      }
       const findingFingerprint = verificationFindingFingerprint(browserEvidence.evidence);
       const findingCount = (repeatedBrowserFindings.get(findingFingerprint) ?? 0) + 1;
       repeatedBrowserFindings.set(findingFingerprint, findingCount);
-      if (findingCount > 1) {
+
+      // A finding that survived its repair means this approach is not working — which is a reason to
+      // change approach, not to end the mission. Stopping here is reserved for the case where a
+      // stronger model has already taken the same evidence and moved nothing.
+      const gateAction = nextGateAction({ attempts: browserGateAttempts, currentFingerprint: findingFingerprint, maxAttempts: browserRepairCeiling });
+      escalateBrowserRepair = gateAction.action === "escalate";
+      if (gateAction.action === "stop") {
         browserVerificationConflict = true;
         await emitExecution(execution, "planning", "warning", "Stopped repeated generated-project repair on unchanged browser findings", {
           internal: true,
-          details: { findingFingerprint, findingCount, paidCallPrevented: true, repairAttempt },
+          rationale: gateAction.reason,
+          details: { findingFingerprint, findingCount, paidCallPrevented: true, repairAttempt, escalationSpent: browserGateAttempts.some((item) => item.escalated) },
         });
         break;
+      }
+      if (escalateBrowserRepair) {
+        await emitExecution(execution, "planning", "running", "Escalating the generated-project browser repair to a stronger model rather than stopping", {
+          internal: true,
+          rationale: gateAction.reason,
+          details: { findingFingerprint, findingCount, repairAttempt, escalated: true },
+        });
       }
       const repairReadPaths = await verifiedBrowserRepairReadPaths(access, browserEvidence.evidence);
       const sourceFingerprint = await sourceProgressFingerprint(access, [...result.changedFiles, ...repairReadPaths]);
@@ -2523,10 +2575,14 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
         ? "The rendered project exposed concrete browser failures. I’m repairing all verified evidence, rebuilding, restarting its owned preview, and running the same checks again."
         : `The generated project still has verified browser failures after repair ${repairAttempt - 1}. I’m continuing from the changed source with the remaining evidence.`, { internal: true });
       const staticBrowserRepair = stackProfile.id === "static-html";
-      const repairTier: ModelTier = /explicit acceptance requirements/i.test(browserEvidence.evidence)
-        && !/(?:Console:|Page error:|Failed local request:|browser interaction failed)/i.test(browserEvidence.evidence)
-        ? "fast"
-        : "builder";
+      // Escalation is the whole point of not stopping: the same evidence, read by something stronger.
+      // Handing it back to the tier that already failed on it would just be the retry loop again.
+      const repairTier: ModelTier = escalateBrowserRepair
+        ? "architect"
+        : /explicit acceptance requirements/i.test(browserEvidence.evidence)
+          && !/(?:Console:|Page error:|Failed local request:|browser interaction failed)/i.test(browserEvidence.evidence)
+          ? "fast"
+          : "builder";
       const browserRepairModel = await modelForMissionStage(task, modelMode, repairTier, undefined, repairAttempt, creationAssessment) ?? implementationModel;
       await emitModelSelection(execution, `browser repair ${repairAttempt}`, browserRepairModel);
       // The browser gate says WHAT is missing on screen; this deterministic check says WHY — the entry
@@ -2562,6 +2618,7 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       });
       result.usage.push(...repair.usage);
       { const destructive = await revertDestructiveRepairEdits(access, execution, repair.timeline).catch(() => [] as string[]); if (destructive.length) { repair.changedFiles = repair.changedFiles.filter((file) => !destructive.includes(file)); repair.status = "failed"; repair.blocker = repair.blocker || `The repair deleted most of ${destructive.length} implemented file(s); the implementation was restored and the repair rejected.`; } }
+      browserGateAttempts.push({ fingerprint: findingFingerprint, changedFiles: repair.changedFiles.length, escalated: escalateBrowserRepair });
       result.changedFiles = [...new Set([...result.changedFiles, ...repair.changedFiles])];
       result.commands.push(...repair.commands);
       modelUsage = summarizeModelUsage(result.usage);
@@ -2638,11 +2695,21 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
       evidence: browserEvidence.evidence,
     });
     if (!browserEvidence.verified) {
+      // The gate no longer decides the mission's ending by itself. It reached here for one of two
+      // reasons, and the continuation authority is what tells them apart: the finding survived repair
+      // and escalation (nothing different left — report it), or the budget ran out (the one question
+      // that is genuinely the user's). Neither ends in "continue recovery from this exact gate",
+      // which was Foundry asking the user to press a button to do its own job.
+      const continuation = resolveContinuation({
+        execution,
+        reason: browserEvidence.evidence,
+        nextAction: browserVerificationConflict ? undefined : "Repair the remaining browser-verified defect from the preserved evidence",
+        nextAttemptUsd: compilerRepairBudgetUsd(),
+        madeProgress: browserRepairChangedFiles.size > 0,
+        result,
+      });
       status = "failed";
-      blocker = browserVerificationConflict
-        ? `Foundry preserved the unfinished project after every configured browser-repair strategy returned unchanged source and evidence. Continue recovery from this exact browser gate.\n\n${browserEvidence.evidence}`
-        : browserEvidence.evidence;
-      result.clarificationQuestions = undefined;
+      blocker = continuation.action === "continue" ? browserEvidence.evidence : result.blocker ?? browserEvidence.evidence;
     } else if (browserEvidenceCanSupersedeBlocker || onlyBoundedBookkeepingRemains || successfulBuildSupersedesBatchBoundary) {
       status = "passed";
       blocker = undefined;
@@ -5700,6 +5767,26 @@ async function runExistingProjectMissionWithAccess(params: {
     || (!followUpResolution && deterministicMutationIntent(requestedTask) === "edit")
     || looksUnambiguouslyLikeSmallEdit(requestedTask)
     || looksLikeBoundedClientInteraction(requestedTask);
+  if (durableBrowserBrief?.exists) {
+    const rememberedBrief = acceptedProjectBriefMemory(
+      durableBrowserBrief.content,
+      requestedTask,
+      requestNamesConcreteChange && !isControlContinuation,
+    );
+    if (rememberedBrief !== durableBrowserBrief.content) {
+      const remembered = await access.writeFile("foundry-brief.md", rememberedBrief);
+      if (remembered.verified && remembered.contentChanged) {
+        await emitExecution(execution, "edit", "completed", "Updated foundry-brief.md with the accepted project decision", {
+          tier: "trace",
+          fileName: "foundry-brief.md",
+          filePath: "foundry-brief.md",
+          output: remembered.diff,
+          beforeContent: remembered.beforeContent,
+          details: { projectMemory: true, bytes: remembered.bytes },
+        });
+      }
+    }
+  }
   const inheritedBrowserRequest = [
     durableBrowserBrief?.exists && !requestNamesConcreteChange ? durableBrowserRequirementsFromBrief(durableBrowserBrief.content) : "",
     requestedTask,
@@ -5733,9 +5820,10 @@ async function runExistingProjectMissionWithAccess(params: {
       const suppliedEvidence = evidenceAttachments.map((attachment) => `${attachment.fileName} ${attachment.rawText ?? ""}`);
       const hardwareProviders = integrationProvidersFromEvidence(requiredIntegrations, [...importedEvidence, ...suppliedEvidence]);
       const missing = missingIntegrationRequirements(requiredIntegrations, [...configured.providers, ...hardwareProviders]);
-      if (missing.length) {
-        const questions = missing.map(integrationRequirementPrompt);
-        const blocker = `Foundry still needs ${missing.length} verified project integration${missing.length === 1 ? "" : "s"} before execution can resume. No generation model was called.`;
+      const blocking = blockingIntegrationRequirements(missing);
+      if (blocking.length) {
+        const questions = blocking.map(integrationRequirementPrompt);
+        const blocker = `Foundry still needs ${blocking.length} verified hardware integration${blocking.length === 1 ? "" : "s"} before execution can resume. No generation model was called.`;
         const paused = await pauseForPlanConflicts(execution, questions.map((question) => question.question));
         return {
           status: paused.status,
@@ -5746,6 +5834,15 @@ async function runExistingProjectMissionWithAccess(params: {
           verification: [],
           events: [blocker, ...questions.map((question) => question.question)],
         };
+      }
+      const deferred = deferredProductionIntegrationNames(missing);
+      if (deferred.length) {
+        await emitExecution(execution, "reasoning", "completed", "Production services remain deferred while Foundry completes the locally verified product.", {
+          tier: "decision",
+          rationale: `Continue with safe local substitutes for ${deferred.join(", ")}. The finished mission will expose the production connection controls without claiming those services are already connected.`,
+          details: { deferredIntegrations: deferred },
+        });
+        task += `\n\nProduction connections remain deferred until after local verification: ${deferred.join(", ")}. Continue with safe local substitutes behind provider/repository adapters and do not ask for production credentials during this build.`;
       }
     }
   }
@@ -6752,7 +6849,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       id: `generated-requirement-${index + 1}`,
       label: `Implement and verify: ${requirement}`,
       status: "pending" as const,
-      phase: "Saved product brief",
+      phase: "Requirements from saved brief",
     })) : inheritedPlan?.length ? inheritedPlan : [
       { id: "complete-generated-source", label: "Create the complete coordinated application source from the saved brief", status: "pending" },
       { id: "verify-generated-project", label: "Run the project checks and confirm the real application starts successfully", status: "pending" },
@@ -7099,7 +7196,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
     const routedImplementationTier = fullGeneratedRecovery ? "builder" : boundedCompilerRepair ? "fast" : implementationTier;
     implementationModel = await modelForMissionStage(task, modelMode, routedImplementationTier, workingSet, parentMission?.state === "failed" ? 1 : 0, routingAssessment) ?? initialModel!;
     await emitModelSelection(execution, "implementation", implementationModel);
-    await emitExecution(execution, "reasoning", "completed", "The working plan is ready. Foundry is reserving the implementation pass now; no source change is claimed until a write is verified on disk.");
+    await emitExecution(execution, "reasoning", "completed", "The working plan is ready. Foundry is requesting the implementation pass now; the UI will name each file only after its write is verified on disk.");
     result = await runMissionExecutor({
     objective,
     task,
@@ -7513,7 +7610,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       const finalRepairTier: ModelTier = repeated > 1 ? "architect" : "builder";
       const finalRepairModel = await modelForMissionStage(finalRepairTask, modelMode, finalRepairTier, finalRepairWorkingSet, repeated, routingAssessment) ?? implementationModel;
       await emitModelSelection(execution, repeated > 1 ? "final verification repair escalation" : "final verification repair", finalRepairModel);
-      await emitExecution(execution, "reasoning", "completed", `Final verification exposed a concrete ${verificationProfile.ecosystem} failure. Foundry is repairing that evidence and rerunning the complete gate instead of returning Repair stopped.`, { details: { finalFingerprint, finalRepairAttempt, sourcePaths: finalRepairPaths } });
+      await emitExecution(execution, "reasoning", "completed", `Final verification exposed a concrete ${verificationProfile.ecosystem} failure. Foundry is requesting a focused repair now; no repair is claimed until a source write is verified, after which the complete gate will run again.`, { details: { finalFingerprint, finalRepairAttempt, sourcePaths: finalRepairPaths } });
       const finalRepair = await runMissionExecutor({
         objective,
         task: finalRepairTask,
@@ -7770,7 +7867,9 @@ Mandatory existing-source contract: preserve this project's established multi-fi
         const browserRepairChangedFiles = new Set<string>();
         const attemptedBrowserRepairFingerprints = new Set<string>();
         const repeatedBrowserFindings = new Map<string, number>();
-        const maximumBrowserRepairStages = boundedSmallEdit || boundedStaticFollowUp ? 1 : autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, depthPolicy(quality).retry.maxRepairStages);
+        const maximumBrowserRepairStages = boundedSmallEdit || boundedStaticFollowUp ? 1 : autonomousRepairStageLimit(process.env.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, gateRepairBudget(depthPolicy(quality).retry.maxRepairStages));
+        const browserGateAttempts: GateAttempt[] = [];
+        let escalateBrowserRepair = false;
         let browserVerificationConflict = false;
         const browserRepairSourcePaths = () => [...new Set([
           ...workingSet.likelyFiles,
@@ -7792,13 +7891,26 @@ Mandatory existing-source contract: preserve this project's established multi-fi
           const findingFingerprint = verificationFindingFingerprint(browserEvidence.evidence);
           const findingCount = (repeatedBrowserFindings.get(findingFingerprint) ?? 0) + 1;
           repeatedBrowserFindings.set(findingFingerprint, findingCount);
-          if (findingCount > 1) {
+          // A surviving finding means this approach is not working, which is a reason to change
+          // approach rather than end the mission. Stopping waits until a stronger model has taken the
+          // same evidence and moved nothing.
+          const gateAction = nextGateAction({ attempts: browserGateAttempts, currentFingerprint: findingFingerprint, maxAttempts: maximumBrowserRepairStages });
+          escalateBrowserRepair = gateAction.action === "escalate";
+          if (gateAction.action === "stop") {
             browserVerificationConflict = true;
             await emitExecution(execution, "planning", "warning", "Stopped repeated repair on unchanged browser findings", {
               internal: true,
-              details: { findingFingerprint, findingCount, paidCallPrevented: true, repairAttempt },
+              rationale: gateAction.reason,
+              details: { findingFingerprint, findingCount, paidCallPrevented: true, repairAttempt, escalationSpent: browserGateAttempts.some((item) => item.escalated) },
             });
             break;
+          }
+          if (escalateBrowserRepair) {
+            await emitExecution(execution, "planning", "running", "Escalating browser repair to a stronger model rather than stopping", {
+              internal: true,
+              rationale: gateAction.reason,
+              details: { findingFingerprint, findingCount, repairAttempt, escalated: true },
+            });
           }
           const sourceFingerprint = await sourceProgressFingerprint(capabilityAccess, browserRepairSourcePaths());
           const evidenceFingerprint = semanticRepairFingerprint(browserEvidence.evidence, sourceFingerprint);
@@ -7826,7 +7938,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
           await emitExecution(execution, "reasoning", "completed", repairAttempt === 1
             ? "The real desktop/mobile preview exposed concrete failures. I’m repairing all verified evidence, rebuilding, restarting the owned preview, and exercising the same routes again."
             : `Browser acceptance still has verified failures after repair ${repairAttempt - 1}. I’m continuing from the changed source with only the remaining evidence.`, { internal: true });
-          const repairModel = await modelForMissionStage(inheritedOperationRequest, modelMode, "builder", workingSet, parentMission?.state === "failed" ? repairAttempt : repairAttempt - 1, routingAssessment) ?? initialModel!;
+          const repairModel = await modelForMissionStage(inheritedOperationRequest, modelMode, escalateBrowserRepair ? "architect" : "builder", workingSet, parentMission?.state === "failed" ? repairAttempt : repairAttempt - 1, routingAssessment) ?? initialModel!;
           await emitModelSelection(execution, `browser repair ${repairAttempt}`, repairModel);
           const repair = await runMissionExecutor({
             objective,
@@ -7860,6 +7972,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
           mergeExecutionTimeline(result.timeline, repair.timeline);
           result.usage.push(...repair.usage);
       { const destructive = await revertDestructiveRepairEdits(access, execution, repair.timeline).catch(() => [] as string[]); if (destructive.length) { repair.changedFiles = repair.changedFiles.filter((file) => !destructive.includes(file)); repair.status = "failed"; repair.blocker = repair.blocker || `The repair deleted most of ${destructive.length} implemented file(s); the implementation was restored and the repair rejected.`; } }
+          browserGateAttempts.push({ fingerprint: findingFingerprint, changedFiles: repair.changedFiles.length, escalated: escalateBrowserRepair });
           result.turnsUsed += repair.turnsUsed;
           if (signal?.aborted || repair.status === "stopped") break;
           if (repair.changedFiles.length === 0) {
@@ -8584,6 +8697,9 @@ async function applyJournalGroundedSummary(input: {
  * the retry prompt the reliability contract forbids. The policy in continuation-authority.ts decides
  * instead, and the only question it ever puts to the user is one they can actually answer.
  */
+/** The part of a mission result a continuation decision is allowed to write to. */
+type ContinuationSink = { status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: MissionClarification[] };
+
 function resolveContinuation(input: {
   execution: ExecutionContext;
   reason: string;
@@ -8591,24 +8707,32 @@ function resolveContinuation(input: {
   nextAttemptUsd: number;
   madeProgress: boolean;
   externallyBlocked?: boolean;
-  result: { status: FactoryProjectResult["status"]; blocker?: string; clarificationQuestions?: MissionClarification[] };
+  result: ContinuationSink;
 }) {
-  const ledger = routingBudgetSnapshot(input.execution.costScopeId);
+  const budget = routingBudgetSnapshot(input.execution.costScopeId);
   const decision = decideContinuation({
     reason: input.reason,
     nextAction: input.nextAction,
-    spentUsd: ledger?.estimatedCostUsd ?? 0,
-    ceilingUsd: ledger?.estimatedCostLimitUsd ?? DEFAULT_ROUTING_BUDGET.estimatedCostUsd,
+    spentUsd: budget?.estimatedCostUsd ?? 0,
+    ceilingUsd: budget?.estimatedCostLimitUsd ?? DEFAULT_ROUTING_BUDGET.estimatedCostUsd,
     nextAttemptUsd: input.nextAttemptUsd,
     madeProgress: input.madeProgress,
     externallyBlocked: input.externallyBlocked,
   });
 
   if (decision.action === "continue") return decision;
+  if (decision.action === "ask") {
+    input.result.status = "needs-clarification";
+    input.result.blocker = decision.question;
+    input.result.clarificationQuestions = [{ question: decision.question, options: decision.options }];
+    return decision;
+  }
 
-  input.result.status = "needs-clarification";
-  input.result.blocker = decision.question;
-  input.result.clarificationQuestions = [{ question: decision.question, options: decision.options }];
+  // Nothing left to try is not a question, so this path records an honest account and offers no
+  // options. It deliberately does not set a status: a spending boundary must never become a terminal
+  // failure here, and only the caller knows whether its own gate is genuinely the end of the mission.
+  input.result.blocker = decision.summary;
+  input.result.clarificationQuestions = undefined;
   return decision;
 }
 

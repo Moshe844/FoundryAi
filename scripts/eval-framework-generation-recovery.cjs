@@ -301,7 +301,14 @@ assert.doesNotMatch(continuationAuthority, /"Continue recovery"/, "The generic r
 // the decision now names what continuing does and what it costs.
 assert.match(runtime, /function resolveContinuation\([\s\S]{0,900}clarificationQuestions = \[\{ question: decision\.question, options: decision\.options \}\]/, "A preserved recovery boundary must offer an actual resumable user decision.");
 assert.match(continuationAuthority, /options: \[`Continue — about \$\$\{signals\.nextAttemptUsd\.toFixed\(2\)\}`/, "The continue option must state what continuing costs.");
-assert.match(continuationAuthority, /options: \["Try again anyway", "Leave it here"\]/, "A boundary with nothing left to try must still leave the choice with the user.");
+// Superseded contract. This used to require options: ["Try again anyway", "Leave it here"] when
+// nothing different was left to try. That was still a retry prompt — it handed the user a control
+// whose only effect was to re-buy the run that had just failed, which is the exact behaviour the
+// reliability contract forbids. A boundary with nothing left to try now reports instead of asking,
+// and the composer remains the way the user says something new.
+assert.match(continuationAuthority, /action: "report"/, "A boundary with nothing left to try must report, not ask.");
+assert.doesNotMatch(continuationAuthority, /Try again anyway/, "A boundary with nothing left to try must never offer to repeat the failed attempt.");
+assert.match(continuationAuthority, /tried every approach it has/, "A report must say what was attempted rather than leaving the user to guess.");
 assert.match(runtime, /failureAttempt > 1 \|\| signatureAttempt > 1/, "A second zero-change compiler observation must enforce a mutation instead of purchasing another inspection-only pass.");
 assert.match(runtime, /transientBuildArtifactDirectory\(deterministicBuildFailure, projectPath\)/, "Missing generated build-cache artifacts must receive deterministic recovery before a repair model is charged.");
 assert.match(runtime, /prisma", "generate"/, "Prisma projects must generate their client before build and preview.");
