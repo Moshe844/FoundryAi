@@ -11,11 +11,14 @@ export function selectModel(profile: TaskProfile, registry: CapabilityRegistry, 
   const preference = options.preference ?? "balanced";
   const costWeight = preference === "economy" ? 0.55 : preference === "quality-first" ? 0.12 : 0.32;
   const latencyWeight = preference === "lowest-latency" || tier === "fast" ? 0.3 : 0.1;
-  // `includeUnavailable` is the caller's explicit last resort: when every candidate has been marked
-  // unhealthy by recent failures, trying the least-unhealthy one beats refusing to route at all.
-  const candidates = registry.list().filter((model) => (options.includeUnavailable || model.available) && !model.deprecated && model.status !== "unknown-alias" && !options.disabledProviders?.includes(model.provider) && withinBudget(model, options.budget) && satisfies(model, requirements));
-  // Capability requirements are a gate, not a score bonus that lets an unnecessarily expensive
-  // model beat a capable cheap one. Choose within the cheapest cost class that clears the gate.
+  const candidates = registry.list().filter((model) =>
+    (options.includeUnavailable || model.available)
+    && !model.deprecated
+    && model.status !== "unknown-alias"
+    && !options.disabledProviders?.includes(model.provider)
+    && withinBudget(model, options.budget)
+    && allowedForTier(model, tier)
+    && satisfies(model, requirements));
   const cheapestCost = candidates.reduce((minimum, model) => Math.min(minimum, COST[model.costClass]), Number.POSITIVE_INFINITY);
   const cheapestCapable = candidates.filter((model) => COST[model.costClass] === cheapestCost);
   const ranked = cheapestCapable.map((model) => {
@@ -35,12 +38,17 @@ export function selectModel(profile: TaskProfile, registry: CapabilityRegistry, 
 
 export function sameTierFallbacks(decision: RoutingDecision, registry: CapabilityRegistry, profile: TaskProfile) {
   const requirements = requirementsFor(decision.tier, profile);
-  return registry.list().filter((model) => model.available && !model.deprecated && model.status !== "unknown-alias" && model.modelId !== decision.model && satisfies(model, requirements)).sort((a, b) =>
+  return registry.list().filter((model) =>
+    model.available
+    && !model.deprecated
+    && model.status !== "unknown-alias"
+    && model.modelId !== decision.model
+    && allowedForTier(model, decision.tier)
+    && satisfies(model, requirements)).sort((a, b) =>
     COST[a.costClass] - COST[b.costClass]
     || (b.tierFit?.[decision.tier] ?? 0) - (a.tierFit?.[decision.tier] ?? 0)
     || b.providerHealth - a.providerHealth
     || b.freshness - a.freshness
-    || COST[a.costClass] - COST[b.costClass]
     || `${a.provider}:${a.modelId}`.localeCompare(`${b.provider}:${b.modelId}`));
 }
 
@@ -50,6 +58,11 @@ function requirementsFor(tier: ModelTier, profile: TaskProfile) {
 }
 function satisfies(model: RegisteredModel, requirement: ReturnType<typeof requirementsFor>) {
   return (!requirement.tools || model.supportsTools) && model.capabilities.coding >= requirement.coding && model.capabilities.debugging >= requirement.debugging && model.capabilities.architecture >= requirement.architecture && model.capabilities.reasoning >= requirement.reasoning;
+}
+function allowedForTier(model: RegisteredModel, tier: ModelTier) {
+  if (RANK[tier] >= RANK.architect) return true;
+  if (process.env.FOUNDRY_ALLOW_PREMIUM_ROUTINE_MODELS === "true") return true;
+  return model.costClass !== "high" && model.costClass !== "premium";
 }
 function capTier(tier: ModelTier, maximum?: ModelTier) { return maximum && RANK[tier] > RANK[maximum] ? maximum : tier; }
 function average(values: number[]) { return values.reduce((sum, value) => sum + value, 0) / values.length; }
