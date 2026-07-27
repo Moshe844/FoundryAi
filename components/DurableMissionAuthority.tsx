@@ -6,6 +6,7 @@ import { DurableMissionClient } from "@/lib/mission-core/browser-client";
 import type { MissionRecord } from "@/lib/mission-core/model";
 import {
   applyAuthoritativeMission,
+  bindWorkspaceMission,
   durableMissionForWorkspace,
   durableWorkspaceStorageKey,
   emptyDurableWorkspaceSnapshot,
@@ -14,6 +15,12 @@ import {
 } from "@/lib/mission-core/workspace-authority";
 
 export const durableMissionEventName = "foundry:durable-mission";
+export const durableMissionBindingEventName = "foundry:durable-mission-binding";
+
+export type DurableMissionBindingEvent = {
+  workspaceMissionId: string;
+  mission: MissionRecord;
+};
 
 export type DurableMissionAuthorityValue = {
   snapshot: DurableWorkspaceSnapshot;
@@ -35,6 +42,16 @@ export function DurableMissionAuthority({ children }: { children: ReactNode }) {
     } catch {
       // Start with an empty authority store when browser storage is unavailable.
     }
+  }, []);
+
+  useEffect(() => {
+    const handleBinding = (event: Event) => {
+      const detail = (event as CustomEvent<DurableMissionBindingEvent>).detail;
+      if (!detail?.workspaceMissionId || !detail.mission) return;
+      setSnapshot((current) => bindWorkspaceMission(current, detail.workspaceMissionId, detail.mission));
+    };
+    window.addEventListener(durableMissionBindingEventName, handleBinding);
+    return () => window.removeEventListener(durableMissionBindingEventName, handleBinding);
   }, []);
 
   useEffect(() => {
