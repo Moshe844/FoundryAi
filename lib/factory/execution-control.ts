@@ -15,6 +15,12 @@ export type ExecutionSnapshot = {
   updatedAt: string;
 };
 
+type ReplaceableExecutionEvent = {
+  id?: unknown;
+  transient?: unknown;
+  details?: { transientKey?: unknown } | null;
+};
+
 function idFor(controlId: string | undefined) {
   return controlId?.trim() || undefined;
 }
@@ -22,6 +28,15 @@ function idFor(controlId: string | undefined) {
 function scopeFor(id: string) {
   const separator = id.lastIndexOf(":");
   return separator > 0 ? id.slice(0, separator) : id;
+}
+
+function replacementKey(event: unknown): string | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const candidate = event as ReplaceableExecutionEvent;
+  if (candidate.transient !== true) return undefined;
+  const explicit = candidate.details?.transientKey;
+  if (typeof explicit === "string" && explicit.trim()) return `transient:${explicit.trim()}`;
+  return typeof candidate.id === "string" && candidate.id.trim() ? `id:${candidate.id.trim()}` : undefined;
 }
 
 export function registerExecution(controlId: string | undefined, controller: AbortController) {
@@ -56,7 +71,11 @@ export function recordExecutionEvent(controlId: string | undefined, event: unkno
   const id = idFor(controlId);
   if (!id) return;
   const current = executionSnapshots.get(id) ?? { state: "running" as const, events: [], updatedAt: new Date().toISOString() };
-  executionSnapshots.set(id, { ...current, events: [...current.events, event].slice(-1000), updatedAt: new Date().toISOString() });
+  const key = replacementKey(event);
+  const events = key
+    ? [...current.events.filter((existing) => replacementKey(existing) !== key), event]
+    : [...current.events, event];
+  executionSnapshots.set(id, { ...current, events: events.slice(-1000), updatedAt: new Date().toISOString() });
 }
 
 export function completeExecution(controlId: string | undefined, result: unknown) {
