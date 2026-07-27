@@ -13,6 +13,7 @@ export type DurableWorkspaceSnapshot = {
 };
 
 export const durableWorkspaceStorageKey = "foundry.durableMissionAuthority.v1";
+export const legacyWorkspaceStorageKey = "foundry.missionThreads.v9";
 
 export function emptyDurableWorkspaceSnapshot(): DurableWorkspaceSnapshot {
   return { bindings: {}, missions: {} };
@@ -80,4 +81,37 @@ export function extractDurableBindingFromFactoryResult(value: unknown): { durabl
     ? candidate.durableMissionRevision
     : 0;
   return { durableMissionId: candidate.durableMissionId, durableMissionRevision: revision };
+}
+
+export function discoverDurableBindingsFromWorkspace(value: unknown): DurableWorkspaceBinding[] {
+  if (!value || typeof value !== "object") return [];
+  const candidate = value as { missions?: unknown[] };
+  if (!Array.isArray(candidate.missions)) return [];
+  const bindings: DurableWorkspaceBinding[] = [];
+
+  for (const rawMission of candidate.missions) {
+    if (!rawMission || typeof rawMission !== "object") continue;
+    const mission = rawMission as { missionId?: unknown; createdArtifacts?: unknown[]; updatedAt?: unknown };
+    if (typeof mission.missionId !== "string") continue;
+    const artifacts = Array.isArray(mission.createdArtifacts) ? mission.createdArtifacts : [];
+    for (const rawArtifact of [...artifacts].reverse()) {
+      if (!rawArtifact || typeof rawArtifact !== "object") continue;
+      const artifact = rawArtifact as { title?: unknown; body?: unknown };
+      if (artifact.title !== "Project Execution" || typeof artifact.body !== "string") continue;
+      try {
+        const result = extractDurableBindingFromFactoryResult(JSON.parse(artifact.body));
+        if (!result) continue;
+        bindings.push({
+          workspaceMissionId: mission.missionId,
+          durableMissionId: result.durableMissionId,
+          revision: result.durableMissionRevision,
+          updatedAt: typeof mission.updatedAt === "string" ? mission.updatedAt : new Date(0).toISOString(),
+        });
+        break;
+      } catch {
+        // Ignore malformed legacy artifacts and continue searching older execution results.
+      }
+    }
+  }
+  return bindings;
 }
