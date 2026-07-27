@@ -26,7 +26,11 @@ export type DirectMissionRequest = {
   operations: DirectOperationRequest[];
 };
 
-export async function executeDirectMission(request: DirectMissionRequest, signal?: AbortSignal): Promise<MissionRecord> {
+export async function executeDirectMission(
+  request: DirectMissionRequest,
+  signal?: AbortSignal,
+  onUpdate?: (mission: MissionRecord) => void | Promise<void>,
+): Promise<MissionRecord> {
   validateRequest(request);
   const missionId = request.missionId || `mission-${randomUUID()}`;
   const projectId = request.projectId || request.localPath || `uploaded:${missionId}`;
@@ -58,7 +62,7 @@ export async function executeDirectMission(request: DirectMissionRequest, signal
     updatedAt: now,
   }));
   await services.coordinator.plan(missionId, operations);
-  return services.coordinator.runUntilPause(missionId, { signal });
+  return services.coordinator.runUntilPause(missionId, { signal, onUpdate });
 }
 
 function validateRequest(request: DirectMissionRequest) {
