@@ -1,0 +1,38 @@
+name: Mission Core Refactor
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [foundry-mission-core-rebuild]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Typecheck
+        run: npm run typecheck > typecheck.log 2>&1 || (tail -200 typecheck.log && exit 1)
+      - name: Mission core tests
+        run: npm run test:mission-core > mission-core-tests.log 2>&1 || (tail -200 mission-core-tests.log && exit 1)
+      - name: Production build
+        run: npm run build > build.log 2>&1 || (tail -200 build.log && exit 1)
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mission-core-validation-logs
+          path: |
+            typecheck.log
+            mission-core-tests.log
+            build.log
+          if-no-files-found: ignore
+          retention-days: 7

@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "typecheck": "node --use-system-ca scripts/typecheck-next.cjs",
     "test": "vitest run",
+    "test:mission-core": "vitest run lib/mission-core",
     "test:integrations": "vitest run lib/integrations",
     "eval:completion-truthfulness": "node scripts/eval-completion-truthfulness.cjs",
     "eval:approval-continuity": "node scripts/eval-approval-continuity.cjs",
