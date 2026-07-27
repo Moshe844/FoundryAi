@@ -68,7 +68,6 @@ async function recoverFalseRoot404(result: FactoryProjectResult, emit: (event: F
           ...result,
           previewState: preview.previewState,
           previewUrl: preview.previewUrl,
-          previewPlatform: preview.previewPlatform,
           previewReason: undefined,
           blocker: /application root returned HTTP 404|no runnable product route exists/i.test(result.blocker ?? "") ? undefined : result.blocker,
         };
