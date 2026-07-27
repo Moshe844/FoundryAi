@@ -7,9 +7,11 @@ import type { MissionRecord } from "@/lib/mission-core/model";
 import {
   applyAuthoritativeMission,
   bindWorkspaceMission,
+  discoverDurableBindingsFromWorkspace,
   durableMissionForWorkspace,
   durableWorkspaceStorageKey,
   emptyDurableWorkspaceSnapshot,
+  legacyWorkspaceStorageKey,
   normalizeDurableWorkspaceSnapshot,
   type DurableWorkspaceSnapshot,
 } from "@/lib/mission-core/workspace-authority";
@@ -53,6 +55,36 @@ export function DurableMissionAuthority({ children }: { children: ReactNode }) {
     window.addEventListener(durableMissionBindingEventName, handleBinding);
     return () => window.removeEventListener(durableMissionBindingEventName, handleBinding);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const discover = async () => {
+      try {
+        const stored = window.localStorage.getItem(legacyWorkspaceStorageKey);
+        if (!stored) return;
+        const bindings = discoverDurableBindingsFromWorkspace(JSON.parse(stored));
+        for (const binding of bindings) {
+          if (cancelled) return;
+          const existing = snapshot.bindings[binding.workspaceMissionId];
+          if (existing?.durableMissionId === binding.durableMissionId && existing.revision >= binding.revision) continue;
+          try {
+            const mission = await clientRef.current.get(binding.durableMissionId);
+            if (!cancelled) setSnapshot((current) => bindWorkspaceMission(current, binding.workspaceMissionId, mission));
+          } catch {
+            // The mission may still be committing; the next discovery pass retries without changing UI state.
+          }
+        }
+      } catch {
+        // Ignore malformed legacy browser state. Durable bindings already stored remain active.
+      }
+    };
+    void discover();
+    const timer = window.setInterval(() => void discover(), 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [snapshot.bindings]);
 
   useEffect(() => {
     try {
