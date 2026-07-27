@@ -26,6 +26,7 @@ export async function executePlannerFirstMission(input: {
   provider?: ProviderId;
   tier?: ModelTier;
   signal?: AbortSignal;
+  onMissionUpdate?: (mission: MissionRecord) => void | Promise<void>;
 }): Promise<PlannerFirstExecutionResult> {
   const key = executionIdempotencyKey({
     controlId: input.body.controlId,
@@ -50,19 +51,27 @@ async function executeWithRecovery(input: {
   provider?: ProviderId;
   tier?: ModelTier;
   signal?: AbortSignal;
+  onMissionUpdate?: (mission: MissionRecord) => void | Promise<void>;
 }): Promise<PlannerFirstExecutionResult> {
   const attempts = plannerRecoveryAttempts(input.tier ?? "builder");
   const priorReasons: string[] = [];
   const seenPlans = new Set<string>();
+  let latestMission: MissionRecord | undefined;
 
   for (const attempt of attempts) {
     if (input.signal?.aborted) throw new Error("Mission planning was canceled.");
     try {
+      const recoverySnapshot = priorReasons.length
+        ? `${input.projectSnapshot}\n\nVerified failures from earlier attempts:\n${priorReasons.map((reason) => `- ${reason}`).join("\n")}`
+        : input.projectSnapshot;
+      const missionId = attempt.number === 1
+        ? input.body.controlId
+        : `${input.body.controlId || "mission"}:repair:${attempt.number}`;
       const planned = await planTypedOperations({
-        missionId: input.body.controlId,
+        missionId,
         projectId: input.body.parentMission?.projectIdentity,
         objective: input.body.task,
-        projectSnapshot: input.projectSnapshot,
+        projectSnapshot: recoverySnapshot,
         localPath: input.body.localPath,
         uploadedFiles: input.body.files,
         provider: input.provider,
@@ -83,13 +92,19 @@ async function executeWithRecovery(input: {
       }
       seenPlans.add(fingerprint);
 
-      const mission = await executeDirectMission(planned.request, input.signal);
-      return {
-        mission,
-        executionPath: "typed-operations",
-        planningAttempts: attempt.number,
-        recoveryStrategies: attempts.slice(0, attempt.number).map((item) => item.strategy),
-      };
+      const mission = await executeDirectMission(planned.request, input.signal, input.onMissionUpdate);
+      latestMission = mission;
+      if (mission.status !== "failed") {
+        return {
+          mission,
+          executionPath: "typed-operations",
+          planningAttempts: attempt.number,
+          recoveryStrategies: attempts.slice(0, attempt.number).map((item) => item.strategy),
+        };
+      }
+
+      const evidence = executionFailureEvidence(mission);
+      priorReasons.push(`Execution attempt ${attempt.number} failed after making real project progress. Repair the exact remaining failure without repeating successful work. ${evidence}`);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       if (/No API key is configured|canceled|aborted/i.test(reason)) throw error;
@@ -97,9 +112,31 @@ async function executeWithRecovery(input: {
     }
   }
 
+  if (latestMission) {
+    return {
+      mission: latestMission,
+      executionPath: "typed-operations",
+      planningAttempts: attempts.length,
+      recoveryStrategies: attempts.map((item) => item.strategy),
+    };
+  }
+
   throw new Error([
-    "Foundry exhausted its bounded autonomous planning recovery budget without producing a safe executable plan.",
+    "Foundry exhausted its bounded autonomous recovery budget without producing a safe executable plan.",
     ...priorReasons.map((reason) => `- ${reason}`),
     "No duplicate or unbounded paid planner calls were made.",
   ].join("\n"));
+}
+
+export function executionFailureEvidence(mission: MissionRecord): string {
+  const failed = mission.operations.filter((operation) => operation.status === "failed");
+  if (!failed.length) return mission.blocker || "The mission failed without operation-level diagnostics.";
+  return failed.map((operation) => {
+    const result = operation.result;
+    const diagnostic = [result?.summary, result?.error, result?.output]
+      .filter(Boolean)
+      .join("\n")
+      .slice(0, 6_000);
+    return `${operation.title}${operation.target ? ` (${operation.target})` : operation.command ? ` (${operation.command})` : ""}: ${diagnostic || "No diagnostic was recorded."}`;
+  }).join("\n\n");
 }

@@ -38,6 +38,7 @@ export async function POST(request: Request) {
   const unregisterExecution = registerExecution(body.controlId, runtimeController);
   let cancelled = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let lastMissionRevision = -1;
   const stream = new ReadableStream({
     async start(controller) {
       const send = (payload: unknown) => {
@@ -45,13 +46,18 @@ export async function POST(request: Request) {
         controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
       };
 
-      heartbeat = setInterval(() => send({ type: "heartbeat", at: Date.now() }), 30_000);
+      heartbeat = setInterval(() => send({ type: "heartbeat", at: Date.now() }), 15_000);
 
       try {
         const execution = await executePlannerFirstMission({
           body,
           projectSnapshot: projectSnapshotFrom(body),
           signal: runtimeController.signal,
+          onMissionUpdate: async (mission) => {
+            if (mission.revision <= lastMissionRevision) return;
+            lastMissionRevision = mission.revision;
+            send({ type: "mission", mission });
+          },
         });
         const result = factoryResultFromMission(execution.mission, {
           projectPath: body.localPath,
@@ -62,9 +68,11 @@ export async function POST(request: Request) {
           durableMissionId: execution.mission.id,
           durableMissionRevision: execution.mission.revision,
           missionExecutionPath: execution.executionPath,
+          planningAttempts: execution.planningAttempts,
+          recoveryStrategies: execution.recoveryStrategies,
         };
         completeExecution(body.controlId, enriched);
-        send({ type: "mission", mission: execution.mission });
+        if (execution.mission.revision > lastMissionRevision) send({ type: "mission", mission: execution.mission });
         send({ type: "result", result: enriched });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Existing project execution failed.";

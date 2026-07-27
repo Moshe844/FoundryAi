@@ -13,19 +13,19 @@ describe("what a failing gate does next", () => {
     // Different finding each pass means the repairs are landing.
     const action = nextGateAction({ attempts: [attempt({ fingerprint: "a" })], currentFingerprint: "b", maxAttempts: 5 });
     expect(action.action).toBe("repair");
-    expect(action.reason).toContain("repairs are landing");
+    expect(action.reason).toContain("previous repair changed the project");
   });
 
   it("keeps the same tier while real source progress is landing", () => {
     const action = nextGateAction({ attempts: [attempt({ fingerprint: "a" })], currentFingerprint: "a", maxAttempts: 5 });
     expect(action.action).toBe("repair");
-    expect(action.reason).toContain("repairs are landing");
+    expect(action.reason).toContain("previous repair changed the project");
   });
 
   it("escalates when a repair wrote nothing at all", () => {
     const action = nextGateAction({ attempts: [attempt({ changedFiles: 0 })], currentFingerprint: "a", maxAttempts: 5 });
     expect(action.action).toBe("escalate");
-    expect(action.reason).toContain("changed no files");
+    expect(action.reason).toContain("made no source change");
   });
 
   it("stops only once escalation has also failed to write source", () => {
@@ -35,7 +35,7 @@ describe("what a failing gate does next", () => {
       maxAttempts: 5,
     });
     expect(action.action).toBe("stop");
-    expect(action.reason).toContain("run out of approaches");
+    expect(action.reason).toContain("could not produce a safe source change");
   });
 
   it("does not escalate twice", () => {
@@ -47,7 +47,7 @@ describe("what a failing gate does next", () => {
     const attempts = Array.from({ length: 5 }, (_, index) => attempt({ fingerprint: `f${index}` }));
     const action = nextGateAction({ attempts, currentFingerprint: "f5", maxAttempts: 5 });
     expect(action.action).toBe("stop");
-    expect(action.reason).toContain("5 repair attempts");
+    expect(action.reason).toContain("5 bounded repair approaches");
   });
 });
 
