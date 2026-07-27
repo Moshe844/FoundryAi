@@ -4,7 +4,7 @@ import type { MissionRecord } from "./model";
 import { MissionNotFoundError, MissionRevisionConflictError, type MissionRepository } from "./repository";
 
 export class FileMissionRepository implements MissionRepository {
-  private readonly writeQueues = new Map<string, Promise<void>>();
+  private static readonly writeQueues = new Map<string, Promise<void>>();
 
   constructor(private readonly rootDirectory: string) {}
 
@@ -44,17 +44,18 @@ export class FileMissionRepository implements MissionRepository {
   }
 
   private async withMissionLock<T>(missionId: string, work: () => Promise<T>): Promise<T> {
-    const previous = this.writeQueues.get(missionId) ?? Promise.resolve();
+    const lockKey = `${path.resolve(this.rootDirectory)}\u0000${missionId}`;
+    const previous = FileMissionRepository.writeQueues.get(lockKey) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const tail = previous.then(() => gate);
-    this.writeQueues.set(missionId, tail);
+    FileMissionRepository.writeQueues.set(lockKey, tail);
     await previous;
     try {
       return await work();
     } finally {
       release();
-      if (this.writeQueues.get(missionId) === tail) this.writeQueues.delete(missionId);
+      if (FileMissionRepository.writeQueues.get(lockKey) === tail) FileMissionRepository.writeQueues.delete(lockKey);
     }
   }
 
