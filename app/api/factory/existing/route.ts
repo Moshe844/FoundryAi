@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
 import { executeExistingProjectTask } from "@/lib/factory/runtime";
 import { executeExistingProjectThroughMissionCore } from "@/lib/mission-core/legacy-runtime-bridge";
+import { executePlannerFirstMission } from "@/lib/mission-core/planned-execution";
+import { factoryResultFromMission } from "@/lib/mission-core/factory-result-adapter";
 import { completeExecution, failExecution, recordExecutionEvent, registerExecution } from "@/lib/factory/execution-control";
 import type { FactoryExecutionEvent, FactoryExistingProjectRequest } from "@/lib/factory/types";
 
 const missionCoreEnabled = process.env.FOUNDRY_MISSION_CORE_V2 === "1";
+const typedPlannerEnabled = process.env.FOUNDRY_TYPED_OPERATION_PLANNER === "1";
 
 export async function POST(request: Request) {
   const body = (await request.json()) as FactoryExistingProjectRequest;
@@ -19,6 +22,25 @@ export async function POST(request: Request) {
   const url = new URL(request.url);
   if (url.searchParams.get("stream") !== "1") {
     try {
+      if (missionCoreEnabled && typedPlannerEnabled) {
+        const execution = await executePlannerFirstMission({
+          body,
+          projectSnapshot: projectSnapshotFrom(body),
+          signal: request.signal,
+          allowCompatibilityFallback: true,
+        });
+        const result = execution.result ?? factoryResultFromMission(execution.mission, {
+          projectPath: body.localPath,
+          sourceMode: body.localPath ? "local-folder" : "uploaded-copy",
+        });
+        return NextResponse.json({
+          ...result,
+          durableMissionId: execution.mission.id,
+          durableMissionRevision: execution.mission.revision,
+          missionExecutionPath: execution.executionPath,
+          missionFallbackReason: execution.fallbackReason,
+        });
+      }
       if (missionCoreEnabled) {
         const execution = await executeExistingProjectThroughMissionCore(body, { signal: request.signal });
         return NextResponse.json({ ...execution.result, durableMissionId: execution.mission.id, durableMissionRevision: execution.mission.revision });
@@ -50,11 +72,31 @@ export async function POST(request: Request) {
         send({ type: "event", event });
       };
 
-      // Keep the client's inactivity watchdog from killing work during a long model call, install, or build.
       heartbeat = setInterval(() => send({ type: "heartbeat", at: Date.now() }), 30_000);
 
       try {
-        if (missionCoreEnabled) {
+        if (missionCoreEnabled && typedPlannerEnabled) {
+          const execution = await executePlannerFirstMission({
+            body,
+            projectSnapshot: projectSnapshotFrom(body),
+            signal: runtimeController.signal,
+            allowCompatibilityFallback: true,
+          });
+          const result = execution.result ?? factoryResultFromMission(execution.mission, {
+            projectPath: body.localPath,
+            sourceMode: body.localPath ? "local-folder" : "uploaded-copy",
+          });
+          const enriched = {
+            ...result,
+            durableMissionId: execution.mission.id,
+            durableMissionRevision: execution.mission.revision,
+            missionExecutionPath: execution.executionPath,
+            missionFallbackReason: execution.fallbackReason,
+          };
+          completeExecution(body.controlId, enriched);
+          send({ type: "mission", mission: execution.mission });
+          send({ type: "result", result: enriched });
+        } else if (missionCoreEnabled) {
           const execution = await executeExistingProjectThroughMissionCore(body, { signal: runtimeController.signal, onEvent: handleEvent });
           const result = { ...execution.result, durableMissionId: execution.mission.id, durableMissionRevision: execution.mission.revision };
           completeExecution(body.controlId, result);
@@ -78,7 +120,6 @@ export async function POST(request: Request) {
     cancel() {
       cancelled = true;
       if (heartbeat) clearInterval(heartbeat);
-      // A browser reload only disconnects this subscriber. Server execution remains recoverable.
     },
   });
 
@@ -88,4 +129,11 @@ export async function POST(request: Request) {
       "Cache-Control": "no-cache, no-transform",
     },
   });
+}
+
+function projectSnapshotFrom(body: FactoryExistingProjectRequest) {
+  const files = (body.files ?? []).slice(0, 200).map((file) => `${file.path} (${file.size} bytes)`).join("\n");
+  return [body.brief, files ? `Uploaded file inventory:\n${files}` : "", body.localPath ? `Connected project root: ${body.localPath}` : ""]
+    .filter(Boolean)
+    .join("\n\n");
 }
