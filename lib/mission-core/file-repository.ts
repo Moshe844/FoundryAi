@@ -4,6 +4,8 @@ import type { MissionRecord } from "./model";
 import { MissionNotFoundError, MissionRevisionConflictError, type MissionRepository } from "./repository";
 
 export class FileMissionRepository implements MissionRepository {
+  private readonly writeQueues = new Map<string, Promise<void>>();
+
   constructor(private readonly rootDirectory: string) {}
 
   async get(id: string): Promise<MissionRecord | undefined> {
@@ -23,18 +25,36 @@ export class FileMissionRepository implements MissionRepository {
   }
 
   async create(record: MissionRecord): Promise<MissionRecord> {
-    await mkdir(this.rootDirectory, { recursive: true });
-    if (await this.get(record.id)) throw new Error(`Mission already exists: ${record.id}`);
-    await this.atomicWrite(record);
-    return structuredClone(record);
+    return this.withMissionLock(record.id, async () => {
+      await mkdir(this.rootDirectory, { recursive: true });
+      if (await this.get(record.id)) throw new Error(`Mission already exists: ${record.id}`);
+      await this.atomicWrite(record);
+      return structuredClone(record);
+    });
   }
 
   async save(record: MissionRecord, expectedRevision: number): Promise<MissionRecord> {
-    const current = await this.get(record.id);
-    if (!current) throw new MissionNotFoundError(record.id);
-    if (current.revision !== expectedRevision) throw new MissionRevisionConflictError(record.id, expectedRevision, current.revision);
-    await this.atomicWrite(record);
-    return structuredClone(record);
+    return this.withMissionLock(record.id, async () => {
+      const current = await this.get(record.id);
+      if (!current) throw new MissionNotFoundError(record.id);
+      if (current.revision !== expectedRevision) throw new MissionRevisionConflictError(record.id, expectedRevision, current.revision);
+      await this.atomicWrite(record);
+      return structuredClone(record);
+    });
+  }
+
+  private async withMissionLock<T>(missionId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.writeQueues.get(missionId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.writeQueues.set(missionId, previous.then(() => current));
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+      if (this.writeQueues.get(missionId) === current) this.writeQueues.delete(missionId);
+    }
   }
 
   private filePath(id: string) {
@@ -50,7 +70,7 @@ export class FileMissionRepository implements MissionRepository {
   private async atomicWrite(record: MissionRecord) {
     await mkdir(this.rootDirectory, { recursive: true });
     const target = this.filePath(record.id);
-    const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+    const temporary = `${target}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     await writeFile(temporary, JSON.stringify(record, null, 2), "utf8");
     await rename(temporary, target);
   }
