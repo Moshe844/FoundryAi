@@ -46,14 +46,15 @@ export class FileMissionRepository implements MissionRepository {
   private async withMissionLock<T>(missionId: string, work: () => Promise<T>): Promise<T> {
     const previous = this.writeQueues.get(missionId) ?? Promise.resolve();
     let release!: () => void;
-    const current = new Promise<void>((resolve) => { release = resolve; });
-    this.writeQueues.set(missionId, previous.then(() => current));
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => gate);
+    this.writeQueues.set(missionId, tail);
     await previous;
     try {
       return await work();
     } finally {
       release();
-      if (this.writeQueues.get(missionId) === current) this.writeQueues.delete(missionId);
+      if (this.writeQueues.get(missionId) === tail) this.writeQueues.delete(missionId);
     }
   }
 
