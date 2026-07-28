@@ -109,6 +109,10 @@ export async function planTypedOperations(input: TypedOperationPlanningRequest):
   const missionId = input.missionId || `mission-${randomUUID()}`;
   const operations = normalizeOperations(parsed.operations);
   if (!operations.length) return { unsupportedReason: parsed.unsupportedReason || "The planner returned no valid executable typed operations." };
+  if (!operations.some((operation) => ["write_file", "delete_file", "run_command", "start_process", "stop_process"].includes(operation.kind))
+    && /\b(?:build|complete|continue|finish|fix|implement|create|add|change|update|repair|refactor|deploy|publish)\b/i.test(input.objective)) {
+    return { unsupportedReason: "The planner returned an inspection-only plan for a mutating engineering objective. Reading files cannot complete the requested change." };
+  }
   return {
     request: {
       missionId,

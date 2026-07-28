@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { executionFailureEvidence } from "./planned-execution";
+import { normalizeOperations } from "./typed-operation-planner";
 import type { MissionRecord } from "./model";
 
 function failedMission(): MissionRecord {
@@ -47,5 +48,11 @@ describe("execution repair evidence", () => {
     expect(evidence).toContain("Run production build");
     expect(evidence).toContain("npm run build");
     expect(evidence).toContain("use server file can only export async functions");
+  });
+});
+
+describe("typed plan mutation truth", () => {
+  it("retains mutation operations needed by implementation plans", () => {
+    expect(normalizeOperations([{ id: "write", kind: "write_file", title: "Implement route", target: "src/app/page.tsx", content: "export default function Page(){}", dependsOn: [], requirementIds: [], risk: "modification" }])).toHaveLength(1);
   });
 });

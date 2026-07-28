@@ -21,7 +21,17 @@ function loadFollowUpPolicy() {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const loadedModule = { exports: {} };
-  vm.runInNewContext(compiled, { module: loadedModule, exports: loadedModule.exports, require }, { filename: "classifyFollowUp.js" });
+  const customRequire = (id) => {
+    if (id !== "@/lib/factory/preview-intent") return require(id);
+    const dependencySource = fs.readFileSync(path.join(root, "lib/factory/preview-intent.ts"), "utf8");
+    const dependencyCompiled = ts.transpileModule(dependencySource, {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const dependencyModule = { exports: {} };
+    vm.runInNewContext(dependencyCompiled, { module: dependencyModule, exports: dependencyModule.exports, require }, { filename: "preview-intent.js" });
+    return dependencyModule.exports;
+  };
+  vm.runInNewContext(compiled, { module: loadedModule, exports: loadedModule.exports, require: customRequire }, { filename: "classifyFollowUp.js" });
   return loadedModule.exports;
 }
 
@@ -163,11 +173,11 @@ assert(factoryRuntime.includes("Boolean(preModelBrowserEvidence) || boundedStati
 assert(factoryRuntime.includes("Implemented the requested project change and verified the changed interface"), "A successful browser-reconciled edit can still expose an internal model-budget blocker as its outcome.");
 assert(factoryRuntime.includes("findUnreachableVerifiedUiFiles"), "Fingerprint reuse does not check whether changed UI components are reachable from the application.");
 assert(factoryRuntime.includes("their UI is not connected to the application"), "Disconnected UI can still be reported as an already-completed implementation.");
-assert(workspaceShell.includes("currentStandaloneMutation && !isMutatingProjectIntent(resolvedIntent.currentIntent)"), "A standalone implementation request can still be rendered as a status evidence packet after semantic misclassification.");
+assert(intentRoute.includes("confidentDirectMutation") && intentRoute.includes("semanticApplyChange"), "A high-confidence standalone implementation request can still be rendered as a status evidence packet after semantic misclassification.");
 assert(workspaceShell.includes("if (reportsCurrentBehaviorFailure(task)) return undefined"), "The client can still attach stale completion evidence to a fresh defect report.");
 assert(intentRoute.includes('intent === "status" || intent === "retrospective"'), "The server policy does not correct imperative mutations misclassified as status or retrospective requests.");
 assert(intentRoute.includes("actionableProjectDefect") && intentRoute.includes("!actionableProjectDefect"), "Actionable defect reports can still be diverted into wording-confirmation clarification.");
-assert(intentRoute.includes('return "debug";') && intentRoute.includes("choosing the file/component"), "Connected-project defect reports can still ask users to identify implementation files instead of starting diagnosis.");
+assert(intentRoute.includes('effectiveIntent === "debug"') && intentRoute.includes("!actionableProjectDefect"), "Connected-project defect reports can still ask users to identify implementation files instead of starting diagnosis.");
 assert(intentRoute.includes("not working|not opening|not responding") && intentRoute.includes("not doing anything|doing nothing|no longer works"), "Ordinary broken-behavior wording is not covered by deterministic debug routing.");
 assert(intentClassifier.includes("shuts?\\s+down") && intentClassifier.includes("clos(?:e|es|ed|ing)"), "Plain-language unexpected app exits are missing from deterministic debug routing.");
 assert(factoryRuntime.includes("observableBrowserContractForTask") && factoryRuntime.includes("validateObservableBrowserContract"), "The browser gate does not derive and exercise observable capabilities from the user's atomic requirements.");

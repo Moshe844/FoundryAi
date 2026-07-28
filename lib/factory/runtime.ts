@@ -25,6 +25,7 @@ import { summarizeFromJournal } from "@/lib/ai/mission/mission-summary";
 import { assessCompletion } from "@/lib/ai/mission/requirement-ledger";
 import { appendJournalEntry, readJournal, shouldJournalEvent, writeJournal } from "@/lib/factory/execution-journal";
 import { hasRunnableProjectEntry, runMissionExecutor } from "@/lib/ai/mission/executor";
+import { needsGreenfieldImplementationRecovery } from "@/lib/factory/greenfield-recovery";
 import { reviewArchitecture } from "@/lib/ai/mission/architecture-review";
 import { verifyMissionResult } from "@/lib/ai/mission/mission-verifier";
 import { verificationAction, verificationImproved, verificationRisk } from "@/lib/ai/mission/verification-policy";
@@ -35,7 +36,7 @@ import { complianceVerdict, correctionInstruction, deriveOutcomeAssertions, isDe
 import { evaluatePlacement, spatialRequirementForRequest, type ElementBox } from "@/lib/verification/dom-placement";
 import { duplicateFileProblem, safelyRemovableDuplicatePaths } from "@/lib/verification/duplicate-files";
 import { deterministicCompilerSourceRepair } from "@/lib/verification/deterministic-source-repair";
-import { planDependencyRepair } from "@/lib/verification/deterministic-dependency-repair";
+import { packagesEligibleForAutomaticInstall, planDependencyRepair } from "@/lib/verification/deterministic-dependency-repair";
 import { missingModuleImports, resolveProjectModulePath } from "@/lib/verification/missing-module-diagnostic";
 import { describeModuleExports, exportedSymbols, missingExportInstruction, missingExports } from "@/lib/verification/module-exports";
 import { describeRepairSequence, shouldContinueRepair, type RepairAttempt } from "@/lib/verification/repair-convergence";
@@ -84,6 +85,7 @@ import { projectIntegrationEnvironment } from "@/lib/integrations/runtime-enviro
 import { detectProjectIntegrations } from "@/lib/integrations/detection";
 import { blockingDetectedIntegrationFailures, blockingIntegrationRequirements, deferredProductionIntegrationNames, integrationProvidersFromEvidence, integrationRequirementPrompt, integrationRequirementsForBrief, missingIntegrationRequirements } from "@/lib/integrations/requirements";
 import { isPreviewRestartRequest } from "@/lib/factory/preview-intent";
+import { isVerificationOnlyOperation } from "@/lib/factory/verification-intent";
 import { attachedAssetPlacement, attachedAssetPublicPath } from "@/lib/factory/asset-placement";
 import { buildUploadIntakeMarker, uploadIntakeMarkerFile, uploadIntakeMarkerMatches } from "@/lib/factory/upload-intake";
 import { unityScaffoldFiles } from "@/lib/factory/unity-scaffold";
@@ -317,6 +319,19 @@ function unresolvedPackageNames(command: FactoryCommandEvent): string[] {
   // a second predictable failure, so compiler evidence for that import authorizes its paired CLI.
   if (unresolved.has("@prisma/client")) unresolved.add("prisma");
   return [...unresolved].sort();
+}
+
+function undeclaredPackagesEligibleForInstall(command: FactoryCommandEvent, projectPath: string): string[] {
+  let manifest: string | undefined;
+  try {
+    manifest = readFileSync(path.join(projectPath, "package.json"), "utf8");
+  } catch {
+    // A missing manifest is handled by the normal installer/build failure path.
+  }
+  return packagesEligibleForAutomaticInstall({
+    packages: unresolvedPackageNames(command),
+    manifest,
+  });
 }
 
 function compatibleGeneratedPackageSpec(packageName: string) {
@@ -1429,29 +1444,39 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
     result = escalated;
   }
 
-  const resumableCreationBatchFailure = (candidate: typeof result) => candidate.status === "failed"
-    && candidate.changedFiles.length > 0
-    && /command or file write failed|production build (?:not verified|failed)/i.test(candidate.blocker ?? "");
+  const resumableCreationBatchFailure = async (candidate: typeof result) => needsGreenfieldImplementationRecovery({
+    status: candidate.status,
+    blocker: candidate.blocker,
+    changedFileCount: candidate.changedFiles.length,
+    hasRunnableEntry: await hasRunnableProjectEntry(access),
+  });
   // Greenfield creation uses the same bounded executor as follow-up work. A substantial starter can
   // legitimately fill one batch while creating coordinated source files; stopping there leaves a
   // convincing-looking but unrunnable project. Continue from the verified files on disk while sharing
   // the mission's original cost ledger, so continuation cannot reset its spend allowance.
   // Reach the deterministic ecosystem verifier before any paid continuation. Compiler-guided
   // repair below is allowed only after that verifier has produced a concrete diagnostic.
-  const maxCreationContinuationBatches = 0;
-  for (let continuationAttempt = 1; continuationAttempt <= maxCreationContinuationBatches && resumableCreationBatchFailure(result); continuationAttempt += 1) {
-    await emitExecution(execution, "reasoning", "completed", `The first build batch wrote real project files but did not finish. I’m continuing automatically with the remaining implementation and verification (batch ${continuationAttempt}).`);
+  const maxCreationContinuationBatches = 1;
+  for (let continuationAttempt = 1; continuationAttempt <= maxCreationContinuationBatches && await resumableCreationBatchFailure(result); continuationAttempt += 1) {
+    const missingRunnableEntry = !(await hasRunnableProjectEntry(access));
+    await emitExecution(execution, "reasoning", "completed", missingRunnableEntry
+      ? "The first generation route produced only setup files, not an application. I’m preserving the brief and escalating once to create the missing runnable product source before any build can count."
+      : `The first build batch wrote real project files but did not finish. I’m continuing automatically with the remaining implementation and verification (batch ${continuationAttempt}).`);
+    const continuationModel = await modelForMissionStage(task, modelMode, "builder", undefined, continuationAttempt, creationAssessment) ?? implementationModel;
+    await emitModelSelection(execution, "greenfield implementation recovery", continuationModel);
     const continuation = await runMissionExecutor({
       objective,
-      task: `Continuation batch ${continuationAttempt}: complete this new project from the authoritative brief and the implementation already on disk. Inspect existing files, create only the missing coordinated source and configuration, then install dependencies as needed and run the real production build. Do not rewrite correct files or stop at read-back evidence.\n\nOriginal task:\n${task}`,
+      task: missingRunnableEntry
+        ? `Greenfield implementation recovery: the previous route created setup/configuration only and no runnable application entry. Create the first complete, reachable product slice now in one coordinated write_files action. Your first action must write real application source, including the framework's user-facing entry route, connected state/domain behavior, and meaningful tests. Do not read the empty scaffold again, do not write package/configuration-only files, and do not run install or build until application source exists.\n\nImplement these staged requirements:\n${initialSlice.map((item) => `- ${item}`).join("\n")}\n\nAuthoritative full project request:\n${task}`
+        : `Continuation batch ${continuationAttempt}: complete this new project from the authoritative brief and the implementation already on disk. Inspect existing files, create only the missing coordinated source and configuration, then install dependencies as needed and run the real production build. Do not rewrite correct files or stop at read-back evidence.\n\nOriginal task:\n${task}`,
       missionContext: requirementLedger?.missionContext,
       checklist: result.checklist,
       costScopeId: execution.costScopeId,
       access,
       verificationProfile: creationVerificationProfile,
-      apiKey: implementationModel.apiKey,
-      provider: implementationModel.provider,
-      tier: implementationModel.tier,
+      apiKey: continuationModel.apiKey,
+      provider: continuationModel.provider,
+      tier: continuationModel.tier,
       onEvent: emitEvent,
       signal,
       approvedCategories: ["dependencies", "package-runner"],
@@ -1686,6 +1711,31 @@ async function createFactoryProjectCore(brief: string, onEvent?: ExecutionEmitte
           result.blocker = testCommand.exitCode === 0
             ? "The declared automated test command discovered zero executable tests; add real test source and rerun it."
             : `The declared automated tests failed: ${summarizeCommandFailure(testCommand)}`;
+        }
+      }
+      if (deterministicTestFailure && result.changedFiles.length > 0) {
+        const deterministicTestRepairs = await applyDeterministicCompilerRepairs(access, deterministicTestFailure, projectPath);
+        if (deterministicTestRepairs.length) {
+          result.changedFiles = Array.from(new Set([...result.changedFiles, ...deterministicTestRepairs.map((repair) => repair.path)]));
+          await emitExecution(execution, "edit", "completed", "Applied a test-runner-proven source repair before any paid recovery", {
+            filePath: deterministicTestRepairs[0].path,
+            details: { repairs: deterministicTestRepairs.map((repair) => `${repair.ruleId}: ${repair.path} — ${repair.reason}`), paidModelCalls: 0 },
+          });
+          const repairedTestCommand = await runCommand(projectPath, "npm.cmd", ["run", "test"], events, execution);
+          result.commands.push(repairedTestCommand);
+          const repairedTestPassed = automatedTestEvidencePassed(projectPath, repairedTestCommand, "nextjs");
+          result.verification.push({
+            check_type: "test",
+            result: repairedTestPassed ? "pass" : "fail",
+            evidence: repairedTestPassed
+              ? "The declared automated tests passed after a deterministic test-runner-evidenced import repair; no repair model was called."
+              : `The deterministic test source repair exposed a remaining failure: ${summarizeCommandFailure(repairedTestCommand)}`,
+          });
+          deterministicTestFailure = repairedTestPassed ? undefined : repairedTestCommand;
+          if (repairedTestPassed) {
+            result.status = "passed";
+            result.blocker = undefined;
+          }
         }
       }
     } catch (error) {
@@ -3311,6 +3361,27 @@ async function readCompleteProjectSource(access: ProjectAccess, sourcePath: stri
 async function applyDeterministicCompilerRepairs(access: ProjectAccess, failure: FactoryCommandEvent, projectPath: string) {
   const diagnostic = compilerDiagnosticOutput(failure);
   const repaired: Array<{ path: string; reason: string; ruleId: string }> = [];
+  // Next already supplies its compiler. A generated Babel config that references an undeclared
+  // preset disables SWC and makes the framework itself fail to compile. Installing the accidental
+  // preset entrenches unnecessary configuration; removing that generated override restores the
+  // verified scaffold's native compiler deterministically.
+  if (/Next\.js[\s\S]*Cannot find module ['"]@babel\/preset-env['"]/i.test(diagnostic)
+    || (/Cannot find module ['"]@babel\/preset-env['"]/i.test(diagnostic) && /next[\\/]dist/i.test(diagnostic))) {
+    const manifest = await access.readFile("package.json", { limitBytes: 100_000 }).catch(() => undefined);
+    if (manifest?.exists && /"next"\s*:/.test(manifest.content)) {
+      for (const babelPath of ["babel.config.js", "babel.config.cjs", ".babelrc", ".babelrc.json"]) {
+        const babel = await access.readFile(babelPath, { limitBytes: 100_000 }).catch(() => undefined);
+        if (!babel?.exists || !/@babel\/preset-env/.test(babel.content)) continue;
+        if (!access.deleteFile) continue;
+        const deleted = await access.deleteFile(babelPath).catch(() => undefined);
+        if (deleted?.verified) repaired.push({
+          path: babelPath,
+          reason: "Removed an accidental Babel override so Next.js can use its verified built-in compiler.",
+          ruleId: "next-remove-broken-babel-override",
+        });
+      }
+    }
+  }
   const sourcePaths = applicationCompilerSourcePaths(diagnostic, projectPath);
   const projectNames = new Set(
     Array.from(diagnostic.matchAll(/(?:^|[\\/\s[])([^\\/\]\s:]+?)(?:_[A-Za-z0-9]+_wpftmp)?\.csproj\b/gim))
@@ -4733,10 +4804,14 @@ async function exerciseNamedBrowserWorkflow(
       await search.fill(existingToken);
       await page.waitForTimeout(150);
       const matchingRows = await rows.count();
-      const matchingVisible = existingToken.length > 0 && matchingRows > 0 && matchingRows <= baselineRows;
+      const matchingVisible = covered.has("create-record")
+        ? (await page.locator("body").innerText()).includes(token)
+        : existingToken.length > 0 && matchingRows > 0 && matchingRows <= baselineRows;
       await search.fill(`no-match-${Date.now()}`);
       await page.waitForTimeout(150);
-      const hiddenForNoMatch = (await rows.count()) === 0;
+      const hiddenForNoMatch = covered.has("create-record")
+        ? !(await page.locator("body").innerText()).includes(token)
+        : (await rows.count()) === 0;
       await search.fill("");
       if (matchingVisible && hiddenForNoMatch) covered.add("search-filter");
       else problems.push("the search control did not reduce the visible data for a real row value and clear the list for a non-match");
@@ -5073,7 +5148,8 @@ async function exerciseNamedBrowserWorkflow(
     const container = record();
     const textDelete = container.locator('button, [role="button"]').filter({ hasText: /delete|remove|discard|trash|^del$/i }).first();
     const labelledDelete = container.locator('button[aria-label*="delete" i], button[aria-label*="remove" i], button[title*="delete" i], button[title*="remove" i]').first();
-    const action = await textDelete.count() ? textDelete : labelledDelete;
+    const tokenDelete = page.locator(`button[aria-label*="delete" i][aria-label*="${token}" i], button[aria-label*="remove" i][aria-label*="${token}" i], button[title*="delete" i][title*="${token}" i], button[title*="remove" i][title*="${token}" i]`).first();
+    const action = await tokenDelete.count() ? tokenDelete : await textDelete.count() ? textDelete : labelledDelete;
     if (!(await action.count())) {
       problems.push("the created record exposed no delete/remove control");
     } else {
@@ -5763,9 +5839,7 @@ async function runExistingProjectMissionWithAccess(params: {
   const originalTask = parentMission?.source_requirements?.find((requirement) => requirement.trim());
   const operationVerbPresent = /\b(?:run|execute|rerun|verify|validate|revalidate|check|recheck|publish|build|test|retest|launch|open|expose)\b/i.test(requestedTask);
   const explicitlyNoMutation = /\b(?:do not|don't|without)\b[^.!?\n]{0,100}\b(?:edit|change|modify|rewrite|touch)(?:ing)?\b|\bno\s+(?:source|file|code)\s+changes?\b/i.test(requestedTask);
-  const verificationOnlyRequest = /\b(?:verify|validate|revalidate|check|recheck|test|retest)\b/i.test(requestedTask)
-    && /\b(?:browser|preview|navigation|build|test|lint|typecheck|runtime|server|endpoint|artifact)\b/i.test(requestedTask)
-    && !/\b(?:add|create|implement|change|modify|rewrite|refactor|fix|repair|resolve|complete|finish|remove|delete)\b/i.test(requestedTask);
+  const verificationOnlyRequest = isVerificationOnlyOperation(requestedTask);
   const explicitlyReadOnlyOperation = operationVerbPresent && (explicitlyNoMutation || verificationOnlyRequest);
   const mutatingOutcomeRequired = !explicitlyReadOnlyOperation && (
     followUpResolution?.currentIntent === "edit"
@@ -6179,8 +6253,9 @@ Mandatory existing-source contract: preserve this project's established multi-fi
       });
     }
   }
-  const explicitBrowserAcceptanceRequest = /\b(?:validate|revalidate|verify|test|retest|exercise|check|recheck)\b/i.test(inheritedBrowserRequest)
-    && /\b(?:browser|preview|live\s+(?:site|app)|navigation|user\s+flow|click(?:ing)?|desktop|mobile|responsive)\b/i.test(inheritedBrowserRequest)
+  const namesBrowserAcceptanceSurface = /\b(?:acceptance|browser|preview|live\s+(?:site|app)|navigation|user\s+flow|workflow|click(?:ing)?|desktop|mobile|responsive)\b/i.test(inheritedBrowserRequest);
+  const explicitBrowserAcceptanceRequest = namesBrowserAcceptanceSurface
+    && (verificationOnlyRequest || /\b(?:validate|revalidate|verify|test|retest|exercise|check|recheck)\b/i.test(inheritedBrowserRequest))
     && previewTarget
     && previewPlatformForStack(stackProfile.label) === "web";
   const preModelCommands: FactoryCommandEvent[] = [...retryPreModelCommands];
@@ -7112,7 +7187,7 @@ Mandatory existing-source contract: preserve this project's established multi-fi
   while (recoveryPreflight && !recoveryPreflight.buildPassed && workspaceProjectPath && deterministicRecoveryPass < 8) {
     const preflightFailure = recoveryPreflight.commands.at(-1);
     if (!preflightFailure) break;
-    const unresolvedPackages = unresolvedPackageNames(preflightFailure);
+    const unresolvedPackages = undeclaredPackagesEligibleForInstall(preflightFailure, workspaceProjectPath);
     if (unresolvedPackages.length) {
       deterministicRecoveryPass += 1;
       await emitExecution(execution, "reasoning", "completed", `The compiler identified ${unresolvedPackages.length} undeclared package${unresolvedPackages.length === 1 ? "" : "s"}. I'm installing only that exact evidence before any repair model is called.`, {
@@ -11340,14 +11415,14 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
       name: safeName,
       version: "0.1.0",
       private: true,
-      scripts: { dev: "next dev", build: "next build", start: "next start", typecheck: "tsc --noEmit", test: "node --test" },
+      scripts: { dev: "next dev", build: "next build", start: "next start", typecheck: "tsc --noEmit", test: "vitest run" },
       dependencies: { next: "^15.5.0", react: "^19.0.0", "react-dom": "^19.0.0", ...(usesPrisma ? { "@prisma/client": "^6.0.0" } : {}), ...(isAiProduct ? { ai: "^5.0.0", "@ai-sdk/openai": "^2.0.0", "@ai-sdk/anthropic": "^2.0.0", "@ai-sdk/google": "^2.0.0", zod: "^4.0.0", pg: "^8.0.0", pgvector: "^0.2.0" } : {}) },
-      devDependencies: { typescript: "^5.0.0", "@types/node": "^20.0.0", "@types/react": "^19.0.0", "@types/react-dom": "^19.0.0", tailwindcss: "^3.4.0", postcss: "^8.0.0", autoprefixer: "^10.0.0", ...(usesPrisma ? { prisma: "^6.0.0" } : {}) },
+      devDependencies: { typescript: "^5.0.0", "@types/node": "^20.0.0", "@types/react": "^19.0.0", "@types/react-dom": "^19.0.0", tailwindcss: "^3.4.0", postcss: "^8.0.0", autoprefixer: "^10.0.0", vitest: "^3.2.0", ...(usesPrisma ? { prisma: "^6.0.0" } : {}) },
     }, null, 2)}\n`;
     const tsconfig = `${JSON.stringify({
       compilerOptions: {
         target: "ES2017", lib: ["dom", "dom.iterable", "esnext"], allowJs: true, skipLibCheck: true,
-        strict: true, noEmit: true, esModuleInterop: true, module: "esnext", moduleResolution: "bundler",
+        strict: true, noEmit: true, allowImportingTsExtensions: true, esModuleInterop: true, module: "esnext", moduleResolution: "bundler",
         resolveJsonModule: true, isolatedModules: true, jsx: "preserve", incremental: true,
         plugins: [{ name: "next" }], paths: { "@/*": ["./src/*"] },
       },
@@ -11359,7 +11434,8 @@ async function ensureRequestedStackScaffold(projectPath: string, stack: StackPro
     // Next walks up into Foundry's repository, inherits Foundry's production distDir, and can build
     // one artifact while `next start` serves a different/missing one. A project-local config makes
     // build, verification, preview, packaging, and later deployment refer to the same output.
-    await writeMissing("next.config.mjs", `/** @type {import("next").NextConfig} */\nconst nextConfig = { distDir: ".next" };\n\nexport default nextConfig;\n`);
+    await writeMissing("next.config.mjs", `/** @type {import("next").NextConfig} */\nconst nextConfig = { distDir: ".next", outputFileTracingRoot: process.cwd() };\n\nexport default nextConfig;\n`);
+    await writeMissing("vitest.config.ts", `import { defineConfig } from "vitest/config";\n\nexport default defineConfig({\n  test: { globals: true, include: ["src/**/*.test.{ts,tsx}"], exclude: ["node_modules/**", ".next/**"] },\n});\n`);
     await writeMissing("tsconfig.json", tsconfig);
     await writeMissing("next-env.d.ts", "/// <reference types=\"next\" />\n/// <reference types=\"next/image-types/global\" />\n");
     await writeMissing("src/app/layout.tsx", `import type { ReactNode } from "react";\nimport "./globals.css";\n\nexport default function RootLayout({ children }: { children: ReactNode }) {\n  return <html lang="en"><body>{children}</body></html>;\n}\n`);

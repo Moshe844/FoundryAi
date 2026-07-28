@@ -68,7 +68,7 @@ assert(
 );
 
 assert(
-  dispatch.includes("providerFallbackWindowMs(candidateTimeoutMs, candidates.length)"),
+  dispatch.includes("providerFallbackWindowMs(candidateTimeoutMs, candidates.length, tier)"),
   "Fallback providers still share one undersized logical timeout.",
 );
 assert(
@@ -132,6 +132,11 @@ assert(
 assert(
   dispatch.includes("No fallback call was sent") && dispatch.includes("did not produce the required executable action"),
   "A paid unusable action is still hidden behind the later fallback cost-guard message.",
+);
+assert(
+  dispatch.includes("consumedPaidTokens")
+    && /consumedPaidTokens[\s\S]{0,220}FOUNDRY_ALLOW_ROUTINE_PROVIDER_FALLBACK/.test(dispatch),
+  "A zero-token nonexistent-model rejection can still block the ranked same-tier fallback.",
 );
 assert(
   executor.includes('["read_file", "replace_in_file", "write_file"')

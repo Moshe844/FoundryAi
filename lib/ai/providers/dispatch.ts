@@ -187,7 +187,15 @@ export async function callManagedModel(request: ManagedModelRequest, options: Ma
 
     const consumedPaidTokens = result.usage.requestCount > 0 && result.usage.totalTokens > 0;
     if (consumedPaidTokens && process.env.FOUNDRY_ALLOW_PAID_PROVIDER_FALLBACK !== "true") break;
-    if ((tier === "fast" || tier === "builder") && process.env.FOUNDRY_ALLOW_ROUTINE_PROVIDER_FALLBACK !== "true") break;
+    // A catalog entry that the provider rejects as nonexistent has not bought useful work and must
+    // not strand the mission on stale routing data. Routine tiers still avoid a second paid attempt
+    // after tokens were consumed, but a zero-token provider rejection may move to the already-ranked
+    // same-tier alternate in this bounded call.
+    if (
+      consumedPaidTokens
+      && (tier === "fast" || tier === "builder")
+      && process.env.FOUNDRY_ALLOW_ROUTINE_PROVIDER_FALLBACK !== "true"
+    ) break;
   }
 
   if (lastResult && candidateFailures.length) {

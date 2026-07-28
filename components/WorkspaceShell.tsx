@@ -2145,6 +2145,14 @@ export function WorkspaceShell() {
         for (const line of lines) {
           await handleLine(line);
         }
+        // The result record is the protocol's terminal truth. Some streaming responses remain open
+        // briefly while the server tears down preview/process resources; waiting for HTTP EOF kept
+        // the client controller "busy" after the UI already said Complete, so every follow-up was
+        // queued forever. Release the reader as soon as the terminal result arrives.
+        if (result) {
+          await reader.cancel().catch(() => undefined);
+          return result;
+        }
         if (done) break;
       }
     } catch (error) {

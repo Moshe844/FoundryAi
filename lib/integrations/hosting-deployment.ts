@@ -77,6 +77,24 @@ export async function deployVerifiedStaticSite(input: HostingDeploymentInput): P
 
 async function deployToVercel(input: HostingDeploymentInput, files: PublishFile[]): Promise<FactoryDeployment> {
   const query = input.teamId ? `?teamId=${encodeURIComponent(input.teamId)}` : "";
+  const uploaded: Array<{ file: string; sha: string; size: number }> = [];
+  for (const file of files) {
+    const sha = createHash("sha1").update(file.bytes).digest("hex");
+    const upload = await fetch(`https://api.vercel.com/v2/files${query}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${input.credential.token}`,
+        "content-type": "application/octet-stream",
+        "x-vercel-digest": sha,
+      },
+      body: Buffer.from(file.bytes),
+    });
+    if (!upload.ok) {
+      const failure = await upload.json().catch(() => ({}));
+      throw providerError("vercel", upload, failure);
+    }
+    uploaded.push({ file: file.path, sha, size: file.bytes.byteLength });
+  }
   const response = await fetch(`https://api.vercel.com/v13/deployments${query}`, {
     method: "POST",
     headers: { authorization: `Bearer ${input.credential.token}`, "content-type": "application/json" },
@@ -84,7 +102,7 @@ async function deployToVercel(input: HostingDeploymentInput, files: PublishFile[
       name: slug(input.projectName),
       target: "production",
       ...(input.existingProjectId ? { project: input.existingProjectId } : {}),
-      files: files.map((file) => ({ file: file.path, data: Buffer.from(file.bytes).toString("base64"), encoding: "base64" })),
+      files: uploaded,
       projectSettings: { framework: null },
     }),
   });

@@ -227,6 +227,60 @@ const repairNextAsyncRouteParams: DeterministicSourceRepairRule = ({ sourcePath,
   };
 };
 
+/**
+ * Node's native TypeScript test runner follows strict ESM resolution: a generated test importing
+ * `./dashboard` does not resolve the real `dashboard.ts` file. The runtime diagnostic identifies
+ * both the missing absolute module and the importing test file, so adding `.ts` to that one exact
+ * relative import is deterministic. Generated Next.js projects compile with noEmit and explicitly
+ * allow TypeScript extensions, preserving the same source for the compiler and Node test runner.
+ */
+const repairNodeTypescriptTestImportExtension: DeterministicSourceRepairRule = ({ sourcePath, content, diagnostic }) => {
+  if (!/(?:^|[\\/]).+\.test\.[cm]?tsx?$/i.test(sourcePath)) return undefined;
+  if (!/ERR_MODULE_NOT_FOUND[\s\S]*Cannot find module/i.test(diagnostic)) return undefined;
+  const importer = diagnostic.match(/\bimported from\s+(.+?\.test\.[cm]?tsx?)\b/i)?.[1]?.replace(/\\/g, "/").toLowerCase();
+  const normalizedSource = sourcePath.replace(/\\/g, "/").toLowerCase();
+  if (!importer || (!importer.endsWith(normalizedSource) && !normalizedSource.endsWith(importer))) return undefined;
+  const missingModule = diagnostic.match(/Cannot find module ['"]([^'"]+)['"]/i)?.[1]?.replace(/\\/g, "/");
+  if (!missingModule) return undefined;
+
+  let changed = false;
+  const repaired = content.replace(
+    /(\b(?:from\s*|import\s*\()\s*['"])(\.{1,2}\/[^'"]+?)(['"]\s*\)?)/g,
+    (whole, prefix: string, specifier: string, suffix: string) => {
+      if (/\.[A-Za-z0-9]+$/.test(specifier)) return whole;
+      const missingTail = missingModule.toLowerCase().replace(/^.*?(?=\/[^/]+$)/, "");
+      const specifierTail = specifier.toLowerCase().replace(/^\.\.?(?=\/)/, "");
+      if (missingTail !== specifierTail && !missingModule.toLowerCase().endsWith(specifierTail)) return whole;
+      changed = true;
+      return `${prefix}${specifier}.ts${suffix}`;
+    },
+  );
+  if (!changed || repaired === content) return undefined;
+  return {
+    content: repaired,
+    reason: "Added the Node ESM-required .ts extension to the exact compiler-identified relative test import.",
+    ruleId: "node-typescript-test-import-extension",
+  };
+};
+
+/**
+ * Next.js requires app/global-error to be a Client Component because it receives a reset callback.
+ * The framework diagnostic is exact and the directive is semantics-preserving, so paying a model
+ * to rediscover this one-line framework invariant is both wasteful and less reliable.
+ */
+const repairNextGlobalErrorClientBoundary: DeterministicSourceRepairRule = ({ sourcePath, content, diagnostic }) => {
+  if (!/(?:^|[\\/])global-error\.(?:tsx|jsx)$/i.test(sourcePath)) return undefined;
+  if (!/global-error\.(?:tsx|jsx)[\s\S]*must be a Client Component[\s\S]*use client/i.test(diagnostic)) return undefined;
+  if (/^\s*["']use client["'];?/m.test(content)) return undefined;
+  const bom = content.startsWith("\uFEFF") ? "\uFEFF" : "";
+  const body = bom ? content.slice(1) : content;
+  return {
+    content: `${bom}"use client";\n\n${body}`,
+    reason: "Added the compiler-required Client Component boundary to Next.js global-error.",
+    ruleId: "next-global-error-client-boundary",
+  };
+};
+
 /** Next.js 15 applies the same Promise contract to page searchParams. Generated type output names
  * PageProps rather than the app source, so the runtime maps that contract back here. */
 const repairNextAsyncSearchParams: DeterministicSourceRepairRule = ({ sourcePath, content, diagnostic }) => {
@@ -371,12 +425,14 @@ const repairDidYouMeanProperty: DeterministicSourceRepairRule = ({ sourcePath, c
 // Add only compiler-proven, semantics-preserving repairs here. This registry makes recovery
 // extensible across ecosystems without filling the runtime with project-specific branches.
 const RULES: DeterministicSourceRepairRule[] = [
+  repairNextGlobalErrorClientBoundary,
   repairWpfEmptyMarkupLabel,
   repairXmlBackslashEscapedQuotes,
   repairDotnetWindowsFormsInterop,
   repairCsharpStaticMemberQualification,
   repairDotnetMissingApplicationIcon,
   repairTypescriptOverwrittenProperty,
+  repairNodeTypescriptTestImportExtension,
   repairNextAsyncRouteParams,
   repairNextAsyncSearchParams,
   repairPrismaJsonObjectType,

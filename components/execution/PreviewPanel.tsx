@@ -1,16 +1,16 @@
 "use client";
 
-import { Download, ExternalLink, Gamepad2, Maximize2, Minimize2, Monitor, PanelRightClose, Play, RefreshCw, Smartphone, Tablet } from "lucide-react";
+import { Download, ExternalLink, Gamepad2, Maximize2, Minimize2, Monitor, PanelRightClose, Play, RefreshCw, Rocket, Smartphone, Tablet } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
-import type { FactoryProjectResult } from "@/lib/factory/types";
+import type { FactoryDeployment, FactoryProjectResult } from "@/lib/factory/types";
 
 /**
  * Relocated verbatim from components/BuildDashboard.tsx (execution-canvas rebuild, step 5) — no
  * behavior change, only moved so the artifact/preview surface has its own file instead of living
  * inside one 6,000+ line component.
  */
-export function PreviewPanel({ execution, fill = false }: { execution: FactoryProjectResult; fill?: boolean }) {
+export function PreviewPanel({ execution, fill = false, onOpenProductionConnections }: { execution: FactoryProjectResult; fill?: boolean; onOpenProductionConnections?: () => void }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const [viewport, setViewport] = useState<"desktop" | "tablet" | "mobile">("desktop");
   const latestReadyEventId = [...(execution.timeline ?? [])].reverse().find((event) => event.kind === "preview" && event.status === "completed" && /preview ready/i.test(event.title))?.id ?? "";
@@ -78,6 +78,7 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
             <a href={visiblePreviewUrl} target="_blank" rel="noreferrer" title={`Open ${visiblePreviewUrl}`} className="min-w-0 truncate font-mono text-[10.5px] text-foundry-subtle underline decoration-overlay/20 underline-offset-2 transition hover:text-foundry-ink">{visiblePreviewUrl}</a>
           </div>
           <div className="flex items-center gap-1">
+            <ProductionDeploymentControl execution={execution} onOpenProductionConnections={onOpenProductionConnections} />
             {([['desktop', Monitor], ['tablet', Tablet], ['mobile', Smartphone]] as const).map(([size, Icon]) => (
               <button key={size} type="button" title={`${size} preview`} onClick={() => setViewport(size)} className={`rounded p-1.5 transition ${viewport === size ? "bg-foundry-teal/[0.16] text-foundry-teal" : "text-foundry-subtle hover:bg-overlay/[0.06] hover:text-foundry-ink"}`}>
                 <Icon size={13} />
@@ -96,6 +97,104 @@ export function PreviewPanel({ execution, fill = false }: { execution: FactoryPr
   }
 
   return <p className={`${wrap} rounded-md border border-dashed border-overlay/15 px-3 py-2 text-xs leading-5 text-foundry-subtle`}>{execution.previewReason || "Open index.html from the project folder to preview this static project."}</p>;
+}
+
+type DeploymentDiscovery = {
+  providers?: Array<FactoryDeployment["provider"]>;
+  deployment?: FactoryDeployment;
+  error?: string;
+};
+
+function ProductionDeploymentControl({ execution, onOpenProductionConnections }: { execution: FactoryProjectResult; onOpenProductionConnections?: () => void }) {
+  const [providers, setProviders] = useState<Array<FactoryDeployment["provider"]>>([]);
+  const [provider, setProvider] = useState<FactoryDeployment["provider"]>("vercel");
+  const [deployment, setDeployment] = useState<FactoryDeployment | undefined>(execution.deployment);
+  const [state, setState] = useState<"loading" | "idle" | "deploying" | "error">("loading");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setState("loading");
+    fetch(`/api/factory/deploy?projectId=${encodeURIComponent(execution.projectId)}`, { cache: "no-store" })
+      .then(async (response) => {
+        const result = await response.json() as DeploymentDiscovery;
+        if (!response.ok) throw new Error(result.error || "Foundry could not inspect deployment readiness.");
+        if (!active) return;
+        const available = result.providers ?? [];
+        setProviders(available);
+        if (available.length) setProvider(available[0]);
+        setDeployment(result.deployment);
+        setState("idle");
+      })
+      .catch((cause) => {
+        if (!active) return;
+        setError(cause instanceof Error ? cause.message : "Foundry could not inspect deployment readiness.");
+        setState("error");
+      });
+    return () => { active = false; };
+  }, [execution.projectId, execution.deployment]);
+
+  async function deploy() {
+    const providerName = provider === "vercel" ? "Vercel" : "Netlify";
+    if (!window.confirm(`Publish ${execution.projectName} to production with ${providerName}? This creates or updates a public website.`)) return;
+    setState("deploying");
+    setError("");
+    try {
+      const response = await fetch("/api/factory/deploy", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          approved: true,
+          provider,
+          projectId: execution.projectId,
+          projectName: execution.projectName,
+          projectPath: execution.projectPath,
+        }),
+      });
+      const result = await response.json() as DeploymentDiscovery & { ok?: boolean };
+      if (!response.ok || !result.deployment) throw new Error(result.error || "The production deployment failed.");
+      setDeployment(result.deployment);
+      setState("idle");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The production deployment failed.");
+      setState("error");
+    }
+  }
+
+  if (deployment?.verificationStatus === "verified") {
+    return (
+      <div className="mr-1 flex items-center gap-1">
+        <a href={deployment.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-md border border-foundry-teal/30 bg-foundry-teal/[0.12] px-2 py-1 text-[10.5px] font-extrabold text-foundry-teal" title={deployment.verificationEvidence}>
+          <span className="h-1.5 w-1.5 rounded-full bg-foundry-teal" />Live<ExternalLink size={11} />
+        </a>
+        <button type="button" disabled={state === "deploying"} onClick={deploy} className="rounded p-1.5 text-foundry-subtle transition hover:bg-overlay/[0.06] hover:text-foundry-ink disabled:opacity-50" title={`Redeploy production with ${provider}`}>
+          <RefreshCw size={13} className={state === "deploying" ? "animate-spin" : ""} />
+        </button>
+      </div>
+    );
+  }
+
+  if (state === "loading") return <span className="px-1 text-[10px] text-foundry-subtle">Checking hosting…</span>;
+  if (!providers.length) {
+    return (
+      <button type="button" onClick={onOpenProductionConnections} disabled={!onOpenProductionConnections} className="mr-1 inline-flex items-center gap-1 rounded-md border border-overlay/15 px-2 py-1 text-[10.5px] font-bold text-foundry-subtle transition hover:border-foundry-teal/30 hover:text-foundry-teal disabled:cursor-default disabled:opacity-60" title={error || "Connect and verify Vercel or Netlify to publish this project."}>
+        <Rocket size={12} />Connect hosting
+      </button>
+    );
+  }
+
+  return (
+    <div className="mr-1 flex items-center gap-1" title={error || "Publish the verified build to a public production URL."}>
+      {providers.length > 1 ? (
+        <select value={provider} onChange={(event) => setProvider(event.target.value as FactoryDeployment["provider"])} className="rounded border border-overlay/15 bg-foundry-bg px-1.5 py-1 text-[10px] font-bold text-foundry-ink">
+          {providers.map((item) => <option key={item} value={item}>{item === "vercel" ? "Vercel" : "Netlify"}</option>)}
+        </select>
+      ) : null}
+      <button type="button" onClick={deploy} disabled={state === "deploying"} className="inline-flex items-center gap-1 rounded-md border border-foundry-teal/30 bg-foundry-teal/[0.1] px-2 py-1 text-[10.5px] font-extrabold text-foundry-teal transition hover:bg-foundry-teal/[0.18] disabled:opacity-60">
+        <Rocket size={12} />{state === "deploying" ? "Publishing…" : "Deploy production"}
+      </button>
+    </div>
+  );
 }
 
 /**
@@ -258,7 +357,7 @@ function previewWorkspaceTitle(platform: FactoryProjectResult["previewPlatform"]
   return "Local Interactive Preview";
 }
 
-export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = false, onToggleFullScreen }: { execution: FactoryProjectResult | null; onCollapse: () => void; fullScreen?: boolean; onToggleFullScreen?: () => void }) {
+export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = false, onToggleFullScreen, onOpenProductionConnections }: { execution: FactoryProjectResult | null; onCollapse: () => void; fullScreen?: boolean; onToggleFullScreen?: () => void; onOpenProductionConnections?: () => void }) {
   const previewUrl = execution?.previewUrl;
   const canPopOut = Boolean(previewUrl) && execution?.previewPlatform !== "api";
 
@@ -297,7 +396,7 @@ export function EngineeringWorkspacePanel({ execution, onCollapse, fullScreen = 
         </div>
       </div>
       <div className="flex min-h-0 flex-1 flex-col overflow-auto">
-        {execution ? <PreviewPanel execution={execution} fill /> : null}
+        {execution ? <PreviewPanel execution={execution} fill onOpenProductionConnections={onOpenProductionConnections} /> : null}
       </div>
     </div>
   );

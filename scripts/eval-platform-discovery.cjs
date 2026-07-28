@@ -17,7 +17,15 @@ function loadPolicy() {
   const loadedModule = { exports: {} };
   const sandboxRequire = (id) => id === "@/lib/ai/project-discovery"
     ? { explicitPlatformFromPrompt: () => undefined, explicitStackFromPrompt: () => undefined }
-    : require(id);
+    : id === "./requirement-intent"
+      ? {
+          requiresFunctionalAuthentication: (text) => {
+            const explicit = /\b(?:auth(?:entication|enticate)?|verify credentials?|password hash(?:ing)?|sessions?|protected pages?|protected routes?|password reset|email verification|backend|api|database)\b/i.test(text);
+            const surfaceOnly = /\b(?:login|sign[- ]?in|sign[- ]?up)\s+(?:page|screen|form)\b/i.test(text) && !explicit;
+            return !surfaceOnly && /\b(?:auth|login|sign[- ]?in|sign[- ]?up|password|session)\b/i.test(text);
+          },
+        }
+      : require(id);
   vm.runInNewContext(compiled, { module: loadedModule, exports: loadedModule.exports, require: sandboxRequire }, { filename: "platform-stack-policy.js" });
   return loadedModule.exports;
 }
@@ -60,6 +68,10 @@ assert(web.family === "web" && /HTML \+ CSS/.test(web.recommendedStack) && web.s
 const authWeb=policy.reconcilePlatformStackOptions("custom",{...baseDiscovery,prompt:"Build a full login signup page with password reset, email verification, remember me and protected pages",projectType:"Authentication web application",architecture:"Server-rendered web application",mainFeatures:["Signup","Password reset","Email verification"],dataModel:["User","Session","Password reset token"],decisions:[{dimension:"platform",hypothesis:"Responsive web application"}]},webOnly);
 assert(/Auth\.js/.test(authWeb.recommendedStack)&&/Prisma/.test(authWeb.recommendedStack)&&/PostgreSQL/.test(authWeb.recommendedStack),"Authentication recommendation omitted its auth, persistence, or migration stack.");
 assert(/secure cookie sessions/.test(authWeb.stackOptions[0].why)&&/reset tokens/.test(authWeb.stackOptions[0].why),"Authentication recommendation does not explain lifecycle/security coverage.");
+
+const loginPageOnly=policy.reconcilePlatformStackOptions("custom",{...baseDiscovery,prompt:"Simple login page",projectType:"Simple login page",recommendedStack:"Next.js + Auth.js + Prisma",mainFeatures:["Account registration","Secure sessions"],dataModel:["User","Session"]},webOnly);
+assert(/^HTML \+ CSS/.test(loginPageOnly.recommendedStack),"A login UI noun still invents a backend authentication stack.");
+assert(!loginPageOnly.stackOptions.some(item=>/Auth\.js|Prisma|PostgreSQL/.test(item.name)),"Model-invented auth features still contaminate a custom login page.");
 
 const staticWeb=policy.reconcilePlatformStackOptions("website",{...baseDiscovery,prompt:"A simple static portfolio with projects and contact links",projectType:"Portfolio website",architecture:"Static site"},webOnly);
 assert(/^HTML \+ CSS/.test(staticWeb.recommendedStack)&&!staticWeb.stackOptions.some(item=>/PostgreSQL|Prisma/.test(item.name)),"Static websites are still being over-engineered.");
@@ -110,8 +122,8 @@ const dashboard = fs.readFileSync(path.join(root, "components/BuildDashboard.tsx
 const discoverRoute = fs.readFileSync(path.join(root, "app/api/factory/discover/route.ts"), "utf8");
 const runtime = fs.readFileSync(path.join(root, "lib/factory/runtime.ts"), "utf8");
 const connector = fs.readFileSync(path.join(root, "scripts/foundry-local-connector.cjs"), "utf8");
-assert(dashboard.includes("platformStackOptionsForProject(template.id)") && dashboard.includes("Pick a complete delivery stack"), "The new-project UI can still seed generic framework-only choices for a known platform.");
-assert(discoverRoute.includes("reconcilePlatformStackOptions(context.starter.id"), "Server discovery does not enforce the selected platform after model parsing.");
+assert(dashboard.includes("platformStackOptionsForProject(template.id)"), "The new-project UI can still seed generic framework-only choices for a known platform.");
+assert(discoverRoute.includes("certifiedDecision(authoritativeBrief") && discoverRoute.includes("certifiedPlatformContract(context.starter.id"), "Server discovery does not enforce certified stack selection after model parsing.");
 assert(runtime.includes("windowsHide: true") && connector.includes("windowsHide: true"), "Managed background servers are not configured to stay inside Foundry on Windows.");
 
 console.log("Platform discovery and managed-preview regression checks passed.");

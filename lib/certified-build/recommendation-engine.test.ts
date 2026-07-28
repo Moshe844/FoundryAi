@@ -43,6 +43,24 @@ describe("Foundry certified build policy",()=>{
     expect(discovery.mainFeatures.join(" ")).not.toMatch(/blog|detail page|database|author|category|mdx/i);
     expect(discovery.dataModel).toEqual([]);
   });
+  it("treats a simple login page as UI, not an invented authentication system",()=>{
+    const brief="Simple login page";
+    const discovery=discoverProject(brief,"custom");
+    const profile=extractProductProfile(brief,discovery);
+    const result=recommendStack(profile,webEnv);
+    expect(discovery.recommendedStack).toBe("Static HTML + CSS + JavaScript");
+    expect(discovery.architecture).toMatch(/semantic HTML.*responsive CSS/i);
+    expect(discovery.decisions.find(item=>item.dimension==="auth-database-api")?.hypothesis).toMatch(/no authentication service/i);
+    expect(discovery.dataModel).toEqual([]);
+    expect(profile.capabilities.authentication).toBe(false);
+    expect(result.selectedStackId).toBe("static-web-vite");
+  });
+  it("escalates only when functional authentication is explicitly requested",()=>{
+    const brief="Build a login page that authenticates real users, hashes passwords, creates secure sessions, and protects the dashboard route.";
+    const profile=extractProductProfile(brief,discoverProject(brief,"custom"));
+    expect(profile.capabilities.authentication).toBe(true);
+    expect(recommendStack(profile,webEnv).selectedStackId).toBe("nextjs-typescript-postgres");
+  });
   it("treats a comma-separated rejection list as negative constraints, not backend evidence",()=>{
     const brief="Build and publish a polished responsive one-page website for a neighborhood florist. Do not add a database, backend, blog, authentication, CMS, or extra pages.";
     const discovery=discoverProject(brief,"custom");
@@ -54,6 +72,12 @@ describe("Foundry certified build policy",()=>{
     expect(discovery.dataModel).toEqual([]);
   });
   it("keeps the exact marketing-site starter on static HTML without model-added architecture",()=>{const profile=extractProductProfile("Marketing site",{prompt:"Marketing site",projectType:"Responsive Website. Subtype: Marketing Site",recommendedStack:"Next.js + PostgreSQL",architecture:"dashboard with a database",mainFeatures:["Admin dashboard","User accounts"],styleDirection:"",dataModel:["User","Record"],assumptions:[],questions:[],decisions:[],keyFacts:[],futureCapabilities:[]});const result=recommendStack(profile,webEnv);expect(result.selectedStackId).toBe("static-web-vite");expect(result.selectedStack?.displayName).toBe("Static HTML + CSS + JavaScript");});
+  it("certifies an explicit dependency-free static browser utility from the live creation flow", () => {
+    const brief = "Build a simple static web app called LiveProof Tasks using plain HTML, CSS, and JavaScript with no external dependencies. Users can add tasks, search tasks, mark tasks complete, delete tasks, and keep data in localStorage. Include accessible responsive design and verify the real browser flow.";
+    const discovery = discoverProject(brief, "custom");
+    const result = recommendStack(extractProductProfile(brief, discovery), webEnv);
+    expect(result.selectedStackId, JSON.stringify(result.candidates.find((candidate) => candidate.manifest.stackId === "static-web-vite")?.disqualifiers)).toBe("static-web-vite");
+  });
   it("chooses relational full stack for SaaS",()=>{expect(recommend("multi-user SaaS dashboard with login, roles and reports").selectedStackId).toBe("nextjs-typescript-postgres");});
   it("describes the business stack without falsely requiring an unconfigured production database",()=>{
     expect(recommend("customer ordering app with login and checkout").selectedStack?.displayName).toBe("Next.js + TypeScript + Relational Database");

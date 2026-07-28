@@ -1,5 +1,6 @@
 import { explicitPlatformFromPrompt, explicitStackFromPrompt, type ProjectDiscoveryResult } from "@/lib/ai/project-discovery";
 import type { StackOption } from "@/lib/ai/project-discovery-llm";
+import { requiresFunctionalAuthentication } from "./requirement-intent";
 
 export type ProjectPlatformFamily = "web" | "desktop" | "mobile" | "backend" | "game" | "cli" | "data" | "library" | "embedded" | "unconstrained";
 
@@ -77,7 +78,7 @@ function workloadSignals(discovery:ProjectDiscoveryResult):WorkloadSignals{
   // "email", "main", "detail"; `ar`/`vr` matched inside "marketing", "card", "start". A request for a
   // "plain HTML page" was therefore classified as dynamic, skipped the static stack branch, and was
   // forced into the Next.js + database stack. This one character class drove most wrong-stack builds.
-  const auth=/\b(?:auth(?:entication)?|login|log in|sign[- ]?up|password|session|user account|member account|mfa|oauth|password reset)\b/.test(evidence);
+  const auth=requiresFunctionalAuthentication(evidence);
   const database=/\b(?:database|persist(?:ence|ent)?|inventory|order management|booking|records?|dashboard|multi-user|shared data|postgres|mysql|sqlite)\b/.test(evidence);
   const dynamic=/\b(?:api|payment|checkout|realtime|real-time|ai|upload|admin|multi-user)\b/.test(evidence);
   return{simple:!auth&&!database&&!dynamic,auth,email:/\b(?:email|password reset|verification|invite|notification)\b/.test(evidence),database,payments:/\b(?:payment|checkout|stripe|paypal|subscription|billing)\b/.test(evidence),ai:/\b(?:ai|llm|model|embedding|vector|inference|machine learning)\b/.test(evidence),realtime:/\b(?:realtime|real-time|websocket|chat|presence|live collaboration)\b/.test(evidence),offline:/\b(?:offline|local-first|sync)\b/.test(evidence),enterprise:/\b(?:enterprise|sso|saml|compliance|audit|multi-tenant|rbac)\b/.test(evidence),windows:/\b(?:windows|wpf|winui)\b/.test(targetEvidence),ios:/\b(?:ios|iphone|ipad|apple)\b/.test(targetEvidence),android:/\b(?:android|jetpack)\b/.test(targetEvidence),hardware:/\b(?:pax|poslink|payment terminal|barcode scanner|licensed sdk|device sdk|usb|serial|bluetooth)\b/.test(evidence),browserGame:/\b(?:browser game|web game|html5 game)\b/.test(evidence),threeD:/\b(?:3d|console|vr|ar|photoreal)\b/.test(evidence)};
@@ -266,7 +267,10 @@ export function reconcilePlatformStackOptions(
     const options = proposed.map((option, index) => ({ ...option, recommended: index === recommendedIndex }));
     return { stackOptions: options, recommendedStack: options.find((option) => option.recommended)?.name || discovery.recommendedStack, repaired: false, family };
   }
-  const complete = dynamicOptionsWithinPolicy(family,discovery,proposed);
+  // Model-proposed custom features may shape presentation, but they cannot authorize infrastructure.
+  // Known starters retain their curated capability contract.
+  const policyDiscovery = starterId === "custom" ? { ...discovery, mainFeatures: [] } : discovery;
+  const complete = dynamicOptionsWithinPolicy(family,policyDiscovery,proposed);
   const previousRecommendation=proposed.find(option=>option.recommended)?.name||discovery.recommendedStack;
   return { stackOptions: complete, recommendedStack: complete[0].name, repaired: previousRecommendation!==complete[0].name||proposed.length!==complete.length, family };
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { modulesMissingTypeDeclarations, planDependencyRepair, typesPackageFor } from "./deterministic-dependency-repair";
+import { modulesMissingTypeDeclarations, packagesEligibleForAutomaticInstall, planDependencyRepair, typesPackageFor } from "./deterministic-dependency-repair";
 
 /** The exact diagnostic from the live failure this repair exists to fix. */
 const LIVE_DIAGNOSTIC = `src/lib/auth.ts(1,17): error TS7016: Could not find a declaration file for module 'jsonwebtoken'. 'C:/Users/x/node_modules/jsonwebtoken/index.js' implicitly has an 'any' type.`;
@@ -93,5 +93,20 @@ describe("planning the install", () => {
   it("explains itself in terms of the failure", () => {
     expect(planDependencyRepair({ diagnostic: LIVE_DIAGNOSTIC })?.reason).toContain("jsonwebtoken");
     expect(planDependencyRepair({ diagnostic: LIVE_DIAGNOSTIC })?.reason).toContain("without touching the scaffold's pinned versions");
+  });
+});
+
+describe("guarding compiler-driven installs", () => {
+  it("does not reinstall a package already declared by the project", () => {
+    const manifest = JSON.stringify({ dependencies: { "better-sqlite3": "^12.0.0" } });
+    expect(packagesEligibleForAutomaticInstall({ packages: ["better-sqlite3", "bcryptjs"], manifest, nodeMajor: 24 }))
+      .toEqual(["bcryptjs"]);
+  });
+
+  it("routes native SQLite addons to source repair on modern Node", () => {
+    expect(packagesEligibleForAutomaticInstall({
+      packages: ["sqlite3", "better-sqlite3", "@types/better-sqlite3", "zod"],
+      nodeMajor: 24,
+    })).toEqual(["zod"]);
   });
 });

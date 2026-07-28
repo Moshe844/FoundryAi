@@ -101,6 +101,10 @@ export function MissionCanvas({
 
   const missionStatus = deriveMissionDisplayStatus(mission);
   const activeExecution = missionStatus.activeExecutionMission;
+  // A durable projection can lag the currently streaming browser execution by one reconciliation
+  // cycle. User control must fail safe: if either source says work is active, keep Stop visible.
+  const executionControlBusy = missionStatus.isBusy
+    || Boolean(activeExecution && ["understanding", "planning", "executing", "verifying", "reconnecting"].includes(activeExecution.state));
   const projectDeleted = Boolean(execution?.projectDeleted);
 
   const priorVMs = useMemo(
@@ -719,6 +723,7 @@ export function MissionCanvas({
                 fullScreen={previewFullScreen}
                 onToggleFullScreen={() => setPreviewFullScreen((value) => !value)}
                 onCollapse={() => { setPreviewOpen(false); setPreviewFullScreen(false); }}
+                onOpenProductionConnections={onOpenProductionConnections}
               />
             </div>
           </>
@@ -762,7 +767,7 @@ export function MissionCanvas({
         <CanvasComposer
           inputRef={composerRef}
           value={task}
-          isBusy={missionStatus.isBusy}
+          isBusy={executionControlBusy}
           pausedForApproval={missionStatus.isPausedForApproval}
           pausedForQuestion={missionStatus.isPausedForUser}
           queuedTask={queuedTask}

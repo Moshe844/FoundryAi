@@ -90,7 +90,7 @@ async function run() {
   assert.match(workspaceShell, /Execution connection could not be recovered:[\s\S]+state: "cancelled"/, "A vanished server execution is still mislabeled as a blocked project.");
   assert.doesNotMatch(runtime, /const existingEnvironment = await environmentReadinessForStack\(capabilityLevelForStackChoice\(detected\.stack\)\.id\)/, "Local project inspection still blocks on an unused synchronous toolchain probe.");
   assert.match(canvasModel, /newest\?\.status === "running" && isInternalExecutionEvent\(newest\) && newest\.title\.trim\(\)/, "Current focus still ignores the newest provider-wait stage.");
-  assert.match(runtime, /boundedSmallEdit \|\| boundedStaticFollowUp \? 1 : autonomousRepairStageLimit\(process\.env\.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, 2\)/, "Bounded static follow-ups get one repair while larger missions retain staged recovery.");
+  assert.match(runtime, /boundedSmallEdit \|\| boundedStaticFollowUp \? 1 : autonomousRepairStageLimit\(process\.env\.FOUNDRY_MAX_AUTONOMOUS_RECOVERY_STAGES, gateRepairBudget\(depthPolicy\(quality\)\.retry\.maxRepairStages\)\)/, "Bounded static follow-ups get one repair while larger missions retain the quality-aware persistent gate-repair budget.");
   assert.doesNotMatch(runtime, /spawnSync\("taskkill\.exe", \["\/pid", String\(processId\), "\/t", "\/f"\]/, "Preview cleanup can still block the server event loop and prevent Stop.");
   assert.match(runtime, /const listed = spawn\(powershell,[\s\S]+listed\.unref\(\)/, "Orphan preview discovery still blocks execution and cancellation.");
 

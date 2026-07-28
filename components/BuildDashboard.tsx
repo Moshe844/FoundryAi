@@ -1753,7 +1753,16 @@ function UnderstandingStep({ start, onUpdate, onAdvance }: { start: ProjectStart
           prompt: seedText,
         }, seedText);
         const certifiedRecommendation = recommendStack(extractProductProfile(seedText, resolvedDiscovery), defaultEnvironmentCapabilities());
-        const resolvedStackOptions: StackOption[] = certifiedRecommendation.selectedStack ? [{ name: certifiedRecommendation.selectedStack.displayName, why: certifiedRecommendation.reasons.join(" "), recommended: true }] : [];
+        const explicitStack = explicitStackFromPrompt(seedText);
+        const resolvedStackOptions: StackOption[] = explicitStack
+          ? [{
+              name: explicitStack,
+              why: "This stack was explicitly required in the project brief and is compatible with the selected platform, so Foundry will preserve it instead of substituting a heavier certified default.",
+              recommended: true,
+            }]
+          : certifiedRecommendation.selectedStack
+            ? [{ name: certifiedRecommendation.selectedStack.displayName, why: certifiedRecommendation.reasons.join(" "), recommended: true }]
+            : [];
         const resolvedStack = resolvedStackOptions[0]?.name || resolvedDiscovery.recommendedStack;
         const authoritativeDiscovery = alignDiscoveryWithSelectionAndConstraints(resolvedDiscovery, start, resolvedStack);
         onUpdate({
@@ -4720,7 +4729,8 @@ function projectBriefFor(start: ProjectStart) {
   // mutable projectName seed here allowed an older dashboard prompt (for example Inventory
   // Management System) to determine the new mission title and folder after the brief changed.
   const projectName = start.template.id === "custom" && !start.projectNameTouched
-    ? cleanProjectName(start.discovery?.projectType || start.projectDescription || start.appKind)
+    ? explicitProjectNameFromPrompt(start.projectDescription)
+      || cleanProjectName(start.discovery?.projectType || start.projectDescription || start.appKind)
     : start.projectName || cleanProjectName(start.discovery?.projectType || start.appKind);
   const discovery = start.discovery;
   const answeredQuestions = Object.entries(start.discoveryAnswers)

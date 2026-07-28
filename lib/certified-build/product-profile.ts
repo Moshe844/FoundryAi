@@ -2,6 +2,7 @@ import { explicitPersistenceFromPrompt, explicitStackFromPrompt, positiveIntentF
 import { taxonomyEntryFor } from "./taxonomy";
 import type { Platform, ProductCapabilities, ProductProfile } from "./types";
 import { technologyConstraintFromPrompt } from "./technology-constraint";
+import { requiresFunctionalAuthentication } from "@/lib/discovery/requirement-intent";
 
 const matches = (text: string, pattern: RegExp) => pattern.test(text);
 const allPlatforms = (): Record<Platform, boolean> => ({ web:false, api:false, android:false, ios:false, windows:false, macos:false, linux:false, game:false, cli:false });
@@ -12,6 +13,7 @@ function authoritativeFamilyFromPrompt(text: string) {
   if (/\bplayable games?\b|\b(?:2d|3d|survival|platformer|puzzle|strategy|rhythm|open[- ]world)\b[^.\n]{0,60}\bgames?\b|\bgames?\b[^.\n]{0,60}\b(?:2d|3d|survival|platformer|puzzle|strategy|rhythm|open[- ]world)\b/.test(text)) return "games-interactive";
   if (/\bapi service\b|\b(?:rest|graphql|public|private|internal)?\s*api\b|\bwebhook service\b|\bmicroservice\b/.test(text)) return "backend-services";
   if (/\bai application\b|\bai-powered\b|\b(?:rag|ai|llm)\s+(?:assistant|agent|app|application|tool)\b/.test(text)) return "data-ai";
+  if (/\b(?:simple|static|dependency[- ]free)\s+(?:web app|web application|website|site)\b/.test(text)) return "websites-content";
   if (/\b(?:responsive\s+)?(?:one-page\s+)?website\b|\blanding page\b|\bmarketing site\b|\bbrochure site\b|\bportfolio website\b/.test(text)) return "websites-content";
   if (/\boperational dashboard\b/.test(text)) return "web-applications-saas";
   if (/\bpoint-of-sale app\b|\be-commerce store\b|\bpos\b|\bcheckout\b/.test(text)) return "commerce-payments";
@@ -114,7 +116,7 @@ export function extractProductProfile(prompt: string, discovery?: ProjectDiscove
 
   const capabilities: ProductCapabilities = {
     multiUser: matches(text, /multi[- ]user|team|staff|customer|employee|seller|admin/),
-    authentication: matches(text, /auth|login|account|member|portal|saas/),
+    authentication: requiresFunctionalAuthentication(text),
     roleBasedAccess: matches(text, /role|permission|admin|manager|staff/),
     relationalData: matches(text, /inventory|order|booking|billing|crm|erp|purchase|supplier|transaction|relational|postgres|sql/),
     offlineMode: matches(text, /offline|local[- ]first|without (?:a )?connection|sync queue/),

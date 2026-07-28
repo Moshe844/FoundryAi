@@ -1425,9 +1425,14 @@ function spawnCommand(invocation, cwd, timeoutMs, keepAliveOnTimeout = false, si
     let abortHandler;
     // A dev/server command (keepAliveOnTimeout) must survive past its own grace-period timeout — detached so
     // it isn't tied to this request's process group, and never killed when the grace period elapses below.
+    const commandEnv = { ...process.env };
+    const nodeMajor = Number(process.versions.node.split(".")[0]) || 0;
+    if (process.platform === "win32" && nodeMajor >= 22 && !/(?:^|\s)--use-system-ca(?:\s|$)/.test(commandEnv.NODE_OPTIONS || "")) {
+      commandEnv.NODE_OPTIONS = `${commandEnv.NODE_OPTIONS || ""} --use-system-ca`.trim();
+    }
     const spawnOptions = invocation.useShellOption
-      ? { cwd, shell: true, windowsHide: true, detached: keepAliveOnTimeout }
-      : { cwd, windowsHide: true, detached: keepAliveOnTimeout };
+      ? { cwd, shell: true, windowsHide: true, detached: keepAliveOnTimeout, env: commandEnv }
+      : { cwd, windowsHide: true, detached: keepAliveOnTimeout, env: commandEnv };
     const child = spawn(invocation.cmd, invocation.args, spawnOptions);
     let stdout = "";
     let stderr = "";

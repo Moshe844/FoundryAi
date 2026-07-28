@@ -100,3 +100,33 @@ function declaredPackages(manifest?: string): Set<string> {
     return new Set();
   }
 }
+
+const NODE_SQLITE_NATIVE_ADDONS = new Set([
+  "better-sqlite3",
+  "sqlite3",
+  "@types/better-sqlite3",
+  "@types/sqlite3",
+]);
+
+/**
+ * Limits the compiler-driven installer to genuinely undeclared packages.
+ *
+ * A missing module that is already in package.json is installation/build failure evidence, not
+ * authorization to repeat `npm install <same package>`. In particular, Node 22+ ships `node:sqlite`;
+ * repeatedly compiling legacy native SQLite addons after npm already rejected their toolchain is a
+ * repair loop. Those failures must go to source repair so the implementation can use the built-in
+ * runtime instead.
+ */
+export function packagesEligibleForAutomaticInstall(input: {
+  packages: string[];
+  manifest?: string;
+  nodeMajor?: number;
+}): string[] {
+  const declared = declaredPackages(input.manifest);
+  const nodeMajor = input.nodeMajor ?? Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
+  return [...new Set(input.packages)].filter((packageName) => {
+    if (declared.has(packageName)) return false;
+    if (nodeMajor >= 22 && NODE_SQLITE_NATIVE_ADDONS.has(packageName)) return false;
+    return true;
+  });
+}

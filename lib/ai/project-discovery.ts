@@ -1,3 +1,5 @@
+import { isPresentationOnlyAuthSurface, isSmallClientOnlyWebRequest, requiresFunctionalAuthentication } from "@/lib/discovery/requirement-intent";
+
 export const discoverySourceValues = ["inferred", "observed", "defaulted", "user-confirmed"] as const;
 export type DiscoverySource = (typeof discoverySourceValues)[number];
 
@@ -178,16 +180,17 @@ export function explicitEntitiesFromPrompt(prompt: string): string[] {
 
 /** Re-applies explicit brief facts after model refinement so a lossy response cannot weaken the contract. */
 export function reconcileDiscoveryWithExplicitBrief(discovery: ProjectDiscoveryResult, prompt: string): ProjectDiscoveryResult {
+  const functionalAuthentication = requiresFunctionalAuthentication(prompt);
   const explicitProductCapabilities = [
-    /\b(?:login|log in|sign in)\b/i.test(prompt) ? "Login" : "",
+    /\b(?:login|log in|sign in)\b/i.test(prompt) ? (functionalAuthentication ? "Login" : "Login form UI") : "",
     /\b(?:sign[- ]?up|create (?:an )?account|registration)\b/i.test(prompt) ? "Account registration" : "",
     /\b(?:browse|catalog|storefront|products?)\b/i.test(prompt) ? "Product browsing" : "",
     /\b(?:add (?:items?|products?) to (?:a |the )?cart|shopping cart)\b/i.test(prompt) ? "Add to cart" : "",
     /\b(?:checkout|place orders?)\b/i.test(prompt) ? "Order placement and checkout" : "",
   ].filter(Boolean);
   const explicitDomainEntities = [
-    /\b(?:login|log in|sign in|sign up|signup|account|session)\b/i.test(prompt) ? "User" : "",
-    /\b(?:login|log in|sign in|session)\b/i.test(prompt) ? "Auth session" : "",
+    functionalAuthentication && /\b(?:login|log in|sign in|sign up|signup|account|session)\b/i.test(prompt) ? "User" : "",
+    functionalAuthentication && /\b(?:login|log in|sign in|session)\b/i.test(prompt) ? "Auth session" : "",
     /\b(?:product|catalog|storefront)\b/i.test(prompt) ? "Product" : "",
     /\bcart\b/i.test(prompt) ? "Cart" : "",
     /\bcart\b/i.test(prompt) ? "Cart item" : "",
@@ -645,6 +648,7 @@ export function discoverProject(prompt: string, starterId?: string): ProjectDisc
 
 function chooseProfile(prompt: string) {
   prompt = positiveIntentFromPrompt(prompt);
+  if (isPresentationOnlyAuthSurface(prompt)) return defaultProfile(prompt);
   const rankedMatches = (value: string) => profiles
     .map((profile) => ({ profile, score: profile.patterns.reduce((score, pattern) => score + (pattern.test(value) ? 1 : 0), 0) }))
     .filter((item) => item.score > 0)
@@ -668,6 +672,7 @@ function chooseProfile(prompt: string) {
 function defaultProfile(prompt: string): SignalProfile {
   const label = deriveTarget(prompt);
   const explicitStack = explicitStackFromPrompt(prompt);
+  const clientOnlyWeb = !explicitStack && isSmallClientOnlyWebRequest(prompt);
   const explicitPlatform = explicitPlatformFromPrompt(prompt);
   const featureClauses = prompt
     .replace(/\r/g, "")
@@ -686,7 +691,9 @@ function defaultProfile(prompt: string): SignalProfile {
   const platform = explicitPlatform ?? (/\b(?:fastapi|express|asp\.?net|api)\b/i.test(explicitStack ?? "") ? "Backend service" : "Web app");
   const architecture = explicitStack
     ? `${explicitStack} project organized around the requested workflows, with typed domain boundaries where the stack supports them and a runnable build, test, and preview path.`
-    : "Application with an editable first version, explicit domain boundaries, and a runnable verification path; persistence and integrations remain clean seams until the brief requires them.";
+    : clientOnlyWeb
+      ? "Static browser application using semantic HTML, responsive CSS, and focused JavaScript only where interaction is requested. No backend, authentication service, or database is implied."
+      : "Application with an editable first version, explicit domain boundaries, and a runnable verification path; persistence and integrations remain clean seams until the brief requires them.";
   const actionEntities = Array.from(prompt.matchAll(/\b(?:add|create|delete|edit|filter|find|manage|pin|schedule|search|show|track|update|cancel)(?:\s*\/\s*(?:add|create|delete|edit|filter|find|manage|pin|schedule|search|show|track|update|cancel))*\s+(?:a|an|new|the|their)?\s*([a-z][a-z-]{2,})/gi)).map((match) => match[1]);
   const surfaceEntities = Array.from(prompt.matchAll(/\b([a-z][a-z-]{2,})\s+(?:table|detail|records?|flows?|catalog|directory|history|search|filters?)\b/gi)).map((match) => match[1]);
   const entityCandidates = [...actionEntities, ...surfaceEntities]
@@ -698,17 +705,17 @@ function defaultProfile(prompt: string): SignalProfile {
     id: "custom",
     label,
     patterns: [],
-    stack: explicitStack ?? "Next.js + TypeScript",
+    stack: explicitStack ?? (clientOnlyWeb ? "Static HTML + CSS + JavaScript" : "Next.js + TypeScript"),
     architecture,
     architectureRationale: explicitStack ? "The user named the implementation stack, so discovery preserves it and plans verification around its native toolchain." : "A runnable, testable boundary avoids locking in technology the user did not request.",
     style: "Clean, practical product UI until a stronger brand or audience signal is provided.",
     styleRationale: "Without a stronger signal on brand or audience, a clean neutral baseline is safer to build on than guessing at a specific aesthetic.",
     features,
-    entities: entities.length ? entities : ["Item", "User", "Record"],
+    entities: entities.length ? entities : clientOnlyWeb ? [] : ["Item", "User", "Record"],
     users: "The target users are not specific yet.",
     platform,
     complexity: features.length >= 6 || /\b(?:production-ready|multi-tenant|roles?|permissions?|audit|integration|prisma|database)\b/i.test(prompt) ? "Feature-rich production application" : "Focused custom application",
-    growth: ["A real database once the data model stabilizes", "User accounts and permissions", "Usage analytics", "Integrations with other tools you rely on"],
+    growth: clientOnlyWeb ? [] : ["A real database once the data model stabilizes", "User accounts and permissions", "Usage analytics", "Integrations with other tools you rely on"],
   };
 }
 
@@ -786,6 +793,7 @@ function authSource(prompt: string): DiscoverySource {
 
 function authDataApiFor(prompt: string, profile: SignalProfile) {
   prompt = positiveIntentFromPrompt(prompt);
+  if (isPresentationOnlyAuthSurface(prompt)) return "Client-side form interaction only; no authentication service, user accounts, sessions, API, or database is implied.";
   if (profile.id === "auth-page") return "Email/password authentication with hashed credentials and secure httpOnly session cookies. OAuth, magic links, verification email, password reset, and MFA remain optional until requested.";
   if (/\b(?:pax|poslink|payment terminal|licensed sdk|sandbox transaction|do not simulate (?:hardware|payments?))\b/i.test(prompt)) return "Durable local catalog/cart state plus a real licensed terminal-SDK boundary; payment, device discovery, and transaction outcomes must be verified rather than mocked.";
   if (/\b(login|auth|account)\b/i.test(prompt)) return "Account/auth-ready UI wired to a real session model, not just a static form.";
@@ -805,15 +813,22 @@ function navigationFor(profile: SignalProfile) {
   if (profile.id === "pos") return "Register, held carts, transaction history, refunds, and shift controls.";
   if (profile.id === "inventory") return "Inventory overview, products/SKUs, stock movements, suppliers, purchase orders, and reports.";
   if (profile.id === "api") return "API routes plus a minimal status/docs surface.";
+  if (isSmallClientOnlyWebRequest(profile.label)) return "Single responsive page using only the controls and links requested.";
   return "Dashboard/home, list/table, detail/edit, settings.";
 }
 
 export function explicitProjectNameFromPrompt(prompt: string): string | undefined {
   const named = prompt.match(/\b(?:called|named)\s+["']?([A-Za-z0-9][A-Za-z0-9 _-]{1,79}?)["']?(?=[.,;]|\s+(?:using|with|that|which)\b|$)/i)?.[1];
   const buildAs = prompt.match(/^\s*(?:build|create|make|develop)\s+(?:me\s+)?["']?(.{2,80}?)["']?\s+(?:as|using|with)\b/i)?.[1];
-  const value = (named || buildAs)?.replace(/\s+/g, " ").trim();
+  // Preserve an explicit product subtype before its purpose clause. Discovery may correctly classify
+  // "Admin dashboard to create tasks" under the broad Dashboard category; that category must not
+  // overwrite the more specific user-authored identity used for the workspace, brief, and mission.
+  const dashboardSubtype = prompt.match(
+    /^\s*(?:build|create|make|develop)?\s*(?:me\s+)?(?:an?\s+)?["']?((?:(?:admin|administration|analytics|operations?|sales|finance|support|customer|employee|inventory|project|task|content|marketing|executive|management)\s+)+dashboard)\b/i,
+  )?.[1];
+  const value = (named || buildAs || dashboardSubtype)?.replace(/\s+/g, " ").trim();
   if (!value || value.split(/\s+/).length > 8) return undefined;
-  return value;
+  return titleCase(value);
 }
 
 function deriveTarget(prompt: string) {

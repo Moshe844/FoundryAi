@@ -117,7 +117,7 @@ export function DurableMissionAuthority({ children }: { children: ReactNode }) {
       });
       subscriptionsRef.current.set(binding.durableMissionId, stop);
     }
-  }, [snapshot.bindings, snapshot.missions]);
+  }, [snapshot]);
 
   useEffect(() => () => {
     for (const stop of subscriptionsRef.current.values()) stop();

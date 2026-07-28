@@ -5,6 +5,7 @@ import { commandPermissionIdentity, isLongRunningServerCommand, isSensitiveFileP
 import { clearFailedCommand, commandRepeatKey, createCommandRepeatState, evaluateCommandRepeat, recordFailedCommand, type CommandRepeatState } from "@/lib/ai/mission/command-repeat-guard";
 import { createWriteScope, evaluateWrite, type WriteScope } from "@/lib/ai/mission/write-scope";
 import { guidanceForRejectedWrite } from "@/lib/ai/mission/rejected-write-strategy";
+import { isScaffoldFoundationDependency, reconcileGeneratedManifest } from "@/lib/ai/mission/manifest-reconciliation";
 import { productEntryPath, productSliceInstruction } from "@/lib/ai/mission/product-slice-recovery";
 import { forcedToolAfterTruncation, guidanceForTruncatedWrite } from "@/lib/ai/mission/truncated-write-recovery";
 import { inBatchCorrectnessGate, inBatchRepairNote, shouldRepairInBatch, type InBatchCheck } from "@/lib/verification/in-batch-typecheck";
@@ -840,6 +841,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             input.newProject && input.staticProject
               ? "This exported static project must still render useful content when index.html is opened directly from disk. Browsers may block fetch('data.json') under file://, so never make local JSON fetch the only initialization path. Embed seed data in a normal script file or provide a real bundled fallback, handle initialization errors visibly, and then use localStorage for local-first edits."
               : "",
+            input.newProject
+              ? "Generated projects must build repeatably in the verified local environment. Do not use next/font Google-hosted fonts or any build-time remote asset fetch; use a local CSS font stack or bundled asset. For zero-setup SQLite on Node 22+, prefer the built-in node:sqlite API over native sqlite3/better-sqlite3 addons when those packages are not already installed. A failed native addon install is a signal to switch to the compatible built-in adapter, not to repeat the install."
+              : "",
             input.newProject && input.staticProject
               ? "Treat visual design as implementation, not decoration: establish an intentional type scale, page hierarchy, content-rich hero or introduction, polished responsive cards, purposeful spacing, accessible empty/error/loading states, and mobile behavior. A header plus empty whitespace or raw form controls is not a finished interface."
               : "",
@@ -1135,7 +1139,9 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       } else {
         const reason = durableWorkExists
           ? `NO_PROGRESS_AFTER_MUTATION: ${changedFiles.size} verified file change${changedFiles.size === 1 ? " is" : "s are"} already on disk, but the current implementation batch then used ${modelCallsSinceDurableProgress} model calls without another durable change or unique successful command. Preserve the written work and continue with deterministic verification or one refreshed continuation batch.`
-          : `NO_PROGRESS_BEFORE_MUTATION: The initial implementation route used ${modelCallsSinceDurableProgress} consecutive model calls without a new file change or unique successful command, and the action-enforced mutation route has already been tried. Preserve the inspected evidence for a refreshed continuation batch.`;
+          : input.newProject
+            ? `NO_PROGRESS_BEFORE_MUTATION: The initial greenfield route used ${modelCallsSinceDurableProgress} consecutive model calls without producing an accepted runnable source batch. Preserve the brief and scaffold evidence for one stronger, action-enforced greenfield continuation.`
+            : `NO_PROGRESS_BEFORE_MUTATION: The initial implementation route used ${modelCallsSinceDurableProgress} consecutive model calls without a new file change or unique successful command, and the action-enforced mutation route has already been tried. Preserve the inspected evidence for a refreshed continuation batch.`;
         await emit("planning", "warning", "Implementation route needs escalation", {
           internal: true,
           details: { reason, paidCallPrevented: true, recoverable: true, durableWorkExists },
@@ -1686,7 +1692,10 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
       const wrongForcedRequiredPath = forceRequiredFile && call.name === "write_file" && writePath.toLowerCase() !== forcedRequiredPath?.toLowerCase()
         ? `This recovery action must create the exact missing user-required path ${forcedRequiredPath}; ${writePath || "a blank path"} is not an accepted substitute.`
         : undefined;
-      const lastCommandFailed = commands.length > 0 && commands[commands.length - 1]?.exitCode !== 0;
+      // The in-batch typecheck runs directly through ProjectAccess, so its failure is not appended to
+      // the model-owned `commands` list. Treating only that list as failure evidence caused Foundry to
+      // request a correction and then reject the exact correction as an unnecessary rewrite.
+      const lastCommandFailed = (commands.length > 0 && commands[commands.length - 1]?.exitCode !== 0) || inBatchChecks.length > 0;
       const repeatedGeneratedWriteIssue = input.newProject
         && ["write_file", "write_files"].includes(call.name ?? "")
         && generatedMutationPaths.length > 0
@@ -1799,6 +1808,7 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           })
         : undefined;
       let generatedManifestIssue: string | undefined;
+      let generatedManifestCorrection: { dependencies: string[]; scripts: string[] } | undefined;
       if (input.newProject) {
         const manifestWrite = call.name === "write_files" && Array.isArray(args.files)
           ? args.files.find((file) => file && typeof file === "object" && /(?:^|\/)package\.json$/i.test(String((file as Record<string, unknown>).path ?? "").replace(/\\/g, "/"))) as Record<string, unknown> | undefined
@@ -1806,27 +1816,19 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
             ? args
             : undefined;
         if (manifestWrite && typeof manifestWrite.content === "string") {
-          try {
-            const proposed = JSON.parse(manifestWrite.content) as { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
-            const previous = await input.access.readFile(String(manifestWrite.path ?? "package.json"), { limitBytes: 200_000 });
-            const current = previous.exists ? JSON.parse(previous.content) as { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> } : undefined;
-            const proposedEntries = { ...(proposed.dependencies ?? {}), ...(proposed.devDependencies ?? {}) };
-            const currentEntries = { ...(current?.dependencies ?? {}), ...(current?.devDependencies ?? {}) };
-            const changedFoundation = Object.entries(currentEntries).find(([name, version]) => proposedEntries[name] && proposedEntries[name] !== version);
-            const removedFoundation = Object.keys(currentEntries).find((name) => proposedEntries[name] === undefined);
-            const removedScaffoldScript = Object.keys(current?.scripts ?? {}).find((name) => proposed.scripts?.[name] === undefined);
-            const floatingVersion = Object.entries(proposedEntries).find(([, version]) => /^latest$/i.test(version));
-            if (changedFoundation) {
-              generatedManifestIssue = `The verified scaffold already pins ${changedFoundation[0]} at ${changedFoundation[1]}. Preserve its compatible foundation versions and add only genuinely required packages; do not replace the scaffold dependency set.`;
-            } else if (removedFoundation) {
-              generatedManifestIssue = `The verified scaffold requires ${removedFoundation}. Generated implementation may add dependencies, but it cannot delete the selected stack's foundation packages.`;
-            } else if (removedScaffoldScript) {
-              generatedManifestIssue = `The verified scaffold requires the ${removedScaffoldScript} script. Generated implementation cannot delete canonical build, typecheck, test, start, or preview commands.`;
-            } else if (floatingVersion) {
-              generatedManifestIssue = `${floatingVersion[0]} uses the floating \"latest\" tag. Generated projects must use an explicit compatible version range so a future registry release cannot silently break the build.`;
+          const previous = await input.access.readFile(String(manifestWrite.path ?? "package.json"), { limitBytes: 200_000 });
+          if (previous.exists) {
+            const reconciliation = reconcileGeneratedManifest(manifestWrite.content, previous.content, isScaffoldFoundationDependency);
+            generatedManifestIssue = reconciliation.issue;
+            if (reconciliation.content) {
+              manifestWrite.content = reconciliation.content;
+              if (reconciliation.preservedDependencies.length || reconciliation.preservedScripts.length) {
+                generatedManifestCorrection = {
+                  dependencies: reconciliation.preservedDependencies,
+                  scripts: reconciliation.preservedScripts,
+                };
+              }
             }
-          } catch {
-            generatedManifestIssue = "package.json must be valid JSON and preserve the verified scaffold's compatible dependency versions.";
           }
         }
       }
@@ -1953,6 +1955,16 @@ export async function runMissionExecutor(input: MissionExecutorInput): Promise<M
           }
         }
       } else {
+        if (generatedManifestCorrection) {
+          await emit("inspection", "completed", "Preserved the verified scaffold while accepting the product batch", {
+            internal: true,
+            details: {
+              preservedDependencies: generatedManifestCorrection.dependencies,
+              preservedScripts: generatedManifestCorrection.scripts,
+              deterministicRepair: true,
+            },
+          });
+        }
         toolResult = await executeTool(call.name ?? "", args, input.access, emit, changedFiles, commands, narrativeObjects, input.preApprovedCommands, input.approvedCategories, messageText, input.task, input.standingApprovedCommands, input.deniedActions, input.newProject, commandRepeatState, writeScope).catch((error) => ({
           error: error instanceof Error ? error.message : "Tool call failed unexpectedly.",
         }));

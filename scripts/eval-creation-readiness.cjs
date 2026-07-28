@@ -15,7 +15,11 @@ const loadTs = (file, customRequire = require) => {
   return loaded.exports;
 };
 
-const discovery = loadTs("lib/ai/project-discovery.ts");
+const requirementIntent = loadTs("lib/discovery/requirement-intent.ts");
+const discovery = loadTs("lib/ai/project-discovery.ts", (id) => {
+  if (id === "@/lib/discovery/requirement-intent") return requirementIntent;
+  return require(id);
+});
 assert.equal(discovery.explicitPlatformFromPrompt("Build a PAX Android point-of-sale application that allows merchants to scan items and checkout."), "Mobile app");
 const dashboardSource = source("components/BuildDashboard.tsx");
 assert.match(dashboardSource, /const subtype = template\.id === "custom" \? "" : firstSubtypeFor\(template\.id\)/, "Freeform projects must not be preclassified as Web apps.");
@@ -87,6 +91,7 @@ assert.equal(productSpecificFallback.decisions.find((item) => item.dimension ===
 
 const policy = loadTs("lib/discovery/platform-stack-policy.ts", (id) => {
   if (id === "@/lib/ai/project-discovery") return discovery;
+  if (id === "./requirement-intent") return requirementIntent;
   return require(id);
 });
 const reconciled = policy.reconcilePlatformStackOptions("custom", staticResult, [
@@ -161,7 +166,11 @@ assert.match(runtime, /const offerMockGate = requestedMockReview &&/);
 assert.match(runtime, /const credentialBrief = \[spec\.projectDescription, `Selected stack: \$\{spec\.stack\}`, spec\.instructions\]/);
 assert.doesNotMatch(runtime, /const credentialBrief = \[brief, spec\.projectDescription/);
 assert.match(runtime, /maxTurns: stackProfile\.id === "static-html" \? 8 : 6/);
-assert.match(runtime, /const maxCreationContinuationBatches = 0/);
+assert.match(runtime, /const maxCreationContinuationBatches = 1/);
+assert.match(runtime, /NO_PROGRESS_BEFORE_MUTATION/);
+assert.match(runtime, /needsGreenfieldImplementationRecovery/);
+assert.match(runtime, /greenfield implementation recovery/);
+assert.match(runtime, /modelForMissionStage\(task, modelMode, "builder", undefined, continuationAttempt, creationAssessment\)/);
 assert.match(runtime, /const generationBoundaryWithFiles = result\.status === "failed"/);
 assert.doesNotMatch(runtime, /const budgetBoundaryAfterGeneration/);
 assert.match(runtime, /Created verified Vite \+ React project scaffold/);
